@@ -1,0 +1,146 @@
+{
+  "name": "sf-org-deploy-wrapper",
+  "displayName": "SF Org Deploy Wrapper",
+  "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
+  "version": "0.1.1",
+  "publisher": "Skrety",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "salesforce",
+    "sf",
+    "sfdx",
+    "deploy",
+    "retrieve",
+    "diff"
+  ],
+  "activationEvents": [
+    "workspaceContains:sfdx-project.json",
+    "workspaceContains:**/force-app/**"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sf-org-deploy-wrapper",
+          "title": "SF Deploy Wrapper",
+          "icon": "$(cloud-upload)"
+        }
+      ]
+    },
+    "views": {
+      "sf-org-deploy-wrapper": [
+        {
+          "type": "webview",
+          "id": "sfOrgDeployWrapper.panel",
+          "name": "Org Deploy"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sfOrgDeployWrapper.selectOrg",
+        "title": "SF Deploy: Select Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.refreshFiles",
+        "title": "SF Deploy: Refresh Metadata Files"
+      },
+      {
+        "command": "sfOrgDeployWrapper.deployFile",
+        "title": "SF Deploy: Deploy to Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.retrieveFile",
+        "title": "SF Deploy: Retrieve from Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.diffFile",
+        "title": "SF Deploy: Diff with Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.diffFileWithOrg",
+        "title": "SF Deploy: Compare with Org…"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "sfOrgDeployWrapper.deployFile",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@1"
+        },
+        {
+          "command": "sfOrgDeployWrapper.retrieveFile",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@2"
+        },
+        {
+          "command": "sfOrgDeployWrapper.diffFile",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@3"
+        },
+        {
+          "command": "sfOrgDeployWrapper.diffFileWithOrg",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@4"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "sfOrgDeployWrapper.deployFile",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@1"
+        },
+        {
+          "command": "sfOrgDeployWrapper.retrieveFile",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@2"
+        },
+        {
+          "command": "sfOrgDeployWrapper.diffFile",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@3"
+        },
+        {
+          "command": "sfOrgDeployWrapper.diffFileWithOrg",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "group": "sfdeploy@4"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SF Org Deploy Wrapper",
+      "properties": {
+        "sfOrgDeployWrapper.commandTimeoutMs": {
+          "type": "number",
+          "default": 180000,
+          "minimum": 10000,
+          "maximum": 900000,
+          "description": "Timeout in milliseconds for sf CLI deploy/retrieve commands."
+        },
+        "sfOrgDeployWrapper.ignoreDeployConflicts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pass --ignore-conflicts to sf project deploy start. Off by default: the CLI will refuse to overwrite org changes that aren't in your local source."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
