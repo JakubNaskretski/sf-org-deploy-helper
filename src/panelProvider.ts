@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
 import { OrgInfo, RetrieveFileResult, SfCliCancelledError, SfCliError, SfCliService } from './sfCliService';
-import { MetadataItem, findItemForPath, scanWorkspace } from './metadataScanner';
+import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -199,6 +199,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.workspaceRoot = root;
     this.post({
       type: 'files',
+      objectChildTypes: [...OBJECT_CHILD_TYPES],
       items: items.map(i => ({
         type: i.type,
         name: i.name,
@@ -465,10 +466,46 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
       }
 
+      // Decomposed object children (CustomField, ValidationRule, …) come back inlined
+      // in the parent .object file in MDAPI format. Convert the retrieved bundle to
+      // source format once so each child can be diffed as its own *-meta.xml against
+      // the local file.
+      let convertedDir: string | undefined;
+      if (items.some(i => OBJECT_CHILD_TYPES.has(i.type))) {
+        const srcDir = path.join(tmpRoot, 'source');
+        tmpPaths.push(srcDir);
+        try {
+          const conv = this.sf.convertMdapi(unpackagedDir, srcDir, root, { timeoutMs: this.timeoutMs() });
+          this.currentCancel = conv.cancel;
+          await conv.promise;
+          convertedDir = srcDir;
+        } catch (e) {
+          // Let a user cancel bubble to the outer handler ("Diff cancelled") rather
+          // than degrade into a per-child "could not convert" error card.
+          if (e instanceof SfCliCancelledError) throw e;
+          this.output.appendLine(`[Diff] mdapi→source convert failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
       for (const item of items) {
-        const remoteFile = await findRetrievedPrimary(unpackagedDir, item);
+        const isChild = OBJECT_CHILD_TYPES.has(item.type);
+        let remoteFile: string | undefined;
+        if (isChild) {
+          // Match the converted file by its `objects/<Object>/<folder>/<file>` suffix so
+          // same-named fields on different objects in one batch don't cross-match.
+          const childFolder = path.basename(path.dirname(item.filePath));
+          const objectFolder = path.basename(path.dirname(path.dirname(item.filePath)));
+          const suffix = path.join('objects', objectFolder, childFolder, path.basename(item.filePath));
+          remoteFile = convertedDir ? await findFileBySuffix(convertedDir, suffix) : undefined;
+        } else {
+          remoteFile = await findRetrievedPrimary(unpackagedDir, item);
+        }
         if (!remoteFile) {
-          missing.push(item);
+          if (isChild && !convertedDir) {
+            errors.push(`${item.type}:${item.name} — could not convert org metadata to source format for diff`);
+          } else {
+            missing.push(item);
+          }
           continue;
         }
         const localUri = vscode.Uri.file(item.filePath);
@@ -652,7 +689,18 @@ async function findRetrievedPrimary(unpackagedDir: string, item: MetadataItem): 
     Workflow: 'workflows',
     EmailTemplate: 'email',
     CustomObject: 'objects',
-    CustomMetadata: 'customMetadata'
+    CustomMetadata: 'customMetadata',
+    FlexiPage: 'flexipages',
+    CustomApplication: 'applications',
+    QuickAction: 'quickActions',
+    CustomPermission: 'customPermissions',
+    NamedCredential: 'namedCredentials',
+    ExternalDataSource: 'externalDataSources',
+    RemoteSiteSetting: 'remoteSiteSettings',
+    Role: 'roles',
+    Settings: 'settings',
+    LightningMessageChannel: 'messageChannels',
+    ApexTestSuite: 'testSuites'
   };
   const folder = folderByType[item.type];
   if (!folder) return undefined;
@@ -707,6 +755,25 @@ async function findFileMatching(dir: string, exactBasename: string, leafName: st
     }
   }
   return prefixHit;
+}
+
+/** Recursively find a file under `dir` whose absolute path ends with `suffixPath`
+ *  (a relative path like `objects/Account/fields/Foo__c.field-meta.xml`). Used to
+ *  locate a decomposed child inside the converted source tree without assuming the
+ *  tree's root nesting, while still keying on the object + child folder. */
+async function findFileBySuffix(dir: string, suffixPath: string): Promise<string | undefined> {
+  let entries: import('fs').Dirent[];
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return undefined; }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const nested = await findFileBySuffix(full, suffixPath);
+      if (nested) return nested;
+    } else if (e.isFile() && (full === suffixPath || full.endsWith(path.sep + suffixPath))) {
+      return full;
+    }
+  }
+  return undefined;
 }
 
 /** Resolve the directory the CLI unzipped a metadata-dir retrieve into. Prefers

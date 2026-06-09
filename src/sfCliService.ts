@@ -176,6 +176,34 @@ export class SfCliService {
     return { promise, cancel: inner.cancel };
   }
 
+  /**
+   * Convert an MDAPI-format tree (`rootDir`) to SFDX source format under `outputDir`.
+   * Used by the diff flow so a decomposed object child (CustomField, ValidationRule,
+   * …) retrieved in metadata format can be compared file-to-file against the local
+   * source-format `*-meta.xml`. Does not require an org.
+   */
+  convertMdapi(
+    rootDir: string,
+    outputDir: string,
+    cwd: string,
+    opts: { timeoutMs?: number } = {}
+  ): Cancellable<{ cmd: string }> {
+    const args = ['project', 'convert', 'mdapi', '--root-dir', rootDir, '--output-dir', outputDir, '--json'];
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<{ status?: number; name?: string; message?: string }>(args, { timeoutMs: opts.timeoutMs, cwd });
+    // runJsonCancellable resolves on process close regardless of exit code, so a
+    // failed-but-JSON convert (`{"status":1,…}`) would otherwise look like success.
+    // Inspect the status envelope and reject so the caller surfaces a real error
+    // instead of silently treating every child as "not on org".
+    const promise = inner.promise.then(json => {
+      if (json.status && json.status !== 0) {
+        throw new SfCliError(`sf project convert mdapi failed (status ${json.status})${json.message ? `: ${json.message}` : ''}`);
+      }
+      return { cmd };
+    });
+    return { promise, cancel: inner.cancel };
+  }
+
   private formatCmd(args: string[]): string {
     // Quote args containing whitespace so the echoed command is copy-pasteable
     // (e.g. an EmailTemplate fullName "Folder/My Template").
