@@ -48,8 +48,47 @@ const RULES: FolderRule[] = [
   { folder: 'groups', type: 'Group', primaryExt: ['.group-meta.xml'] },
   { folder: 'globalValueSets', type: 'GlobalValueSet', primaryExt: ['.globalValueSet-meta.xml'] },
   { folder: 'workflows', type: 'Workflow', primaryExt: ['.workflow-meta.xml'] },
+  // Single-file top-level types (Tier A). Each is one `*-meta.xml`; the org side
+  // diffs cleanly against the MDAPI retrieve (same root element, no decomposition).
+  { folder: 'flexipages', type: 'FlexiPage', primaryExt: ['.flexipage-meta.xml'] },
+  { folder: 'applications', type: 'CustomApplication', primaryExt: ['.app-meta.xml'] },
+  { folder: 'quickActions', type: 'QuickAction', primaryExt: ['.quickAction-meta.xml'] },
+  { folder: 'customPermissions', type: 'CustomPermission', primaryExt: ['.customPermission-meta.xml'] },
+  { folder: 'namedCredentials', type: 'NamedCredential', primaryExt: ['.namedCredential-meta.xml'] },
+  { folder: 'externalDataSources', type: 'ExternalDataSource', primaryExt: ['.externalDataSource-meta.xml'] },
+  { folder: 'remoteSiteSettings', type: 'RemoteSiteSetting', primaryExt: ['.remoteSiteSetting-meta.xml'] },
+  { folder: 'roles', type: 'Role', primaryExt: ['.role-meta.xml'] },
+  { folder: 'settings', type: 'Settings', primaryExt: ['.settings-meta.xml'] },
+  { folder: 'messageChannels', type: 'LightningMessageChannel', primaryExt: ['.messageChannel-meta.xml'] },
+  { folder: 'testSuites', type: 'ApexTestSuite', primaryExt: ['.testSuite-meta.xml'] },
   { folder: 'email', type: 'EmailTemplate', primaryExt: ['.email'], metaSuffix: '.email-meta.xml', nested: true },
 ];
+
+/** Decomposed children of a CustomObject in SFDX source format. Each is a single
+ *  `*-meta.xml` file living under `objects/<Object>/<folder>/`, and each is its own
+ *  addressable metadata type with the fullName `Object.Child`
+ *  (e.g. `CustomField:Account.MyField__c`). These exist on standard objects too —
+ *  even ones with no deployable `*.object-meta.xml` — so they're scanned
+ *  independently of the CustomObject bundle. */
+const OBJECT_CHILD_RULES: Array<{ folder: string; type: string; suffix: string }> = [
+  { folder: 'fields', type: 'CustomField', suffix: '.field-meta.xml' },
+  { folder: 'businessProcesses', type: 'BusinessProcess', suffix: '.businessProcess-meta.xml' },
+  { folder: 'compactLayouts', type: 'CompactLayout', suffix: '.compactLayout-meta.xml' },
+  { folder: 'fieldSets', type: 'FieldSet', suffix: '.fieldSet-meta.xml' },
+  { folder: 'indexes', type: 'Index', suffix: '.index-meta.xml' },
+  { folder: 'listViews', type: 'ListView', suffix: '.listView-meta.xml' },
+  { folder: 'recordTypes', type: 'RecordType', suffix: '.recordType-meta.xml' },
+  { folder: 'sharingReasons', type: 'SharingReason', suffix: '.sharingReason-meta.xml' },
+  { folder: 'validationRules', type: 'ValidationRule', suffix: '.validationRule-meta.xml' },
+  { folder: 'webLinks', type: 'WebLink', suffix: '.webLink-meta.xml' },
+];
+
+const OBJECT_CHILD_BY_FOLDER = new Map(OBJECT_CHILD_RULES.map(r => [r.folder, r]));
+
+/** Metadata types that are decomposed children of a CustomObject (one `*-meta.xml`
+ *  file each). The diff flow needs this to know the org side must be converted
+ *  MDAPI→source before a meaningful file-to-file diff. */
+export const OBJECT_CHILD_TYPES: ReadonlySet<string> = new Set(OBJECT_CHILD_RULES.map(r => r.type));
 
 /** Resolve the package directories from sfdx-project.json or fall back to force-app. */
 export async function resolvePackageDirs(root: string): Promise<string[]> {
@@ -134,6 +173,10 @@ export async function scanWorkspace(): Promise<{ items: MetadataItem[]; root?: s
         const files = await listAllFiles(bundlePath);
         items.push({ type: 'CustomObject', name: path.basename(bundlePath), filePath: bundlePath, files });
       }
+      // Decomposed children (fields, validation rules, record types, …) — scanned
+      // independently of the bundle above so they're picked up on standard objects
+      // that have no deployable *.object-meta.xml.
+      await scanObjectChildren(objectsDir, items);
     }
   }
   // Dedupe by type:name — the same component can appear under multiple package
@@ -150,14 +193,45 @@ export async function scanWorkspace(): Promise<{ items: MetadataItem[]; root?: s
   return { items: deduped, root };
 }
 
+/** Walk `objectsDir` and emit one item per decomposed object child. A directory whose
+ *  name matches a known child folder (`fields`, `validationRules`, …) has its parent's
+ *  basename as the owning object's API name; the files inside are the children. */
+async function scanObjectChildren(objectsDir: string, items: MetadataItem[]): Promise<void> {
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > MAX_SCAN_DEPTH) return;
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || shouldSkipDir(e.name)) continue;
+      const rule = OBJECT_CHILD_BY_FOLDER.get(e.name);
+      if (rule) {
+        const objectName = path.basename(dir);
+        const found = await walkForFilesMatching(path.join(dir, e.name), [rule.suffix]);
+        for (const filePath of found) {
+          const base = path.basename(filePath);
+          const stem = base.slice(0, base.length - rule.suffix.length);
+          items.push({ type: rule.type, name: `${objectName}.${stem}`, filePath, files: [filePath] });
+        }
+      } else {
+        await walk(path.join(dir, e.name), depth + 1);
+      }
+    }
+  };
+  await walk(objectsDir, 0);
+}
+
 /** Find the workspace metadata item that owns the given absolute file path, if any. */
 export function findItemForPath(items: MetadataItem[], absPath: string): MetadataItem | undefined {
   const normalized = path.normalize(absPath);
-  // Prefer exact file match first
-  let match = items.find(i => i.files.some(f => path.normalize(f) === normalized));
+  // 1. Prefer the component whose primary file IS this file — picks the specific
+  //    leaf (e.g. a CustomField) over the CustomObject bundle that also contains it.
+  let match = items.find(i => path.normalize(i.filePath) === normalized);
   if (match) return match;
-  // Then containing bundle/folder
-  match = items.find(i => normalized.startsWith(path.normalize(i.filePath) + path.sep) || path.normalize(i.filePath) === normalized);
+  // 2. Any component that lists this exact file (e.g. a sidecar -meta.xml).
+  match = items.find(i => i.files.some(f => path.normalize(f) === normalized));
+  if (match) return match;
+  // 3. The containing bundle/folder.
+  match = items.find(i => normalized.startsWith(path.normalize(i.filePath) + path.sep));
   return match;
 }
 

@@ -7,6 +7,7 @@
     orgs: [],
     selectedOrg: null,
     items: [], // {type, name, key (type:name), filePath, files[]}
+    objectChildTypes: new Set(), // metadata types that nest under an object (CustomField, …)
     selected: new Set(), // keys
     expandedGroups: new Set(persisted.expandedGroups || []),
     filter: persisted.filter || '',
@@ -71,6 +72,7 @@
         return;
       case 'files':
         state.items = msg.items || [];
+        state.objectChildTypes = new Set(msg.objectChildTypes || []);
         // Drop selections that no longer exist
         const valid = new Set(state.items.map(i => `${i.type}:${i.name}`));
         for (const k of Array.from(state.selected)) if (!valid.has(k)) state.selected.delete(k);
@@ -88,9 +90,8 @@
       case 'activeFile':
         state.activeFileKey = msg.key || null;
         if (msg.key && msg.select) {
-          // explicit "Use active file" — expand its group, select it, scroll into view
-          const grp = msg.key.split(':')[0];
-          state.expandedGroups.add(grp);
+          // explicit "Use active file" — expand its group path, select it, scroll into view
+          expandPathForKey(msg.key);
           state.selected.add(msg.key);
           savePersisted();
           renderTree();
@@ -225,6 +226,167 @@
     return state.typeFilter.has(type);
   }
 
+  // key = "Type:Name"; Name itself may contain ':' on no known type, so split on the first.
+  function splitKey(key) {
+    const idx = key.indexOf(':');
+    return [key.slice(0, idx), key.slice(idx + 1)];
+  }
+
+  // Friendly plural label for an object-child type group.
+  const CHILD_LABELS = {
+    CustomField: 'Fields',
+    ValidationRule: 'Validation Rules',
+    RecordType: 'Record Types',
+    ListView: 'List Views',
+    FieldSet: 'Field Sets',
+    CompactLayout: 'Compact Layouts',
+    WebLink: 'Buttons & Links',
+    BusinessProcess: 'Business Processes',
+    Index: 'Indexes',
+    SharingReason: 'Sharing Reasons'
+  };
+  function childLabel(type) { return CHILD_LABELS[type] || type; }
+
+  // Expand the group path that reveals `key` (so "Use active file" can scroll to it).
+  function expandPathForKey(key) {
+    const [type, name] = splitKey(key);
+    if (state.objectChildTypes.has(type)) {
+      const obj = name.split('.')[0];
+      state.expandedGroups.add('__OBJECTS__');
+      state.expandedGroups.add('obj/' + obj);
+      state.expandedGroups.add('objc/' + obj + '/' + type);
+    } else if (type === 'CustomObject') {
+      state.expandedGroups.add('__OBJECTS__');
+      state.expandedGroups.add('obj/' + name);
+    } else {
+      state.expandedGroups.add(type);
+    }
+  }
+
+  // Partition the (filtered) item list into the object tree and the flat type groups.
+  function buildGroups() {
+    const filter = state.filter;
+    const objectMap = new Map(); // objectName -> { obj: item|null, children: Map<type, item[]> }
+    const flatGroups = new Map(); // type -> item[]
+    const getObj = (n) => {
+      let o = objectMap.get(n);
+      if (!o) { o = { obj: null, children: new Map() }; objectMap.set(n, o); }
+      return o;
+    };
+    for (const item of state.items) {
+      if (!isTypeAllowed(item.type)) continue;
+      if (filter && !`${item.type} ${item.name}`.toLowerCase().includes(filter)) continue;
+      if (item.type === 'CustomObject') {
+        getObj(item.name).obj = item;
+      } else if (state.objectChildTypes.has(item.type)) {
+        const o = getObj(item.name.split('.')[0]);
+        if (!o.children.has(item.type)) o.children.set(item.type, []);
+        o.children.get(item.type).push(item);
+      } else {
+        if (!flatGroups.has(item.type)) flatGroups.set(item.type, []);
+        flatGroups.get(item.type).push(item);
+      }
+    }
+    return { objectMap, flatGroups };
+  }
+
+  const INDENT = (depth) => `${8 + depth * 14}px`;
+
+  // A collapsible group node with a tri-state select-all checkbox. Returns the wrapper
+  // and the body element to append children into (only when expanded).
+  function makeGroupNode({ key, label, count, itemKeys, expanded, depth }) {
+    const group = document.createElement('div');
+    group.className = 'group';
+    const header = document.createElement('div');
+    header.className = 'group-header';
+    header.style.paddingLeft = INDENT(depth);
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    const sel = itemKeys.filter(k => state.selected.has(k)).length;
+    if (sel === 0) { cb.checked = false; cb.indeterminate = false; }
+    else if (sel === itemKeys.length) { cb.checked = true; cb.indeterminate = false; }
+    else { cb.checked = false; cb.indeterminate = true; }
+    cb.title = 'Select/deselect all visible items in this group';
+    cb.addEventListener('click', (e) => e.stopPropagation());
+    cb.addEventListener('change', () => {
+      const all = sel === itemKeys.length;
+      for (const k of itemKeys) { if (all) state.selected.delete(k); else state.selected.add(k); }
+      renderTree();
+      renderActions();
+    });
+    header.appendChild(cb);
+
+    const caret = document.createElement('span');
+    caret.className = 'caret';
+    caret.textContent = expanded ? '▾' : '▸';
+    header.appendChild(caret);
+    const lbl = document.createElement('span');
+    lbl.textContent = label;
+    header.appendChild(lbl);
+    const cnt = document.createElement('span');
+    cnt.className = 'count';
+    cnt.textContent = `(${count})`;
+    header.appendChild(cnt);
+
+    header.addEventListener('click', (e) => {
+      if (e.target === cb) return;
+      if (state.expandedGroups.has(key)) state.expandedGroups.delete(key);
+      else state.expandedGroups.add(key);
+      savePersisted();
+      renderTree();
+    });
+    group.appendChild(header);
+    const body = document.createElement('div');
+    group.appendChild(body);
+    return { group, body };
+  }
+
+  // A selectable leaf row for a single metadata item, indented to `depth`.
+  function makeLeafRow(item, displayName, depth) {
+    const key = `${item.type}:${item.name}`;
+    const row = document.createElement('div');
+    const isActive = key === state.activeFileKey;
+    row.className = 'row' + (isActive ? ' focused active-editor' : '');
+    row.dataset.key = key;
+    row.style.paddingLeft = INDENT(depth);
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = state.selected.has(key);
+    cb.addEventListener('change', () => {
+      if (cb.checked) state.selected.add(key); else state.selected.delete(key);
+      renderTree();
+      renderActions();
+    });
+    row.appendChild(cb);
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = displayName;
+    name.title = item.filePath;
+    row.appendChild(name);
+    if (item.files && item.files.length > 1) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = `${item.files.length} files`;
+      row.appendChild(badge);
+    }
+    row.addEventListener('click', (e) => {
+      if (e.target === cb) return;
+      cb.checked = !cb.checked;
+      if (cb.checked) state.selected.add(key); else state.selected.delete(key);
+      renderTree();
+      renderActions();
+    });
+    return row;
+  }
+
+  function keysUnderObject(o) {
+    const keys = [];
+    if (o.obj) keys.push(`${o.obj.type}:${o.obj.name}`);
+    for (const arr of o.children.values()) for (const it of arr) keys.push(`${it.type}:${it.name}`);
+    return keys;
+  }
+
   function renderTree() {
     const tree = $('tree');
     tree.innerHTML = '';
@@ -236,111 +398,54 @@
       return;
     }
     const filter = state.filter;
-    const groups = new Map();
-    for (const item of state.items) {
-      if (!isTypeAllowed(item.type)) continue;
-      if (filter) {
-        const hay = `${item.type} ${item.name}`.toLowerCase();
-        if (!hay.includes(filter)) continue;
-      }
-      if (!groups.has(item.type)) groups.set(item.type, []);
-      groups.get(item.type).push(item);
-    }
-    const types = Array.from(groups.keys()).sort();
-    if (types.length === 0) {
+    const { objectMap, flatGroups } = buildGroups();
+    if (objectMap.size === 0 && flatGroups.size === 0) {
       const d = document.createElement('div');
       d.className = 'status-empty';
       d.textContent = 'No metadata matches the current filter.';
       tree.appendChild(d);
       return;
     }
-    for (const type of types) {
-      const arr = groups.get(type);
-      const groupEl = document.createElement('div');
-      groupEl.className = 'group';
-      const expanded = state.expandedGroups.has(type) || !!filter;
-      const header = document.createElement('div');
-      header.className = 'group-header';
 
-      // group-select checkbox (T14)
-      const groupCb = document.createElement('input');
-      groupCb.type = 'checkbox';
-      const selectedInGroup = arr.filter(i => state.selected.has(`${i.type}:${i.name}`)).length;
-      if (selectedInGroup === 0) { groupCb.checked = false; groupCb.indeterminate = false; }
-      else if (selectedInGroup === arr.length) { groupCb.checked = true; groupCb.indeterminate = false; }
-      else { groupCb.checked = false; groupCb.indeterminate = true; }
-      groupCb.title = 'Select/deselect all visible items in this group';
-      groupCb.addEventListener('click', (e) => e.stopPropagation());
-      groupCb.addEventListener('change', () => {
-        const allSelected = selectedInGroup === arr.length;
-        for (const i of arr) {
-          const k = `${i.type}:${i.name}`;
-          if (allSelected) state.selected.delete(k);
-          else state.selected.add(k);
-        }
-        renderTree();
-        renderActions();
-      });
-      header.appendChild(groupCb);
-
-      const caret = document.createElement('span');
-      caret.className = 'caret';
-      caret.textContent = expanded ? '▾' : '▸';
-      header.appendChild(caret);
-      const typeLbl = document.createElement('span');
-      typeLbl.textContent = type;
-      header.appendChild(typeLbl);
-      const count = document.createElement('span');
-      count.className = 'count';
-      count.textContent = `(${arr.length})`;
-      header.appendChild(count);
-
-      header.addEventListener('click', (e) => {
-        if (e.target === groupCb) return;
-        if (state.expandedGroups.has(type)) state.expandedGroups.delete(type);
-        else state.expandedGroups.add(type);
-        savePersisted();
-        renderTree();
-      });
-      groupEl.appendChild(header);
-      if (expanded) {
-        for (const item of arr) {
-          const key = `${item.type}:${item.name}`;
-          const row = document.createElement('div');
-          const isActive = key === state.activeFileKey;
-          row.className = 'row' + (isActive ? ' focused active-editor' : '');
-          row.dataset.key = key;
-          const cb = document.createElement('input');
-          cb.type = 'checkbox';
-          cb.checked = state.selected.has(key);
-          cb.addEventListener('change', () => {
-            if (cb.checked) state.selected.add(key); else state.selected.delete(key);
-            renderTree();
-            renderActions();
-          });
-          row.appendChild(cb);
-          const name = document.createElement('span');
-          name.className = 'name';
-          name.textContent = item.name;
-          name.title = item.filePath;
-          row.appendChild(name);
-          if (item.files && item.files.length > 1) {
-            const badge = document.createElement('span');
-            badge.className = 'badge';
-            badge.textContent = `${item.files.length} files`;
-            row.appendChild(badge);
+    // ---- Objects super-group: object → child-type sub-groups → rows ----
+    if (objectMap.size > 0) {
+      const objectNames = Array.from(objectMap.keys()).sort();
+      const allKeys = objectNames.flatMap(n => keysUnderObject(objectMap.get(n)));
+      const objectsExpanded = state.expandedGroups.has('__OBJECTS__') || !!filter;
+      const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: 0 });
+      tree.appendChild(objectsNode.group);
+      if (objectsExpanded) {
+        for (const name of objectNames) {
+          const o = objectMap.get(name);
+          const objKeys = keysUnderObject(o);
+          const objExpanded = state.expandedGroups.has('obj/' + name) || !!filter;
+          const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: 1 });
+          objectsNode.body.appendChild(objNode.group);
+          if (!objExpanded) continue;
+          // The object's own definition (CustomObject) — diff is unsupported, but it
+          // can still be deployed/retrieved, so surface it as a selectable row.
+          if (o.obj) objNode.body.appendChild(makeLeafRow(o.obj, '⊙ object definition', 2));
+          for (const ct of Array.from(o.children.keys()).sort()) {
+            const arr = o.children.get(ct).slice().sort((a, b) => a.name.localeCompare(b.name));
+            const ctKeys = arr.map(it => `${it.type}:${it.name}`);
+            const ctExpanded = state.expandedGroups.has('objc/' + name + '/' + ct) || !!filter;
+            const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: 2 });
+            objNode.body.appendChild(ctNode.group);
+            if (!ctExpanded) continue;
+            for (const it of arr) ctNode.body.appendChild(makeLeafRow(it, it.name.slice(name.length + 1), 3));
           }
-          row.addEventListener('click', (e) => {
-            if (e.target === cb) return;
-            cb.checked = !cb.checked;
-            if (cb.checked) state.selected.add(key); else state.selected.delete(key);
-            renderTree();
-            renderActions();
-          });
-          groupEl.appendChild(row);
         }
       }
-      tree.appendChild(groupEl);
+    }
+
+    // ---- Flat groups for everything that isn't an object or object child ----
+    for (const type of Array.from(flatGroups.keys()).sort()) {
+      const arr = flatGroups.get(type).slice().sort((a, b) => a.name.localeCompare(b.name));
+      const keys = arr.map(it => `${it.type}:${it.name}`);
+      const expanded = state.expandedGroups.has(type) || !!filter;
+      const node = makeGroupNode({ key: type, label: type, count: arr.length, itemKeys: keys, expanded, depth: 0 });
+      tree.appendChild(node.group);
+      if (expanded) for (const it of arr) node.body.appendChild(makeLeafRow(it, it.name, 1));
     }
   }
 
