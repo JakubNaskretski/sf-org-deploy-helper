@@ -3,7 +3,7 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
-## Unreleased
+## 0.3.0
 
 - Clear errors for CLI-level failures: expired auth, source conflicts, and
   similar errors now surface the sf CLI's own message (with an actionable hint)
