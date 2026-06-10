@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
-import { OrgInfo, RetrieveFileResult, SfCliCancelledError, SfCliError, SfCliService } from './sfCliService';
+import { OrgInfo, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService } from './sfCliService';
 import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
@@ -30,6 +30,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private busy = false;
   private currentCancel?: () => void;
   private currentAction?: string;
+  private currentProgressText?: string;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -142,6 +143,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Re-sync busy state so a webview recreated mid-operation (e.g. after the
         // sidebar was collapsed) doesn't show enabled buttons during a running op.
         this.post({ type: 'busy', busy: this.busy, action: this.currentAction });
+        if (this.busy && this.currentProgressText) this.post({ type: 'progress', text: this.currentProgressText });
         return;
       case 'refreshOrgs':
         await this.loadOrgs(true);
@@ -265,53 +267,57 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.setBusy(true, 'Deploy');
     const start = Date.now();
     try {
-      const handle = this.sf.deployMetadata(
-        items.map(i => `${i.type}:${i.name}`),
-        org,
-        root,
-        { ignoreConflicts, timeoutMs: this.timeoutMs() }
-      );
-      this.currentCancel = handle.cancel;
-      const { result, cmd } = await handle.promise;
-      this.updateCmd(cmdId, cmd);
-      // Per-component results live under `details.*` on older `sf` output and under
-      // `files` on newer output — read both so failures are never silently dropped
-      // (and the success gate accounts for both).
-      const detailFailures = result.details?.componentFailures ?? [];
-      const detailSuccesses = result.details?.componentSuccesses ?? [];
-      const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
-      const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !f.problem);
-      const failures = detailFailures.length ? detailFailures : fileFailures;
-      const successes = detailSuccesses.length ? detailSuccesses : fileSuccesses;
-      const success = result.success
-        && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
-        && failures.length === 0;
-      const lines = items.map(i => `${i.type}:${i.name}`);
-      if (success) {
-        this.post({
-          type: 'status',
-          card: {
-            kind: 'ok',
-            title: `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
-            meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded`,
-            lines
-          }
-        });
-      } else {
-        const errLines = failures.length
-          ? failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`)
-          : ['Deploy reported failure with no per-component details.'];
-        this.post({
-          type: 'status',
-          card: {
-            kind: 'err',
-            title: `Deploy failed against ${orgLabel}`,
-            meta: `${failures.length} failure${failures.length === 1 ? '' : 's'}, ${successes.length} success`,
-            lines: errLines
-          }
-        });
-      }
-      this.endCmd(cmdId, success, Date.now() - start);
+      await this.withWindowProgress(`Deploying ${noun} to ${orgLabel}`, async () => {
+        this.postProgress(`Deploying ${noun} to ${orgLabel}…`);
+        const handle = this.sf.deployMetadata(
+          items.map(i => `${i.type}:${i.name}`),
+          org,
+          root,
+          { ignoreConflicts, timeoutMs: this.timeoutMs() }
+        );
+        this.currentCancel = handle.cancel;
+        const { result, cmd } = await handle.promise;
+        this.updateCmd(cmdId, cmd);
+        // Per-component results live under `details.*` on older `sf` output and under
+        // `files` on newer output — read both so failures are never silently dropped
+        // (and the success gate accounts for both).
+        const detailFailures = result.details?.componentFailures ?? [];
+        const detailSuccesses = result.details?.componentSuccesses ?? [];
+        const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+        const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !f.problem);
+        const failures = detailFailures.length ? detailFailures : fileFailures;
+        const successes = detailSuccesses.length ? detailSuccesses : fileSuccesses;
+        const success = result.success
+          && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
+          && failures.length === 0;
+        const lines = items.map(i => `${i.type}:${i.name}`);
+        this.endCmd(cmdId, success, Date.now() - start);
+        if (success) {
+          this.post({
+            type: 'status',
+            card: {
+              kind: 'ok',
+              title: `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
+              meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded`,
+              lines
+            }
+          });
+          this.notifySuccessIfPanelHidden(`Deployed ${noun} to ${orgLabel}`);
+        } else {
+          const errLines = failures.length
+            ? failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`)
+            : ['Deploy reported failure with no per-component details.'];
+          this.post({
+            type: 'status',
+            card: {
+              kind: 'err',
+              title: `Deploy failed against ${orgLabel}`,
+              meta: `${failures.length} failure${failures.length === 1 ? '' : 's'}, ${successes.length} success`,
+              lines: errLines
+            }
+          });
+        }
+      });
     } catch (err) {
       this.endCmd(cmdId, false, Date.now() - start);
       if (err instanceof SfCliCancelledError) this.reportCancelled('Deploy');
@@ -330,9 +336,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!org) return;
     const items = this.resolveKeys(keys);
     if (items.length === 0) return;
+    const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
+    const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
 
     const confirm = await vscode.window.showWarningMessage(
-      `Retrieve ${items.length} component${items.length === 1 ? '' : 's'} from ${org}? This will overwrite local files.`,
+      `Retrieve ${noun} from ${orgLabel}? This will overwrite local files.`,
       { modal: true },
       'Retrieve'
     );
@@ -342,52 +350,60 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.setBusy(true, 'Retrieve');
     const start = Date.now();
     try {
-      const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs() });
-      this.currentCancel = handle.cancel;
-      const { result, cmd } = await handle.promise;
-      this.updateCmd(cmdId, cmd);
-      const files = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
-      const ok = files.filter(f => !f.problem && (f.state === undefined || f.state !== 'Failed'));
-      const failed = files.filter(f => f.problem || f.state === 'Failed');
-      const missing = items.filter(i => !files.some(f => f.fullName === i.name && f.type === i.type));
+      await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
+        this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
+        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs() });
+        this.currentCancel = handle.cancel;
+        const { result, cmd } = await handle.promise;
+        this.updateCmd(cmdId, cmd);
+        const files = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
+        const ok = files.filter(f => !f.problem && (f.state === undefined || f.state !== 'Failed'));
+        const failed = files.filter(f => f.problem || f.state === 'Failed');
+        const missing = items.filter(i => !files.some(f => f.fullName === i.name && f.type === i.type));
+        // Org-level messages (e.g. "entity of type X named Y cannot be found")
+        // explain an empty result better than the bare missing list — surface them.
+        const msgLines = (result.messages ?? []).filter(m => m.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
+        this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
 
-      if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
-        this.post({
-          type: 'status',
-          card: {
-            kind: 'ok',
-            title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${org}`,
-            lines: ok.map(f => `${f.type}:${f.fullName}`)
-          }
-        });
-      } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
-        this.post({
-          type: 'status',
-          card: {
-            kind: 'warn',
-            title: `Nothing retrieved from ${org}`,
-            meta: `${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`,
-            lines: missing.map(i => `${i.type}:${i.name} — not on org`)
-          }
-        });
-      } else {
-        const lines: string[] = [];
-        for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
-        for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
-        for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
-        this.post({
-          type: 'status',
-          card: {
-            kind: failed.length > 0 ? 'err' : 'warn',
-            title: `Retrieve from ${org} completed with issues`,
-            meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing`,
-            lines
-          }
-        });
-      }
-      this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
-      // refresh workspace scan (file count badges etc.)
-      this.loadFiles().catch(() => undefined);
+        if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
+          this.post({
+            type: 'status',
+            card: {
+              kind: 'ok',
+              title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
+              lines: ok.map(f => `${f.type}:${f.fullName}`)
+            }
+          });
+          this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
+        } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
+          this.post({
+            type: 'status',
+            card: {
+              kind: 'warn',
+              title: `Nothing retrieved from ${orgLabel}`,
+              meta: `${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`,
+              lines: [...missing.map(i => `${i.type}:${i.name} — not on org`), ...msgLines]
+            }
+          });
+        } else {
+          const lines: string[] = [];
+          for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
+          for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
+          for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
+          lines.push(...msgLines);
+          this.post({
+            type: 'status',
+            card: {
+              kind: failed.length > 0 ? 'err' : 'warn',
+              title: `Retrieve from ${orgLabel} completed with issues`,
+              meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing`,
+              lines
+            }
+          });
+        }
+        // refresh workspace scan (file count badges etc.)
+        this.loadFiles().catch(() => undefined);
+      });
     } catch (err) {
       this.endCmd(cmdId, false, Date.now() - start);
       if (err instanceof SfCliCancelledError) this.reportCancelled('Retrieve');
@@ -443,101 +459,160 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Always isolate temp dir outside the workspace so git doesn't see it.
     const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deploy-diff-'));
     const tmpPaths: string[] = [tmpRoot];
-    const cmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(items)} --target-org ${org} --target-metadata-dir <tmp> --unzip`);
     this.setBusy(true, 'Diff');
-    const start = Date.now();
     try {
-      const handle = this.sf.retrieveMetadata(
-        items.map(i => `${i.type}:${i.name}`), org, root, { outputDir: tmpRoot, timeoutMs: this.timeoutMs() }
-      );
-      this.currentCancel = handle.cancel;
-      const { result, cmd } = await handle.promise;
-      this.updateCmd(cmdId, cmd);
+      await this.withWindowProgress(`Comparing ${items.length} component${items.length === 1 ? '' : 's'} with ${orgLabel}`, async report => {
+        const missing: MetadataItem[] = [];
+        const opened: string[] = [];
+        const errors: string[] = [];
 
-      // sf usually unzips under tmpRoot/unpackaged/, but the folder name can vary
-      // across CLI versions / manifest names — resolve it instead of assuming.
-      const unpackagedDir = await resolveUnpackagedDir(tmpRoot);
-      const missing: MetadataItem[] = [];
-      const opened: string[] = [];
-      const errors: string[] = [];
-
-      const sfFailures = (result.messages ?? []).filter(m => m.problem);
-      for (const f of sfFailures) {
-        errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
-      }
-
-      // Decomposed object children (CustomField, ValidationRule, …) come back inlined
-      // in the parent .object file in MDAPI format. Convert the retrieved bundle to
-      // source format once so each child can be diffed as its own *-meta.xml against
-      // the local file.
-      let convertedDir: string | undefined;
-      if (items.some(i => OBJECT_CHILD_TYPES.has(i.type))) {
-        const srcDir = path.join(tmpRoot, 'source');
-        tmpPaths.push(srcDir);
-        try {
-          const conv = this.sf.convertMdapi(unpackagedDir, srcDir, root, { timeoutMs: this.timeoutMs() });
-          this.currentCancel = conv.cancel;
-          await conv.promise;
-          convertedDir = srcDir;
-        } catch (e) {
-          // Let a user cancel bubble to the outer handler ("Diff cancelled") rather
-          // than degrade into a per-child "could not convert" error card.
-          if (e instanceof SfCliCancelledError) throw e;
-          this.output.appendLine(`[Diff] mdapi→source convert failed: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-
-      for (const item of items) {
-        const isChild = OBJECT_CHILD_TYPES.has(item.type);
-        let remoteFile: string | undefined;
-        if (isChild) {
-          // Match the converted file by its `objects/<Object>/<folder>/<file>` suffix so
-          // same-named fields on different objects in one batch don't cross-match.
-          const childFolder = path.basename(path.dirname(item.filePath));
-          const objectFolder = path.basename(path.dirname(path.dirname(item.filePath)));
-          const suffix = path.join('objects', objectFolder, childFolder, path.basename(item.filePath));
-          remoteFile = convertedDir ? await findFileBySuffix(convertedDir, suffix) : undefined;
-        } else {
-          remoteFile = await findRetrievedPrimary(unpackagedDir, item);
-        }
-        if (!remoteFile) {
-          if (isChild && !convertedDir) {
-            errors.push(`${item.type}:${item.name} — could not convert org metadata to source format for diff`);
-          } else {
-            missing.push(item);
+        // Fast path: Apex/Visualforce bodies come back from a single Tooling API
+        // query in ~1-2s, vs a Metadata API retrieve round-trip. Anything the query
+        // can't resolve cleanly falls back to the retrieve below.
+        const fastItems = items.filter(i => FAST_DIFF_FIELD[i.type]);
+        const slowItems = items.filter(i => !FAST_DIFF_FIELD[i.type]);
+        if (fastItems.length > 0) {
+          report('querying org (Tooling API)…');
+          this.postProgress(`Fetching ${fastItems.length} component${fastItems.length === 1 ? '' : 's'} from ${orgLabel} via Tooling API…`);
+          const byType = new Map<string, MetadataItem[]>();
+          for (const i of fastItems) {
+            const arr = byType.get(i.type);
+            if (arr) arr.push(i); else byType.set(i.type, [i]);
           }
-          continue;
+          for (const [type, arr] of byType) {
+            const field = FAST_DIFF_FIELD[type];
+            const inList = arr.map(i => `'${i.name.replace(/'/g, "\\'")}'`).join(', ');
+            const soql = `SELECT Name, NamespacePrefix, ${field} FROM ${type} WHERE Name IN (${inList})`;
+            const qStart = Date.now();
+            const qCmdId = this.beginCmd(`sf data query --use-tooling-api --target-org ${org} --query "${soql}"`);
+            try {
+              const q = this.sf.queryTooling<ToolingCodeRecord>(soql, org, root, { timeoutMs: this.timeoutMs() });
+              this.currentCancel = q.cancel;
+              const { records } = await q.promise;
+              this.endCmd(qCmdId, true, Date.now() - qStart);
+              for (const item of arr) {
+                const recs = records.filter(r => r.Name === item.name);
+                // Prefer the unmanaged record; accept a single namespaced one
+                // (namespaced dev org). Hidden bodies (managed packages) and
+                // ambiguous names fall back to the Metadata API retrieve.
+                const rec = recs.find(r => !r.NamespacePrefix) ?? (recs.length === 1 ? recs[0] : undefined);
+                const body = rec?.[field];
+                if (recs.length === 0) { missing.push(item); continue; }
+                if (typeof body !== 'string' || body === '(hidden)') { slowItems.push(item); continue; }
+                const staged = await stageDiffText(body, item);
+                tmpPaths.push(staged.dir);
+                await this.openDiff(item, staged.file, orgLabel);
+                opened.push(`${item.type}:${item.name}`);
+              }
+            } catch (e) {
+              this.endCmd(qCmdId, false, Date.now() - qStart);
+              if (e instanceof SfCliCancelledError) throw e;
+              this.output.appendLine(`[Diff] Tooling query for ${type} failed — falling back to retrieve: ${e instanceof Error ? e.message : String(e)}`);
+              slowItems.push(...arr);
+            }
+          }
         }
-        const localUri = vscode.Uri.file(item.filePath);
-        const staged = await stageDiffCopy(remoteFile, item);
-        tmpPaths.push(staged.dir);
-        const remoteUri = vscode.Uri.file(staged.file);
-        const title = `${item.type}:${item.name} — Local ↔ ${orgLabel}`;
-        await vscode.commands.executeCommand('vscode.diff', localUri, remoteUri, title, { preview: false });
-        opened.push(`${item.type}:${item.name}`);
-      }
 
-      const lines: string[] = [];
-      for (const k of opened) lines.push(`✓ opened diff: ${k}`);
-      for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
-      for (const e of errors) lines.push(`✗ ${e}`);
-      for (const w of preLines) lines.push(w);
+        if (slowItems.length > 0) {
+          report('retrieving from org…');
+          this.postProgress(`Retrieving ${slowItems.length} component${slowItems.length === 1 ? '' : 's'} from ${orgLabel}…`);
+          const rStart = Date.now();
+          const rCmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(slowItems)} --target-org ${org} --target-metadata-dir <tmp> --unzip`);
+          const handle = this.sf.retrieveMetadata(
+            slowItems.map(i => `${i.type}:${i.name}`), org, root, { outputDir: tmpRoot, timeoutMs: this.timeoutMs() }
+          );
+          this.currentCancel = handle.cancel;
+          let result: RetrieveResult;
+          try {
+            const r = await handle.promise;
+            result = r.result;
+            this.updateCmd(rCmdId, r.cmd);
+          } catch (e) {
+            this.endCmd(rCmdId, false, Date.now() - rStart);
+            throw e;
+          }
 
-      const kind = errors.length > 0 ? 'err' : ((missing.length > 0 || unsupported.length > 0) ? 'warn' : 'ok');
-      this.post({
-        type: 'status',
-        card: {
-          kind,
-          title: opened.length > 0
-            ? `Diff opened for ${opened.length} component${opened.length === 1 ? '' : 's'}`
-            : (missing.length === items.length ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues`),
-          meta: `${opened.length} opened · ${missing.length} missing · ${errors.length} errors${unsupported.length ? ` · ${unsupported.length} unsupported` : ''}`,
-          lines
+          // sf usually unzips under tmpRoot/unpackaged/, but the folder name can vary
+          // across CLI versions / manifest names — resolve it instead of assuming.
+          const unpackagedDir = await resolveUnpackagedDir(tmpRoot);
+          const sfFailures = (result.messages ?? []).filter(m => m.problem);
+          for (const f of sfFailures) {
+            errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
+          }
+          this.endCmd(rCmdId, sfFailures.length === 0, Date.now() - rStart);
+
+          // Decomposed object children (CustomField, ValidationRule, …) come back inlined
+          // in the parent .object file in MDAPI format. Convert the retrieved bundle to
+          // source format once so each child can be diffed as its own *-meta.xml against
+          // the local file.
+          let convertedDir: string | undefined;
+          if (slowItems.some(i => OBJECT_CHILD_TYPES.has(i.type))) {
+            report('converting to source format…');
+            this.postProgress('Converting retrieved metadata to source format…');
+            const srcDir = path.join(tmpRoot, 'source');
+            tmpPaths.push(srcDir);
+            try {
+              const conv = this.sf.convertMdapi(unpackagedDir, srcDir, root, { timeoutMs: this.timeoutMs() });
+              this.currentCancel = conv.cancel;
+              await conv.promise;
+              convertedDir = srcDir;
+            } catch (e) {
+              // Let a user cancel bubble to the outer handler ("Diff cancelled") rather
+              // than degrade into a per-child "could not convert" error card.
+              if (e instanceof SfCliCancelledError) throw e;
+              this.output.appendLine(`[Diff] mdapi→source convert failed: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+
+          report('opening diff editors…');
+          for (const item of slowItems) {
+            const isChild = OBJECT_CHILD_TYPES.has(item.type);
+            let remoteFile: string | undefined;
+            if (isChild) {
+              // Match the converted file by its `objects/<Object>/<folder>/<file>` suffix so
+              // same-named fields on different objects in one batch don't cross-match.
+              const childFolder = path.basename(path.dirname(item.filePath));
+              const objectFolder = path.basename(path.dirname(path.dirname(item.filePath)));
+              const suffix = path.join('objects', objectFolder, childFolder, path.basename(item.filePath));
+              remoteFile = convertedDir ? await findFileBySuffix(convertedDir, suffix) : undefined;
+            } else {
+              remoteFile = await findRetrievedPrimary(unpackagedDir, item);
+            }
+            if (!remoteFile) {
+              if (isChild && !convertedDir) {
+                errors.push(`${item.type}:${item.name} — could not convert org metadata to source format for diff`);
+              } else {
+                missing.push(item);
+              }
+              continue;
+            }
+            const staged = await stageDiffCopy(remoteFile, item);
+            tmpPaths.push(staged.dir);
+            await this.openDiff(item, staged.file, orgLabel);
+            opened.push(`${item.type}:${item.name}`);
+          }
         }
+
+        const lines: string[] = [];
+        for (const k of opened) lines.push(`✓ opened diff: ${k}`);
+        for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
+        for (const e of errors) lines.push(`✗ ${e}`);
+        for (const w of preLines) lines.push(w);
+
+        const kind = errors.length > 0 ? 'err' : ((missing.length > 0 || unsupported.length > 0) ? 'warn' : 'ok');
+        this.post({
+          type: 'status',
+          card: {
+            kind,
+            title: opened.length > 0
+              ? `Diff opened for ${opened.length} component${opened.length === 1 ? '' : 's'}`
+              : (missing.length === items.length ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues`),
+            meta: `${opened.length} opened · ${missing.length} missing · ${errors.length} errors${unsupported.length ? ` · ${unsupported.length} unsupported` : ''}`,
+            lines
+          }
+        });
       });
-      this.endCmd(cmdId, errors.length === 0 && opened.length > 0, Date.now() - start);
     } catch (err) {
-      this.endCmd(cmdId, false, Date.now() - start);
       if (err instanceof SfCliCancelledError) this.reportCancelled('Diff');
       else this.reportError('Diff', err);
     } finally {
@@ -578,9 +653,39 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   private setBusy(b: boolean, action?: string): void {
     this.busy = b;
-    if (b) this.currentAction = action;
-    else this.currentAction = undefined;
+    this.currentAction = b ? action : undefined;
+    if (!b) this.currentProgressText = undefined;
     this.post({ type: 'busy', busy: b, action: this.currentAction });
+  }
+
+  /** Run `body` under a cancellable VS Code progress notification so operations
+   *  give feedback even when the panel is hidden (context-menu flows). The
+   *  notification's Cancel button maps onto the currently running sf command. */
+  private withWindowProgress<T>(title: string, body: (report: (message: string) => void) => Promise<T>): Promise<T> {
+    return Promise.resolve(vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `SF Deploy: ${title}`, cancellable: true },
+      (progress, token) => {
+        const sub = token.onCancellationRequested(() => this.currentCancel?.());
+        return body(message => progress.report({ message })).finally(() => sub.dispose());
+      }
+    ));
+  }
+
+  /** Update the in-panel progress card with the current phase of the running op. */
+  private postProgress(text: string): void {
+    this.currentProgressText = text;
+    this.post({ type: 'progress', text });
+  }
+
+  /** Success toast (status bar) when the panel isn't visible — otherwise the
+   *  result card lands in a webview nobody can see. */
+  private notifySuccessIfPanelHidden(message: string): void {
+    if (!this.view?.visible) vscode.window.setStatusBarMessage(`$(check) ${message}`, 8000);
+  }
+
+  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string): Promise<void> {
+    const title = `${item.type}:${item.name} — Local ↔ ${orgLabel}`;
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(item.filePath), vscode.Uri.file(remoteFile), title, { preview: false });
   }
 
   private reportCancelled(action: string): void {
@@ -636,7 +741,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         kind: 'err',
         title: `${action} failed`,
         meta: 'See command log / output channel for details',
-        errText: [message, stderr].filter(Boolean).join('\n').trim()
+        errText: [message, stderr].filter(Boolean).join('\n').trim(),
+        hint: hintForError(err)
       }
     });
     vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Output').then(choice => {
@@ -660,6 +766,44 @@ function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
 /** Metadata types whose MDAPI-format retrieve differs structurally from source format,
  *  making `vscode.diff` against the local source-format file misleading. */
 const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
+
+/** Tooling API body field per metadata type eligible for the diff fast path:
+ *  one REST query instead of a Metadata API retrieve round-trip. */
+const FAST_DIFF_FIELD: Record<string, string> = {
+  ApexClass: 'Body',
+  ApexTrigger: 'Body',
+  ApexPage: 'Markup',
+  ApexComponent: 'Markup'
+};
+
+interface ToolingCodeRecord {
+  Name?: string;
+  NamespacePrefix?: string | null;
+  [field: string]: unknown;
+}
+
+/** Map well-known sf CLI failures to a one-line actionable hint for the error card. */
+function hintForError(err: unknown): string | undefined {
+  const name = err instanceof SfCliError ? err.errorName ?? '' : '';
+  const message = err instanceof Error ? err.message : String(err);
+  const txt = `${name} ${message}`.toLowerCase();
+  if (txt.includes('conflict')) {
+    return 'The org has changes that conflict with your local files — retrieve them first, or enable sfOrgDeployWrapper.ignoreDeployConflicts.';
+  }
+  if (/namedorgnotfound|noauthinfofound|invalid_grant|expired|refreshtokenauth/.test(txt)) {
+    return 'Org authentication looks expired or missing — run `sf org login web` and retry.';
+  }
+  if (/requiresproject|sfdx-project\.json/.test(txt)) {
+    return 'This workspace is not a Salesforce DX project (sfdx-project.json not found).';
+  }
+  if (/enotfound|getaddrinfo|econnrefused|econnreset|etimedout|socket hang up/.test(txt)) {
+    return 'Network problem reaching the org — check your connection/VPN and retry.';
+  }
+  if (txt.includes('timed out')) {
+    return 'The command hit the configured timeout — raise sfOrgDeployWrapper.commandTimeoutMs for large components.';
+  }
+  return undefined;
+}
 
 /** Find the primary retrieved file inside the unpackaged folder for a given metadata item. */
 async function findRetrievedPrimary(unpackagedDir: string, item: MetadataItem): Promise<string | undefined> {
@@ -790,13 +934,28 @@ async function resolveUnpackagedDir(tmpRoot: string): Promise<string> {
   return preferred; // nothing better; the caller's access() check treats it as missing
 }
 
+/** `item.name` can contain path separators (e.g. EmailTemplate `Folder/Name`) —
+ *  flatten them so the staged file lands inside the staging dir, not a missing subdir. */
+function safeStagedName(item: MetadataItem, srcBasename: string): string {
+  return `${item.type}__${item.name}__${srcBasename}`.replace(/[\\/:]/g, '_');
+}
+
 /** Copy retrieved file into a dedicated diff-staging folder under tmpdir with a friendly name.
  *  Returns both the file path (for opening in diff) and the dir (so the caller can clean it up). */
 async function stageDiffCopy(srcPath: string, item: MetadataItem): Promise<{ file: string; dir: string }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-diff-stage-'));
-  const dest = path.join(dir, `${item.type}__${item.name}__${path.basename(srcPath)}`);
+  const dest = path.join(dir, safeStagedName(item, path.basename(srcPath)));
   await fs.copyFile(srcPath, dest);
   return { file: dest, dir };
+}
+
+/** Write org-side text (a tooling-query body) into a diff-staging file named like the
+ *  local file so the diff editor gets the right syntax highlighting. */
+async function stageDiffText(content: string, item: MetadataItem): Promise<{ file: string; dir: string }> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-diff-stage-'));
+  const file = path.join(dir, safeStagedName(item, path.basename(item.filePath)));
+  await fs.writeFile(file, content, 'utf8');
+  return { file, dir };
 }
 
 /** Clean up tmp folders once no visible editor still references any of them. */
