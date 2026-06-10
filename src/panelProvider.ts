@@ -516,10 +516,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (slowItems.length > 0) {
           report('retrieving from org…');
           this.postProgress(`Retrieving ${slowItems.length} component${slowItems.length === 1 ? '' : 's'} from ${orgLabel}…`);
+          // Retrieve in SOURCE format into an isolated throwaway project — the same
+          // mechanism the standard Salesforce extension's "diff against org" uses. A
+          // metadata-format retrieve (`--target-metadata-dir`) silently comes back empty
+          // for some components — custom-metadata-type Layouts
+          // (`Foo__mdt-Some Layout.layout`) are the classic case — which surfaced here as
+          // a bogus "not on org". Source format also lands each file at the same relative
+          // path as the local copy, so top-level types and decomposed object children
+          // (CustomField, ValidationRule, …) both match by name with no separate
+          // MDAPI→source convert step.
+          const proj = path.join(tmpRoot, 'proj');
+          await scaffoldSourceProject(proj);
+          const sourceRoot = await resolveSourceDefaultDir(proj);
           const rStart = Date.now();
-          const rCmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(slowItems)} --target-org ${org} --target-metadata-dir <tmp> --unzip`);
+          const rCmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(slowItems)} --target-org ${org}`);
           const handle = this.sf.retrieveMetadata(
-            slowItems.map(i => `${i.type}:${i.name}`), org, root, { outputDir: tmpRoot, timeoutMs: this.timeoutMs() }
+            slowItems.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs() }
           );
           this.currentCancel = handle.cancel;
           let result: RetrieveResult;
@@ -532,58 +544,28 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             throw e;
           }
 
-          // sf usually unzips under tmpRoot/unpackaged/, but the folder name can vary
-          // across CLI versions / manifest names — resolve it instead of assuming.
-          const unpackagedDir = await resolveUnpackagedDir(tmpRoot);
           const sfFailures = (result.messages ?? []).filter(m => m.problem);
           for (const f of sfFailures) {
             errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
           }
           this.endCmd(rCmdId, sfFailures.length === 0, Date.now() - rStart);
 
-          // Decomposed object children (CustomField, ValidationRule, …) come back inlined
-          // in the parent .object file in MDAPI format. Convert the retrieved bundle to
-          // source format once so each child can be diffed as its own *-meta.xml against
-          // the local file.
-          let convertedDir: string | undefined;
-          if (slowItems.some(i => OBJECT_CHILD_TYPES.has(i.type))) {
-            report('converting to source format…');
-            this.postProgress('Converting retrieved metadata to source format…');
-            const srcDir = path.join(tmpRoot, 'source');
-            tmpPaths.push(srcDir);
-            try {
-              const conv = this.sf.convertMdapi(unpackagedDir, srcDir, root, { timeoutMs: this.timeoutMs() });
-              this.currentCancel = conv.cancel;
-              await conv.promise;
-              convertedDir = srcDir;
-            } catch (e) {
-              // Let a user cancel bubble to the outer handler ("Diff cancelled") rather
-              // than degrade into a per-child "could not convert" error card.
-              if (e instanceof SfCliCancelledError) throw e;
-              this.output.appendLine(`[Diff] mdapi→source convert failed: ${e instanceof Error ? e.message : String(e)}`);
-            }
-          }
-
           report('opening diff editors…');
           for (const item of slowItems) {
             const isChild = OBJECT_CHILD_TYPES.has(item.type);
             let remoteFile: string | undefined;
             if (isChild) {
-              // Match the converted file by its `objects/<Object>/<folder>/<file>` suffix so
-              // same-named fields on different objects in one batch don't cross-match.
+              // Match by the `objects/<Object>/<folder>/<file>` suffix so same-named
+              // fields on different objects in one batch don't cross-match.
               const childFolder = path.basename(path.dirname(item.filePath));
               const objectFolder = path.basename(path.dirname(path.dirname(item.filePath)));
               const suffix = path.join('objects', objectFolder, childFolder, path.basename(item.filePath));
-              remoteFile = convertedDir ? await findFileBySuffix(convertedDir, suffix) : undefined;
+              remoteFile = await findFileBySuffix(sourceRoot, suffix);
             } else {
-              remoteFile = await findRetrievedPrimary(unpackagedDir, item);
+              remoteFile = await findRetrievedPrimary(sourceRoot, item);
             }
             if (!remoteFile) {
-              if (isChild && !convertedDir) {
-                errors.push(`${item.type}:${item.name} — could not convert org metadata to source format for diff`);
-              } else {
-                missing.push(item);
-              }
+              missing.push(item);
               continue;
             }
             const staged = await stageDiffCopy(remoteFile, item);
@@ -920,18 +902,30 @@ async function findFileBySuffix(dir: string, suffixPath: string): Promise<string
   return undefined;
 }
 
-/** Resolve the directory the CLI unzipped a metadata-dir retrieve into. Prefers
- *  `<tmpRoot>/unpackaged`, falling back to a single child directory if the CLI
- *  used a different (manifest-derived) folder name. */
-async function resolveUnpackagedDir(tmpRoot: string): Promise<string> {
-  const preferred = path.join(tmpRoot, 'unpackaged');
-  try { await fs.access(preferred); return preferred; } catch { /* fall through */ }
-  try {
-    const entries = await fs.readdir(tmpRoot, { withFileTypes: true });
-    const dirs = entries.filter(e => e.isDirectory());
-    if (dirs.length === 1) return path.join(tmpRoot, dirs[0].name);
-  } catch { /* ignore */ }
-  return preferred; // nothing better; the caller's access() check treats it as missing
+/** Scaffold a throwaway SFDX project so a source-format retrieve has somewhere to
+ *  land without touching the user's workspace. `sourceApiVersion` is deliberately
+ *  omitted so the retrieve uses the org's max API version (what we want for a diff). */
+async function scaffoldSourceProject(projDir: string): Promise<void> {
+  await fs.mkdir(path.join(projDir, 'force-app'), { recursive: true });
+  await fs.writeFile(
+    path.join(projDir, 'sfdx-project.json'),
+    JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }], namespace: '' }, null, 2),
+    'utf8'
+  );
+}
+
+/** Resolve where a source-format retrieve wrote its files inside the throwaway
+ *  project. The CLI uses `<pkgDir>/main/default/…`; fall back gracefully so an
+ *  unexpected layout still finds the folder rather than misreporting "not on org". */
+async function resolveSourceDefaultDir(projDir: string): Promise<string> {
+  const candidates = [
+    path.join(projDir, 'force-app', 'main', 'default'),
+    path.join(projDir, 'force-app')
+  ];
+  for (const c of candidates) {
+    try { await fs.access(c); return c; } catch { /* try next */ }
+  }
+  return candidates[0];
 }
 
 /** `item.name` can contain path separators (e.g. EmailTemplate `Folder/Name`) —
