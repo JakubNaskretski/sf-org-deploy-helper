@@ -527,7 +527,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // MDAPI→source convert step.
           const proj = path.join(tmpRoot, 'proj');
           await scaffoldSourceProject(proj);
-          const sourceRoot = await resolveSourceDefaultDir(proj);
           const rStart = Date.now();
           const rCmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(slowItems)} --target-org ${org}`);
           const handle = this.sf.retrieveMetadata(
@@ -560,9 +559,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               const childFolder = path.basename(path.dirname(item.filePath));
               const objectFolder = path.basename(path.dirname(path.dirname(item.filePath)));
               const suffix = path.join('objects', objectFolder, childFolder, path.basename(item.filePath));
-              remoteFile = await findFileBySuffix(sourceRoot, suffix);
+              remoteFile = await findFileBySuffix(proj, suffix);
             } else {
-              remoteFile = await findRetrievedPrimary(sourceRoot, item);
+              // Source format writes each file with the SAME basename as the local copy
+              // (e.g. `SomeType__mdt-Some Layout.layout-meta.xml`). Search the whole
+              // retrieve tree by basename so this never depends on the exact
+              // `<pkgDir>/main/default` nesting the CLI happens to use.
+              const localBasename = path.basename(item.filePath);
+              const leaf = item.name.split('/').pop() ?? item.name;
+              remoteFile = await findFileMatching(proj, localBasename, leaf);
             }
             if (!remoteFile) {
               missing.push(item);
@@ -787,83 +792,6 @@ function hintForError(err: unknown): string | undefined {
   return undefined;
 }
 
-/** Find the primary retrieved file inside the unpackaged folder for a given metadata item. */
-async function findRetrievedPrimary(unpackagedDir: string, item: MetadataItem): Promise<string | undefined> {
-  try {
-    await fs.access(unpackagedDir);
-  } catch {
-    return undefined;
-  }
-  // map metadata type to retrieved folder name + expected file name pattern
-  const folderByType: Record<string, string> = {
-    ApexClass: 'classes',
-    ApexTrigger: 'triggers',
-    ApexPage: 'pages',
-    ApexComponent: 'components',
-    LightningComponentBundle: 'lwc',
-    AuraDefinitionBundle: 'aura',
-    Flow: 'flows',
-    Layout: 'layouts',
-    PermissionSet: 'permissionsets',
-    Profile: 'profiles',
-    StaticResource: 'staticresources',
-    CustomTab: 'tabs',
-    CustomLabels: 'labels',
-    Queue: 'queues',
-    Group: 'groups',
-    GlobalValueSet: 'globalValueSets',
-    Workflow: 'workflows',
-    EmailTemplate: 'email',
-    CustomObject: 'objects',
-    CustomMetadata: 'customMetadata',
-    FlexiPage: 'flexipages',
-    CustomApplication: 'applications',
-    QuickAction: 'quickActions',
-    CustomPermission: 'customPermissions',
-    NamedCredential: 'namedCredentials',
-    ExternalDataSource: 'externalDataSources',
-    RemoteSiteSetting: 'remoteSiteSettings',
-    Role: 'roles',
-    Settings: 'settings',
-    LightningMessageChannel: 'messageChannels',
-    ApexTestSuite: 'testSuites'
-  };
-  const folder = folderByType[item.type];
-  if (!folder) return undefined;
-  const base = path.join(unpackagedDir, folder);
-  try { await fs.access(base); } catch { return undefined; }
-
-  const localBasename = path.basename(item.filePath);
-  // For bundle types: prefer matching same-named file under bundle dir
-  if (item.type === 'LightningComponentBundle' || item.type === 'AuraDefinitionBundle' || item.type === 'CustomObject') {
-    const bundleDir = path.join(base, item.name);
-    try {
-      await fs.access(bundleDir);
-    } catch {
-      return undefined;
-    }
-    // Try to find the same filename present locally
-    const candidate = path.join(bundleDir, localBasename);
-    try { await fs.access(candidate); return candidate; } catch { /* fall through */ }
-    // Otherwise return the directory itself (vscode.diff supports files only; pick the meta xml if present)
-    const entries = await fs.readdir(bundleDir);
-    const meta = entries.find(n => n.endsWith('-meta.xml'));
-    if (meta) return path.join(bundleDir, meta);
-    if (entries[0]) return path.join(bundleDir, entries[0]);
-    return undefined;
-  }
-  // Foldered types (e.g. EmailTemplate) carry the folder in item.name as
-  // "Folder/Name", and the retrieve nests the file under that folder.
-  const nameSegments = item.name.split('/');
-  const folderSegments = nameSegments.slice(0, -1);
-  const leaf = nameSegments[nameSegments.length - 1];
-  const candidate = path.join(base, ...folderSegments, localBasename);
-  try { await fs.access(candidate); return candidate; } catch { /* fall through */ }
-  // Fall back: recursively scan for the exact local basename, else a file whose
-  // stem matches the leaf name (handles folder nesting and ext differences).
-  return findFileMatching(base, localBasename, leaf);
-}
-
 /** Recursively find a file under `dir` whose name equals `exactBasename`, else the
  *  first whose name starts with `leafName + '.'`. Bounded by the retrieve output. */
 async function findFileMatching(dir: string, exactBasename: string, leafName: string): Promise<string | undefined> {
@@ -912,20 +840,6 @@ async function scaffoldSourceProject(projDir: string): Promise<void> {
     JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }], namespace: '' }, null, 2),
     'utf8'
   );
-}
-
-/** Resolve where a source-format retrieve wrote its files inside the throwaway
- *  project. The CLI uses `<pkgDir>/main/default/…`; fall back gracefully so an
- *  unexpected layout still finds the folder rather than misreporting "not on org". */
-async function resolveSourceDefaultDir(projDir: string): Promise<string> {
-  const candidates = [
-    path.join(projDir, 'force-app', 'main', 'default'),
-    path.join(projDir, 'force-app')
-  ];
-  for (const c of candidates) {
-    try { await fs.access(c); return c; } catch { /* try next */ }
-  }
-  return candidates[0];
 }
 
 /** `item.name` can contain path separators (e.g. EmailTemplate `Folder/Name`) —
