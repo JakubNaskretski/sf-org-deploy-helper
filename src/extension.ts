@@ -29,7 +29,13 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar,
     orgStore,
     orgStore.onDidChange(refreshStatus),
-    vscode.window.registerWebviewViewProvider(DeployPanelProvider.viewType, provider),
+    vscode.window.registerWebviewViewProvider(DeployPanelProvider.viewType, provider, {
+      // Keep the webview (org list, selection, status cards) alive when the user
+      // switches to another activity-bar view and back, instead of tearing it down
+      // and re-running the org/file scan from scratch each time. Matches the soql /
+      // apex editor plugins in this family.
+      webviewOptions: { retainContextWhenHidden: true }
+    }),
     vscode.commands.registerCommand('sfOrgDeployWrapper.selectOrg', () => provider.pickOrg()),
     vscode.commands.registerCommand('sfOrgDeployWrapper.refreshFiles', () => provider.refreshFiles()),
     vscode.commands.registerCommand('sfOrgDeployWrapper.deployFile', (uri?: vscode.Uri) => provider.deployFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),

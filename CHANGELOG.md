@@ -3,6 +3,19 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.3.1
+
+- Fixed: "Compare with Org" wrongly reported some components as "not on the
+  org" — most visibly layouts on custom metadata types
+  (`SomeType__mdt-Some Layout`). The diff now fetches the org copy with a
+  source-format retrieve, the same mechanism the standard Salesforce extension
+  uses, instead of a metadata-format retrieve that silently returned nothing for
+  these components. As a side effect the separate metadata-to-source conversion
+  step is gone, so object-child diffs do one less round-trip.
+- The panel no longer reloads the org and metadata lists from scratch each time
+  you switch to another activity-bar view and back — the view keeps its state
+  while hidden.
+
 ## 0.3.0
 
 - Clear errors for CLI-level failures: expired auth, source conflicts, and
