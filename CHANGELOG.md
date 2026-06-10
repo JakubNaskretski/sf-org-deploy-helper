@@ -3,6 +3,15 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.3.2
+
+- Fixed a regression in 0.3.1: "Compare with Org" reported layouts and other
+  single-file metadata (permission sets, FlexiPages, custom apps, …) as "not on
+  the org" even when present. The org copy was being looked up in the wrong
+  folder of the retrieve; it's now located by file name anywhere in the
+  retrieved tree, so every supported type is matched. Object-child diffs
+  (custom fields, validation rules, …) were unaffected.
+
 ## 0.3.1
 
 - Fixed: "Compare with Org" wrongly reported some components as "not on the
