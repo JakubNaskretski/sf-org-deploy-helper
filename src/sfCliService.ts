@@ -54,10 +54,22 @@ export interface RetrieveResult {
 }
 
 export class SfCliError extends Error {
+  /** sf CLI error name from the JSON envelope (e.g. NamedOrgNotFound), when known. */
+  public errorName?: string;
   constructor(message: string, public readonly stderr?: string, public readonly raw?: string, public readonly cause?: unknown) {
     super(message);
     this.name = 'SfCliError';
   }
+}
+
+/** Top-level envelope every `sf … --json` command prints. CLI-level failures
+ *  (expired auth, source conflicts, bad project, …) carry `name`/`message` at the
+ *  top and omit `result`. */
+interface SfJsonEnvelope<R> {
+  status?: number;
+  result?: R;
+  name?: string;
+  message?: string;
 }
 
 interface RunOptions {
@@ -131,11 +143,8 @@ export class SfCliService {
     if (opts.ignoreConflicts) args.push('--ignore-conflicts');
     args.push('--json');
     const cmd = this.formatCmd(args);
-    const inner = this.runJsonCancellable<{ result: DeployResult; status?: number }>(args, { timeoutMs: opts.timeoutMs, cwd });
-    const promise = inner.promise.then(json => ({
-      result: json.result ?? ({ status: json.status ?? 1, success: false } as DeployResult),
-      cmd
-    }));
+    const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project deploy start'), cmd }));
     return { promise, cancel: inner.cancel };
   }
 
@@ -168,12 +177,41 @@ export class SfCliService {
     if (opts.outputDir) args.push('--target-metadata-dir', opts.outputDir, '--unzip');
     args.push('--json');
     const cmd = this.formatCmd(args);
-    const inner = this.runJsonCancellable<{ result: RetrieveResult; status?: number }>(args, { timeoutMs: opts.timeoutMs, cwd });
-    const promise = inner.promise.then(json => ({
-      result: json.result ?? ({ status: json.status ?? 1, success: false } as RetrieveResult),
-      cmd
-    }));
+    const inner = this.runJsonCancellable<SfJsonEnvelope<RetrieveResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project retrieve start'), cmd }));
     return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * Tooling API SOQL query via `sf data query --use-tooling-api`. The diff fast
+   * path uses this to fetch Apex/Visualforce bodies in one REST call instead of a
+   * Metadata API retrieve round-trip.
+   */
+  queryTooling<T = Record<string, unknown>>(
+    soql: string,
+    targetOrg: string,
+    cwd: string,
+    opts: { timeoutMs?: number } = {}
+  ): Cancellable<{ records: T[]; cmd: string }> {
+    const args = ['data', 'query', '--query', soql, '--use-tooling-api', '--target-org', targetOrg, '--json'];
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<SfJsonEnvelope<{ records?: T[] }>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => ({ records: this.unwrapResult(json, 'data query').records ?? [], cmd }));
+    return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * Unwrap `result` from an sf JSON envelope, rejecting with the envelope's own
+   * error name/message when there is none (CLI-level failure: expired auth,
+   * source conflicts, bad project, …). Without this, callers see an empty result
+   * and misreport the failure as e.g. "component not on org".
+   */
+  private unwrapResult<R>(json: SfJsonEnvelope<R>, what: string): R {
+    if (json.result != null) return json.result;
+    const msg = (json.message ?? '').trim() || `sf ${what} returned no result (status ${json.status ?? '?'})`;
+    const err = new SfCliError(json.name ? `${json.name}: ${msg}` : msg);
+    err.errorName = json.name;
+    throw err;
   }
 
   /**

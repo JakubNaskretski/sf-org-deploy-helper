@@ -14,6 +14,7 @@
     typeFilter: new Set(persisted.typeFilter || []), // empty = all
     busy: false,
     busyAction: null,
+    progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
     cmdLog: [],
@@ -46,6 +47,11 @@
   $('diffBtn').addEventListener('click', () => action('diff'));
   $('cancelBtn').addEventListener('click', () => send('cancel'));
   $('useActive').addEventListener('click', () => send('useActiveFile'));
+  $('clearSel').addEventListener('click', () => {
+    state.selected.clear();
+    renderTree();
+    renderActions();
+  });
   $('cmdlogHeader').addEventListener('click', () => {
     state.cmdLogCollapsed = !state.cmdLogCollapsed;
     savePersisted();
@@ -105,7 +111,21 @@
       case 'busy':
         state.busy = !!msg.busy;
         state.busyAction = msg.action || null;
+        if (state.busy) {
+          state.progress = { text: state.busyAction ? `${state.busyAction} running…` : 'Working…', startedAt: Date.now() };
+          startProgressTimer();
+        } else {
+          state.progress = null;
+          stopProgressTimer();
+        }
         renderActions();
+        renderStatus();
+        return;
+      case 'progress':
+        if (state.progress && msg.text) {
+          state.progress.text = msg.text;
+          renderStatus();
+        }
         return;
       case 'status':
         // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText }
@@ -466,11 +486,13 @@
     const diffBtn = $('diffBtn');
     const cancelBtn = $('cancelBtn');
     const useActive = $('useActive');
+    const clearSel = $('clearSel');
     if (state.busy) {
       deployBtn.style.display = 'none';
       retrieveBtn.style.display = 'none';
       diffBtn.style.display = 'none';
       useActive.style.display = 'none';
+      clearSel.style.display = 'none';
       cancelBtn.style.display = '';
       cancelBtn.textContent = state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel';
     } else {
@@ -478,6 +500,7 @@
       retrieveBtn.style.display = '';
       diffBtn.style.display = '';
       useActive.style.display = '';
+      clearSel.style.display = state.selected.size > 0 ? '' : 'none';
       cancelBtn.style.display = 'none';
       deployBtn.disabled = !can;
       retrieveBtn.disabled = !can;
@@ -485,10 +508,55 @@
     }
   }
 
+  // ---- Progress (busy) card ----
+  let progressTimer = null;
+  function startProgressTimer() {
+    stopProgressTimer();
+    progressTimer = setInterval(() => {
+      const el = document.getElementById('progressElapsed');
+      if (el && state.progress) el.textContent = fmtElapsed(Date.now() - state.progress.startedAt);
+    }, 1000);
+  }
+  function stopProgressTimer() {
+    if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+  }
+  function fmtElapsed(ms) {
+    const s = Math.floor(ms / 1000);
+    return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+  }
+  function fmtDur(ms) {
+    return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+  }
+
+  const CARD_ICONS = { ok: '✓', err: '✕', warn: '⚠' };
+  const MAX_CARD_LINES = 8;
+
   function renderStatus() {
     const st = $('status');
     st.innerHTML = '';
-    if (state.statusCards.length === 0) {
+    if (state.progress) {
+      const el = document.createElement('div');
+      el.className = 'status-card progress';
+      const t = document.createElement('div');
+      t.className = 'title';
+      const sp = document.createElement('span');
+      sp.className = 'spinner';
+      t.appendChild(sp);
+      const txt = document.createElement('span');
+      txt.textContent = state.progress.text;
+      t.appendChild(txt);
+      el.appendChild(t);
+      const m = document.createElement('div');
+      m.className = 'meta';
+      m.append('elapsed ');
+      const es = document.createElement('span');
+      es.id = 'progressElapsed';
+      es.textContent = fmtElapsed(Date.now() - state.progress.startedAt);
+      m.appendChild(es);
+      el.appendChild(m);
+      st.appendChild(el);
+    }
+    if (state.statusCards.length === 0 && !state.progress) {
       const d = document.createElement('div');
       d.className = 'status-empty';
       d.textContent = 'No operations yet.';
@@ -500,7 +568,13 @@
       el.className = `status-card ${card.kind || 'ok'}`;
       const t = document.createElement('div');
       t.className = 'title';
-      t.textContent = card.title || '';
+      const ic = document.createElement('span');
+      ic.className = `card-icon ${card.kind || 'ok'}`;
+      ic.textContent = CARD_ICONS[card.kind] || CARD_ICONS.ok;
+      t.appendChild(ic);
+      const ttxt = document.createElement('span');
+      ttxt.textContent = card.title || '';
+      t.appendChild(ttxt);
       el.appendChild(t);
       if (card.meta) {
         const m = document.createElement('div');
@@ -510,18 +584,32 @@
       }
       if (card.lines && card.lines.length) {
         const ul = document.createElement('ul');
-        for (const line of card.lines) {
+        const visible = card.expanded ? card.lines : card.lines.slice(0, MAX_CARD_LINES);
+        for (const line of visible) {
           const li = document.createElement('li');
           li.textContent = line;
           ul.appendChild(li);
         }
         el.appendChild(ul);
+        if (card.lines.length > MAX_CARD_LINES && !card.expanded) {
+          const btn = document.createElement('button');
+          btn.className = 'show-more';
+          btn.textContent = `Show all ${card.lines.length} lines`;
+          btn.addEventListener('click', () => { card.expanded = true; renderStatus(); });
+          el.appendChild(btn);
+        }
       }
       if (card.errText) {
         const e = document.createElement('div');
         e.className = 'err-text';
         e.textContent = card.errText;
         el.appendChild(e);
+      }
+      if (card.hint) {
+        const h = document.createElement('div');
+        h.className = 'hint';
+        h.textContent = `Hint: ${card.hint}`;
+        el.appendChild(h);
       }
       st.appendChild(el);
     }
@@ -550,7 +638,7 @@
       row.appendChild(cmd);
       const dur = document.createElement('div');
       dur.className = 'dur';
-      dur.textContent = e.durationMs != null ? `${e.durationMs}ms` : (e.status === 'run' ? '…' : '');
+      dur.textContent = e.durationMs != null ? fmtDur(e.durationMs) : (e.status === 'run' ? '…' : '');
       row.appendChild(dur);
       body.appendChild(row);
     }

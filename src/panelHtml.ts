@@ -92,14 +92,23 @@ body {
 }
 .tree-search input { width: 100%; }
 .type-filter-row { margin-top: 4px; font-size: 11px; }
-.type-filter-row summary { cursor: pointer; color: var(--muted); user-select: none; }
+/* Custom disclosure caret: the native <summary> marker renders misaligned in the
+   webview (pushed right), which made the whole filter list look skewed. */
+.type-filter-row summary {
+  cursor: pointer; color: var(--muted); user-select: none;
+  list-style: none; display: flex; align-items: center; gap: 5px;
+}
+.type-filter-row summary::-webkit-details-marker { display: none; }
+.type-filter-row summary::before { content: '▸'; font-size: 9px; opacity: 0.8; }
+.type-filter-row details[open] summary::before { content: '▾'; }
 .type-filter-list {
   margin-top: 4px; padding: 4px 4px;
   border: 1px solid var(--border); border-radius: 2px;
   max-height: 160px; overflow-y: auto;
   display: flex; flex-direction: column; gap: 2px;
 }
-.type-filter-list label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+.type-filter-list label { display: flex; gap: 6px; align-items: center; cursor: pointer; padding: 1px 2px; }
+.type-filter-list input[type="checkbox"] { margin: 0; flex: none; width: 13px; height: 13px; }
 .type-filter-actions { display: flex; gap: 6px; margin-top: 4px; }
 .type-filter-actions button {
   background: transparent; color: var(--fg); border: 1px solid var(--border);
@@ -153,8 +162,22 @@ body {
   border-color: var(--err); cursor: pointer;
 }
 .actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.actions button:not(:disabled):hover { filter: brightness(1.12); }
+.actions button.subtle {
+  background: transparent; border: none; color: var(--muted);
+  padding: 4px 4px; cursor: pointer;
+}
+.actions button.subtle:hover { color: var(--fg); filter: none; }
 .actions .spacer { flex: 1; }
 .actions .selected-count { color: var(--muted); align-self: center; }
+
+/* In a narrow sidebar the side-by-side tree/status split is unreadably cramped —
+   stack vertically instead. */
+@media (max-width: 480px) {
+  .body { flex-direction: column; }
+  .left { border-right: none; border-bottom: 1px solid var(--border); flex: 3; }
+  .right { min-width: 0; flex: 2; }
+}
 
 .status {
   flex: 1; overflow-y: auto; padding: 8px;
@@ -167,10 +190,21 @@ body {
 .status-card.ok { border-left: 3px solid var(--ok); }
 .status-card.err { border-left: 3px solid var(--err); }
 .status-card.warn { border-left: 3px solid var(--warn); }
-.status-card .title { font-weight: 600; margin-bottom: 2px; }
+.status-card.progress { border-left: 3px solid var(--accent); }
+.status-card .title { font-weight: 600; margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
+.status-card .card-icon { font-weight: 700; flex: none; }
+.status-card .card-icon.ok { color: var(--ok); }
+.status-card .card-icon.err { color: var(--err); }
+.status-card .card-icon.warn { color: var(--warn); }
 .status-card .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
 .status-card ul { margin: 4px 0 0 0; padding-left: 16px; font-size: 12px; }
 .status-card .err-text { color: var(--err); white-space: pre-wrap; font-family: var(--vscode-editor-font-family); font-size: 11px; }
+.status-card .hint { margin-top: 4px; font-size: 11px; color: var(--warn); }
+.status-card .show-more {
+  background: transparent; border: none; padding: 2px 0; margin-top: 2px;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  cursor: pointer; font-size: 11px; font-family: inherit;
+}
 .status-empty { color: var(--muted); font-style: italic; text-align: center; padding: 16px 8px; }
 
 .cmdlog {
@@ -239,6 +273,7 @@ body {
         <button id="useActive" class="secondary" title="Select the file currently open in editor">Use active file</button>
         <span class="spacer"></span>
         <span id="selCount" class="selected-count">0 selected</span>
+        <button id="clearSel" class="subtle" style="display:none;" title="Clear selection">✕</button>
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
         <button id="deployBtn" class="primary" disabled>Deploy</button>
