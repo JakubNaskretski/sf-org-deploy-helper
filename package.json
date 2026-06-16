@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "Skrety",
   "license": "MIT",
   "engines": {
@@ -129,6 +129,18 @@
           "type": "boolean",
           "default": false,
           "description": "Pass --ignore-conflicts to sf project deploy start. Off by default: the CLI will refuse to overwrite org changes that aren't in your local source."
+        },
+        "sfOrgDeployWrapper.fetchIncludeManaged": {
+          "type": "boolean",
+          "default": false,
+          "description": "When fetching org metadata, include components from installed managed packages. Off by default: managed-package components are read-only and add thousands of non-editable entries to the browse tree."
+        },
+        "sfOrgDeployWrapper.fetchConcurrency": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 12,
+          "description": "How many metadata types to fetch in parallel when browsing org metadata. Lower this if Fetch Org strains your machine; raise it for faster fetches on a capable machine."
         }
       }
     }

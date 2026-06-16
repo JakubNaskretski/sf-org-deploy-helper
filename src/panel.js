@@ -19,7 +19,13 @@
     statusCards: [],
     cmdLog: [],
     cmdLogCollapsed: !!persisted.cmdLogCollapsed,
-    banner: ''
+    banner: '',
+    // Org metadata browse state
+    orgKeys: new Set(),      // "Type:Name" keys that exist on the org
+    localKeys: new Set(),    // "Type:Name" keys that exist locally
+    orgOnlyItems: [],        // { type, name } items on org but not local
+    orgLoaded: false,        // has org metadata been fetched this session?
+    sourceFilter: 'all',     // 'all' | 'local-only' | 'org-only' | 'both'
   };
 
   function savePersisted() {
@@ -39,8 +45,17 @@
   window.addEventListener('message', (ev) => handleMessage(ev.data));
   $('refreshOrgs').addEventListener('click', () => send('refreshOrgs'));
   $('refreshFiles').addEventListener('click', () => send('refreshFiles'));
+  $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) send('fetchOrgMetadata'); });
+  $('sourceFilter').addEventListener('change', (e) => { state.sourceFilter = e.target.value; renderTree(); });
   $('orgSelect').addEventListener('change', (e) => { state.selectedOrg = e.target.value || null; send('selectOrg', { username: state.selectedOrg }); });
-  $('search').addEventListener('input', (e) => { state.filter = e.target.value.toLowerCase(); savePersisted(); renderTree(); });
+  // Debounce the filter so a fast typist on a large org-metadata tree doesn't
+  // trigger a full re-render on every keystroke.
+  let searchTimer = null;
+  $('search').addEventListener('input', (e) => {
+    const v = e.target.value.toLowerCase();
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { state.filter = v; savePersisted(); renderTree(); }, 200);
+  });
   $('search').value = state.filter;
   $('deployBtn').addEventListener('click', () => action('deploy'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
@@ -79,12 +94,44 @@
       case 'files':
         state.items = msg.items || [];
         state.objectChildTypes = new Set(msg.objectChildTypes || []);
-        // Drop selections that no longer exist
-        const valid = new Set(state.items.map(i => `${i.type}:${i.name}`));
+        state.localKeys = new Set(state.items.map(i => `${i.type}:${i.name}`));
+        // Recompute org-only items if org metadata is already loaded
+        if (state.orgLoaded) {
+          state.orgOnlyItems = Array.from(state.orgKeys)
+            .filter(k => !state.localKeys.has(k))
+            .map(k => { const c = k.indexOf(':'); return { type: k.slice(0, c), name: k.slice(c + 1) }; });
+        }
+        // Drop selections that no longer exist in either local or org
+        const valid = new Set([...state.localKeys, ...state.orgKeys]);
         for (const k of Array.from(state.selected)) if (!valid.has(k)) state.selected.delete(k);
-        // Drop stale type-filter entries
-        const types = new Set(state.items.map(i => i.type));
-        for (const t of Array.from(state.typeFilter)) if (!types.has(t)) state.typeFilter.delete(t);
+        // Drop stale type-filter entries (allow org types too)
+        const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
+        for (const t of Array.from(state.typeFilter)) if (!allKnownTypes.has(t)) state.typeFilter.delete(t);
+        renderTypeFilter();
+        renderTree();
+        renderActions();
+        return;
+      case 'orgMetadata':
+        state.localKeys = new Set(state.items.map(i => `${i.type}:${i.name}`));
+        state.orgKeys = new Set((msg.orgItems || []).map(i => `${i.type}:${i.name}`));
+        state.orgOnlyItems = (msg.orgItems || []).filter(i => !state.localKeys.has(`${i.type}:${i.name}`));
+        state.orgLoaded = true;
+        renderSourceFilter();
+        renderTypeFilter();
+        renderTree();
+        renderActions();
+        return;
+      case 'orgMetadataReset':
+        // Target org changed — drop fetched org membership so badges/filter/org-only
+        // rows don't describe a different org than the one now selected.
+        state.orgKeys = new Set();
+        state.orgOnlyItems = [];
+        state.orgLoaded = false;
+        state.sourceFilter = 'all';
+        if ($('sourceFilter')) $('sourceFilter').value = 'all';
+        // Drop any selected org-only keys that no longer exist locally.
+        for (const k of Array.from(state.selected)) if (!state.localKeys.has(k)) state.selected.delete(k);
+        renderSourceFilter();
         renderTypeFilter();
         renderTree();
         renderActions();
@@ -185,11 +232,19 @@
     b.textContent = state.banner;
   }
 
+  function renderSourceFilter() {
+    const row = $('sourceFilterRow');
+    row.style.display = state.orgLoaded ? 'block' : 'none';
+  }
+
   function renderTypeFilter() {
     const row = $('typeFilterRow');
     const list = $('typeFilterList');
     const label = $('typeFilterLabel');
-    const types = Array.from(new Set(state.items.map(i => i.type))).sort();
+    const types = Array.from(new Set([
+      ...state.items.map(i => i.type),
+      ...state.orgOnlyItems.map(i => i.type)
+    ])).sort();
     if (types.length === 0) { row.style.display = 'none'; return; }
     row.style.display = 'block';
     list.innerHTML = '';
@@ -246,6 +301,39 @@
     return state.typeFilter.has(type);
   }
 
+  /** Returns 'local', 'org', or 'both' for a key when org metadata has been loaded. */
+  function itemSource(key) {
+    if (!state.orgLoaded) return null;
+    const isLocal = state.localKeys.has(key);
+    const isOrg = state.orgKeys.has(key);
+    if (isLocal && isOrg) return 'both';
+    if (isLocal) return 'local';
+    if (isOrg) return 'org';
+    return null;
+  }
+
+  function isSourceAllowed(source) {
+    if (!state.orgLoaded || state.sourceFilter === 'all') return true;
+    if (state.sourceFilter === 'local-only') return source === 'local';
+    if (state.sourceFilter === 'org-only') return source === 'org';
+    if (state.sourceFilter === 'both') return source === 'both';
+    return true;
+  }
+
+  /** Merges local items with org-only items into one flat array tagged with _source. */
+  function buildMergedItems() {
+    const merged = [];
+    for (const item of state.items) {
+      merged.push({ ...item, _source: itemSource(`${item.type}:${item.name}`) });
+    }
+    if (state.orgLoaded) {
+      for (const item of state.orgOnlyItems) {
+        merged.push({ type: item.type, name: item.name, filePath: null, files: [], _source: 'org' });
+      }
+    }
+    return merged;
+  }
+
   // key = "Type:Name"; Name itself may contain ':' on no known type, so split on the first.
   function splitKey(key) {
     const idx = key.indexOf(':');
@@ -283,7 +371,7 @@
     }
   }
 
-  // Partition the (filtered) item list into the object tree and the flat type groups.
+  // Partition the (filtered) merged item list into the object tree and the flat type groups.
   function buildGroups() {
     const filter = state.filter;
     const objectMap = new Map(); // objectName -> { obj: item|null, children: Map<type, item[]> }
@@ -293,8 +381,9 @@
       if (!o) { o = { obj: null, children: new Map() }; objectMap.set(n, o); }
       return o;
     };
-    for (const item of state.items) {
+    for (const item of buildMergedItems()) {
       if (!isTypeAllowed(item.type)) continue;
+      if (!isSourceAllowed(item._source)) continue;
       if (filter && !`${item.type} ${item.name}`.toLowerCase().includes(filter)) continue;
       if (item.type === 'CustomObject') {
         getObj(item.name).obj = item;
@@ -365,9 +454,10 @@
   // A selectable leaf row for a single metadata item, indented to `depth`.
   function makeLeafRow(item, displayName, depth) {
     const key = `${item.type}:${item.name}`;
+    const isOrgOnly = item._source === 'org';
     const row = document.createElement('div');
     const isActive = key === state.activeFileKey;
-    row.className = 'row' + (isActive ? ' focused active-editor' : '');
+    row.className = 'row' + (isActive ? ' focused active-editor' : '') + (isOrgOnly ? ' org-only' : '');
     row.dataset.key = key;
     row.style.paddingLeft = INDENT(depth);
     const cb = document.createElement('input');
@@ -382,9 +472,23 @@
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = displayName;
-    name.title = item.filePath;
+    name.title = item.filePath || (isOrgOnly ? 'On org — not retrieved locally' : '');
     row.appendChild(name);
-    if (item.files && item.files.length > 1) {
+    // Source badge (shown once org metadata has been loaded)
+    if (state.orgLoaded && item._source) {
+      const srcBadge = document.createElement('span');
+      srcBadge.className = `source-badge ${item._source}`;
+      const labels = { both: 'local+org', local: 'local', org: 'org' };
+      const tips = {
+        both: 'Exists locally and on org',
+        local: 'Local only — not found on org',
+        org: 'On org — not retrieved locally yet'
+      };
+      srcBadge.textContent = labels[item._source] || item._source;
+      srcBadge.title = tips[item._source] || '';
+      row.appendChild(srcBadge);
+    }
+    if (!isOrgOnly && item.files && item.files.length > 1) {
       const badge = document.createElement('span');
       badge.className = 'badge';
       badge.textContent = `${item.files.length} files`;
@@ -410,10 +514,14 @@
   function renderTree() {
     const tree = $('tree');
     tree.innerHTML = '';
-    if (state.items.length === 0) {
+    const hasLocal = state.items.length > 0;
+    const hasOrg = state.orgLoaded && state.orgOnlyItems.length > 0;
+    if (!hasLocal && !hasOrg) {
       const d = document.createElement('div');
       d.className = 'status-empty';
-      d.textContent = 'No metadata found in workspace. Open a Salesforce project (with force-app/ or sfdx-project.json).';
+      d.textContent = state.orgLoaded
+        ? 'No metadata found in workspace or on org.'
+        : 'No metadata found in workspace. Open a Salesforce project or click "Fetch Org" to browse org metadata.';
       tree.appendChild(d);
       return;
     }
@@ -427,32 +535,50 @@
       return;
     }
 
+    // Cap the number of DOM nodes built in a single render. On a large org the merged
+    // tree can be tens of thousands of components; force-expanding (via filter) and
+    // building a node per row would freeze the webview. We stop at NODE_CAP and show a
+    // "narrow your filter" notice instead — the data is all still there, just not all
+    // painted at once.
+    const NODE_CAP = 1000;
+    let nodes = 0;
+    let truncated = false;
+    const budgetLeft = () => nodes < NODE_CAP;
+
     // ---- Objects super-group: object → child-type sub-groups → rows ----
     if (objectMap.size > 0) {
       const objectNames = Array.from(objectMap.keys()).sort();
       const allKeys = objectNames.flatMap(n => keysUnderObject(objectMap.get(n)));
       const objectsExpanded = state.expandedGroups.has('__OBJECTS__') || !!filter;
       const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: 0 });
-      tree.appendChild(objectsNode.group);
+      tree.appendChild(objectsNode.group); nodes++;
       if (objectsExpanded) {
         for (const name of objectNames) {
+          if (!budgetLeft()) { truncated = true; break; }
           const o = objectMap.get(name);
           const objKeys = keysUnderObject(o);
           const objExpanded = state.expandedGroups.has('obj/' + name) || !!filter;
           const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: 1 });
-          objectsNode.body.appendChild(objNode.group);
+          objectsNode.body.appendChild(objNode.group); nodes++;
           if (!objExpanded) continue;
           // The object's own definition (CustomObject) — diff is unsupported, but it
           // can still be deployed/retrieved, so surface it as a selectable row.
-          if (o.obj) objNode.body.appendChild(makeLeafRow(o.obj, '⊙ object definition', 2));
+          if (o.obj) {
+            if (!budgetLeft()) { truncated = true; break; }
+            objNode.body.appendChild(makeLeafRow(o.obj, '⊙ object definition', 2)); nodes++;
+          }
           for (const ct of Array.from(o.children.keys()).sort()) {
+            if (!budgetLeft()) { truncated = true; break; }
             const arr = o.children.get(ct).slice().sort((a, b) => a.name.localeCompare(b.name));
             const ctKeys = arr.map(it => `${it.type}:${it.name}`);
             const ctExpanded = state.expandedGroups.has('objc/' + name + '/' + ct) || !!filter;
             const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: 2 });
-            objNode.body.appendChild(ctNode.group);
+            objNode.body.appendChild(ctNode.group); nodes++;
             if (!ctExpanded) continue;
-            for (const it of arr) ctNode.body.appendChild(makeLeafRow(it, it.name.slice(name.length + 1), 3));
+            for (const it of arr) {
+              if (!budgetLeft()) { truncated = true; break; }
+              ctNode.body.appendChild(makeLeafRow(it, it.name.slice(name.length + 1), 3)); nodes++;
+            }
           }
         }
       }
@@ -460,12 +586,23 @@
 
     // ---- Flat groups for everything that isn't an object or object child ----
     for (const type of Array.from(flatGroups.keys()).sort()) {
+      if (!budgetLeft()) { truncated = true; break; }
       const arr = flatGroups.get(type).slice().sort((a, b) => a.name.localeCompare(b.name));
       const keys = arr.map(it => `${it.type}:${it.name}`);
       const expanded = state.expandedGroups.has(type) || !!filter;
       const node = makeGroupNode({ key: type, label: type, count: arr.length, itemKeys: keys, expanded, depth: 0 });
-      tree.appendChild(node.group);
-      if (expanded) for (const it of arr) node.body.appendChild(makeLeafRow(it, it.name, 1));
+      tree.appendChild(node.group); nodes++;
+      if (expanded) for (const it of arr) {
+        if (!budgetLeft()) { truncated = true; break; }
+        node.body.appendChild(makeLeafRow(it, it.name, 1)); nodes++;
+      }
+    }
+
+    if (truncated) {
+      const d = document.createElement('div');
+      d.className = 'status-empty';
+      d.textContent = `Showing the first ${NODE_CAP} rows. Narrow with the filter box, type filter, or source filter to see the rest.`;
+      tree.appendChild(d);
     }
   }
 
@@ -480,7 +617,11 @@
 
   function renderActions() {
     $('selCount').textContent = `${state.selected.size} selected`;
-    const can = state.selected.size > 0 && !!state.selectedOrg && !state.busy;
+    const hasOrg = !!state.selectedOrg && !state.busy;
+    const anySelected = state.selected.size > 0 && hasOrg;
+    // Deploy and Diff require at least one locally-present file.
+    const hasLocalSelected = anySelected && Array.from(state.selected).some(k => state.localKeys.has(k));
+    const allOrgOnly = anySelected && Array.from(state.selected).every(k => !state.localKeys.has(k));
     const deployBtn = $('deployBtn');
     const retrieveBtn = $('retrieveBtn');
     const diffBtn = $('diffBtn');
@@ -502,9 +643,11 @@
       useActive.style.display = '';
       clearSel.style.display = state.selected.size > 0 ? '' : 'none';
       cancelBtn.style.display = 'none';
-      deployBtn.disabled = !can;
-      retrieveBtn.disabled = !can;
-      diffBtn.disabled = !can;
+      deployBtn.disabled = !hasLocalSelected;
+      retrieveBtn.disabled = !anySelected;
+      diffBtn.disabled = !hasLocalSelected;
+      deployBtn.title = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : '';
+      diffBtn.title = allOrgOnly ? 'Org-only items have no local file to diff against — retrieve them first.' : '';
     }
   }
 
