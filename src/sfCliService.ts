@@ -45,6 +45,13 @@ export interface RetrieveFileResult {
   problem?: string;
 }
 
+export interface OrgMember {
+  fullName: string;
+  fileName?: string;
+  manageableState?: string;
+  namespacePrefix?: string;
+}
+
 export interface RetrieveResult {
   status: number;
   success: boolean;
@@ -197,6 +204,49 @@ export class SfCliService {
     const cmd = this.formatCmd(args);
     const inner = this.runJsonCancellable<SfJsonEnvelope<{ records?: T[] }>>(args, { timeoutMs: opts.timeoutMs, cwd });
     const promise = inner.promise.then(json => ({ records: this.unwrapResult(json, 'data query').records ?? [], cmd }));
+    return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * List metadata members of a given type on the connected org.
+   *
+   * Returns an empty array when the type genuinely has no members. THROWS an
+   * SfCliError for real failures (expired auth, named-org-not-found,
+   * no-default-org, network) so the caller can surface them instead of silently
+   * reporting "0 components" success — the previous behaviour, which coerced
+   * every error envelope to an empty array.
+   *
+   * `opts.folder` is required for folder-based types (EmailTemplate, Report,
+   * Dashboard, Document): a folderless list of those types returns nothing.
+   */
+  listMetadata(
+    metadataType: string,
+    targetOrg: string,
+    cwd: string,
+    opts: { timeoutMs?: number; folder?: string } = {}
+  ): Cancellable<{ members: OrgMember[]; cmd: string }> {
+    const args = ['org', 'list', 'metadata', '--metadata-type', metadataType];
+    if (opts.folder) args.push('--folder', opts.folder);
+    args.push('--target-org', targetOrg, '--json');
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<SfJsonEnvelope<OrgMember[]>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => {
+      if (json.result == null) {
+        // No `result`. Distinguish a genuine error envelope (carries a `name`,
+        // or a non-zero status) from a benign empty listing. Only the former
+        // should fail the call; an empty type just yields zero members.
+        const isError = !!json.name || (typeof json.status === 'number' && json.status !== 0);
+        if (isError) {
+          const msg = (json.message ?? '').trim() || `sf org list metadata ${metadataType} returned no result`;
+          const err = new SfCliError(json.name ? `${json.name}: ${msg}` : msg);
+          err.errorName = json.name;
+          throw err;
+        }
+        return { members: [], cmd };
+      }
+      const members = Array.isArray(json.result) ? json.result.filter(m => !!m?.fullName) : [];
+      return { members, cmd };
+    });
     return { promise, cancel: inner.cancel };
   }
 

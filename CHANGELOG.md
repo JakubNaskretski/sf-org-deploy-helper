@@ -3,6 +3,28 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.0
+
+- New: **Browse org metadata.** A "Fetch Org" button lists every component on the
+  selected org — not just what's already in your workspace — across ~40 metadata
+  types. Each row is badged **local**, **org**, or **local+org**, with a source
+  filter to show only what's missing locally, only what's on the org, or both.
+  Components that exist only on the org can be selected and retrieved directly;
+  once retrieved they flip to "local+org". Deploy and Diff stay limited to
+  components you have locally.
+- Folder-based email templates are now included in the org listing (they were
+  previously skipped because folder metadata needs to be enumerated separately).
+- Installed managed-package components are hidden from the org listing by default
+  to keep the tree readable; enable `sfOrgDeployWrapper.fetchIncludeManaged` to
+  show them.
+- Fetch Org now reports a real error if it can't reach the org (expired auth,
+  wrong org, network) instead of silently showing an empty result, and warns when
+  some metadata types fail to list.
+- Performance: the org listing is fetched with a bounded number of parallel CLI
+  calls (`sfOrgDeployWrapper.fetchConcurrency`, default 5), and the tree caps how
+  many rows it paints at once so large orgs stay responsive — narrow with the
+  filter to see more.
+
 ## 0.3.2
 
 - Fixed a regression in 0.3.1: "Compare with Org" reported layouts and other

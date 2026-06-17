@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
-import { OrgInfo, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService } from './sfCliService';
+import { OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService } from './sfCliService';
 import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
@@ -11,6 +11,7 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'refreshOrgs' }
   | { type: 'refreshFiles' }
+  | { type: 'fetchOrgMetadata' }
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
   | { type: 'deploy'; keys: string[] }
@@ -31,6 +32,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentCancel?: () => void;
   private currentAction?: string;
   private currentProgressText?: string;
+  /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
+  private orgMembers = new Map<string, true>();
+  /** The org username `orgMembers` was fetched from — guards against using a stale
+   *  membership map after the user switches the target org. */
+  private orgMembersOrg?: string;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -56,6 +62,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const username = await this.promptForOrg('Select Salesforce org');
     if (username) {
       await this.orgStore.set(username);
+      if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
       this.postOrgs();
     }
   }
@@ -151,10 +158,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       case 'refreshFiles':
         await this.loadFiles();
         return;
-      case 'selectOrg':
-        await this.orgStore.set(msg.username || undefined);
+      case 'fetchOrgMetadata':
+        await this.loadOrgMetadata();
+        return;
+      case 'selectOrg': {
+        const nextOrg = msg.username || undefined;
+        await this.orgStore.set(nextOrg);
+        // Switching target org invalidates any fetched org-membership data.
+        if (this.orgMembersOrg && nextOrg !== this.orgMembersOrg) this.resetOrgMetadata();
         this.postOrgs();
         return;
+      }
       case 'useActiveFile':
         this.sendActiveFile(true, true);
         return;
@@ -184,6 +198,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const def = this.orgs.find(o => o.isDefaultUsername) ?? this.orgs[0];
         if (def) await this.orgStore.set(def.username);
       }
+      // If the effective org no longer matches what org metadata was fetched for, drop it.
+      if (this.orgMembersOrg && this.orgStore.get() !== this.orgMembersOrg) this.resetOrgMetadata();
       this.postOrgs();
       if (notify && this.orgs.length === 0) {
         vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
@@ -238,8 +254,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!root) return;
     const org = this.requireOrg();
     if (!org) return;
-    const items = this.resolveKeys(keys);
-    if (items.length === 0) return;
+    const allResolved = this.resolveKeys(keys);
+    const orgOnlySkipped = allResolved.filter(i => !i.filePath);
+    const items = allResolved.filter(i => !!i.filePath);
+    if (items.length === 0) {
+      vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
+      return;
+    }
 
     const orgInfo = this.orgs.find(o => o.username === org);
     const orgLabel = orgInfo?.alias ?? org;
@@ -291,15 +312,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
           && failures.length === 0;
         const lines = items.map(i => `${i.type}:${i.name}`);
+        const skipLines = orgOnlySkipped.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`);
         this.endCmd(cmdId, success, Date.now() - start);
         if (success) {
           this.post({
             type: 'status',
             card: {
-              kind: 'ok',
+              kind: orgOnlySkipped.length > 0 ? 'warn' : 'ok',
               title: `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
-              meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded`,
-              lines
+              meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
+              lines: [...lines, ...skipLines]
             }
           });
           this.notifySuccessIfPanelHidden(`Deployed ${noun} to ${orgLabel}`);
@@ -313,7 +335,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: 'err',
               title: `Deploy failed against ${orgLabel}`,
               meta: `${failures.length} failure${failures.length === 1 ? '' : 's'}, ${successes.length} success`,
-              lines: errLines
+              lines: [...errLines, ...skipLines]
             }
           });
         }
@@ -339,9 +361,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
     const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
 
+    const orgOnlyCount = items.filter(i => !i.filePath).length;
+    const localCount = items.length - orgOnlyCount;
+    const detail = orgOnlyCount > 0 && localCount > 0
+      ? `${localCount} local file${localCount !== 1 ? 's' : ''} will be overwritten · ${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created`
+      : orgOnlyCount > 0
+        ? `${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created locally`
+        : 'This will overwrite your local files.';
     const confirm = await vscode.window.showWarningMessage(
-      `Retrieve ${noun} from ${orgLabel}? This will overwrite local files.`,
-      { modal: true },
+      `Retrieve ${noun} from ${orgLabel}?`,
+      { modal: true, detail },
       'Retrieve'
     );
     if (confirm !== 'Retrieve') return;
@@ -425,10 +454,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const allItems = this.resolveKeys(keys);
     if (allItems.length === 0) return;
 
+    // Org-only items have no local file — diff is meaningless for them (nothing to compare against).
+    const orgOnlySkipped = allItems.filter(i => !i.filePath);
+    const withLocalFile = allItems.filter(i => !!i.filePath);
+
     // Partition into diffable vs unsupported metadata types.
-    const diffable = allItems.filter(i => !DIFF_UNSUPPORTED.has(i.type));
-    const unsupported = allItems.filter(i => DIFF_UNSUPPORTED.has(i.type));
-    const preLines: string[] = unsupported.map(i => `— ${i.type}:${i.name} — diff not supported for this metadata type yet`);
+    const diffable = withLocalFile.filter(i => !DIFF_UNSUPPORTED.has(i.type));
+    const unsupported = withLocalFile.filter(i => DIFF_UNSUPPORTED.has(i.type));
+    const preLines: string[] = [
+      ...unsupported.map(i => `— ${i.type}:${i.name} — diff not supported for this metadata type yet`),
+      ...orgOnlySkipped.map(i => `— ${i.type}:${i.name} — org-only, no local file to diff (retrieve first)`)
+    ];
 
     if (diffable.length === 0) {
       this.post({
@@ -609,6 +645,156 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ---- Org metadata browse ----
+
+  /** Clear cached org-membership (provider + webview) so stale badges/rows from a
+   *  previously-fetched org never describe a different selected org. */
+  private resetOrgMetadata(): void {
+    this.orgMembers = new Map();
+    this.orgMembersOrg = undefined;
+    this.post({ type: 'orgMetadataReset' });
+  }
+
+  private async loadOrgMetadata(): Promise<void> {
+    if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
+    const root = this.requireRoot();
+    if (!root) return;
+    const org = this.requireOrg();
+    if (!org) return;
+    const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
+
+    const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
+    const includeManaged = cfg.get<boolean>('fetchIncludeManaged', false);
+    const concurrency = Math.max(1, Math.min(12, cfg.get<number>('fetchConcurrency', 5)));
+    const timeoutMs = this.timeoutMs();
+
+    const orgItems: Array<{ type: string; name: string }> = [];
+    let managedSkipped = 0;
+    const failures: Array<{ label: string; err: unknown }> = [];
+    let fetchCancelled = false;
+    const activeCancels = new Set<() => void>();
+
+    this.currentCancel = () => {
+      fetchCancelled = true;
+      for (const c of activeCancels) c();
+    };
+    this.setBusy(true, 'Fetch Org');
+
+    // Run one listMetadata call, folding its members into orgItems (honouring the
+    // managed-package filter) or recording a failure. Never throws (except cancel).
+    const runOne = async (type: string, label: string, folder?: string): Promise<void> => {
+      if (fetchCancelled) return;
+      const h = this.sf.listMetadata(type, org, root, { timeoutMs, folder });
+      activeCancels.add(h.cancel);
+      try {
+        const { members } = await h.promise;
+        for (const m of members) {
+          if (!m.fullName) continue;
+          if (!includeManaged && m.manageableState === 'installed') { managedSkipped++; continue; }
+          orgItems.push({ type, name: m.fullName });
+        }
+      } catch (err) {
+        if (fetchCancelled || err instanceof SfCliCancelledError) throw err;
+        failures.push({ label, err });
+        this.output.appendLine(`[Fetch Org] ${label}: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        activeCancels.delete(h.cancel);
+      }
+    };
+
+    try {
+      await this.withWindowProgress(`Fetching metadata from ${orgLabel}`, async report => {
+        // Folder-based types (EmailTemplate) return nothing without --folder: first
+        // enumerate the folders, then fetch each folder's members. fullNames come back
+        // as `Folder/Name`, matching the local scanner's key for the same component.
+        const tasks: Array<{ type: string; label: string; folder?: string }> = [];
+        for (const type of FETCH_ORG_TYPES) {
+          if (type === 'EmailTemplate') continue;
+          tasks.push({ type, label: type });
+        }
+        if (FETCH_ORG_TYPES.includes('EmailTemplate')) {
+          try {
+            const fh = this.sf.listMetadata('EmailTemplateFolder', org, root, { timeoutMs });
+            activeCancels.add(fh.cancel);
+            const { members } = await fh.promise;
+            activeCancels.delete(fh.cancel);
+            for (const f of members) {
+              if (f.fullName) tasks.push({ type: 'EmailTemplate', label: `EmailTemplate (${f.fullName})`, folder: f.fullName });
+            }
+          } catch (err) {
+            if (fetchCancelled || err instanceof SfCliCancelledError) throw err;
+            failures.push({ label: 'EmailTemplateFolder', err });
+            this.output.appendLine(`[Fetch Org] EmailTemplateFolder: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        // Bounded concurrency pool: at most `concurrency` sf processes in flight at
+        // once, instead of spawning one per type/folder all at once.
+        const total = tasks.length;
+        let done = 0;
+        let next = 0;
+        const worker = async (): Promise<void> => {
+          while (!fetchCancelled) {
+            const i = next++;
+            if (i >= tasks.length) return;
+            const t = tasks[i];
+            await runOne(t.type, t.label, t.folder);
+            done++;
+            report(`${done}/${total}…`);
+            this.postProgress(`Fetching org metadata: ${done}/${total}…`);
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
+        if (fetchCancelled) throw new SfCliCancelledError();
+      });
+
+      const fatal = failures.filter(f => isFatalFetchError(f.err));
+      // Zero results AND at least one failure → we can't claim the org is empty.
+      // Surface a real error instead of a misleading "0 components" success. Prefer an
+      // auth/network-class error for the message/hint since that explains a total wipe-out.
+      if (orgItems.length === 0 && failures.length > 0) {
+        const first = (fatal[0] ?? failures[0]).err;
+        this.post({
+          type: 'status',
+          card: {
+            kind: 'err',
+            title: `Fetch Org failed against ${orgLabel}`,
+            meta: 'Could not list metadata — see command log / output channel',
+            errText: first instanceof Error ? first.message : String(first),
+            hint: hintForError(first) ?? 'Check the org authentication and your connection, then retry.'
+          }
+        });
+        return;
+      }
+
+      this.orgMembers = new Map(orgItems.map(i => [`${i.type}:${i.name}`, true as const]));
+      this.orgMembersOrg = org;
+      this.post({ type: 'orgMetadata', orgItems, orgLabel });
+
+      const metaParts = [`${orgItems.length} components`];
+      if (managedSkipped > 0) metaParts.push(`${managedSkipped} managed skipped`);
+      if (failures.length > 0) metaParts.push(`${failures.length} type${failures.length === 1 ? '' : 's'} failed`);
+      const card: Record<string, unknown> = {
+        kind: failures.length > 0 ? 'warn' : 'ok',
+        title: `Org metadata loaded from ${orgLabel}`,
+        meta: metaParts.join(' · ')
+      };
+      if (failures.length > 0) {
+        const lines = failures.slice(0, 8).map(f => `✗ ${f.label} — ${f.err instanceof Error ? f.err.message : String(f.err)}`);
+        if (failures.length > 8) lines.push(`…and ${failures.length - 8} more (see output channel)`);
+        if (managedSkipped > 0) lines.unshift(`— ${managedSkipped} managed-package component${managedSkipped === 1 ? '' : 's'} hidden (enable sfOrgDeployWrapper.fetchIncludeManaged to show)`);
+        card.lines = lines;
+      }
+      this.post({ type: 'status', card });
+    } catch (err) {
+      if (err instanceof SfCliCancelledError) this.reportCancelled('Fetch Org');
+      else this.reportError('Fetch Org', err);
+    } finally {
+      this.currentCancel = undefined;
+      this.setBusy(false);
+    }
+  }
+
   // ---- helpers ----
   private requireRoot(): string | undefined {
     if (this.workspaceRoot) return this.workspaceRoot;
@@ -627,7 +813,26 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   private resolveKeys(keys: string[]): MetadataItem[] {
     const set = new Set(keys);
-    return this.items.filter(i => set.has(`${i.type}:${i.name}`));
+    const result: MetadataItem[] = [];
+    const matched = new Set<string>();
+    for (const i of this.items) {
+      const key = `${i.type}:${i.name}`;
+      if (set.has(key)) { result.push(i); matched.add(key); }
+    }
+    // Include org-only items as virtual MetadataItems (no local file) — valid for
+    // retrieve. Only trust the membership map when it was fetched for the org that's
+    // currently selected, so a stale map can never synthesize items for a wrong org.
+    const membershipValid = !!this.orgMembersOrg && this.orgMembersOrg === this.orgStore.get();
+    if (membershipValid) {
+      for (const key of set) {
+        if (matched.has(key)) continue;
+        if (this.orgMembers.has(key)) {
+          const colon = key.indexOf(':');
+          result.push({ type: key.slice(0, colon), name: key.slice(colon + 1), filePath: '', files: [] });
+        }
+      }
+    }
+    return result;
   }
 
   private metadataArgs(items: MetadataItem[]): string {
@@ -740,6 +945,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
 // ---- module-local helpers ----
 
+/** All metadata types the extension supports — fetched in one batch when the user clicks "Fetch Org". */
+const FETCH_ORG_TYPES: readonly string[] = [
+  // Apex / Visualforce
+  'ApexClass', 'ApexTrigger', 'ApexPage', 'ApexComponent', 'ApexTestSuite',
+  // Lightning
+  'LightningComponentBundle', 'AuraDefinitionBundle', 'LightningMessageChannel', 'FlexiPage',
+  // Automation
+  'Flow', 'Workflow',
+  // Security / access
+  'PermissionSet', 'Profile', 'Role', 'CustomPermission',
+  // Object children (returned as ObjectName.MemberName)
+  'CustomObject', 'CustomField', 'ValidationRule', 'RecordType', 'ListView',
+  'FieldSet', 'CompactLayout', 'WebLink', 'BusinessProcess', 'Index', 'SharingReason',
+  // UI / UX
+  'Layout', 'CustomTab', 'CustomApplication', 'QuickAction',
+  // Data / config
+  'CustomLabels', 'CustomMetadata', 'GlobalValueSet',
+  'Queue', 'Group', 'StaticResource',
+  // Integration / connectivity
+  'NamedCredential', 'ExternalDataSource', 'RemoteSiteSetting',
+  // Misc
+  'EmailTemplate', 'Settings',
+];
+
 function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
   if (o.isScratch) return 'scratch';
   if (o.isSandbox) return 'sandbox';
@@ -767,6 +996,16 @@ interface ToolingCodeRecord {
   Name?: string;
   NamespacePrefix?: string | null;
   [field: string]: unknown;
+}
+
+/** A fetch error that would affect every metadata type (expired auth, wrong/missing
+ *  org, network) rather than being specific to one type. Used to decide whether a
+ *  Fetch Org with zero results is a genuine failure vs a legitimately empty org. */
+function isFatalFetchError(err: unknown): boolean {
+  const name = err instanceof SfCliError ? err.errorName ?? '' : '';
+  const message = err instanceof Error ? err.message : String(err);
+  const txt = `${name} ${message}`.toLowerCase();
+  return /nodefaultenv|namedorgnotfound|noauthinfofound|invalid_grant|expired|refreshtokenauth|enotfound|getaddrinfo|econnrefused|econnreset|etimedout|socket hang up|timed out/.test(txt);
 }
 
 /** Map well-known sf CLI failures to a one-line actionable hint for the error card. */

@@ -141,6 +141,26 @@ body {
   font-size: 10px; color: var(--muted); padding: 0 4px;
   border: 1px solid var(--border); border-radius: 2px;
 }
+.source-badge {
+  font-size: 10px; padding: 1px 4px; margin-left: 2px;
+  border-radius: 2px; border: 1px solid; font-weight: 500;
+  flex-shrink: 0; letter-spacing: 0;
+}
+.source-badge.both { color: var(--ok); border-color: var(--ok); }
+.source-badge.local { color: var(--warn); border-color: var(--warn); }
+.source-badge.org {
+  color: var(--vscode-editorInfo-foreground, #75beff);
+  border-color: var(--vscode-editorInfo-foreground, #75beff);
+}
+.tree .row.org-only .name { opacity: 0.75; font-style: italic; }
+.tree-search select {
+  width: 100%; margin-top: 4px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border));
+  border-radius: 2px; padding: 2px 4px;
+  font-family: inherit; font-size: inherit;
+}
 
 .actions {
   display: flex; gap: 6px; padding: 6px 8px;
@@ -254,6 +274,7 @@ body {
     <select id="orgSelect" class="org" title="Authenticated orgs"></select>
     <button id="refreshOrgs" class="secondary" title="Refresh org list">⟳</button>
     <button id="refreshFiles" class="secondary" title="Rescan workspace metadata">Rescan</button>
+    <button id="fetchOrgBtn" class="secondary" title="Fetch all metadata from the connected org and merge with local workspace">Fetch Org</button>
   </div>
   <div id="banner" class="banner" style="display:none;"></div>
 
@@ -261,6 +282,14 @@ body {
     <div class="left">
       <div class="tree-search">
         <input id="search" type="text" placeholder="Filter… (type or name)" />
+        <div id="sourceFilterRow" style="display:none;">
+          <select id="sourceFilter">
+            <option value="all">All sources</option>
+            <option value="local-only">Local only (not on org)</option>
+            <option value="org-only">Org only (not local)</option>
+            <option value="both">In both</option>
+          </select>
+        </div>
         <div id="typeFilterRow" class="type-filter-row" style="display:none;">
           <details id="typeFilterDetails">
             <summary><span id="typeFilterLabel">All types</span></summary>
