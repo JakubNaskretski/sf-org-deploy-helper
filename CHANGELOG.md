@@ -19,7 +19,11 @@ This file starts at the current release; earlier history predates it.
   show them.
 - Fetch Org now reports a real error if it can't reach the org (expired auth,
   wrong org, network) instead of silently showing an empty result, and warns when
-  some metadata types fail to list.
+  some metadata types fail to list. If a connection drops part-way through, the
+  listing is flagged as incomplete so the source badges aren't trusted as
+  exhaustive.
+- The org switcher and Fetch/Rescan buttons are locked while an operation is
+  running, so an in-flight fetch can't be applied to the wrong org after a switch.
 - Performance: the org listing is fetched with a bounded number of parallel CLI
   calls (`sfOrgDeployWrapper.fetchConcurrency`, default 5), and the tree caps how
   many rows it paints at once so large orgs stay responsive — narrow with the

@@ -748,6 +748,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (fetchCancelled) throw new SfCliCancelledError();
       });
 
+      // If the user switched the target org while this fetch was in flight, the
+      // result describes the wrong org — discard it rather than badge org B's tree
+      // with org A's membership. (The org select is also disabled while busy; this
+      // is the backstop for programmatic org changes.)
+      if (org !== this.orgStore.get()) {
+        this.output.appendLine(`[Fetch Org] target org changed during fetch (${org} → ${this.orgStore.get() ?? 'none'}); discarding stale result.`);
+        this.post({
+          type: 'status',
+          card: { kind: 'warn', title: 'Fetch Org cancelled', meta: 'Target org changed during the fetch — run Fetch Org again for the current org.' }
+        });
+        return;
+      }
+
       const fatal = failures.filter(f => isFatalFetchError(f.err));
       // Zero results AND at least one failure → we can't claim the org is empty.
       // Surface a real error instead of a misleading "0 components" success. Prefer an
@@ -771,17 +784,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.orgMembersOrg = org;
       this.post({ type: 'orgMetadata', orgItems, orgLabel });
 
+      // A fatal (auth/network-class) failure that arrived mid-fetch means some types
+      // never listed, so the membership map is INCOMPLETE: a component that exists on
+      // the org under a failed type would mis-badge as "local only". We still show what
+      // we got (better than nothing), but flag the listing as incomplete so the badges
+      // aren't trusted as exhaustive.
+      const incomplete = fatal.length > 0;
       const metaParts = [`${orgItems.length} components`];
       if (managedSkipped > 0) metaParts.push(`${managedSkipped} managed skipped`);
       if (failures.length > 0) metaParts.push(`${failures.length} type${failures.length === 1 ? '' : 's'} failed`);
       const card: Record<string, unknown> = {
-        kind: failures.length > 0 ? 'warn' : 'ok',
-        title: `Org metadata loaded from ${orgLabel}`,
+        kind: incomplete ? 'err' : (failures.length > 0 ? 'warn' : 'ok'),
+        title: incomplete ? `Org metadata incomplete for ${orgLabel}` : `Org metadata loaded from ${orgLabel}`,
         meta: metaParts.join(' · ')
       };
       if (failures.length > 0) {
         const lines = failures.slice(0, 8).map(f => `✗ ${f.label} — ${f.err instanceof Error ? f.err.message : String(f.err)}`);
         if (failures.length > 8) lines.push(`…and ${failures.length - 8} more (see output channel)`);
+        if (incomplete) lines.unshift('⚠ A connection/auth error interrupted the listing — some "local only" badges may be incomplete. Re-run Fetch Org.');
         if (managedSkipped > 0) lines.unshift(`— ${managedSkipped} managed-package component${managedSkipped === 1 ? '' : 's'} hidden (enable sfOrgDeployWrapper.fetchIncludeManaged to show)`);
         card.lines = lines;
       }
