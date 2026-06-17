@@ -211,7 +211,8 @@
       sel.disabled = true;
       return;
     }
-    sel.disabled = false;
+    // Keep the select locked if an operation is mid-flight (renderActions owns this too).
+    sel.disabled = state.busy;
     const placeholder = document.createElement('option');
     placeholder.value = ''; placeholder.text = '— select org —';
     sel.appendChild(placeholder);
@@ -649,6 +650,13 @@
       deployBtn.title = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : '';
       diffBtn.title = allOrgOnly ? 'Org-only items have no local file to diff against — retrieve them first.' : '';
     }
+    // Lock org switching and fetch/refresh while an operation runs, so an in-flight
+    // Fetch Org can't be raced by an org change or a second fetch.
+    const orgSelect = $('orgSelect');
+    if (orgSelect) orgSelect.disabled = state.busy || state.orgs.length === 0;
+    $('fetchOrgBtn').disabled = state.busy;
+    $('refreshOrgs').disabled = state.busy;
+    $('refreshFiles').disabled = state.busy;
   }
 
   // ---- Progress (busy) card ----
