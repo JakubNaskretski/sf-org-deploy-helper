@@ -3,6 +3,10 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.1
+
+- Add a branded extension icon — shown on the Marketplace listing and the activity-bar.
+
 ## 0.4.0
 
 - New: **Browse org metadata.** A "Fetch Org" button lists every component on the
