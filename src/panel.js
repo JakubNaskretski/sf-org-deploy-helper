@@ -17,8 +17,11 @@
     progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
+    lastError: null, // most recent error card, mirrored into the full-width footer
     cmdLog: [],
     cmdLogCollapsed: !!persisted.cmdLogCollapsed,
+    // Fraction of the body given to the Status pane (right/bottom). null = CSS default.
+    statusRatio: typeof persisted.statusRatio === 'number' ? persisted.statusRatio : null,
     banner: '',
     // Org metadata browse state
     orgKeys: new Set(),      // "Type:Name" keys that exist on the org
@@ -33,7 +36,8 @@
       expandedGroups: Array.from(state.expandedGroups),
       filter: state.filter,
       typeFilter: Array.from(state.typeFilter),
-      cmdLogCollapsed: state.cmdLogCollapsed
+      cmdLogCollapsed: state.cmdLogCollapsed,
+      statusRatio: state.statusRatio
     });
   }
 
@@ -72,6 +76,8 @@
     savePersisted();
     renderCmdLog();
   });
+  setupSplitter();
+  renderErrorFooter();
   send('ready');
 
   function action(kind) {
@@ -159,6 +165,10 @@
         state.busy = !!msg.busy;
         state.busyAction = msg.action || null;
         if (state.busy) {
+          // A fresh op started — drop the previous error from the footer so a stale
+          // failure doesn't sit there looking like it belongs to the new run.
+          state.lastError = null;
+          renderErrorFooter();
           state.progress = { text: state.busyAction ? `${state.busyAction} running…` : 'Working…', startedAt: Date.now() };
           startProgressTimer();
         } else {
@@ -175,9 +185,13 @@
         }
         return;
       case 'status':
-        // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText }
+        // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint }
         state.statusCards.unshift(msg.card);
         if (state.statusCards.length > 25) state.statusCards.length = 25;
+        if (msg.card && msg.card.kind === 'err') {
+          state.lastError = msg.card;
+          renderErrorFooter();
+        }
         renderStatus();
         return;
       case 'cmd':
@@ -756,6 +770,19 @@
         e.textContent = card.errText;
         el.appendChild(e);
       }
+      if (card.actions && card.actions.length) {
+        const tl = document.createElement('div');
+        tl.className = 'try-label';
+        tl.textContent = 'Try:';
+        el.appendChild(tl);
+        const aul = document.createElement('ul');
+        for (const a of card.actions) {
+          const li = document.createElement('li');
+          li.textContent = a;
+          aul.appendChild(li);
+        }
+        el.appendChild(aul);
+      }
       if (card.hint) {
         const h = document.createElement('div');
         h.className = 'hint';
@@ -793,5 +820,128 @@
       row.appendChild(dur);
       body.appendChild(row);
     }
+  }
+
+  // ---- Resizable tree/status split ----
+  function setupSplitter() {
+    const body = document.querySelector('.body');
+    const splitter = $('splitter');
+    const left = document.querySelector('.left');
+    const right = document.querySelector('.right');
+    if (!body || !splitter || !left || !right) return;
+    // The sidebar flips between side-by-side (wide) and stacked (narrow) at 480px;
+    // the same persisted ratio drives both, measured along the active axis.
+    const colQuery = window.matchMedia('(max-width: 480px)');
+    let dragging = false;
+
+    function applyRatio() {
+      const r = state.statusRatio;
+      if (r == null) { left.style.flex = ''; right.style.flex = ''; return; }
+      const rr = Math.max(0.15, Math.min(0.85, r));
+      left.style.flex = String(1 - rr);
+      right.style.flex = String(rr);
+    }
+    applyRatio();
+
+    function onMove(e) {
+      if (!dragging) return;
+      const rect = body.getBoundingClientRect();
+      const frac = colQuery.matches
+        ? 1 - (e.clientY - rect.top) / rect.height
+        : 1 - (e.clientX - rect.left) / rect.width;
+      state.statusRatio = Math.max(0.15, Math.min(0.85, frac));
+      applyRatio();
+    }
+    function endDrag(e) {
+      if (!dragging) return;
+      dragging = false;
+      try { splitter.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      document.body.classList.remove('resizing');
+      savePersisted();
+    }
+    splitter.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      try { splitter.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      document.body.classList.add('resizing');
+      e.preventDefault();
+    });
+    splitter.addEventListener('pointermove', onMove);
+    splitter.addEventListener('pointerup', endDrag);
+    splitter.addEventListener('pointercancel', endDrag);
+    // Double-click restores the default proportions.
+    splitter.addEventListener('dblclick', () => {
+      state.statusRatio = null;
+      applyRatio();
+      savePersisted();
+    });
+  }
+
+  // ---- Full-width error footer ----
+  function errorDetailText(card) {
+    if (card.errText) return card.errText;
+    if (card.lines && card.lines.length) return card.lines.join('\n');
+    return card.meta || '';
+  }
+
+  function renderErrorFooter() {
+    const f = $('errorFooter');
+    const card = state.lastError;
+    if (!card) { f.style.display = 'none'; f.innerHTML = ''; return; }
+    f.style.display = 'block';
+    f.innerHTML = '';
+
+    const head = document.createElement('div');
+    head.className = 'ef-head';
+    const ic = document.createElement('span');
+    ic.className = 'ef-icon';
+    ic.textContent = '✕';
+    head.appendChild(ic);
+    const title = document.createElement('span');
+    title.className = 'ef-title';
+    title.textContent = card.title || 'Error';
+    head.appendChild(title);
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'ef-btn';
+    copyBtn.textContent = 'Copy';
+    copyBtn.title = 'Copy the full error to the clipboard';
+    head.appendChild(copyBtn);
+    const dismissBtn = document.createElement('button');
+    dismissBtn.className = 'ef-btn';
+    dismissBtn.textContent = '✕';
+    dismissBtn.title = 'Dismiss';
+    dismissBtn.addEventListener('click', () => { state.lastError = null; renderErrorFooter(); });
+    head.appendChild(dismissBtn);
+    f.appendChild(head);
+
+    const detailText = errorDetailText(card);
+    if (detailText) {
+      const d = document.createElement('div');
+      d.className = 'ef-detail';
+      d.textContent = detailText;
+      f.appendChild(d);
+    }
+    if (card.actions && card.actions.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'ef-actions';
+      for (const a of card.actions) {
+        const li = document.createElement('li');
+        li.textContent = a;
+        ul.appendChild(li);
+      }
+      f.appendChild(ul);
+    }
+    if (card.hint) {
+      const h = document.createElement('div');
+      h.className = 'ef-hint';
+      h.textContent = `Hint: ${card.hint}`;
+      f.appendChild(h);
+    }
+
+    copyBtn.addEventListener('click', () => {
+      const parts = [card.title, detailText];
+      if (card.actions && card.actions.length) parts.push('Try:\n' + card.actions.map(a => '• ' + a).join('\n'));
+      if (card.hint) parts.push('Hint: ' + card.hint);
+      send('copyText', { text: parts.filter(Boolean).join('\n\n') });
+    });
   }
 })();

@@ -77,6 +77,17 @@ body {
   flex: 1; display: flex; flex-direction: column; min-width: 0;
   min-width: 220px;
 }
+/* Draggable sash between the tree and the Status pane. Sits over the 1px border
+   (negative margin) and is invisible until hovered/dragged, like VS Code's own
+   sashes. Wide layout → vertical gutter (col-resize); narrow/stacked layout →
+   horizontal gutter (row-resize, handled in the media query below). */
+.splitter {
+  flex: none; position: relative; z-index: 2;
+  width: 6px; margin: 0 -3px; cursor: col-resize;
+  background: transparent; transition: background 0.1s;
+}
+.splitter:hover, body.resizing .splitter { background: var(--accent); opacity: 0.8; }
+body.resizing { cursor: col-resize; user-select: none; }
 .section-header {
   padding: 4px 8px; font-size: 11px; text-transform: uppercase;
   color: var(--muted); letter-spacing: 0.5px;
@@ -197,6 +208,8 @@ body {
   .body { flex-direction: column; }
   .left { border-right: none; border-bottom: 1px solid var(--border); flex: 3; }
   .right { min-width: 0; flex: 2; }
+  .splitter { width: auto; height: 6px; margin: -3px 0; cursor: row-resize; }
+  body.resizing { cursor: row-resize; }
 }
 
 .status {
@@ -218,7 +231,12 @@ body {
 .status-card .card-icon.warn { color: var(--warn); }
 .status-card .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
 .status-card ul { margin: 4px 0 0 0; padding-left: 16px; font-size: 12px; }
-.status-card .err-text { color: var(--err); white-space: pre-wrap; font-family: var(--vscode-editor-font-family); font-size: 11px; }
+.status-card .err-text {
+  color: var(--err); white-space: pre-wrap; word-break: break-word;
+  font-family: var(--vscode-editor-font-family); font-size: 11px;
+  max-height: 140px; overflow-y: auto;
+}
+.status-card .try-label { color: var(--muted); font-size: 11px; margin-top: 4px; }
 .status-card .hint { margin-top: 4px; font-size: 11px; color: var(--warn); }
 .status-card .show-more {
   background: transparent; border: none; padding: 2px 0; margin-top: 2px;
@@ -251,6 +269,34 @@ body {
 .cmd-entry .status-dot.err { background: var(--err); }
 .cmd-entry .status-dot.run { background: var(--warn); }
 .cmd-entry .dur { color: var(--muted); font-size: 10px; }
+
+/* Full-width error footer above the command log. The right-side Status cards can be
+   narrow; this surfaces the latest error across the whole panel width where a long
+   sf message is actually readable. Dismissable; replaced when a new op starts. */
+.error-footer {
+  border-top: 2px solid var(--err);
+  background: var(--vscode-inputValidation-errorBackground, rgba(244, 67, 54, 0.12));
+  color: var(--fg);
+  padding: 6px 8px; font-size: 12px;
+  max-height: 40%; overflow-y: auto; flex: none;
+}
+.error-footer .ef-head { display: flex; align-items: center; gap: 6px; }
+.error-footer .ef-icon { color: var(--err); font-weight: 700; flex: none; }
+.error-footer .ef-title { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.error-footer .ef-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--fg);
+  border-radius: 2px; padding: 1px 7px; cursor: pointer; font-size: 11px; font-family: inherit;
+  flex: none;
+}
+.error-footer .ef-btn:hover { background: var(--row-hover); }
+.error-footer .ef-detail {
+  margin-top: 4px; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--vscode-editor-font-family); font-size: 11px;
+  color: var(--err); max-height: 160px; overflow-y: auto;
+}
+.error-footer .ef-actions { margin: 4px 0 0 0; padding-left: 16px; font-size: 11px; }
+.error-footer .ef-actions li { margin: 1px 0; }
+.error-footer .ef-hint { margin-top: 4px; font-size: 11px; color: var(--warn); }
 
 .spinner {
   display: inline-block; width: 10px; height: 10px;
@@ -309,6 +355,7 @@ body {
         <button id="cancelBtn" class="danger" style="display:none;">Cancel</button>
       </div>
     </div>
+    <div id="splitter" class="splitter" title="Drag to resize · double-click to reset"></div>
     <div class="right">
       <div class="section-header">Status</div>
       <div id="status" class="status">
@@ -316,6 +363,8 @@ body {
       </div>
     </div>
   </div>
+
+  <div id="errorFooter" class="error-footer" style="display:none;"></div>
 
   <div id="cmdlog" class="cmdlog">
     <div class="section-header" id="cmdlogHeader">

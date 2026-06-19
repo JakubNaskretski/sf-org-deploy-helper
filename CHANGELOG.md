@@ -3,6 +3,20 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.2
+
+- New: **Resize the Status panel.** Drag the divider between the file tree and the
+  Status panel to give status messages more room — whether the two are shown
+  side-by-side or stacked in a narrow sidebar. The size is remembered across
+  reloads; double-click the divider to reset it.
+- New: **Full-width error bar.** When an operation fails, the error is also shown
+  across the full width of the panel, above the command log, where long messages
+  are far easier to read — with a one-click **Copy** button. Dismiss it manually,
+  or it clears when the next operation starts.
+- Errors now surface the Salesforce CLI's own suggested next steps when it provides
+  them, and colour codes are stripped so messages read cleanly. Long error text now
+  scrolls within its card instead of stretching the panel.
+
 ## 0.4.1
 
 - Add a branded extension icon — shown on the Marketplace listing and the activity-bar.

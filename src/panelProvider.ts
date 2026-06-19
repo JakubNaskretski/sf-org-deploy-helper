@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
-import { OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService } from './sfCliService';
+import { OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, stripAnsi } from './sfCliService';
 import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
@@ -17,6 +17,7 @@ type Inbound =
   | { type: 'deploy'; keys: string[] }
   | { type: 'retrieve'; keys: string[] }
   | { type: 'diff'; keys: string[] }
+  | { type: 'copyText'; text: string }
   | { type: 'cancel' };
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
@@ -180,6 +181,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       case 'diff':
         await this.runDiff(msg.keys);
+        return;
+      case 'copyText':
+        if (msg.text) {
+          await vscode.env.clipboard.writeText(msg.text);
+          vscode.window.setStatusBarMessage('$(check) SF Deploy: error copied to clipboard', 2500);
+        }
         return;
       case 'cancel':
         if (this.currentCancel) this.currentCancel();
@@ -773,7 +780,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             kind: 'err',
             title: `Fetch Org failed against ${orgLabel}`,
             meta: 'Could not list metadata — see command log / output channel',
-            errText: first instanceof Error ? first.message : String(first),
+            errText: stripAnsi(first instanceof Error ? first.message : String(first)),
+            actions: first instanceof SfCliError ? first.actions : undefined,
             hint: hintForError(first) ?? 'Check the org authentication and your connection, then retry.'
           }
         });
@@ -953,7 +961,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         kind: 'err',
         title: `${action} failed`,
         meta: 'See command log / output channel for details',
-        errText: [message, stderr].filter(Boolean).join('\n').trim(),
+        errText: stripAnsi([message, stderr].filter(Boolean).join('\n')).trim(),
+        actions: err instanceof SfCliError ? err.actions : undefined,
         hint: hintForError(err)
       }
     });

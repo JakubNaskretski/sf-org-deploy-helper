@@ -63,20 +63,41 @@ export interface RetrieveResult {
 export class SfCliError extends Error {
   /** sf CLI error name from the JSON envelope (e.g. NamedOrgNotFound), when known. */
   public errorName?: string;
+  /** The CLI's own suggested next steps from the envelope's `actions[]`, when present.
+   *  These are command-specific and usually more precise than any hint we guess. */
+  public actions?: string[];
   constructor(message: string, public readonly stderr?: string, public readonly raw?: string, public readonly cause?: unknown) {
     super(message);
     this.name = 'SfCliError';
   }
 }
 
+/** Strip ANSI colour escapes so an error rendered in the panel (plain text) isn't
+ *  littered with `\u001b[31m`-style codes when the CLI colourises its message. */
+export function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+/** Normalise the envelope's `actions` into clean, non-empty lines (or undefined). */
+function cleanActions(actions: unknown): string[] | undefined {
+  if (!Array.isArray(actions)) return undefined;
+  const lines = actions
+    .filter((a): a is string => typeof a === 'string')
+    .map(a => stripAnsi(a).trim())
+    .filter(Boolean);
+  return lines.length ? lines : undefined;
+}
+
 /** Top-level envelope every `sf … --json` command prints. CLI-level failures
  *  (expired auth, source conflicts, bad project, …) carry `name`/`message` at the
- *  top and omit `result`. */
+ *  top and omit `result`; many also carry `actions[]` with suggested fixes. */
 interface SfJsonEnvelope<R> {
   status?: number;
   result?: R;
   name?: string;
   message?: string;
+  actions?: string[];
 }
 
 interface RunOptions {
@@ -237,9 +258,10 @@ export class SfCliService {
         // should fail the call; an empty type just yields zero members.
         const isError = !!json.name || (typeof json.status === 'number' && json.status !== 0);
         if (isError) {
-          const msg = (json.message ?? '').trim() || `sf org list metadata ${metadataType} returned no result`;
+          const msg = stripAnsi((json.message ?? '').trim()) || `sf org list metadata ${metadataType} returned no result`;
           const err = new SfCliError(json.name ? `${json.name}: ${msg}` : msg);
           err.errorName = json.name;
+          err.actions = cleanActions(json.actions);
           throw err;
         }
         return { members: [], cmd };
@@ -258,9 +280,10 @@ export class SfCliService {
    */
   private unwrapResult<R>(json: SfJsonEnvelope<R>, what: string): R {
     if (json.result != null) return json.result;
-    const msg = (json.message ?? '').trim() || `sf ${what} returned no result (status ${json.status ?? '?'})`;
+    const msg = stripAnsi((json.message ?? '').trim()) || `sf ${what} returned no result (status ${json.status ?? '?'})`;
     const err = new SfCliError(json.name ? `${json.name}: ${msg}` : msg);
     err.errorName = json.name;
+    err.actions = cleanActions(json.actions);
     throw err;
   }
 
