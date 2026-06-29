@@ -3,6 +3,15 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.4
+
+- The file tree now takes about three-quarters of the panel by default (was two-thirds),
+  and the Status panel keeps a minimum height — expanding a large group can no longer push
+  Status out of reach; the tree scrolls within its own area instead.
+- Right-click a folder or a single component in the tree to **Deploy**, **Retrieve**, or
+  **Diff** it directly, without ticking checkboxes first. When components are checked, the
+  menu adds a **Selected (N)** section that acts on the whole selection.
+
 ## 0.4.3
 
 - New: **Deploy, retrieve, and compare files anywhere.** Right-clicking a Salesforce
