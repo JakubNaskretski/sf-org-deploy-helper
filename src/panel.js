@@ -526,7 +526,50 @@
     return keys;
   }
 
+  // Pinned chip tray mirroring the current selection. Rendered from state.selected
+  // (insertion order, so existing chips never reorder when you add/remove one) and
+  // independent of the tree's filter, so selected items stay visible even when a
+  // filter hides their row below.
+  function renderSelectedTray() {
+    const tray = $('selectedTray');
+    if (!tray) return;
+    tray.innerHTML = '';
+    if (state.selected.size === 0) { tray.style.display = 'none'; return; }
+    tray.style.display = '';
+    const head = document.createElement('div');
+    head.className = 'tray-head';
+    const lbl = document.createElement('span');
+    lbl.textContent = `Selected (${state.selected.size})`;
+    head.appendChild(lbl);
+    const clear = document.createElement('button');
+    clear.className = 'tray-clear';
+    clear.textContent = 'Clear all';
+    clear.title = 'Deselect everything';
+    clear.addEventListener('click', () => { state.selected.clear(); renderTree(); renderActions(); });
+    head.appendChild(clear);
+    tray.appendChild(head);
+    for (const key of state.selected) {
+      const ci = key.indexOf(':');
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.title = key;
+      const text = document.createElement('span');
+      text.className = 'chip-label';
+      text.textContent = ci >= 0 ? key.slice(ci + 1) : key; // show name; type is in the tooltip
+      chip.appendChild(text);
+      const x = document.createElement('button');
+      x.className = 'chip-x';
+      x.textContent = '×';
+      x.title = `Deselect ${key}`;
+      x.setAttribute('aria-label', `Deselect ${key}`);
+      x.addEventListener('click', () => { state.selected.delete(key); renderTree(); renderActions(); });
+      chip.appendChild(x);
+      tray.appendChild(chip);
+    }
+  }
+
   function renderTree() {
+    renderSelectedTray();
     const tree = $('tree');
     tree.innerHTML = '';
     const hasLocal = state.items.length > 0;
@@ -829,9 +872,8 @@
     const left = document.querySelector('.left');
     const right = document.querySelector('.right');
     if (!body || !splitter || !left || !right) return;
-    // The sidebar flips between side-by-side (wide) and stacked (narrow) at 480px;
-    // the same persisted ratio drives both, measured along the active axis.
-    const colQuery = window.matchMedia('(max-width: 480px)');
+    // Tree and Status are always stacked (two rows), so the sash is horizontal and
+    // the persisted ratio is measured top-to-bottom.
     let dragging = false;
 
     function applyRatio() {
@@ -846,9 +888,7 @@
     function onMove(e) {
       if (!dragging) return;
       const rect = body.getBoundingClientRect();
-      const frac = colQuery.matches
-        ? 1 - (e.clientY - rect.top) / rect.height
-        : 1 - (e.clientX - rect.left) / rect.width;
+      const frac = 1 - (e.clientY - rect.top) / rect.height;
       state.statusRatio = Math.max(0.15, Math.min(0.85, frac));
       applyRatio();
     }

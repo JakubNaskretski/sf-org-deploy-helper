@@ -112,7 +112,12 @@ export async function scanWorkspace(): Promise<{ items: MetadataItem[]; root?: s
   const pkgDirs = await resolvePackageDirs(root);
   const items: MetadataItem[] = [];
   for (const pkg of pkgDirs) {
-    const defaultDir = path.join(root, pkg, 'main', 'default');
+    // Standard layout is <pkg>/main/default, but SFDX only requires <pkg>; metadata
+    // can sit directly under the package dir. Fall back to <pkg> when main/default is
+    // absent so non-standard layouts aren't scanned to nothing.
+    const pkgRoot = path.join(root, pkg);
+    const mainDefault = path.join(pkgRoot, 'main', 'default');
+    const defaultDir = (await pathExists(mainDefault)) ? mainDefault : pkgRoot;
     if (!(await pathExists(defaultDir))) continue;
     for (const rule of RULES) {
       const dir = path.join(defaultDir, rule.folder);
@@ -233,6 +238,66 @@ export function findItemForPath(items: MetadataItem[], absPath: string): Metadat
   // 3. The containing bundle/folder.
   match = items.find(i => normalized.startsWith(path.normalize(i.filePath) + path.sep));
   return match;
+}
+
+/**
+ * Infer a MetadataItem straight from any metadata file path, independent of the
+ * workspace scan and the project's package-directory layout. Used as a fallback
+ * when the user runs a context-menu action on a file the scan didn't pick up —
+ * e.g. one that lives outside the declared package directories — so pointing at a
+ * file just works instead of being rejected. Mirrors the same folder→type rules
+ * the scanner uses. Returns undefined when the path isn't recognizable SF metadata.
+ *
+ * The caller deploys/retrieves the result by `--source-dir filePath`, which works
+ * anywhere (`--metadata Type:Name` can't resolve a file outside the package dirs).
+ */
+export function inferItemForPath(absPath: string): MetadataItem | undefined {
+  const norm = path.normalize(absPath);
+  const base = path.basename(norm);
+  const segs = norm.split(path.sep);
+  const item = (type: string, name: string, filePath = norm): MetadataItem => ({ type, name, filePath, files: [filePath] });
+
+  // 1. Decomposed object children (and the CustomObject itself) under objects/<Object>/…
+  const oi = segs.lastIndexOf('objects');
+  if (oi >= 0 && oi + 1 < segs.length) {
+    const objectName = segs[oi + 1];
+    for (const rule of OBJECT_CHILD_RULES) {
+      if (base.endsWith(rule.suffix) && segs.slice(oi + 2).includes(rule.folder)) {
+        return item(rule.type, `${objectName}.${base.slice(0, -rule.suffix.length)}`);
+      }
+    }
+    if (base.endsWith('.object-meta.xml')) return item('CustomObject', objectName);
+  }
+
+  // 2. Bundle types (LWC/Aura): the component is the bundle directory under lwc/ or aura/.
+  for (const rule of RULES) {
+    if (!rule.bundle) continue;
+    const bi = segs.lastIndexOf(rule.folder);
+    if (bi >= 0 && bi + 1 < segs.length) {
+      const bundleDir = segs.slice(0, bi + 2).join(path.sep);
+      return item(rule.type, segs[bi + 1], bundleDir);
+    }
+  }
+
+  // 3. Nested EmailTemplate: email/<Folder>/<Name>.email → fullName `Folder/Name`.
+  // Require a folder level (file at ei+2 or deeper) — a bare email/<Name>.email has no
+  // valid fullName, so leave it unrecognized rather than inventing `<Name>.email/<Name>`.
+  const ei = segs.lastIndexOf('email');
+  if (ei >= 0 && ei + 2 < segs.length) {
+    for (const suffix of ['.email-meta.xml', '.email']) {
+      if (base.endsWith(suffix)) return item('EmailTemplate', `${segs[ei + 1]}/${base.slice(0, -suffix.length)}`);
+    }
+  }
+
+  // 4. Regular single-/per-file types — matched by the type's folder plus extension.
+  for (const rule of RULES) {
+    if (rule.bundle || rule.nested || segs.lastIndexOf(rule.folder) < 0) continue;
+    for (const ext of rule.primaryExt ?? []) {
+      if (base.endsWith(ext)) return item(rule.type, base.slice(0, -ext.length));
+    }
+    if (rule.metaSuffix && base.endsWith(rule.metaSuffix)) return item(rule.type, base.slice(0, -rule.metaSuffix.length));
+  }
+  return undefined;
 }
 
 function matchExt(name: string, exts: string[]): string | undefined {

@@ -3,6 +3,23 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.3
+
+- New: **Deploy, retrieve, and compare files anywhere.** Right-clicking a Salesforce
+  source file now works even when it lives outside the default package directory — the
+  file you point at is deployed, retrieved, or compared directly, instead of being
+  rejected as "not under a package directory".
+- New: **Selected components tray.** Checked components appear as removable chips pinned
+  above the file tree, so your current selection is always visible. Click a chip's ✕ (or
+  untick it below) to drop it — the tree stays put, nothing jumps around.
+- New: **Open comparisons in a separate window.** Org-comparison diffs can pop into their
+  own window so you can read them next to your code; toggle with the new
+  `sfOrgDeployWrapper.openDiffInFloatingWindow` setting (on by default).
+- Faster org list: the org picker no longer waits on a per-org connection check, so it
+  loads near-instantly and reliably remembers your last selected org.
+- The file tree and Status panel now stack as two rows, giving each the full sidebar
+  width instead of splitting it into two cramped columns.
+
 ## 0.4.2
 
 - New: **Resize the Status panel.** Drag the divider between the file tree and the

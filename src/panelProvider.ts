@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
 import { OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, stripAnsi } from './sfCliService';
-import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, scanWorkspace } from './metadataScanner';
+import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, inferItemForPath, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -131,14 +131,35 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Load orgs too so the production guard can classify the target on deploys
     // initiated from the explorer/editor context menu (panel may never have opened).
     if (this.orgs.length === 0) await this.loadOrgs();
-    const match = findItemForPath(this.items, uri.fsPath);
+    // Fall back to inferring the component from the file path so a file the scan
+    // didn't pick up — e.g. one outside the project's package directories — still
+    // works when the user points at it, rather than being rejected.
+    let match = findItemForPath(this.items, uri.fsPath);
+    let inferred = false;
     if (!match) {
-      vscode.window.showInformationMessage('Not a recognized metadata source under workspace package directories.');
+      match = inferItemForPath(uri.fsPath);
+      if (match) {
+        inferred = true;
+        const k = `${match.type}:${match.name}`;
+        // Make resolveKeys / runDiff see it (they only look at this.items).
+        // If a same Type:Name is already scanned in-workspace we keep that one; deploy/
+        // retrieve still hit the clicked file via --source-dir. Only a diff of a same-named
+        // twin outside the project would compare the in-workspace copy — and duplicate
+        // component names in one project aren't valid SFDX anyway.
+        if (!this.items.some(i => `${i.type}:${i.name}` === k)) this.items.push(match);
+      }
+    }
+    if (!match) {
+      vscode.window.showInformationMessage('Not a recognized Salesforce metadata file.');
       return;
     }
     const key = `${match.type}:${match.name}`;
-    if (action === 'deploy') return this.runDeploy([key]);
-    if (action === 'retrieve') return this.runRetrieve([key]);
+    // For inferred (unscanned) files, deploy/retrieve by explicit source path —
+    // --metadata can't resolve a component outside the package directories. Diff
+    // locates the org copy by Type:Name, so it needs no source override.
+    const sourceDir = inferred ? match.filePath : undefined;
+    if (action === 'deploy') return this.runDeploy([key], { sourceDir });
+    if (action === 'retrieve') return this.runRetrieve([key], { sourceDir });
     return this.runDiff([key], orgOverride);
   }
 
@@ -255,7 +276,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   // ---- Operations ----
-  private async runDeploy(keys: string[]): Promise<void> {
+  private async runDeploy(keys: string[], opts: { sourceDir?: string } = {}): Promise<void> {
     if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
     const root = this.requireRoot();
     if (!root) return;
@@ -291,7 +312,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       .getConfiguration('sfOrgDeployWrapper')
       .get<boolean>('ignoreDeployConflicts', false);
 
-    const cmdId = this.beginCmd(`sf project deploy start ${this.metadataArgs(items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
+    const cmdId = this.beginCmd(`sf project deploy start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
     this.setBusy(true, 'Deploy');
     const start = Date.now();
     try {
@@ -301,7 +322,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           items.map(i => `${i.type}:${i.name}`),
           org,
           root,
-          { ignoreConflicts, timeoutMs: this.timeoutMs() }
+          { ignoreConflicts, timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined }
         );
         this.currentCancel = handle.cancel;
         const { result, cmd } = await handle.promise;
@@ -357,7 +378,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async runRetrieve(keys: string[]): Promise<void> {
+  private async runRetrieve(keys: string[], opts: { sourceDir?: string } = {}): Promise<void> {
     if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
     const root = this.requireRoot();
     if (!root) return;
@@ -382,13 +403,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     );
     if (confirm !== 'Retrieve') return;
 
-    const cmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(items)} --target-org ${org}`);
+    const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}`);
     this.setBusy(true, 'Retrieve');
     const start = Date.now();
     try {
       await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
         this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
-        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs() });
+        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined });
         this.currentCancel = handle.cancel;
         const { result, cmd } = await handle.promise;
         this.updateCmd(cmdId, cmd);
@@ -621,6 +642,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             await this.openDiff(item, staged.file, orgLabel);
             opened.push(`${item.type}:${item.name}`);
           }
+        }
+
+        if (opened.length > 0 &&
+            vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('openDiffInFloatingWindow', true)) {
+          // Pop the freshly-opened diff editor group into its own OS window. Group (not
+          // single) so all diffs land in one window. No setTimeout tick — vscode.diff is
+          // awaited so the diff editor is already active; add a short delay guard if a live
+          // VS Code is ever observed moving the wrong group.
+          await Promise.resolve(
+            vscode.commands.executeCommand('workbench.action.moveEditorGroupToNewWindow')
+          ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed: ${String(e)}`));
         }
 
         const lines: string[] = [];
@@ -865,6 +897,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   private metadataArgs(items: MetadataItem[]): string {
     return items.map(i => `--metadata ${i.type}:${i.name}`).join(' ');
+  }
+
+  /** Echoed-command target: an explicit `--source-dir <path>` when deploying/retrieving
+   *  a pointed-at file, else the per-component `--metadata` list. */
+  private targetArg(sourceDir: string | undefined, items: MetadataItem[]): string {
+    if (!sourceDir) return this.metadataArgs(items);
+    return `--source-dir ${/\s/.test(sourceDir) ? `"${sourceDir}"` : sourceDir}`;
   }
 
   private timeoutMs(): number {

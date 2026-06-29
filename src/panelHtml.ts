@@ -66,28 +66,29 @@ body {
 .toolbar .grow { flex: 1; }
 .toolbar .org { min-width: 0; flex: 1; }
 
+/* Tree (top) and Status (bottom) stack as two rows so each gets the full sidebar
+   width — a side-by-side split leaves both halves too cramped to read in a panel
+   this narrow. */
 .body {
-  flex: 1; display: flex; min-height: 0; overflow: hidden;
+  flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .left {
-  flex: 2; display: flex; flex-direction: column; min-width: 0;
-  border-right: 1px solid var(--border);
+  flex: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  border-bottom: 1px solid var(--border);
 }
 .right {
-  flex: 1; display: flex; flex-direction: column; min-width: 0;
-  min-width: 220px;
+  flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0;
 }
-/* Draggable sash between the tree and the Status pane. Sits over the 1px border
-   (negative margin) and is invisible until hovered/dragged, like VS Code's own
-   sashes. Wide layout → vertical gutter (col-resize); narrow/stacked layout →
-   horizontal gutter (row-resize, handled in the media query below). */
+/* Draggable sash between the tree (top) and the Status pane (bottom). Sits over the
+   1px border (negative margin) and is invisible until hovered/dragged, like VS Code's
+   own sashes. The panel always stacks vertically, so this is a horizontal gutter. */
 .splitter {
   flex: none; position: relative; z-index: 2;
-  width: 6px; margin: 0 -3px; cursor: col-resize;
+  height: 6px; margin: -3px 0; cursor: row-resize;
   background: transparent; transition: background 0.1s;
 }
 .splitter:hover, body.resizing .splitter { background: var(--accent); opacity: 0.8; }
-body.resizing { cursor: col-resize; user-select: none; }
+body.resizing { cursor: row-resize; user-select: none; }
 .section-header {
   padding: 4px 8px; font-size: 11px; text-transform: uppercase;
   color: var(--muted); letter-spacing: 0.5px;
@@ -102,6 +103,37 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 4px 8px; border-bottom: 1px solid var(--border);
 }
 .tree-search input { width: 100%; }
+
+/* Pinned "Selected" tray above the tree: mirrors the checked components as removable
+   chips so the current selection is always visible without scrolling. Bounded height
+   + own scroll so growing the selection never pushes the page around — and the tree
+   below never reorders (items stay in their groups), so the layout stays stable. */
+.selected-tray {
+  flex: none; padding: 4px 8px; border-bottom: 1px solid var(--border);
+  max-height: 92px; overflow-y: auto;
+  display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start;
+}
+.selected-tray .tray-head {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted);
+}
+.selected-tray .tray-clear {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 11px; font-family: inherit; padding: 0;
+}
+.selected-tray .tray-clear:hover { color: var(--fg); text-decoration: underline; }
+.chip {
+  display: inline-flex; align-items: center; gap: 2px; max-width: 100%;
+  background: var(--row-active); border: 1px solid var(--border);
+  border-radius: 10px; padding: 0 2px 0 8px; font-size: 11px; line-height: 18px;
+}
+.chip .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip .chip-x {
+  flex: none; cursor: pointer; border: none; background: transparent;
+  color: var(--muted); font-size: 13px; line-height: 1; padding: 1px 3px;
+  border-radius: 8px; font-family: inherit;
+}
+.chip .chip-x:hover { color: var(--fg); background: var(--row-hover); }
 .type-filter-row { margin-top: 4px; font-size: 11px; }
 /* Custom disclosure caret: the native <summary> marker renders misaligned in the
    webview (pushed right), which made the whole filter list look skewed. */
@@ -201,16 +233,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 .actions button.subtle:hover { color: var(--fg); filter: none; }
 .actions .spacer { flex: 1; }
 .actions .selected-count { color: var(--muted); align-self: center; }
-
-/* In a narrow sidebar the side-by-side tree/status split is unreadably cramped —
-   stack vertically instead. */
-@media (max-width: 480px) {
-  .body { flex-direction: column; }
-  .left { border-right: none; border-bottom: 1px solid var(--border); flex: 3; }
-  .right { min-width: 0; flex: 2; }
-  .splitter { width: auto; height: 6px; margin: -3px 0; cursor: row-resize; }
-  body.resizing { cursor: row-resize; }
-}
 
 .status {
   flex: 1; overflow-y: auto; padding: 8px;
@@ -343,6 +365,7 @@ body.resizing { cursor: col-resize; user-select: none; }
           </details>
         </div>
       </div>
+      <div id="selectedTray" class="selected-tray" style="display:none;"></div>
       <div id="tree" class="tree"></div>
       <div class="actions" id="actionsBar">
         <button id="useActive" class="secondary" title="Select the file currently open in editor">Use active file</button>

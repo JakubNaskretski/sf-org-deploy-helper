@@ -127,6 +127,11 @@ export class SfCliService {
   private readonly defaultTimeoutMs = 180_000;
 
   async listOrgs(): Promise<OrgInfo[]> {
+    // --skip-connection-status: don't probe every org's auth over the network.
+    // That probe is the slow part of `sf org list` (seconds per org), and an org
+    // that fails it can drop out of the result — which used to wipe the saved
+    // selection. We never read connectedStatus, so skipping it is pure win:
+    // listing becomes a near-instant local-auth read and reliably stable.
     const json = await this.runJson<{
       result: {
         nonScratchOrgs?: OrgInfo[];
@@ -134,7 +139,7 @@ export class SfCliService {
         sandboxes?: OrgInfo[];
         other?: OrgInfo[];
       };
-    }>(['org', 'list', '--json']);
+    }>(['org', 'list', '--skip-connection-status', '--json']);
     const r = json.result ?? {};
     // Merge the buckets by username, tagging scratch/sandbox from the bucket the
     // org came from (the most reliable signal) so production classification is
@@ -163,10 +168,13 @@ export class SfCliService {
     metadata: string[],
     targetOrg: string,
     cwd: string,
-    opts: { ignoreConflicts?: boolean; timeoutMs?: number } = {}
+    opts: { ignoreConflicts?: boolean; timeoutMs?: number; sourceDirs?: string[] } = {}
   ): Cancellable<{ result: DeployResult; cmd: string }> {
     const args = ['project', 'deploy', 'start'];
-    for (const m of metadata) args.push('--metadata', m);
+    // Deploy by explicit path when given (file may live outside the package
+    // directories, where --metadata Type:Name can't resolve it); else by metadata.
+    if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
+    else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
     if (opts.ignoreConflicts) args.push('--ignore-conflicts');
     args.push('--json');
@@ -197,10 +205,11 @@ export class SfCliService {
     metadata: string[],
     targetOrg: string,
     cwd: string,
-    opts: { outputDir?: string; timeoutMs?: number } = {}
+    opts: { outputDir?: string; timeoutMs?: number; sourceDirs?: string[] } = {}
   ): Cancellable<{ result: RetrieveResult; cmd: string }> {
     const args = ['project', 'retrieve', 'start'];
-    for (const m of metadata) args.push('--metadata', m);
+    if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
+    else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
     if (opts.outputDir) args.push('--target-metadata-dir', opts.outputDir, '--unzip');
     args.push('--json');

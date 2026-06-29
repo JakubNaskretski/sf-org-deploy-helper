@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -142,6 +142,11 @@
           "minimum": 1,
           "maximum": 12,
           "description": "How many metadata types to fetch in parallel when browsing org metadata. Lower this if Fetch Org strains your machine; raise it for faster fetches on a capable machine."
+        },
+        "sfOrgDeployWrapper.openDiffInFloatingWindow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pop org-comparison diffs into their own OS window (auxiliary window). Turn off to keep them as diff tabs in the main window."
         }
       }
     }
