@@ -77,6 +77,8 @@
     renderCmdLog();
   });
   setupSplitter();
+  // Close the right-click menu if the tree scrolls out from under it.
+  $('tree').addEventListener('scroll', () => closeContextMenu());
   renderErrorFooter();
   send('ready');
 
@@ -460,6 +462,11 @@
       savePersisted();
       renderTree();
     });
+    // Right-click a folder (group) to deploy/retrieve/diff everything under it.
+    header.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showContextMenu(e.clientX, e.clientY, treeMenuSections(itemKeys, `${label} (${itemKeys.length})`));
+    });
     group.appendChild(header);
     const body = document.createElement('div');
     group.appendChild(body);
@@ -516,6 +523,11 @@
       renderTree();
       renderActions();
     });
+    // Right-click a single component to deploy/retrieve/diff it directly.
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showContextMenu(e.clientX, e.clientY, treeMenuSections([key], displayName));
+    });
     return row;
   }
 
@@ -569,6 +581,7 @@
   }
 
   function renderTree() {
+    closeContextMenu();
     renderSelectedTray();
     const tree = $('tree');
     tree.innerHTML = '';
@@ -914,6 +927,96 @@
       applyRatio();
       savePersisted();
     });
+  }
+
+  // ---- Right-click context menu (deploy / retrieve / diff a folder or component) ----
+  let ctxMenuEl = null;
+  function onCtxOutside(e) { if (ctxMenuEl && !ctxMenuEl.contains(e.target)) closeContextMenu(); }
+  function onCtxKey(e) { if (e.key === 'Escape') { e.preventDefault(); closeContextMenu(); } }
+  function closeContextMenu() {
+    if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; }
+    document.removeEventListener('mousedown', onCtxOutside, true);
+    document.removeEventListener('keydown', onCtxKey, true);
+    window.removeEventListener('blur', closeContextMenu);
+    window.removeEventListener('resize', closeContextMenu);
+  }
+
+  function showContextMenu(x, y, sections) {
+    closeContextMenu();
+    const menu = document.createElement('div');
+    menu.className = 'ctx-menu';
+    sections.forEach((sec, si) => {
+      if (sec.head) {
+        const h = document.createElement('div');
+        h.className = 'ctx-head';
+        h.textContent = sec.head;
+        h.title = sec.head;
+        menu.appendChild(h);
+      }
+      for (const it of sec.items) {
+        const el = document.createElement('div');
+        el.className = 'ctx-item' + (it.disabled ? ' disabled' : '');
+        el.textContent = it.label;
+        if (it.title) el.title = it.title;
+        if (!it.disabled) el.addEventListener('click', () => { closeContextMenu(); it.run(); });
+        menu.appendChild(el);
+      }
+      if (sec.sep && si < sections.length - 1) {
+        const s = document.createElement('div');
+        s.className = 'ctx-sep';
+        menu.appendChild(s);
+      }
+    });
+    // Append off-screen so we can measure, then clamp into the viewport.
+    menu.style.left = '0px';
+    menu.style.top = '0px';
+    menu.style.visibility = 'hidden';
+    document.body.appendChild(menu);
+    const r = menu.getBoundingClientRect();
+    menu.style.left = Math.max(2, Math.min(x, window.innerWidth - r.width - 4)) + 'px';
+    menu.style.top = Math.max(2, Math.min(y, window.innerHeight - r.height - 4)) + 'px';
+    menu.style.visibility = '';
+    ctxMenuEl = menu;
+    document.addEventListener('mousedown', onCtxOutside, true);
+    document.addEventListener('keydown', onCtxKey, true);
+    window.addEventListener('blur', closeContextMenu);
+    window.addEventListener('resize', closeContextMenu);
+  }
+
+  function runKeys(kind, keys) {
+    if (state.busy || !state.selectedOrg || !keys || !keys.length) return;
+    send(kind, { keys });
+  }
+
+  // Deploy/Retrieve/Diff menu items for a set of component keys. Deploy and Diff need a
+  // local file, so they're disabled when every key is org-only (mirrors the toolbar
+  // buttons); the provider would otherwise just skip those keys.
+  function actionItems(keys) {
+    const arr = Array.from(keys);
+    const hasLocal = arr.some(k => state.localKeys.has(k));
+    const base = !state.busy && !!state.selectedOrg && arr.length > 0;
+    const orgTip = state.selectedOrg ? '' : 'Select an org first';
+    return [
+      { label: 'Deploy', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : ''), run: () => runKeys('deploy', arr) },
+      { label: 'Retrieve', disabled: !base, title: orgTip, run: () => runKeys('retrieve', arr) },
+      { label: 'Diff', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to diff' : ''), run: () => runKeys('diff', arr) },
+    ];
+  }
+
+  // Sections for a right-clicked tree target. The target (a folder's items, or one
+  // component) is primary; the current checkbox selection is offered as a second section
+  // when it differs — so "tick several, right-click, deploy" works too.
+  function treeMenuSections(targetKeys, targetLabel) {
+    const sections = [{ head: targetLabel, items: actionItems(targetKeys), sep: true }];
+    const sel = Array.from(state.selected);
+    const tset = new Set(targetKeys);
+    const sameAsTarget = sel.length === tset.size && sel.every(k => tset.has(k));
+    if (sel.length > 0 && !sameAsTarget) {
+      sections.push({ head: `Selected (${sel.length})`, items: actionItems(sel) });
+    } else {
+      sections[0].sep = false;
+    }
+    return sections;
   }
 
   // ---- Full-width error footer ----

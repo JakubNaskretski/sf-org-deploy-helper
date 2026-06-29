@@ -68,16 +68,19 @@ body {
 
 /* Tree (top) and Status (bottom) stack as two rows so each gets the full sidebar
    width — a side-by-side split leaves both halves too cramped to read in a panel
-   this narrow. */
+   this narrow. Default split is 3:1 (tree gets ~3/4) since browsing the tree is the
+   primary task; the splitter can override it. */
 .body {
   flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .left {
-  flex: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  flex: 3; display: flex; flex-direction: column; min-width: 0; min-height: 0;
   border-bottom: 1px solid var(--border);
 }
+/* The tree pane (.left) scrolls internally, so the Status pane keeps a guaranteed
+   floor height — expanding a big group can never push Status out of reach. */
 .right {
-  flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 96px;
 }
 /* Draggable sash between the tree (top) and the Status pane (bottom). Sits over the
    1px border (negative margin) and is invisible until hovered/dragged, like VS Code's
@@ -334,6 +337,34 @@ body.resizing { cursor: row-resize; user-select: none; }
   border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, var(--border));
   font-size: 12px;
 }
+
+/* Right-click context menu for the tree: deploy / retrieve / diff a whole folder
+   (group) or a single component without first ticking checkboxes. Positioned at the
+   cursor; dismissed on click-away, Escape, scroll, or blur. */
+.ctx-menu {
+  position: fixed; z-index: 50; min-width: 172px;
+  background: var(--vscode-menu-background, var(--vscode-editor-background, var(--bg)));
+  color: var(--vscode-menu-foreground, var(--fg));
+  border: 1px solid var(--vscode-menu-border, var(--border));
+  border-radius: 4px; padding: 4px 0;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.36);
+  font-size: 12px; user-select: none;
+}
+.ctx-menu .ctx-head {
+  padding: 3px 12px 4px; font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px;
+}
+.ctx-menu .ctx-item {
+  padding: 4px 12px; cursor: pointer; white-space: nowrap;
+  display: flex; align-items: center; gap: 8px;
+}
+.ctx-menu .ctx-item:hover {
+  background: var(--vscode-menu-selectionBackground, var(--row-active));
+  color: var(--vscode-menu-selectionForeground, var(--fg));
+}
+.ctx-menu .ctx-item.disabled { opacity: 0.4; cursor: default; }
+.ctx-menu .ctx-item.disabled:hover { background: transparent; color: inherit; }
+.ctx-menu .ctx-sep { height: 1px; margin: 4px 0; background: var(--vscode-menu-separatorBackground, var(--border)); }
 </style>
 </head>
 <body>
