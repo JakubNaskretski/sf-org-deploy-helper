@@ -529,6 +529,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const opened: string[] = [];
         const errors: string[] = [];
 
+        // When floating is on, open every diff into ONE dedicated editor group
+        // beside the user's tabs (first diff → Beside, rest → Active land in that
+        // same new group). Moving *that* group to a new window then carries only
+        // the diffs — never the user's pre-existing open tabs.
+        const floatDiff = vscode.workspace
+          .getConfiguration('sfOrgDeployWrapper')
+          .get<boolean>('openDiffInFloatingWindow', true);
+        const diffColumn = (): vscode.ViewColumn | undefined =>
+          floatDiff ? (opened.length === 0 ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active) : undefined;
+
         // Fast path: Apex/Visualforce bodies come back from a single Tooling API
         // query in ~1-2s, vs a Metadata API retrieve round-trip. Anything the query
         // can't resolve cleanly falls back to the retrieve below.
@@ -564,7 +574,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 if (typeof body !== 'string' || body === '(hidden)') { slowItems.push(item); continue; }
                 const staged = await stageDiffText(body, item);
                 tmpPaths.push(staged.dir);
-                await this.openDiff(item, staged.file, orgLabel);
+                await this.openDiff(item, staged.file, orgLabel, diffColumn());
                 opened.push(`${item.type}:${item.name}`);
               }
             } catch (e) {
@@ -638,17 +648,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             }
             const staged = await stageDiffCopy(remoteFile, item);
             tmpPaths.push(staged.dir);
-            await this.openDiff(item, staged.file, orgLabel);
+            await this.openDiff(item, staged.file, orgLabel, diffColumn());
             opened.push(`${item.type}:${item.name}`);
           }
         }
 
-        if (opened.length > 0 &&
-            vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('openDiffInFloatingWindow', true)) {
-          // Pop the freshly-opened diff editor group into its own OS window. Group (not
-          // single) so all diffs land in one window. No setTimeout tick — vscode.diff is
-          // awaited so the diff editor is already active; add a short delay guard if a live
-          // VS Code is ever observed moving the wrong group.
+        if (opened.length > 0 && floatDiff) {
+          // The diffs opened into a dedicated group beside the user's tabs (see
+          // diffColumn above), so that group is now active and holds ONLY the diffs.
+          // Pop it into its own OS window — the user's original tabs stay put. No
+          // setTimeout tick: vscode.diff is awaited so the diff editor is already active.
           await Promise.resolve(
             vscode.commands.executeCommand('workbench.action.moveEditorGroupToNewWindow')
           ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed: ${String(e)}`));
@@ -951,9 +960,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!this.view?.visible) vscode.window.setStatusBarMessage(`$(check) ${message}`, 8000);
   }
 
-  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string): Promise<void> {
+  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn): Promise<void> {
     const title = `${item.type}:${item.name} — Local ↔ ${orgLabel}`;
-    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(item.filePath), vscode.Uri.file(remoteFile), title, { preview: false });
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(item.filePath), vscode.Uri.file(remoteFile), title, { preview: false, viewColumn });
   }
 
   private reportCancelled(action: string): void {
