@@ -49,7 +49,7 @@
   window.addEventListener('message', (ev) => handleMessage(ev.data));
   $('refreshOrgs').addEventListener('click', () => send('refreshOrgs'));
   $('refreshFiles').addEventListener('click', () => send('refreshFiles'));
-  $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) send('fetchOrgMetadata'); });
+  $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) send('fetchOrgMetadata', { username: state.selectedOrg }); });
   $('sourceFilter').addEventListener('change', (e) => { state.sourceFilter = e.target.value; renderTree(); });
   $('orgSelect').addEventListener('change', (e) => { state.selectedOrg = e.target.value || null; send('selectOrg', { username: state.selectedOrg }); });
   // Debounce the filter so a fast typist on a large org-metadata tree doesn't
@@ -74,6 +74,17 @@
   $('cmdlogHeader').addEventListener('click', () => {
     state.cmdLogCollapsed = !state.cmdLogCollapsed;
     savePersisted();
+    renderCmdLog();
+  });
+  $('clearStatus').addEventListener('click', () => {
+    state.statusCards = [];
+    state.lastError = null;
+    renderStatus();
+    renderErrorFooter();
+  });
+  $('clearCmdLog').addEventListener('click', (e) => {
+    e.stopPropagation();   // don't also toggle the log's collapse
+    state.cmdLog = [];
     renderCmdLog();
   });
   setupSplitter();
@@ -755,6 +766,7 @@
   function renderStatus() {
     const st = $('status');
     st.innerHTML = '';
+    const csBtn = $('clearStatus'); if (csBtn) csBtn.style.display = state.statusCards.length ? '' : 'none';
     if (state.progress) {
       const el = document.createElement('div');
       el.className = 'status-card progress';
@@ -854,6 +866,7 @@
     if (state.cmdLogCollapsed) root.classList.add('collapsed');
     else root.classList.remove('collapsed');
     $('cmdlogCaret').textContent = state.cmdLogCollapsed ? '▸' : '▼';
+    const ccBtn = $('clearCmdLog'); if (ccBtn) ccBtn.style.display = state.cmdLog.length ? '' : 'none';
     const body = $('cmdlogBody');
     body.innerHTML = '';
     for (const e of state.cmdLog) {

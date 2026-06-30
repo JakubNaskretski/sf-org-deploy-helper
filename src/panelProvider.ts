@@ -11,7 +11,7 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'refreshOrgs' }
   | { type: 'refreshFiles' }
-  | { type: 'fetchOrgMetadata' }
+  | { type: 'fetchOrgMetadata'; username?: string }
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
   | { type: 'deploy'; keys: string[] }
@@ -181,16 +181,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await this.loadFiles();
         return;
       case 'fetchOrgMetadata':
+        // Trust the org the webview has selected, applied before we read it back —
+        // otherwise a fetch fired right after first-launch auto-selection could race
+        // the persisted selection and fetch the default org instead of the picked one.
+        if (msg.username) await this.applyOrgSelection(msg.username);
         await this.loadOrgMetadata();
         return;
-      case 'selectOrg': {
-        const nextOrg = msg.username || undefined;
-        await this.orgStore.set(nextOrg);
-        // Switching target org invalidates any fetched org-membership data.
-        if (this.orgMembersOrg && nextOrg !== this.orgMembersOrg) this.resetOrgMetadata();
-        this.postOrgs();
+      case 'selectOrg':
+        await this.applyOrgSelection(msg.username || undefined);
         return;
-      }
       case 'useActiveFile':
         this.sendActiveFile(true, true);
         return;
@@ -692,6 +691,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.orgMembers = new Map();
     this.orgMembersOrg = undefined;
     this.post({ type: 'orgMetadataReset' });
+  }
+
+  /** Apply a target-org selection from the webview: persist it, drop org metadata
+   *  fetched for a different org, and re-broadcast. No-op when unchanged, so it's safe
+   *  to call defensively right before an operation that must hit the selected org. */
+  private async applyOrgSelection(username: string | undefined): Promise<void> {
+    if (username === this.orgStore.get()) return;
+    await this.orgStore.set(username);
+    if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
+    this.postOrgs();
   }
 
   private async loadOrgMetadata(): Promise<void> {

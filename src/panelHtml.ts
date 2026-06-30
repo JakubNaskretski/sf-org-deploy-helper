@@ -99,6 +99,12 @@ body.resizing { cursor: row-resize; user-select: none; }
   cursor: pointer; user-select: none;
 }
 .section-header .caret { font-size: 9px; opacity: 0.7; }
+.section-header .hdr-actions { display: flex; align-items: center; gap: 8px; }
+.section-clear {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 11px; font-family: inherit; padding: 0 2px;
+}
+.section-clear:hover { color: var(--fg); text-decoration: underline; }
 .tree {
   flex: 1; overflow-y: auto; padding: 4px 0;
 }
@@ -270,10 +276,12 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .status-empty { color: var(--muted); font-style: italic; text-align: center; padding: 16px 8px; }
 
+/* Cap the command log so a growing history can't crowd out the tree — it scrolls
+   inside this bound, and the Clear button empties it. */
 .cmdlog {
   border-top: 1px solid var(--border);
   display: flex; flex-direction: column;
-  max-height: 50%;
+  max-height: 30%;
 }
 .cmdlog.collapsed { max-height: 28px; }
 .cmdlog-body {
@@ -411,7 +419,10 @@ body.resizing { cursor: row-resize; user-select: none; }
     </div>
     <div id="splitter" class="splitter" title="Drag to resize · double-click to reset"></div>
     <div class="right">
-      <div class="section-header">Status</div>
+      <div class="section-header" id="statusHeader">
+        <span>Status</span>
+        <button id="clearStatus" class="section-clear" title="Clear status cards" style="display:none;">Clear</button>
+      </div>
       <div id="status" class="status">
         <div class="status-empty">No operations yet.</div>
       </div>
@@ -423,7 +434,10 @@ body.resizing { cursor: row-resize; user-select: none; }
   <div id="cmdlog" class="cmdlog">
     <div class="section-header" id="cmdlogHeader">
       <span>Command log</span>
-      <span class="caret" id="cmdlogCaret">▼</span>
+      <span class="hdr-actions">
+        <button id="clearCmdLog" class="section-clear" title="Clear command log" style="display:none;">Clear</button>
+        <span class="caret" id="cmdlogCaret">▼</span>
+      </span>
     </div>
     <div class="cmdlog-body" id="cmdlogBody"></div>
   </div>
