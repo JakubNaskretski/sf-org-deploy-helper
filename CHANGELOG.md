@@ -3,6 +3,15 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.4.5
+
+- Fixed: **Fetch Org** now always targets the org selected in the dropdown. On a fresh
+  start it could fetch from your default org instead of the one you had just picked.
+- New: **Clear** buttons on the Status and Command Log sections to wipe accumulated
+  entries.
+- The Command Log no longer grows tall enough to crowd out the component tree — it stays
+  in a bounded, scrollable area at the bottom of the panel.
+
 ## 0.4.4
 
 - The file tree now takes about three-quarters of the panel by default (was two-thirds),
