@@ -954,10 +954,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'progress', text });
   }
 
-  /** Success toast (status bar) when the panel isn't visible — otherwise the
-   *  result card lands in a webview nobody can see. */
+  /** Visible success confirmation when the panel isn't open — e.g. a deploy/retrieve
+   *  fired from the Explorer or editor right-click menu, where the result card would
+   *  otherwise land in a hidden webview and read as "no feedback". Mirrors the error
+   *  path's notification + action button; offers to open the panel for the details. */
   private notifySuccessIfPanelHidden(message: string): void {
-    if (!this.view?.visible) vscode.window.setStatusBarMessage(`$(check) ${message}`, 8000);
+    if (this.view?.visible) return;
+    vscode.window.setStatusBarMessage(`$(check) ${message}`, 8000);
+    vscode.window.showInformationMessage(`SF Deploy: ${message}`, 'Show Panel').then(choice => {
+      if (choice === 'Show Panel') {
+        vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+      }
+    });
   }
 
   private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn): Promise<void> {
