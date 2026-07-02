@@ -7,6 +7,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Org Deploy Wrapper');
   const sf = new SfCliService();
   const orgStore = new OrgStore(context.globalState);
+  // Seed the shared setting from the legacy globalState key so the remembered org
+  // survives the move to `skrety.salesforce.targetOrg`. Fire-and-forget: the
+  // status bar refreshes off the store's change event once the seed lands.
+  void orgStore.migrate();
   const provider = new DeployPanelProvider(context, orgStore, sf, output);
 
   // Status bar org indicator (T13)

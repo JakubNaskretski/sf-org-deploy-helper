@@ -1,17 +1,32 @@
-import { spawn } from 'child_process';
+/**
+ * Salesforce CLI wrapper for sf-org-deploy-helper.
+ *
+ * The generic spawn/JSON/cancel core now lives in the shared kit
+ * (`src/kit/sfCli.ts`, vendored from sf-kit) — it carries the family-wide fixes
+ * this plugin's own copy pre-dated: the Windows `sf.cmd` shim resolution
+ * (spawn-safe, no `shell:true`), SIGTERM→SIGKILL escalation on the *timeout*
+ * path (was SIGTERM-only here), the "sf not found" inference from a spawn ENOENT
+ * only (never from stderr contents), the partial-JSON guard on timeout/maxBuffer,
+ * and multi-byte-safe UTF-8 decoding.
+ *
+ * This file keeps the deploy/retrieve/query/list-metadata domain methods, built
+ * on the kit's public run helpers, plus the validate-only / quick-deploy /
+ * test-level surface (WO-2 P1) and a server-side deploy-cancel (WO-2 MED).
+ */
+import {
+  Cancellable,
+  OrgInfo,
+  SfCliCancelledError,
+  SfCliError,
+  SfCliService as KitSfCliService,
+  SfJsonEnvelope,
+  cleanActions,
+  stripAnsi
+} from './kit/sfCli';
 
-export interface OrgInfo {
-  username: string;
-  alias?: string;
-  orgId?: string;
-  instanceUrl?: string;
-  isDefaultUsername?: boolean;
-  connectedStatus?: string;
-  /** True when `sf org list` reported this org under its sandboxes bucket (or the entry is flagged). */
-  isSandbox?: boolean;
-  /** True when `sf org list` reported this org under its scratchOrgs bucket (or the entry is flagged). */
-  isScratch?: boolean;
-}
+// Re-export the kit types the rest of the plugin imports from here, so callers
+// keep a single import site and don't need to know the split.
+export { Cancellable, OrgInfo, SfCliCancelledError, SfCliError, stripAnsi };
 
 export interface DeployFileResult {
   fullName: string;
@@ -24,15 +39,34 @@ export interface DeployFileResult {
   columnNumber?: number;
 }
 
+/** A single Apex test failure from a deploy that ran tests (RunLocalTests etc.). */
+export interface DeployTestFailure {
+  name?: string;
+  methodName?: string;
+  message?: string;
+  stackTrace?: string;
+}
+
 export interface DeployResult {
-  status: number;
+  /** Async job id of the deploy/validation — needed for quick-deploy of a
+   *  validated deployment and for a server-side `deploy cancel`. */
+  id?: string;
+  status: number | string;
   success: boolean;
   numberComponentsDeployed?: number;
   numberComponentsTotal?: number;
   numberComponentErrors?: number;
+  numberTestsCompleted?: number;
+  numberTestsTotal?: number;
+  numberTestErrors?: number;
   details?: {
     componentSuccesses?: DeployFileResult[];
     componentFailures?: DeployFileResult[];
+    runTestResult?: {
+      numFailures?: number | string;
+      numTestsRun?: number | string;
+      failures?: DeployTestFailure[];
+    };
   };
   files?: DeployFileResult[];
 }
@@ -60,145 +94,83 @@ export interface RetrieveResult {
   inboundFiles?: RetrieveFileResult[];
 }
 
-export class SfCliError extends Error {
-  /** sf CLI error name from the JSON envelope (e.g. NamedOrgNotFound), when known. */
-  public errorName?: string;
-  /** The CLI's own suggested next steps from the envelope's `actions[]`, when present.
-   *  These are command-specific and usually more precise than any hint we guess. */
-  public actions?: string[];
-  constructor(message: string, public readonly stderr?: string, public readonly raw?: string, public readonly cause?: unknown) {
-    super(message);
-    this.name = 'SfCliError';
-  }
-}
+/** Apex test level for a deploy (`--test-level`). NoTestRun is the sandbox
+ *  default; RunLocalTests is offered/required for production. */
+export type TestLevel = 'NoTestRun' | 'RunSpecifiedTests' | 'RunLocalTests' | 'RunAllTestsInOrg';
 
-/** Strip ANSI colour escapes so an error rendered in the panel (plain text) isn't
- *  littered with `\u001b[31m`-style codes when the CLI colourises its message. */
-export function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\u001b\[[0-9;]*m/g, '');
-}
-
-/** Normalise the envelope's `actions` into clean, non-empty lines (or undefined). */
-function cleanActions(actions: unknown): string[] | undefined {
-  if (!Array.isArray(actions)) return undefined;
-  const lines = actions
-    .filter((a): a is string => typeof a === 'string')
-    .map(a => stripAnsi(a).trim())
-    .filter(Boolean);
-  return lines.length ? lines : undefined;
-}
-
-/** Top-level envelope every `sf … --json` command prints. CLI-level failures
- *  (expired auth, source conflicts, bad project, …) carry `name`/`message` at the
- *  top and omit `result`; many also carry `actions[]` with suggested fixes. */
-interface SfJsonEnvelope<R> {
-  status?: number;
-  result?: R;
-  name?: string;
-  message?: string;
-  actions?: string[];
-}
-
-interface RunOptions {
+export interface DeployOptions {
+  ignoreConflicts?: boolean;
   timeoutMs?: number;
-  cwd?: string;
+  sourceDirs?: string[];
+  /** `sf project deploy validate` (check-only) instead of `deploy start`; the
+   *  returned `id` can then be quick-deployed. Validation always runs tests, so
+   *  callers should pass a non-NoTestRun level (the CLI enforces this). */
+  validateOnly?: boolean;
+  /** `--test-level`. Omitted → CLI default (NoTestRun for a normal deploy). */
+  testLevel?: TestLevel;
+  /** Class names for RunSpecifiedTests (`--tests`). */
+  runTests?: string[];
 }
 
-interface RunResult {
-  stdout: string;
-  stderr: string;
-  code: number;
-}
-
-export interface Cancellable<T> {
-  promise: Promise<T>;
-  cancel: () => void;
-}
-
-export class SfCliCancelledError extends SfCliError {
-  constructor() {
-    super('sf command cancelled');
-    this.name = 'SfCliCancelledError';
-  }
-}
-
-export class SfCliService {
-  private readonly defaultTimeoutMs = 180_000;
-
-  async listOrgs(): Promise<OrgInfo[]> {
-    // --skip-connection-status: don't probe every org's auth over the network.
-    // That probe is the slow part of `sf org list` (seconds per org), and an org
-    // that fails it can drop out of the result — which used to wipe the saved
-    // selection. We never read connectedStatus, so skipping it is pure win:
-    // listing becomes a near-instant local-auth read and reliably stable.
-    const json = await this.runJson<{
-      result: {
-        nonScratchOrgs?: OrgInfo[];
-        scratchOrgs?: OrgInfo[];
-        sandboxes?: OrgInfo[];
-        other?: OrgInfo[];
-      };
-    }>(['org', 'list', '--skip-connection-status', '--json']);
-    const r = json.result ?? {};
-    // Merge the buckets by username, tagging scratch/sandbox from the bucket the
-    // org came from (the most reliable signal) so production classification is
-    // accurate regardless of My Domain URL shape.
-    const byUser = new Map<string, OrgInfo>();
-    const add = (orgs: OrgInfo[] | undefined, extra: Partial<OrgInfo>): void => {
-      for (const o of orgs ?? []) {
-        if (!o?.username) continue;
-        const prev = byUser.get(o.username) ?? ({} as OrgInfo);
-        byUser.set(o.username, {
-          ...prev,
-          ...o,
-          isSandbox: extra.isSandbox || o.isSandbox || prev.isSandbox,
-          isScratch: extra.isScratch || o.isScratch || prev.isScratch
-        });
-      }
-    };
-    add(r.nonScratchOrgs, {});
-    add(r.scratchOrgs, { isScratch: true });
-    add(r.sandboxes, { isSandbox: true });
-    add(r.other, {});
-    return [...byUser.values()];
-  }
-
+export class SfCliService extends KitSfCliService {
   deployMetadata(
     metadata: string[],
     targetOrg: string,
     cwd: string,
-    opts: { ignoreConflicts?: boolean; timeoutMs?: number; sourceDirs?: string[] } = {}
+    opts: DeployOptions = {}
   ): Cancellable<{ result: DeployResult; cmd: string }> {
-    const args = ['project', 'deploy', 'start'];
+    // Validation is a check-only deploy that returns a job id for a later
+    // quick-deploy; `start` is the real thing. Both take the same arg shape.
+    const verb = opts.validateOnly ? 'validate' : 'start';
+    const args = ['project', 'deploy', verb];
     // Deploy by explicit path when given (file may live outside the package
     // directories, where --metadata Type:Name can't resolve it); else by metadata.
     if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
     else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
     if (opts.ignoreConflicts) args.push('--ignore-conflicts');
+    if (opts.testLevel) args.push('--test-level', opts.testLevel);
+    if (opts.testLevel === 'RunSpecifiedTests') for (const t of opts.runTests ?? []) args.push('--tests', t);
     args.push('--json');
     const cmd = this.formatCmd(args);
     const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
-    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project deploy start'), cmd }));
+    const promise = inner.promise.then(json => ({
+      result: this.unwrapResult(json, `project deploy ${verb}`),
+      cmd
+    }));
     return { promise, cancel: inner.cancel };
   }
 
   /**
-   * Is this org likely a production org (vs sandbox/scratch)?
-   *
-   * Trusts the scratch/sandbox flags from `sf org list` first (set from the bucket
-   * the org came from). Otherwise treats the org as production unless the URL has a
-   * clear non-prod marker — so production orgs on classic instance hosts or vanity
-   * domains (not just `*.my.salesforce.com`) still trigger the production
-   * confirmation. We err toward over-warning rather than a silent prod deploy.
+   * Deploy a previously-validated deployment by its job id, skipping the
+   * validation/test run (`sf project deploy quick --job-id`). Fast, because the
+   * org already validated + ran the tests during `deploy validate`.
    */
-  isLikelyProduction(org: OrgInfo | undefined): boolean {
-    if (!org) return false;
-    if (org.isScratch || org.isSandbox) return false;
-    const url = (org.instanceUrl ?? '').toLowerCase();
-    if (/\.sandbox\.|\.scratch\.|\.cs\d+\.|test\.salesforce\.com/.test(url)) return false;
-    return true;
+  quickDeploy(
+    jobId: string,
+    targetOrg: string,
+    cwd: string,
+    opts: { timeoutMs?: number } = {}
+  ): Cancellable<{ result: DeployResult; cmd: string }> {
+    const args = ['project', 'deploy', 'quick', '--job-id', jobId, '--target-org', targetOrg, '--json'];
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project deploy quick'), cmd }));
+    return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * Ask the org to cancel an in-progress deploy by job id
+   * (`sf project deploy cancel --job-id`). Best-effort — used after we kill the
+   * local `sf` process so a deploy the org already accepted doesn't silently keep
+   * running. Not cancellable itself (short-lived); errors are the caller's to
+   * surface or swallow.
+   */
+  async deployCancel(jobId: string, targetOrg: string, cwd: string, opts: { timeoutMs?: number } = {}): Promise<void> {
+    await this.runJson<SfJsonEnvelope<unknown>>(
+      ['project', 'deploy', 'cancel', '--job-id', jobId, '--target-org', targetOrg, '--json'],
+      { timeoutMs: opts.timeoutMs ?? 60_000, cwd }
+    );
   }
 
   retrieveMetadata(
@@ -279,99 +251,5 @@ export class SfCliService {
       return { members, cmd };
     });
     return { promise, cancel: inner.cancel };
-  }
-
-  /**
-   * Unwrap `result` from an sf JSON envelope, rejecting with the envelope's own
-   * error name/message when there is none (CLI-level failure: expired auth,
-   * source conflicts, bad project, …). Without this, callers see an empty result
-   * and misreport the failure as e.g. "component not on org".
-   */
-  private unwrapResult<R>(json: SfJsonEnvelope<R>, what: string): R {
-    if (json.result != null) return json.result;
-    const msg = stripAnsi((json.message ?? '').trim()) || `sf ${what} returned no result (status ${json.status ?? '?'})`;
-    const err = new SfCliError(json.name ? `${json.name}: ${msg}` : msg);
-    err.errorName = json.name;
-    err.actions = cleanActions(json.actions);
-    throw err;
-  }
-
-  private formatCmd(args: string[]): string {
-    // Quote args containing whitespace so the echoed command is copy-pasteable
-    // (e.g. an EmailTemplate fullName "Folder/My Template").
-    return 'sf ' + args.filter(a => a !== '--json').map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ');
-  }
-
-  private async runJson<T>(args: string[], options: RunOptions = {}): Promise<T> {
-    return this.runJsonCancellable<T>(args, options).promise;
-  }
-
-  private runJsonCancellable<T>(args: string[], options: RunOptions = {}): Cancellable<T> {
-    const inner = this.runCancellable(args, options);
-    const promise = inner.promise.then(({ stdout, stderr, code }) => {
-      const trimmed = stdout.trim();
-      if (!trimmed) {
-        throw new SfCliError(`sf ${args.join(' ')} produced no output (exit ${code})`, stderr);
-      }
-      try {
-        return JSON.parse(trimmed) as T;
-      } catch (err) {
-        throw new SfCliError(`Failed to parse JSON from sf ${args.join(' ')}`, stderr, trimmed, err);
-      }
-    });
-    return { promise, cancel: inner.cancel };
-  }
-
-  private runCancellable(args: string[], options: RunOptions = {}): Cancellable<RunResult> {
-    let cancelFn: () => void = () => undefined;
-    const promise = new Promise<RunResult>((resolve, reject) => {
-      const child = spawn('sf', args, { shell: false, cwd: options.cwd });
-      const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
-      let settled = false;
-      let cancelled = false;
-      let killTimer: NodeJS.Timeout | undefined;
-      let timer: NodeJS.Timeout;
-
-      // Single teardown path so the timeout, cancel-kill, and close/error timers
-      // are always cleared exactly once (no stray SIGKILL timer after settle).
-      const cleanup = (): void => {
-        clearTimeout(timer);
-        if (killTimer) clearTimeout(killTimer);
-      };
-      const settle = (fn: () => void): void => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        fn();
-      };
-
-      timer = setTimeout(() => settle(() => {
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-        reject(new SfCliError(`sf ${args.join(' ')} timed out after ${timeoutMs}ms`));
-      }), timeoutMs);
-
-      cancelFn = () => {
-        if (settled || cancelled) return;
-        cancelled = true;
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-        killTimer = setTimeout(() => {
-          try { child.kill('SIGKILL'); } catch { /* ignore */ }
-        }, 5000);
-      };
-
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', c => { stdout += c.toString(); });
-      child.stderr.on('data', c => { stderr += c.toString(); });
-      child.on('error', err => settle(() => {
-        if (cancelled) reject(new SfCliCancelledError());
-        else reject(new SfCliError(`Failed to launch sf CLI: ${(err as Error).message}. Is the Salesforce CLI installed and on PATH?`, undefined, undefined, err));
-      }));
-      child.on('close', code => settle(() => {
-        if (cancelled) reject(new SfCliCancelledError());
-        else resolve({ stdout, stderr, code: code ?? -1 });
-      }));
-    });
-    return { promise, cancel: () => cancelFn() };
   }
 }
