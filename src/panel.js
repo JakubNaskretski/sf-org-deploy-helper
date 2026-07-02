@@ -62,6 +62,7 @@
   });
   $('search').value = state.filter;
   $('deployBtn').addEventListener('click', () => action('deploy'));
+  $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
   $('diffBtn').addEventListener('click', () => action('diff'));
   $('cancelBtn').addEventListener('click', () => send('cancel'));
@@ -98,7 +99,12 @@
     const keys = Array.from(state.selected);
     if (keys.length === 0) return;
     if (!state.selectedOrg) return;
-    send(kind === 'deploy' ? 'deploy' : kind === 'retrieve' ? 'retrieve' : 'diff', { keys });
+    // The chosen test level applies to deploy and validate (empty → CLI/host default).
+    const testLevel = ($('testLevel') && $('testLevel').value) || undefined;
+    if (kind === 'deploy') return send('deploy', { keys, testLevel });
+    if (kind === 'validate') return send('deploy', { keys, validateOnly: true, testLevel });
+    if (kind === 'retrieve') return send('retrieve', { keys });
+    return send('diff', { keys });
   }
 
   // ---- Message handling ----
@@ -705,27 +711,37 @@
     const hasLocalSelected = anySelected && Array.from(state.selected).some(k => state.localKeys.has(k));
     const allOrgOnly = anySelected && Array.from(state.selected).every(k => !state.localKeys.has(k));
     const deployBtn = $('deployBtn');
+    const validateBtn = $('validateBtn');
     const retrieveBtn = $('retrieveBtn');
     const diffBtn = $('diffBtn');
     const cancelBtn = $('cancelBtn');
+    const testLevel = $('testLevel');
     const useActive = $('useActive');
     const clearSel = $('clearSel');
     if (state.busy) {
       deployBtn.style.display = 'none';
+      if (validateBtn) validateBtn.style.display = 'none';
       retrieveBtn.style.display = 'none';
       diffBtn.style.display = 'none';
+      if (testLevel) testLevel.style.display = 'none';
       useActive.style.display = 'none';
       clearSel.style.display = 'none';
       cancelBtn.style.display = '';
       cancelBtn.textContent = state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel';
     } else {
       deployBtn.style.display = '';
+      if (validateBtn) validateBtn.style.display = '';
       retrieveBtn.style.display = '';
       diffBtn.style.display = '';
+      if (testLevel) { testLevel.style.display = ''; testLevel.disabled = !hasLocalSelected; }
       useActive.style.display = '';
       clearSel.style.display = state.selected.size > 0 ? '' : 'none';
       cancelBtn.style.display = 'none';
       deployBtn.disabled = !hasLocalSelected;
+      if (validateBtn) {
+        validateBtn.disabled = !hasLocalSelected;
+        validateBtn.title = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
+      }
       retrieveBtn.disabled = !anySelected;
       diffBtn.disabled = !hasLocalSelected;
       deployBtn.title = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : '';
@@ -856,6 +872,22 @@
         h.className = 'hint';
         h.textContent = `Hint: ${card.hint}`;
         el.appendChild(h);
+      }
+      // Quick Deploy affordance on a successful validate-only card: deploy the
+      // already-validated components without re-running validation or tests.
+      if (card.quickDeploy && card.quickDeploy.jobId && !card.quickDeployDone) {
+        const qd = document.createElement('button');
+        qd.className = 'primary quick-deploy';
+        qd.textContent = card.quickDeploy.label || 'Quick Deploy validated components';
+        qd.disabled = state.busy;
+        qd.title = 'Deploy the validated components — skips validation and the test run.';
+        qd.addEventListener('click', () => {
+          if (state.busy) return;
+          card.quickDeployDone = true;   // one-shot: a validation can be quick-deployed once
+          renderStatus();
+          send('quickDeploy', { jobId: card.quickDeploy.jobId });
+        });
+        el.appendChild(qd);
       }
       st.appendChild(el);
     }

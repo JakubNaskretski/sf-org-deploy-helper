@@ -9,7 +9,7 @@ const LEGACY_KEY = 'sfOrgDeployWrapper.selectedOrg.v1';
  * Target-org store. Backed by the family-shared setting
  * `skrety.salesforce.targetOrg` (machine scope) so the chosen org is shared with
  * the other Skrety SF plugins, rather than this plugin's private globalState
- * (REVIEW Tier 1 / WO-2). The public surface (`get`/`set`/`onDidChange`) is
+ * The public surface (`get`/`set`/`onDidChange`) is
  * unchanged, so callers didn't need to move.
  *
  * `onDidChange` now fires for BOTH our own writes and external ones (another

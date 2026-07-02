@@ -10,7 +10,7 @@ import * as path from 'path';
  *
  * Base: sf-org-deploy-helper's `src/sfCliService.ts` (cancellable spawn,
  * `--skip-connection-status`, error-envelope `actions[]`, SIGTERM→SIGKILL
- * cancel escalation). Family-wide fixes folded in for the kit (REVIEW §2 / WO-1):
+ * cancel escalation). Family-wide fixes folded in for the kit:
  *  - Windows: the `sf` launcher is a `.cmd`/`.ps1` shim that Node refuses to
  *    spawn directly (EINVAL since the CVE-2024-27980 hardening). We resolve the
  *    real shim path ONCE via PATHEXT / `where sf` and spawn that absolute path
@@ -287,7 +287,6 @@ export class SfCliService {
       let cancelled = false;
       let termination: RunTermination = 'exit';
       let killTimer: NodeJS.Timeout | undefined;
-      let timer: NodeJS.Timeout;
 
       // Single teardown path so the timeout, cancel-kill, and abort timers are
       // always cleared exactly once (no stray SIGKILL timer after settle).
@@ -312,7 +311,7 @@ export class SfCliService {
         }, 5000);
       };
 
-      timer = setTimeout(() => {
+      const timer = setTimeout(() => {
         termination = 'timeout';
         killEscalating();
         settle(() => reject(new SfCliError(`sf ${args.join(' ')} timed out after ${timeoutMs}ms`)));

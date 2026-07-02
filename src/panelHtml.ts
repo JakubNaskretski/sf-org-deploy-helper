@@ -242,6 +242,12 @@ body.resizing { cursor: row-resize; user-select: none; }
 .actions button.subtle:hover { color: var(--fg); filter: none; }
 .actions .spacer { flex: 1; }
 .actions .selected-count { color: var(--muted); align-self: center; }
+.actions select {
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 2px;
+  padding: 3px 6px; font-family: inherit; font-size: inherit; max-width: 150px;
+}
+.actions select:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .status {
   flex: 1; overflow-y: auto; padding: 8px;
@@ -274,6 +280,13 @@ body.resizing { cursor: row-resize; user-select: none; }
   color: var(--vscode-textLink-foreground, #3794ff);
   cursor: pointer; font-size: 11px; font-family: inherit;
 }
+.status-card .quick-deploy {
+  margin-top: 8px; padding: 4px 10px; border: none; border-radius: 3px;
+  background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+  cursor: pointer; font-size: 12px; font-family: inherit;
+}
+.status-card .quick-deploy:hover:not(:disabled) { filter: brightness(1.12); }
+.status-card .quick-deploy:disabled { opacity: 0.5; cursor: not-allowed; }
 .status-empty { color: var(--muted); font-style: italic; text-align: center; padding: 16px 8px; }
 
 /* Cap the command log so a growing history can't crowd out the tree — it scrolls
@@ -411,8 +424,15 @@ body.resizing { cursor: row-resize; user-select: none; }
         <span class="spacer"></span>
         <span id="selCount" class="selected-count">0 selected</span>
         <button id="clearSel" class="subtle" style="display:none;" title="Clear selection">✕</button>
+        <select id="testLevel" class="org" title="Apex test level for deploy/validate">
+          <option value="">Tests: default</option>
+          <option value="NoTestRun">NoTestRun</option>
+          <option value="RunLocalTests">RunLocalTests</option>
+          <option value="RunAllTestsInOrg">RunAllTestsInOrg</option>
+        </select>
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
+        <button id="validateBtn" class="secondary" disabled title="Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.">Validate</button>
         <button id="deployBtn" class="primary" disabled>Deploy</button>
         <button id="cancelBtn" class="danger" style="display:none;">Cancel</button>
       </div>

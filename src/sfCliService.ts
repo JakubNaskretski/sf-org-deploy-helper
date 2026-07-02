@@ -11,7 +11,7 @@
  *
  * This file keeps the deploy/retrieve/query/list-metadata domain methods, built
  * on the kit's public run helpers, plus the validate-only / quick-deploy /
- * test-level surface (WO-2 P1) and a server-side deploy-cancel (WO-2 MED).
+ * test-level surface and a server-side deploy-cancel.
  */
 import {
   Cancellable,

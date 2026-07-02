@@ -3,7 +3,8 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
-import { OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, stripAnsi } from './sfCliService';
+import { DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
+import { isLikelyProduction } from './kit/orgs';
 import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, inferItemForPath, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
@@ -14,7 +15,8 @@ type Inbound =
   | { type: 'fetchOrgMetadata'; username?: string }
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
-  | { type: 'deploy'; keys: string[] }
+  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel }
+  | { type: 'quickDeploy'; jobId: string }
   | { type: 'retrieve'; keys: string[] }
   | { type: 'diff'; keys: string[] }
   | { type: 'copyText'; text: string }
@@ -33,6 +35,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentCancel?: () => void;
   private currentAction?: string;
   private currentProgressText?: string;
+  /** Async job id of the running deploy, once the org has accepted it. Lets Cancel
+   *  ask the org to cancel the server-side deploy (not just kill the local process),
+   *  and lets a validated deployment be quick-deployed. */
+  private currentDeployJobId?: string;
+  /** The org a `currentDeployJobId` belongs to (for the server-side cancel call). */
+  private currentDeployOrg?: string;
+  /** Last successful validate-only deployment, offered for quick-deploy on the card. */
+  private lastValidated?: { jobId: string; org: string; label: string; count: number };
   /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
   private orgMembers = new Map<string, true>();
   /** The org username `orgMembers` was fetched from — guards against using a stale
@@ -194,7 +204,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.sendActiveFile(true, true);
         return;
       case 'deploy':
-        await this.runDeploy(msg.keys);
+        await this.runDeploy(msg.keys, { validateOnly: msg.validateOnly, testLevel: msg.testLevel });
+        return;
+      case 'quickDeploy':
+        await this.runQuickDeploy(msg.jobId);
         return;
       case 'retrieve':
         await this.runRetrieve(msg.keys);
@@ -209,8 +222,33 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
         return;
       case 'cancel':
-        if (this.currentCancel) this.currentCancel();
+        this.cancelCurrent();
         return;
+    }
+  }
+
+  /**
+   * Cancel the running operation. Kills the local `sf` process, then — if a
+   * deploy has already been accepted by the org (we have its job id) — asks the
+   * org to cancel the server-side deploy too, so "Deploy cancelled" isn't a false
+   * safety signal on a PROD flow. If the deploy hasn't reached the org
+   * yet (no job id), killing the local process is enough.
+   */
+  private cancelCurrent(): void {
+    const jobId = this.currentDeployJobId;
+    const org = this.currentDeployOrg;
+    if (this.currentCancel) this.currentCancel();
+    if (jobId && org) {
+      const root = this.workspaceRoot;
+      // Best-effort, out of band: the local kill already rejected the op.
+      void (async () => {
+        try {
+          await this.sf.deployCancel(jobId, org, root ?? process.cwd());
+          this.output.appendLine(`[Cancel] requested org-side cancel of deploy ${jobId} on ${org}`);
+        } catch (e) {
+          this.output.appendLine(`[Cancel] org-side deploy cancel failed for ${jobId}: ${e instanceof Error ? e.message : String(e)}. The deploy may still complete on the org.`);
+        }
+      })();
     }
   }
 
@@ -275,138 +313,311 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   // ---- Operations ----
-  private async runDeploy(keys: string[], opts: { sourceDir?: string } = {}): Promise<void> {
-    if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
-    const root = this.requireRoot();
-    if (!root) return;
-    const org = this.requireOrg();
-    if (!org) return;
-    const allResolved = this.resolveKeys(keys);
-    const orgOnlySkipped = allResolved.filter(i => !i.filePath);
-    const items = allResolved.filter(i => !!i.filePath);
-    if (items.length === 0) {
-      vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
-      return;
-    }
-
-    const orgInfo = this.orgs.find(o => o.username === org);
-    const orgLabel = orgInfo?.alias ?? org;
-    const isProd = this.sf.isLikelyProduction(orgInfo);
-    const n = items.length;
-    const noun = `${n} component${n === 1 ? '' : 's'}`;
-    const confirm = isProd
-      ? await vscode.window.showWarningMessage(
-          `⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.`,
-          { modal: true, detail: orgInfo?.instanceUrl ?? '' },
-          'Deploy to PROD'
-        )
-      : await vscode.window.showWarningMessage(
-          `Deploy ${noun} to ${orgLabel}?`,
-          { modal: true },
-          'Deploy'
-        );
-    if (!confirm) return;
-
-    const ignoreConflicts = vscode.workspace
-      .getConfiguration('sfOrgDeployWrapper')
-      .get<boolean>('ignoreDeployConflicts', false);
-
-    const cmdId = this.beginCmd(`sf project deploy start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
-    this.setBusy(true, 'Deploy');
-    const start = Date.now();
+  private async runDeploy(
+    keys: string[],
+    opts: { sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel } = {}
+  ): Promise<void> {
+    // Reserve the busy slot synchronously, before the first await (the confirm
+    // modal): otherwise a second deploy/retrieve/diff fired during the modal
+    // passes the entry check and two ops run at once, clobbering currentCancel and
+    // re-enabling the UI mid-op (busy-flag TOCTOU). Release on any early
+    // return with `releaseBusy()`.
+    if (!this.reserveBusy(opts.validateOnly ? 'Validate' : 'Deploy')) return;
+    let reserved = true;
+    const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
     try {
-      await this.withWindowProgress(`Deploying ${noun} to ${orgLabel}`, async () => {
-        this.postProgress(`Deploying ${noun} to ${orgLabel}…`);
-        const handle = this.sf.deployMetadata(
-          items.map(i => `${i.type}:${i.name}`),
-          org,
-          root,
-          { ignoreConflicts, timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined }
-        );
-        this.currentCancel = handle.cancel;
-        const { result, cmd } = await handle.promise;
-        this.updateCmd(cmdId, cmd);
-        // Per-component results live under `details.*` on older `sf` output and under
-        // `files` on newer output — read both so failures are never silently dropped
-        // (and the success gate accounts for both).
-        const detailFailures = result.details?.componentFailures ?? [];
-        const detailSuccesses = result.details?.componentSuccesses ?? [];
-        const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
-        const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !f.problem);
-        const failures = detailFailures.length ? detailFailures : fileFailures;
-        const successes = detailSuccesses.length ? detailSuccesses : fileSuccesses;
-        const success = result.success
-          && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
-          && failures.length === 0;
-        const lines = items.map(i => `${i.type}:${i.name}`);
-        const skipLines = orgOnlySkipped.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`);
-        this.endCmd(cmdId, success, Date.now() - start);
-        if (success) {
-          this.post({
-            type: 'status',
-            card: {
-              kind: orgOnlySkipped.length > 0 ? 'warn' : 'ok',
-              title: `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
-              meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
-              lines: [...lines, ...skipLines]
+      const root = this.requireRoot();
+      if (!root) return;
+      const org = this.requireOrg();
+      if (!org) return;
+      const allResolved = this.resolveKeys(keys);
+      const orgOnlySkipped = allResolved.filter(i => !i.filePath);
+      const items = allResolved.filter(i => !!i.filePath);
+      if (items.length === 0) {
+        vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
+        return;
+      }
+
+      const orgInfo = this.orgs.find(o => o.username === org);
+      const orgLabel = orgInfo?.alias ?? org;
+      // Kit classification: an unknown/unloaded org counts as PRODUCTION (over-warn).
+      const isProd = isLikelyProduction(orgInfo);
+      const n = items.length;
+      const noun = `${n} component${n === 1 ? '' : 's'}`;
+      const verb = opts.validateOnly ? 'Validate' : 'Deploy';
+      // Production defaults to running local tests (the org requires them anyway);
+      // sandbox defaults to no tests. Validate-only always runs tests, so force at
+      // least RunLocalTests there.
+      const testLevel: TestLevel = opts.testLevel
+        ?? (opts.validateOnly || isProd ? 'RunLocalTests' : 'NoTestRun');
+      const testNote = testLevel === 'NoTestRun' ? '' : `\n\nTests: ${testLevel}`;
+
+      const confirmLabel = opts.validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
+      const confirm = isProd && !opts.validateOnly
+        ? await vscode.window.showWarningMessage(
+            `⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.${testNote}`,
+            { modal: true, detail: orgInfo?.instanceUrl ?? '' },
+            confirmLabel
+          )
+        : await vscode.window.showWarningMessage(
+            opts.validateOnly
+              ? `Validate ${noun} against ${orgLabel}? (check-only — nothing is deployed)${testNote}`
+              : `Deploy ${noun} to ${orgLabel}?${testNote}`,
+            { modal: true, ...(isProd ? { detail: orgInfo?.instanceUrl ?? '' } : {}) },
+            confirmLabel
+          );
+      if (!confirm) return;
+
+      const ignoreConflicts = vscode.workspace
+        .getConfiguration('sfOrgDeployWrapper')
+        .get<boolean>('ignoreDeployConflicts', false);
+      const testArg = testLevel !== 'NoTestRun' ? ` --test-level ${testLevel}` : '';
+
+      const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
+      // From here the async work runs under the reserved slot; the finally block
+      // owns releasing it, so stop the early-return releaser from double-firing.
+      reserved = false;
+      const start = Date.now();
+      const progressTitle = opts.validateOnly ? `Validating ${noun} against ${orgLabel}` : `Deploying ${noun} to ${orgLabel}`;
+      try {
+        await this.withWindowProgress(progressTitle, async () => {
+          this.postProgress(`${progressTitle}…`);
+          const handle = this.sf.deployMetadata(
+            items.map(i => `${i.type}:${i.name}`),
+            org,
+            root,
+            {
+              ignoreConflicts,
+              timeoutMs: this.timeoutMs(),
+              sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined,
+              validateOnly: opts.validateOnly,
+              testLevel: testLevel === 'NoTestRun' ? undefined : testLevel
             }
+          );
+          this.currentCancel = handle.cancel;
+          this.currentDeployOrg = org;
+          const { result, cmd } = await handle.promise;
+          // Capture the job id so Cancel can reach the org-side deploy and a
+          // validated deployment can be quick-deployed.
+          this.currentDeployJobId = result.id;
+          this.updateCmd(cmdId, cmd);
+          this.reportDeployResult(result, {
+            items, orgOnlySkipped, orgLabel, org, noun, cmdId, start,
+            validateOnly: !!opts.validateOnly
           });
-          this.notifySuccessIfPanelHidden(`Deployed ${noun} to ${orgLabel}`);
-        } else {
-          const errLines = failures.length
-            ? failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`)
-            : ['Deploy reported failure with no per-component details.'];
-          this.post({
-            type: 'status',
-            card: {
-              kind: 'err',
-              title: `Deploy failed against ${orgLabel}`,
-              meta: `${failures.length} failure${failures.length === 1 ? '' : 's'}, ${successes.length} success`,
-              lines: [...errLines, ...skipLines]
-            }
-          });
+        });
+      } catch (err) {
+        this.endCmd(cmdId, false, Date.now() - start);
+        if (err instanceof SfCliCancelledError) {
+          this.reportCancelled(verb, this.currentDeployJobId
+            ? 'Asked the org to cancel the server-side deploy.'
+            : 'The org-side deploy may still complete — check the org.');
+        } else this.reportError(verb, err);
+      } finally {
+        this.currentCancel = undefined;
+        this.currentDeployJobId = undefined;
+        this.currentDeployOrg = undefined;
+        this.setBusy(false);
+      }
+    } finally {
+      releaseBusy();
+    }
+  }
+
+  /** Render the status card for a completed deploy/validate, including Apex test
+   *  failures (surfaced when a test-level ran) and a Quick Deploy affordance for a
+   *  successful validation. */
+  private reportDeployResult(
+    result: DeployResult,
+    ctx: {
+      items: MetadataItem[];
+      orgOnlySkipped: MetadataItem[];
+      orgLabel: string;
+      org: string;
+      noun: string;
+      cmdId: string;
+      start: number;
+      validateOnly: boolean;
+    }
+  ): void {
+    const { items, orgOnlySkipped, orgLabel, org, cmdId, start, validateOnly } = ctx;
+    // Per-component results live under `details.*` on older `sf` output and under
+    // `files` on newer output — read both so failures are never silently dropped
+    // (and the success gate accounts for both).
+    const detailFailures = result.details?.componentFailures ?? [];
+    const detailSuccesses = result.details?.componentSuccesses ?? [];
+    const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+    const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !f.problem);
+    const failures = detailFailures.length ? detailFailures : fileFailures;
+    const successes = detailSuccesses.length ? detailSuccesses : fileSuccesses;
+    const testFailures: DeployTestFailure[] = result.details?.runTestResult?.failures ?? [];
+    const success = result.success
+      && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
+      && failures.length === 0
+      && testFailures.length === 0;
+    const lines = items.map(i => `${i.type}:${i.name}`);
+    const skipLines = orgOnlySkipped.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`);
+    const testMeta = result.numberTestsTotal
+      ? ` · ${(result.numberTestsTotal ?? 0) - (result.numberTestErrors ?? 0)}/${result.numberTestsTotal} tests passed`
+      : '';
+    this.endCmd(cmdId, success, Date.now() - start);
+    if (success) {
+      if (validateOnly && result.id) {
+        // Remember the validated deployment so the card's Quick Deploy button can
+        // deploy it without re-validating / re-running tests.
+        this.lastValidated = { jobId: result.id, org, label: orgLabel, count: items.length };
+      }
+      this.post({
+        type: 'status',
+        card: {
+          kind: orgOnlySkipped.length > 0 ? 'warn' : 'ok',
+          title: validateOnly
+            ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
+            : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
+          meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
+          lines: [...lines, ...skipLines],
+          ...(validateOnly && result.id
+            ? { quickDeploy: { jobId: result.id, label: `Quick Deploy ${items.length} validated component${items.length === 1 ? '' : 's'} to ${orgLabel}` } }
+            : {})
         }
       });
-    } catch (err) {
-      this.endCmd(cmdId, false, Date.now() - start);
-      if (err instanceof SfCliCancelledError) this.reportCancelled('Deploy');
-      else this.reportError('Deploy', err);
+      this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
+    } else {
+      const errLines = failures.length
+        ? failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`)
+        : (testFailures.length ? [] : ['Deploy reported failure with no per-component details.']);
+      const testLines = testFailures.map(t =>
+        `✗ test ${t.name ?? '?'}.${t.methodName ?? '?'} — ${stripAnsi(t.message ?? 'failed').split('\n')[0]}`
+      );
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'err',
+          title: validateOnly ? `Validation failed against ${orgLabel}` : `Deploy failed against ${orgLabel}`,
+          meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}, ${successes.length} success${testFailures.length ? ` · ${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}` : ''}`,
+          lines: [...errLines, ...testLines, ...skipLines]
+        }
+      });
+    }
+  }
+
+  /** Quick-deploy a previously-validated deployment by its job id — no re-run of
+   *  validation or tests. Guarded to the same org the validation ran against. */
+  private async runQuickDeploy(jobId: string): Promise<void> {
+    if (!this.reserveBusy('Deploy')) return;
+    let reserved = true;
+    try {
+      const root = this.requireRoot();
+      if (!root) return;
+      const validated = this.lastValidated;
+      if (!validated || validated.jobId !== jobId) {
+        vscode.window.showWarningMessage('That validated deployment is no longer available — validate again before quick-deploying.');
+        return;
+      }
+      const org = validated.org;
+      const orgLabel = validated.label;
+      const orgInfo = this.orgs.find(o => o.username === org);
+      const isProd = isLikelyProduction(orgInfo);
+      const confirm = await vscode.window.showWarningMessage(
+        isProd
+          ? `⚠ Quick Deploy ${validated.count} validated component${validated.count === 1 ? '' : 's'} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.`
+          : `Quick Deploy ${validated.count} validated component${validated.count === 1 ? '' : 's'} to ${orgLabel}?`,
+        { modal: true, ...(isProd ? { detail: orgInfo?.instanceUrl ?? '' } : {}) },
+        isProd ? 'Deploy to PROD' : 'Deploy'
+      );
+      if (!confirm) return;
+      reserved = false;
+      const cmdId = this.beginCmd(`sf project deploy quick --job-id ${jobId} --target-org ${org}`);
+      const start = Date.now();
+      try {
+        await this.withWindowProgress(`Quick-deploying to ${orgLabel}`, async () => {
+          this.postProgress(`Quick-deploying validated components to ${orgLabel}…`);
+          const handle = this.sf.quickDeploy(jobId, org, root, { timeoutMs: this.timeoutMs() });
+          this.currentCancel = handle.cancel;
+          this.currentDeployOrg = org;
+          const { result, cmd } = await handle.promise;
+          this.currentDeployJobId = result.id ?? jobId;
+          this.updateCmd(cmdId, cmd);
+          // The quick deploy consumes the validation — clear it either way.
+          this.lastValidated = undefined;
+          const noun = `${validated.count} component${validated.count === 1 ? '' : 's'}`;
+          this.endCmd(cmdId, !!result.success, Date.now() - start);
+          if (result.success) {
+            this.post({
+              type: 'status',
+              card: {
+                kind: 'ok',
+                title: `Quick-deployed ${noun} to ${orgLabel}`,
+                meta: `${result.numberComponentsDeployed ?? validated.count} deployed`
+              }
+            });
+            this.notifySuccessIfPanelHidden(`Quick-deployed ${noun} to ${orgLabel}`);
+          } else {
+            const failures = result.details?.componentFailures
+              ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+            this.post({
+              type: 'status',
+              card: {
+                kind: 'err',
+                title: `Quick Deploy failed against ${orgLabel}`,
+                meta: 'The validation may have expired (validated deployments are valid for ~10 days; the org may also have changed).',
+                lines: failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`)
+              }
+            });
+          }
+        });
+      } catch (err) {
+        this.endCmd(cmdId, false, Date.now() - start);
+        if (err instanceof SfCliCancelledError) {
+          this.reportCancelled('Deploy', this.currentDeployJobId
+            ? 'Asked the org to cancel the server-side deploy.'
+            : 'The org-side deploy may still complete — check the org.');
+        } else this.reportError('Quick Deploy', err);
+      } finally {
+        this.currentCancel = undefined;
+        this.currentDeployJobId = undefined;
+        this.currentDeployOrg = undefined;
+        this.setBusy(false);
+      }
     } finally {
-      this.currentCancel = undefined;
-      this.setBusy(false);
+      if (reserved) this.setBusy(false);
     }
   }
 
   private async runRetrieve(keys: string[], opts: { sourceDir?: string } = {}): Promise<void> {
-    if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
-    const root = this.requireRoot();
-    if (!root) return;
-    const org = this.requireOrg();
-    if (!org) return;
-    const items = this.resolveKeys(keys);
-    if (items.length === 0) return;
-    const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
-    const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
-
-    const orgOnlyCount = items.filter(i => !i.filePath).length;
-    const localCount = items.length - orgOnlyCount;
-    const detail = orgOnlyCount > 0 && localCount > 0
-      ? `${localCount} local file${localCount !== 1 ? 's' : ''} will be overwritten · ${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created`
-      : orgOnlyCount > 0
-        ? `${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created locally`
-        : 'This will overwrite your local files.';
-    const confirm = await vscode.window.showWarningMessage(
-      `Retrieve ${noun} from ${orgLabel}?`,
-      { modal: true, detail },
-      'Retrieve'
-    );
-    if (confirm !== 'Retrieve') return;
-
-    const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}`);
-    this.setBusy(true, 'Retrieve');
-    const start = Date.now();
+    // Reserve the busy slot synchronously before the confirm modal (TOCTOU guard).
+    if (!this.reserveBusy('Retrieve')) return;
+    let reserved = true;
+    const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
     try {
-      await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
+      const root = this.requireRoot();
+      if (!root) return;
+      const org = this.requireOrg();
+      if (!org) return;
+      const items = this.resolveKeys(keys);
+      if (items.length === 0) return;
+      const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
+      const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
+
+      const orgOnlyCount = items.filter(i => !i.filePath).length;
+      const localCount = items.length - orgOnlyCount;
+      const detail = orgOnlyCount > 0 && localCount > 0
+        ? `${localCount} local file${localCount !== 1 ? 's' : ''} will be overwritten · ${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created`
+        : orgOnlyCount > 0
+          ? `${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created locally`
+          : 'This will overwrite your local files.';
+      const confirm = await vscode.window.showWarningMessage(
+        `Retrieve ${noun} from ${orgLabel}?`,
+        { modal: true, detail },
+        'Retrieve'
+      );
+      if (confirm !== 'Retrieve') return;
+
+      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}`);
+      reserved = false;
+      const start = Date.now();
+      try {
+        await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
         this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
         const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined });
         this.currentCancel = handle.cancel;
@@ -459,71 +670,80 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
-      });
-    } catch (err) {
-      this.endCmd(cmdId, false, Date.now() - start);
-      if (err instanceof SfCliCancelledError) this.reportCancelled('Retrieve');
-      else this.reportError('Retrieve', err);
+        });
+      } catch (err) {
+        this.endCmd(cmdId, false, Date.now() - start);
+        if (err instanceof SfCliCancelledError) this.reportCancelled('Retrieve');
+        else this.reportError('Retrieve', err);
+      } finally {
+        this.currentCancel = undefined;
+        this.setBusy(false);
+      }
     } finally {
-      this.currentCancel = undefined;
-      this.setBusy(false);
+      releaseBusy();
     }
   }
 
   private async runDiff(keys: string[], orgOverride?: string): Promise<void> {
-    if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
-    const root = this.requireRoot();
-    if (!root) return;
-    const org = orgOverride ?? this.requireOrg();
-    if (!org) return;
-    // Friendly label (alias) for titles/messages; falls back to the username.
-    const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
-    const allItems = this.resolveKeys(keys);
-    if (allItems.length === 0) return;
-
-    // Org-only items have no local file — diff is meaningless for them (nothing to compare against).
-    const orgOnlySkipped = allItems.filter(i => !i.filePath);
-    const withLocalFile = allItems.filter(i => !!i.filePath);
-
-    // Partition into diffable vs unsupported metadata types.
-    const diffable = withLocalFile.filter(i => !DIFF_UNSUPPORTED.has(i.type));
-    const unsupported = withLocalFile.filter(i => DIFF_UNSUPPORTED.has(i.type));
-    const preLines: string[] = [
-      ...unsupported.map(i => `— ${i.type}:${i.name} — diff not supported for this metadata type yet`),
-      ...orgOnlySkipped.map(i => `— ${i.type}:${i.name} — org-only, no local file to diff (retrieve first)`)
-    ];
-
-    if (diffable.length === 0) {
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'warn',
-          title: 'Nothing to diff',
-          meta: `${unsupported.length} unsupported metadata type${unsupported.length === 1 ? '' : 's'} selected`,
-          lines: preLines
-        }
-      });
-      return;
-    }
-
-    // Cap the number of diff editors we open in one go.
-    let items = diffable;
-    if (diffable.length > 5) {
-      const choice = await vscode.window.showWarningMessage(
-        `About to open ${diffable.length} diff editors.`,
-        { modal: true, detail: 'Opening many diff editors can slow the window down.' },
-        'Open All',
-        'First 5'
-      );
-      if (!choice) return;
-      if (choice === 'First 5') items = diffable.slice(0, 5);
-    }
-
-    // Always isolate temp dir outside the workspace so git doesn't see it.
-    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deploy-diff-'));
-    const tmpPaths: string[] = [tmpRoot];
-    this.setBusy(true, 'Diff');
+    // Reserve the busy slot synchronously before the >5-diff confirm modal and the
+    // mkdtemp await (TOCTOU guard). Released via `releaseBusy()` on early return.
+    if (!this.reserveBusy('Diff')) return;
+    let reserved = true;
+    const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
+    const tmpPaths: string[] = [];
     try {
+      const root = this.requireRoot();
+      if (!root) return;
+      const org = orgOverride ?? this.requireOrg();
+      if (!org) return;
+      // Friendly label (alias) for titles/messages; falls back to the username.
+      const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
+      const allItems = this.resolveKeys(keys);
+      if (allItems.length === 0) return;
+
+      // Org-only items have no local file — diff is meaningless for them (nothing to compare against).
+      const orgOnlySkipped = allItems.filter(i => !i.filePath);
+      const withLocalFile = allItems.filter(i => !!i.filePath);
+
+      // Partition into diffable vs unsupported metadata types.
+      const diffable = withLocalFile.filter(i => !DIFF_UNSUPPORTED.has(i.type));
+      const unsupported = withLocalFile.filter(i => DIFF_UNSUPPORTED.has(i.type));
+      const preLines: string[] = [
+        ...unsupported.map(i => `— ${i.type}:${i.name} — diff not supported for this metadata type yet`),
+        ...orgOnlySkipped.map(i => `— ${i.type}:${i.name} — org-only, no local file to diff (retrieve first)`)
+      ];
+
+      if (diffable.length === 0) {
+        this.post({
+          type: 'status',
+          card: {
+            kind: 'warn',
+            title: 'Nothing to diff',
+            meta: `${unsupported.length} unsupported metadata type${unsupported.length === 1 ? '' : 's'} selected`,
+            lines: preLines
+          }
+        });
+        return;
+      }
+
+      // Cap the number of diff editors we open in one go.
+      let items = diffable;
+      if (diffable.length > 5) {
+        const choice = await vscode.window.showWarningMessage(
+          `About to open ${diffable.length} diff editors.`,
+          { modal: true, detail: 'Opening many diff editors can slow the window down.' },
+          'Open All',
+          'First 5'
+        );
+        if (!choice) return;
+        if (choice === 'First 5') items = diffable.slice(0, 5);
+      }
+
+      // Always isolate temp dir outside the workspace so git doesn't see it.
+      const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deploy-diff-'));
+      tmpPaths.push(tmpRoot);
+      reserved = false;
+      try {
       await this.withWindowProgress(`Comparing ${items.length} component${items.length === 1 ? '' : 's'} with ${orgLabel}`, async report => {
         const missing: MetadataItem[] = [];
         const opened: string[] = [];
@@ -682,13 +902,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           }
         });
       });
-    } catch (err) {
-      if (err instanceof SfCliCancelledError) this.reportCancelled('Diff');
-      else this.reportError('Diff', err);
+      } catch (err) {
+        if (err instanceof SfCliCancelledError) this.reportCancelled('Diff');
+        else this.reportError('Diff', err);
+      } finally {
+        this.currentCancel = undefined;
+        this.setBusy(false);
+        scheduleTmpCleanup(tmpPaths);
+      }
     } finally {
-      this.currentCancel = undefined;
-      this.setBusy(false);
-      scheduleTmpCleanup(tmpPaths);
+      // Released only if we returned before entering the inner op (the inner
+      // finally owns setBusy(false) once we commit). Clean up any staged tmp dirs
+      // created on an early-return path too.
+      if (reserved) {
+        this.setBusy(false);
+        scheduleTmpCleanup(tmpPaths);
+      }
     }
   }
 
@@ -713,11 +942,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async loadOrgMetadata(): Promise<void> {
-    if (this.busy) { vscode.window.showInformationMessage('Another operation is already running.'); return; }
+    // No await between this check and setBusy below (requireRoot/Org and config
+    // reads are synchronous), so reserving here is race-free. reserveBusy keeps the
+    // "already running" messaging consistent with the other ops.
+    if (!this.reserveBusy('Fetch Org')) return;
     const root = this.requireRoot();
-    if (!root) return;
+    if (!root) { this.setBusy(false); return; }
     const org = this.requireOrg();
-    if (!org) return;
+    if (!org) { this.setBusy(false); return; }
     const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
 
     const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
@@ -735,7 +967,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       fetchCancelled = true;
       for (const c of activeCancels) c();
     };
-    this.setBusy(true, 'Fetch Org');
 
     // Run one listMetadata call, folding its members into orgItems (honouring the
     // managed-package filter) or recording a failure. Never throws (except cancel).
@@ -935,6 +1166,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'busy', busy: b, action: this.currentAction });
   }
 
+  /**
+   * Atomically claim the busy slot. Returns false (and shows the "already running"
+   * message) if an op is in flight. Callers MUST hold the slot across every await
+   * up to the finishing `setBusy(false)` — checking `this.busy` and only *later*
+   * setting it left a window where a modal-blocked second op slipped through
+   * (busy-flag TOCTOU). Setting `busy` here, synchronously before any
+   * await, closes that window.
+   */
+  private reserveBusy(action: string): boolean {
+    if (this.busy) {
+      vscode.window.showInformationMessage('Another operation is already running.');
+      return false;
+    }
+    this.setBusy(true, action);
+    return true;
+  }
+
   /** Run `body` under a cancellable VS Code progress notification so operations
    *  give feedback even when the panel is hidden (context-menu flows). The
    *  notification's Cancel button maps onto the currently running sf command. */
@@ -942,7 +1190,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return Promise.resolve(vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `SF Deploy: ${title}`, cancellable: true },
       (progress, token) => {
-        const sub = token.onCancellationRequested(() => this.currentCancel?.());
+        const sub = token.onCancellationRequested(() => this.cancelCurrent());
         return body(message => progress.report({ message })).finally(() => sub.dispose());
       }
     ));
@@ -973,10 +1221,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(item.filePath), vscode.Uri.file(remoteFile), title, { preview: false, viewColumn });
   }
 
-  private reportCancelled(action: string): void {
+  private reportCancelled(action: string, note?: string): void {
     this.post({
       type: 'status',
-      card: { kind: 'warn', title: `${action} cancelled` }
+      card: { kind: 'warn', title: `${action} cancelled`, ...(note ? { meta: note } : {}) }
     });
   }
 

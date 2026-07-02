@@ -3,6 +3,29 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## Unreleased
+
+- New: **Validate-only deploy.** A **Validate** button runs a check-only deploy
+  (`sf project deploy validate`) that validates and runs Apex tests without deploying.
+  A successful validation shows a **Quick Deploy** button on its status card that deploys
+  the already-validated components without re-running validation or the tests.
+- New: **Test level control.** A test-level selector on the action bar lets you choose the
+  Apex test level for a deploy or validation (defaults to running local tests for
+  production and validations, no tests for sandboxes).
+- New: **LWC & Aura context menu.** Right-clicking a Lightning Web Component or Aura bundle
+  file now shows the Deploy / Retrieve / Diff / Compare menu (the bundle deploy already
+  worked; only the menu entry point was missing).
+- Fixed: **Cancel now reaches the org.** Cancelling a deploy also asks the org to cancel the
+  server-side deployment when its job id is known; otherwise the status card now says the
+  org-side deploy may still complete, instead of implying it was fully stopped.
+- Fixed: a second deploy/retrieve/diff started while a confirmation dialog was open could
+  slip past the "already running" guard and run concurrently; operations now reserve the
+  busy slot before any prompt.
+- Internal: the Salesforce CLI wrapper and org handling now sit on the shared family core
+  (fixes Windows `sf.cmd` launching and a few edge cases), and the target org is stored in
+  the shared `skrety.salesforce.targetOrg` setting so it's shared across the Skrety SF
+  plugins. Your previously remembered org is migrated automatically.
+
 ## 0.4.5
 
 - Fixed: **Fetch Org** now always targets the org selected in the dropdown. On a fresh

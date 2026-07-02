@@ -8,7 +8,7 @@ import { OrgInfo } from './sfCli';
  *
  * Classification is lifted from apex-editor's `SfCliService.kindOf` /
  * `isLikelyProduction`, with the apex-editor HIGH bug fixed at the root
- * (REVIEW §5): an **undefined / unknown org is treated as PRODUCTION**. The old
+ * an **undefined / unknown org is treated as PRODUCTION**. The old
  * code mapped `kindOf(undefined) → 'other' → isLikelyProduction === false`, so a
  * palette run fired before the org list loaded skipped the production
  * confirmation. The family's design is over-warn, so unknown MUST err toward
@@ -16,7 +16,7 @@ import { OrgInfo } from './sfCli';
  *
  * Selection: a single shared VS Code setting `skrety.salesforce.targetOrg`
  * (machine scope, ConfigurationTarget.Global) so org choice is shared across all
- * family plugins (REVIEW Tier 1) — read/write/watch helpers plus a QuickPick
+ * family plugins — read/write/watch helpers plus a QuickPick
  * picker and a status-bar item factory.
  */
 
@@ -154,7 +154,7 @@ export async function pickOrg(
  * Create a status-bar item that shows the current org with a kind badge and
  * runs `command` on click. The caller updates it via the returned `update`.
  * Push `item` into subscriptions. Respects the shared status-bar dedup rule via
- * the `show` option (REVIEW Tier 1: only one family plugin shows it by default).
+ * the `show` option (only one family plugin shows it by default).
  */
 export function createOrgStatusBar(opts: {
   command: string;

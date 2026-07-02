@@ -75,7 +75,7 @@ ${styleLink}
 </head>
 <body>
 ${body}
-<script nonce="${nonce}" src="${opts.scriptUri}"><\/script>
+<script nonce="${nonce}" src="${opts.scriptUri}"></script>
 </body>
 </html>`;
 }

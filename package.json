@@ -74,44 +74,44 @@
       "explorer/context": [
         {
           "command": "sfOrgDeployWrapper.deployFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@1"
         },
         {
           "command": "sfOrgDeployWrapper.retrieveFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@2"
         },
         {
           "command": "sfOrgDeployWrapper.diffFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@3"
         },
         {
           "command": "sfOrgDeployWrapper.diffFileWithOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@4"
         }
       ],
       "editor/context": [
         {
           "command": "sfOrgDeployWrapper.deployFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@1"
         },
         {
           "command": "sfOrgDeployWrapper.retrieveFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@2"
         },
         {
           "command": "sfOrgDeployWrapper.diffFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@3"
         },
         {
           "command": "sfOrgDeployWrapper.diffFileWithOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|flow-meta\\.xml|object-meta\\.xml|permissionset-meta\\.xml|profile-meta\\.xml|layout-meta\\.xml|labels-meta\\.xml|tab-meta\\.xml|workflow-meta\\.xml|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@4"
         }
       ]
@@ -147,6 +147,12 @@
           "type": "boolean",
           "default": true,
           "description": "Pop org-comparison diffs into their own OS window (auxiliary window). Turn off to keep them as diff tabs in the main window."
+        },
+        "skrety.salesforce.targetOrg": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Shared target Salesforce org (username or alias) for the Skrety SF plugin family. Set from the org picker in any of the plugins; machine-scoped so it isn't synced to other machines. Leave empty to fall back to the CLI default org."
         }
       }
     }
