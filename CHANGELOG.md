@@ -3,7 +3,7 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
-## Unreleased
+## 0.5.0
 
 - New: **Validate-only deploy.** A **Validate** button runs a check-only deploy
   (`sf project deploy validate`) that validates and runs Apex tests without deploying.
