@@ -69,7 +69,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'out')]
     };
     view.webview.html = getPanelHtml(view.webview, this.context.extensionUri, generateNonce());
-    view.webview.onDidReceiveMessage((m: Inbound) => this.handleMessage(m));
+    // Never let a handler rejection vanish — an org-select or refresh that dies
+    // in an unhandled promise looks to the user like the panel simply ignoring
+    // clicks, with no trace anywhere.
+    view.webview.onDidReceiveMessage((m: Inbound) => {
+      void this.handleMessage(m).catch(err => this.reportError(m?.type ?? 'panel action', err));
+    });
     const editorChangeSub = vscode.window.onDidChangeActiveTextEditor(() => this.sendActiveFile());
     view.onDidDispose(() => { editorChangeSub.dispose(); this.view = undefined; });
   }
@@ -274,6 +279,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private async loadOrgs(notify = false): Promise<void> {
     try {
       this.orgs = await this.sf.listOrgs();
+    } catch (err) {
+      // One env line so a "works in terminal, fails in panel" report is
+      // diagnosable from the log alone (extension-host PATH ≠ shell PATH).
+      this.output.appendLine(`[list orgs] diag cwd=${this.workspaceRoot ?? process.cwd()} PATH=${(process.env.PATH ?? '').split(':').slice(0, 6).join(':')}`);
+      const msg = stripAnsi(err instanceof Error ? err.message : String(err)).trim();
+      const hint = hintForError(err);
+      // The banner carries the real reason — "see output channel" alone strands
+      // users who don't know where that is. reportError adds the error card in
+      // the panel, the output-channel line, and a toast whose button OPENS the
+      // channel; broken org listing means a dead panel, so loud is correct even
+      // on the automatic load at startup.
+      this.post({ type: 'banner', message: `Failed to list orgs: ${msg}${hint ? ` — ${hint}` : ''}` });
+      this.reportError('List orgs', err);
+      return;
+    }
+    try {
       const current = this.orgStore.get();
       if (current && !this.orgs.some(o => o.username === current)) {
         await this.orgStore.set(undefined);
@@ -281,17 +302,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const def = this.orgs.find(o => o.isDefaultUsername) ?? this.orgs[0];
         if (def) await this.orgStore.set(def.username);
       }
-      // If the effective org no longer matches what org metadata was fetched for, drop it.
-      if (this.orgMembersOrg && this.orgStore.get() !== this.orgMembersOrg) this.resetOrgMetadata();
-      this.postOrgs();
-      if (notify && this.orgs.length === 0) {
-        vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
-      }
-      this.post({ type: 'banner', message: this.orgs.length === 0 ? 'No authenticated Salesforce orgs found. Run `sf org login web`.' : '' });
     } catch (err) {
-      this.handleError('list orgs', err);
-      this.post({ type: 'banner', message: 'Failed to list orgs. See output channel.' });
+      // Persisting the selection failed — the listing itself succeeded, so keep
+      // going (dropdown still populates) and attribute the error honestly.
+      this.reportError('Save org selection', err);
     }
+    // If the effective org no longer matches what org metadata was fetched for, drop it.
+    if (this.orgMembersOrg && this.orgStore.get() !== this.orgMembersOrg) this.resetOrgMetadata();
+    this.postOrgs();
+    if (notify && this.orgs.length === 0) {
+      vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
+    }
+    this.post({ type: 'banner', message: this.orgs.length === 0 ? 'No authenticated Salesforce orgs found. Run `sf org login web`.' : '' });
   }
 
   // ---- Learned type rules ----

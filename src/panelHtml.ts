@@ -242,12 +242,18 @@ body.resizing { cursor: row-resize; user-select: none; }
 .actions button.subtle:hover { color: var(--fg); filter: none; }
 .actions .spacer { flex: 1; }
 .actions .selected-count { color: var(--muted); align-self: center; }
+/* Deliberate rows instead of accidental flex-wrap at sidebar widths: the test-level
+   select takes a full row, and the verb buttons form one equal-width group that
+   wraps into even halves when the panel is very narrow. */
 .actions select {
   background: var(--vscode-input-background); color: var(--vscode-input-foreground);
   border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 2px;
-  padding: 3px 6px; font-family: inherit; font-size: inherit; max-width: 150px;
+  padding: 3px 6px; font-family: inherit; font-size: inherit; flex: 1 1 100%;
 }
 .actions select:disabled { opacity: 0.5; cursor: not-allowed; }
+#diffBtn, #retrieveBtn, #validateBtn, #deployBtn, #cancelBtn {
+  flex: 1 1 0; min-width: 68px; white-space: nowrap;
+}
 
 .status {
   flex: 1; overflow-y: auto; padding: 8px;
@@ -353,9 +359,13 @@ body.resizing { cursor: row-resize; user-select: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .banner {
-  padding: 6px 8px; background: var(--vscode-inputValidation-warningBackground, #5a4a1a);
-  color: var(--vscode-inputValidation-warningForeground, var(--fg));
-  border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, var(--border));
+  /* statusBarItem.warning* is a matched fg/bg pair with core defaults in every
+     base theme. The old inputValidation-warningBackground + general foreground
+     mix rendered near-white text on bright yellow in themes that define the
+     background but not inputValidation.warningForeground. */
+  padding: 6px 8px; background: var(--vscode-statusBarItem-warningBackground, #7a6400);
+  color: var(--vscode-statusBarItem-warningForeground, #ffffff);
+  border-bottom: 1px solid var(--border);
   font-size: 12px;
 }
 

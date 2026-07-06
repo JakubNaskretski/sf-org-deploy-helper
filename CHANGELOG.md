@@ -3,6 +3,28 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.1
+
+- Fixed: **Errors now tell you what went wrong.** When listing orgs fails, the panel banner
+  shows the actual reason (plus a suggested fix where one is known — expired auth, CLI not
+  installed, network, timeout) instead of just "see output channel", an error card with the
+  full text appears in the panel, and a notification's **Show Output** button jumps straight
+  to the extension's log.
+- Fixed: **A failed settings write no longer looks like a failed org list.** If saving the
+  selected org failed (for example an unwritable settings file), the panel wrongly reported
+  "Failed to list orgs" and left the org dropdown empty and unusable. Listing and saving are
+  now independent: the dropdown always fills from the successful listing, and the save error
+  is reported as what it is.
+- Fixed: **No more silent failures on panel actions.** An action that failed early — like an
+  org selection that didn't stick — could previously fail with no message at all. Every
+  panel action now reports its error.
+- Fixed: **Warning banner readable in all themes.** The banner used a theme color pair that
+  some themes render as near-white text on bright yellow; it now uses a matched
+  high-contrast pair.
+- Improved: **Tidier action bar.** The test-level picker sits on its own row, the
+  Diff / Retrieve / Validate / Deploy buttons are evenly sized instead of wrapping raggedly,
+  and Cancel is a single full-width button while an operation runs.
+
 ## 0.6.0
 
 - New: **Any metadata type can now be deployed, retrieved and diffed.** Previously the
