@@ -3,6 +3,17 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.0
+
+- New: **Any metadata type can now be deployed, retrieved and diffed.** Previously the
+  extension recognized ~36 common types from a built-in list and rejected everything else
+  ("not a recognized metadata file"). Unknown types are now resolved through the Salesforce
+  CLI's own metadata registry (offline, no org call) — anything your installed `sf` CLI
+  knows just works, including types Salesforce ships in the future. Newly resolved types
+  appear in the file tree automatically.
+- New: `sfOrgDeployWrapper.typeCacheDays` setting — how many days resolved type rules stay
+  cached (default 7; 0 re-resolves every time).
+
 ## 0.5.0
 
 - New: **Validate-only deploy.** A **Validate** button runs a check-only deploy

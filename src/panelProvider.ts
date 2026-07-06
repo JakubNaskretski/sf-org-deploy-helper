@@ -5,7 +5,7 @@ import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
 import { DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { MetadataItem, OBJECT_CHILD_TYPES, findItemForPath, inferItemForPath, scanWorkspace } from './metadataScanner';
+import { FolderRule, LearnedRule, MetadataItem, OBJECT_CHILD_TYPES, deriveRule, findItemForPath, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -23,6 +23,9 @@ type Inbound =
   | { type: 'cancel' };
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
+
+/** globalState key for folder→type rules learned from the sf CLI registry. */
+const LEARNED_RULES_KEY = 'learnedTypeRules';
 
 export class DeployPanelProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'sfOrgDeployWrapper.panel';
@@ -48,6 +51,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The org username `orgMembers` was fetched from — guards against using a stale
    *  membership map after the user switches the target org. */
   private orgMembersOrg?: string;
+  /** Folders whose type resolution via the CLI registry failed this session —
+   *  skipped on rescans so a refresh doesn't respawn `sf` for a lost cause. */
+  private unresolvableFolders = new Set<string>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -147,7 +153,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     let match = findItemForPath(this.items, uri.fsPath);
     let inferred = false;
     if (!match) {
-      match = inferItemForPath(uri.fsPath);
+      // Static + learned rules first (pure path logic); the CLI registry as the
+      // authoritative last resort — if that says no, it genuinely isn't metadata.
+      match = inferItemForPath(uri.fsPath, this.learnedRules());
+      if (!match) {
+        try {
+          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath));
+        } catch (err) {
+          // CLI failure (timeout, no project, …) — distinct from "not metadata".
+          const msg = err instanceof Error ? err.message : String(err);
+          vscode.window.showErrorMessage(`Couldn't resolve this file's metadata type — the sf CLI failed (not a verdict on the file): ${msg}`);
+          return;
+        }
+      }
       if (match) {
         inferred = true;
         const k = `${match.type}:${match.name}`;
@@ -276,8 +294,127 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ---- Learned type rules ----
+  // Static RULES in metadataScanner cover the everyday types instantly and
+  // offline. Everything else is resolved on demand by the sf CLI's own metadata
+  // registry (`sf project generate manifest` — offline, no org call) and cached
+  // here as folder→type rules, so new Salesforce types work without a plugin
+  // release; the CLI (`sf update`) is the source of truth.
+
+  private typeCacheDays(): number {
+    return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('typeCacheDays', 7);
+  }
+
+  /** Cached learned rules, expired entries dropped. Cache off (0 days) → none. */
+  private learnedRules(): FolderRule[] {
+    const days = this.typeCacheDays();
+    if (days <= 0) return [];
+    const cutoff = Date.now() - days * 86_400_000;
+    return this.context.globalState.get<LearnedRule[]>(LEARNED_RULES_KEY, []).filter(r => r.learnedAt >= cutoff);
+  }
+
+  private async rememberRule(rule: FolderRule): Promise<void> {
+    if (this.typeCacheDays() <= 0) return;
+    const all = this.context.globalState.get<LearnedRule[]>(LEARNED_RULES_KEY, []);
+    const next = all.filter(r => !(r.folder === rule.folder && r.type === rule.type));
+    next.push({ ...rule, learnedAt: Date.now() });
+    await this.context.globalState.update(LEARNED_RULES_KEY, next);
+  }
+
+  /** Resolve unknown folders' types via the CLI registry, one call per folder so
+   *  a folder of junk (TypeInferenceError) can't block a legit one. Returns the
+   *  learned rules (also cached) — returned directly so they reach the caller's
+   *  rescan even when the cache is disabled (typeCacheDays 0). Failures are
+   *  logged and skipped for the session. */
+  private async learnRulesForFolders(folders: string[], root: string): Promise<FolderRule[]> {
+    const learned: FolderRule[] = [];
+    for (const folder of folders) {
+      const label = path.basename(folder);
+      try {
+        const xml = await this.sf.generateManifest([folder], root);
+        const types = parseManifestTypes(xml);
+        const fileNames = await fs.readdir(folder);
+        let ruleFound = false;
+        // Derive only from a clean single-type folder — when two types share a
+        // folder, a same-named member could bind the other type's file suffix
+        // and the wrong cached rule would mislabel the whole folder on every
+        // scan until TTL expiry. Multi-type folders stay click-deployable.
+        if (types.length === 1) {
+          const rule = deriveRule(label, types[0].type, types[0].members, fileNames);
+          if (rule) { await this.rememberRule(rule); learned.push(rule); ruleFound = true; }
+        }
+        if (ruleFound) {
+          this.output.appendLine(`[typeResolve] learned ${label} → ${types.map(t => t.type).join(', ')} (sf registry, cached ${this.typeCacheDays()}d)`);
+        } else {
+          this.unresolvableFolders.add(folder);
+          this.output.appendLine(`[typeResolve] ${label}: resolved ${types.map(t => t.type).join(', ') || 'nothing'} but no per-file rule derivable — not shown in tree (deploy via right-click still works)`);
+        }
+      } catch (err) {
+        this.unresolvableFolders.add(folder);
+        this.output.appendLine(`[typeResolve] ${label}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return learned;
+  }
+
+  /** Last-resort resolution for a single clicked file the rules don't cover: ask
+   *  the CLI registry what it is, and learn the folder rule for future scans. */
+  private async resolveItemViaCli(absPath: string): Promise<MetadataItem | undefined> {
+    const cwd = this.workspaceRoot;
+    if (!cwd) return undefined;
+    const base = path.basename(absPath);
+    try {
+      const xml = await this.sf.generateManifest([absPath], cwd);
+      const types = parseManifestTypes(xml);
+      const t = types[0];
+      if (!t?.members.length) return undefined;
+      // Name: exact stem match, then prefix match. For aggregate files that list
+      // many members (CustomLabels-style) fall back to the file STEM — never
+      // members[0], which would put an arbitrary member on the deploy card and
+      // break a later diff of that key.
+      const stem = base.split('.')[0];
+      const leaf = (m: string) => m.split('/').pop() ?? m;
+      const byStem = t.members.find(m => leaf(m) === stem);
+      const byPrefix = byStem ? undefined : t.members.find(m => base.startsWith(leaf(m) + '.'));
+      const name = byStem ?? byPrefix ?? (t.members.length === 1 ? t.members[0] : stem);
+      const guessed = !byStem && !byPrefix && t.members.length !== 1;
+      // Learn a folder rule only from a clean single-type resolution — a
+      // multi-type answer can't be attributed to files safely, and a wrong-type
+      // rule would poison every future scan of that folder until TTL expiry.
+      const rule = types.length === 1 ? deriveRule(path.basename(path.dirname(absPath)), t.type, t.members, [base]) : undefined;
+      if (rule) void this.rememberRule(rule).catch(err => this.output.appendLine(`[typeResolve] cache write failed: ${err instanceof Error ? err.message : String(err)}`));
+      this.output.appendLine(`[typeResolve] ${base} → ${t.type}:${name}${guessed ? ' (aggregate: name from file stem)' : ''} (sf registry)`);
+      return { type: t.type, name, filePath: absPath, files: [absPath] };
+    } catch (err) {
+      this.output.appendLine(`[typeResolve] ${base}: ${err instanceof Error ? err.message : String(err)}`);
+      // The registry genuinely not knowing the file → undefined ("not metadata",
+      // authoritative). Anything else — timeout, no project, transient CLI
+      // failure — must NOT masquerade as "not metadata": rethrow for the caller.
+      const notMetadata = err instanceof SfCliError &&
+        (err.errorName === 'TypeInferenceError' || /TypeInferenceError/.test(err.message));
+      if (notMetadata) return undefined;
+      throw err;
+    }
+  }
+
   private async loadFiles(): Promise<void> {
-    const { items, root, warning } = await scanWorkspace();
+    let scan = await scanWorkspace(this.learnedRules());
+    // Folders no rule covers: resolve their types via the CLI registry, then
+    // rescan so they land in the tree. Learned rules persist, so this spawns
+    // `sf` only for genuinely new folders (or after cache expiry).
+    const pending = scan.unknownFolders.filter(f => !this.unresolvableFolders.has(f));
+    let resolveFailures: string[] = [];
+    if (pending.length && scan.root) {
+      const scanRoot = scan.root;
+      // Under window progress — this spawns `sf` (30s timeout per folder) and
+      // would otherwise stall the tree with zero feedback on panel open/refresh.
+      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot));
+      // Fresh rules are passed directly (not just via the cache) so the rescan
+      // sees them even with typeCacheDays 0.
+      if (fresh.length) scan = await scanWorkspace([...this.learnedRules(), ...fresh]);
+      resolveFailures = pending.filter(f => this.unresolvableFolders.has(f)).map(f => path.basename(f));
+    }
+    const { items, root, warning } = scan;
     this.items = items;
     this.workspaceRoot = root;
     this.post({
@@ -292,6 +429,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     });
     if (warning) this.post({ type: 'banner', message: warning });
     else if (items.length === 0 && root) this.post({ type: 'banner', message: 'No metadata found in workspace package directories.' });
+    // Folders the registry couldn't type-resolve would otherwise vanish from the
+    // tree with the only trace buried in the output channel — surface it in-panel.
+    if (resolveFailures.length) {
+      this.post({ type: 'banner', message: `Couldn't resolve metadata type for: ${resolveFailures.join(', ')} — see Output › "SF Org Deploy Wrapper".` });
+    }
   }
 
   private sendActiveFile(notifyIfMissing = false, selectAndScroll = false): void {

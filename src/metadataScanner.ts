@@ -15,7 +15,7 @@ export interface MetadataItem {
   files: string[];
 }
 
-interface FolderRule {
+export interface FolderRule {
   folder: string;
   type: string;
   /** true = each subfolder is one bundle; false = each file is one component */
@@ -61,6 +61,7 @@ const RULES: FolderRule[] = [
   { folder: 'settings', type: 'Settings', primaryExt: ['.settings-meta.xml'] },
   { folder: 'messageChannels', type: 'LightningMessageChannel', primaryExt: ['.messageChannel-meta.xml'] },
   { folder: 'testSuites', type: 'ApexTestSuite', primaryExt: ['.testSuite-meta.xml'] },
+  { folder: 'platformEventSubscriberConfigs', type: 'PlatformEventSubscriberConfig', primaryExt: ['.platformEventSubscriberConfig-meta.xml'] },
   { folder: 'email', type: 'EmailTemplate', primaryExt: ['.email'], metaSuffix: '.email-meta.xml', nested: true },
 ];
 
@@ -85,6 +86,12 @@ const OBJECT_CHILD_RULES: Array<{ folder: string; type: string; suffix: string }
 
 const OBJECT_CHILD_BY_FOLDER = new Map(OBJECT_CHILD_RULES.map(r => [r.folder, r]));
 
+/** A FolderRule learned at runtime from the sf CLI's own metadata registry
+ *  (via `sf project generate manifest`), cached with a timestamp so it can
+ *  expire after `typeCacheDays`. Static RULES stay the zero-cost fast path;
+ *  learned rules cover every type the CLI knows without a plugin release. */
+export type LearnedRule = FolderRule & { learnedAt: number };
+
 /** Metadata types that are decomposed children of a CustomObject (one `*-meta.xml`
  *  file each). The diff flow needs this to know the org side must be converted
  *  MDAPI→source before a meaningful file-to-file diff. */
@@ -103,14 +110,21 @@ export async function resolvePackageDirs(root: string): Promise<string[]> {
   return ['force-app'];
 }
 
-export async function scanWorkspace(): Promise<{ items: MetadataItem[]; root?: string; warning?: string }> {
+export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<{ items: MetadataItem[]; root?: string; warning?: string; unknownFolders: string[] }> {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
-    return { items: [], warning: 'No workspace folder open.' };
+    return { items: [], warning: 'No workspace folder open.', unknownFolders: [] };
   }
   const root = folders[0].uri.fsPath;
   const pkgDirs = await resolvePackageDirs(root);
   const items: MetadataItem[] = [];
+  // Static rules first, learned rules after — a duplicate folder match produces
+  // duplicate items, which the existing type:name dedupe below collapses.
+  const rules = [...RULES, ...extraRules];
+  // Top-level folders under the package default dir that no rule covers — the
+  // caller can resolve their types via the sf CLI registry and rescan.
+  const unknownFolders: string[] = [];
+  const knownFolders = new Set([...rules.map(r => r.folder), 'objects']);
   for (const pkg of pkgDirs) {
     // Standard layout is <pkg>/main/default, but SFDX only requires <pkg>; metadata
     // can sit directly under the package dir. Fall back to <pkg> when main/default is
@@ -119,7 +133,15 @@ export async function scanWorkspace(): Promise<{ items: MetadataItem[]; root?: s
     const mainDefault = path.join(pkgRoot, 'main', 'default');
     const defaultDir = (await pathExists(mainDefault)) ? mainDefault : pkgRoot;
     if (!(await pathExists(defaultDir))) continue;
-    for (const rule of RULES) {
+    // Collect unrecognized sibling folders that hold metadata-looking files.
+    try {
+      for (const e of await fs.readdir(defaultDir, { withFileTypes: true })) {
+        if (!e.isDirectory() || shouldSkipDir(e.name) || knownFolders.has(e.name)) continue;
+        const p = path.join(defaultDir, e.name);
+        if ((await walkForFilesMatching(p, ['-meta.xml'])).length) unknownFolders.push(p);
+      }
+    } catch { /* unreadable dir — nothing to report */ }
+    for (const rule of rules) {
       const dir = path.join(defaultDir, rule.folder);
       if (!(await pathExists(dir))) continue;
       if (rule.bundle) {
@@ -195,7 +217,7 @@ export async function scanWorkspace(): Promise<{ items: MetadataItem[]; root?: s
     return true;
   });
   deduped.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type.localeCompare(b.type)));
-  return { items: deduped, root };
+  return { items: deduped, root, unknownFolders };
 }
 
 /** Walk `objectsDir` and emit one item per decomposed object child. A directory whose
@@ -251,10 +273,11 @@ export function findItemForPath(items: MetadataItem[], absPath: string): Metadat
  * The caller deploys/retrieves the result by `--source-dir filePath`, which works
  * anywhere (`--metadata Type:Name` can't resolve a file outside the package dirs).
  */
-export function inferItemForPath(absPath: string): MetadataItem | undefined {
+export function inferItemForPath(absPath: string, extraRules: FolderRule[] = []): MetadataItem | undefined {
   const norm = path.normalize(absPath);
   const base = path.basename(norm);
   const segs = norm.split(path.sep);
+  const rules = [...RULES, ...extraRules];
   const item = (type: string, name: string, filePath = norm): MetadataItem => ({ type, name, filePath, files: [filePath] });
 
   // 1. Decomposed object children (and the CustomObject itself) under objects/<Object>/…
@@ -270,7 +293,7 @@ export function inferItemForPath(absPath: string): MetadataItem | undefined {
   }
 
   // 2. Bundle types (LWC/Aura): the component is the bundle directory under lwc/ or aura/.
-  for (const rule of RULES) {
+  for (const rule of rules) {
     if (!rule.bundle) continue;
     const bi = segs.lastIndexOf(rule.folder);
     if (bi >= 0 && bi + 1 < segs.length) {
@@ -290,12 +313,52 @@ export function inferItemForPath(absPath: string): MetadataItem | undefined {
   }
 
   // 4. Regular single-/per-file types — matched by the type's folder plus extension.
-  for (const rule of RULES) {
+  for (const rule of rules) {
     if (rule.bundle || rule.nested || segs.lastIndexOf(rule.folder) < 0) continue;
     for (const ext of rule.primaryExt ?? []) {
       if (base.endsWith(ext)) return item(rule.type, base.slice(0, -ext.length));
     }
     if (rule.metaSuffix && base.endsWith(rule.metaSuffix)) return item(rule.type, base.slice(0, -rule.metaSuffix.length));
+  }
+  return undefined;
+}
+
+/** Parse `<types>` blocks out of a package.xml produced by
+ *  `sf project generate manifest`. Deliberately a regex over CLI-emitted XML we
+ *  control the producer of — no XML-parser dependency. */
+export function parseManifestTypes(xml: string): Array<{ type: string; members: string[] }> {
+  const out: Array<{ type: string; members: string[] }> = [];
+  for (const block of xml.match(/<types>[\s\S]*?<\/types>/g) ?? []) {
+    const type = /<name>([^<]+)<\/name>/.exec(block)?.[1]?.trim();
+    if (!type) continue;
+    const members = [...block.matchAll(/<members>([^<]+)<\/members>/g)].map(m => m[1].trim()).filter(Boolean);
+    if (members.length) out.push({ type, members });
+  }
+  return out;
+}
+
+/**
+ * Derive a reusable FolderRule from one CLI-resolved folder: find a member whose
+ * file is `<member><suffix>` and generalize to `folder + suffix → type`.
+ * Prefers the `-meta.xml` sibling when a type has a content/meta file pair, so
+ * the rule keys on the canonical suffix. Returns undefined for shapes that don't
+ * generalize from one sample (bundles: member is a directory, no dot; nested
+ * types: member contains '/').
+ * Known ceiling: per-file suffix rules only — exotic bundle types aren't learned
+ * into the tree; context-menu deploy of them still works via --source-dir.
+ */
+export function deriveRule(folderName: string, type: string, members: string[], fileNames: string[]): FolderRule | undefined {
+  const files = [...fileNames].sort((a, b) => Number(b.endsWith('-meta.xml')) - Number(a.endsWith('-meta.xml')));
+  for (const m of members) {
+    if (m.includes('/')) continue;
+    for (const f of files) {
+      if (!f.startsWith(m + '.')) continue;
+      const suffix = f.slice(m.length);
+      // Canonical sidecar suffixes only: a generic content suffix (e.g. `.xml`)
+      // would scoop unrelated files on later scans. Every deployable per-file
+      // type in source format carries a `*-meta.xml`.
+      if (suffix.endsWith('-meta.xml')) return { folder: folderName, type, primaryExt: [suffix] };
+    }
   }
   return undefined;
 }

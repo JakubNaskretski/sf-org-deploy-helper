@@ -13,6 +13,9 @@
  * on the kit's public run helpers, plus the validate-only / quick-deploy /
  * test-level surface and a server-side deploy-cancel.
  */
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import {
   Cancellable,
   OrgInfo,
@@ -171,6 +174,34 @@ export class SfCliService extends KitSfCliService {
       ['project', 'deploy', 'cancel', '--job-id', jobId, '--target-org', targetOrg, '--json'],
       { timeoutMs: opts.timeoutMs ?? 60_000, cwd }
     );
+  }
+
+  /**
+   * Resolve metadata types for local paths via `sf project generate manifest` —
+   * the CLI's own metadata registry, fully offline (no org call). Returns the
+   * generated package.xml content. Throws SfCliError (TypeInferenceError) when a
+   * path isn't recognizable metadata; requires cwd inside an SFDX project.
+   */
+  async generateManifest(sourceDirs: string[], cwd: string, opts: { timeoutMs?: number } = {}): Promise<string> {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'sfodw-manifest-'));
+    try {
+      const args = ['project', 'generate', 'manifest'];
+      for (const d of sourceDirs) args.push('--source-dir', d);
+      args.push('--output-dir', tmp, '--name', 'package.xml', '--json');
+      const json = await this.runJson<SfJsonEnvelope<unknown>>(args, { timeoutMs: opts.timeoutMs ?? 30_000, cwd });
+      // Surface the CLI's own error (e.g. TypeInferenceError) instead of an
+      // ENOENT from reading a manifest that was never written.
+      this.unwrapResult(json, 'project generate manifest');
+      try {
+        return await fs.readFile(path.join(tmp, 'package.xml'), 'utf8');
+      } catch {
+        // Success envelope but no file at the expected path (e.g. a future CLI
+        // writing elsewhere) — a bare ENOENT with a temp path is unactionable.
+        throw new SfCliError('sf project generate manifest reported success but wrote no package.xml');
+      }
+    } finally {
+      fs.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   retrieveMetadata(

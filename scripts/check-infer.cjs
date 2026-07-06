@@ -7,7 +7,7 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
-const { inferItemForPath } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { inferItemForPath, parseManifestTypes, deriveRule } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep); // build OS-native paths
 
 const cases = [
@@ -19,6 +19,7 @@ const cases = [
   [p('x', 'layouts', 'Foo__mdt-Some Layout.layout-meta.xml'), 'Layout', 'Foo__mdt-Some Layout'],
   [p('x', 'permissionsets', 'Admin.permissionset-meta.xml'), 'PermissionSet', 'Admin'],
   [p('x', 'flexipages', 'Home.flexipage-meta.xml'), 'FlexiPage', 'Home'],
+  [p('x', 'platformEventSubscriberConfigs', 'nameSmth.platformEventSubscriberConfig-meta.xml'), 'PlatformEventSubscriberConfig', 'nameSmth'],
   // bundles: component is the bundle dir, regardless of which inner file was clicked
   [p('a', 'lwc', 'myCmp', 'myCmp.js'), 'LightningComponentBundle', 'myCmp', p('a', 'lwc', 'myCmp')],
   [p('a', 'lwc', 'myCmp', 'sub', 'helper.js'), 'LightningComponentBundle', 'myCmp', p('a', 'lwc', 'myCmp')],
@@ -52,5 +53,65 @@ for (const input of noMatch) {
   if (inferItemForPath(input) !== undefined) { failed++; console.error('FAIL: expected no match for', input); }
 }
 
+// Learned (extra) rules must extend inferItemForPath exactly like static ones.
+const learned = [{ folder: 'xyzzyConfigs', type: 'XyzzyConfig', primaryExt: ['.xyzzyConfig-meta.xml'] }];
+{
+  const input = p('x', 'xyzzyConfigs', 'A.xyzzyConfig-meta.xml');
+  const got = inferItemForPath(input, learned);
+  try {
+    assert.ok(got, `expected learned-rule match for ${input}`);
+    assert.strictEqual(got.type, 'XyzzyConfig');
+    assert.strictEqual(got.name, 'A');
+    assert.strictEqual(inferItemForPath(input), undefined, 'must NOT match without the learned rule');
+  } catch (e) { failed++; console.error('FAIL:', e.message); }
+}
+
+// parseManifestTypes: real CLI output shape (verified live, sf 2.137.7).
+{
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>nameSmth</members>
+        <members>other</members>
+        <name>PlatformEventSubscriberConfig</name>
+    </types>
+    <types>
+        <members>Acme</members>
+        <name>ApexClass</name>
+    </types>
+    <version>61.0</version>
+</Package>`;
+  try {
+    assert.deepStrictEqual(parseManifestTypes(xml), [
+      { type: 'PlatformEventSubscriberConfig', members: ['nameSmth', 'other'] },
+      { type: 'ApexClass', members: ['Acme'] }
+    ]);
+    assert.deepStrictEqual(parseManifestTypes('<Package></Package>'), []);
+  } catch (e) { failed++; console.error('FAIL parseManifestTypes:', e.message); }
+}
+
+// deriveRule: suffix generalization + the shapes that must NOT generalize.
+try {
+  assert.deepStrictEqual(
+    deriveRule('platformEventSubscriberConfigs', 'PlatformEventSubscriberConfig', ['nameSmth'], ['nameSmth.platformEventSubscriberConfig-meta.xml']),
+    { folder: 'platformEventSubscriberConfigs', type: 'PlatformEventSubscriberConfig', primaryExt: ['.platformEventSubscriberConfig-meta.xml'] }
+  );
+  // content/meta pair → prefer the -meta.xml suffix
+  assert.deepStrictEqual(
+    deriveRule('discovery', 'DiscoveryAIModel', ['M'], ['M.model', 'M.model-meta.xml']).primaryExt,
+    ['.model-meta.xml']
+  );
+  // bundle member (directory, no dot-suffix file) → no rule
+  assert.strictEqual(deriveRule('waveTemplates', 'WaveTemplateBundle', ['MyTpl'], ['MyTpl']), undefined);
+  // content-only suffix (no -meta.xml sidecar in list) → no rule; a generic
+  // suffix like '.xml' must never be learned (would scoop unrelated files)
+  assert.strictEqual(deriveRule('fooBars', 'FooBar', ['M'], ['M.foobar']), undefined);
+  assert.strictEqual(deriveRule('things', 'Thing', ['M'], ['M.xml']), undefined);
+  // nested fullName → no rule
+  assert.strictEqual(deriveRule('reports', 'Report', ['Folder/Rep'], ['Rep.report-meta.xml']), undefined);
+  // member not prefixing any file → no rule
+  assert.strictEqual(deriveRule('somemadeup', 'Whatever', ['A'], ['B.x-meta.xml']), undefined);
+} catch (e) { failed++; console.error('FAIL deriveRule:', e.message); }
+
 if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
-console.log(`inferItemForPath: all ${cases.length + noMatch.length} checks passed`);
+console.log(`inferItemForPath/parseManifestTypes/deriveRule: all checks passed (${cases.length + noMatch.length} infer cases + learned-rule + parser + derive)`);
