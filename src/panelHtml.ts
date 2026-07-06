@@ -407,6 +407,7 @@ body.resizing { cursor: row-resize; user-select: none; }
     <button id="fetchOrgBtn" class="secondary" title="Fetch all metadata from the connected org and merge with local workspace">Fetch Org</button>
   </div>
   <div id="banner" class="banner" style="display:none;"></div>
+  <div id="scanBanner" class="banner" style="display:none;"></div>
 
   <div class="body">
     <div class="left">

@@ -23,6 +23,9 @@
     // Fraction of the body given to the Status pane (right/bottom). null = CSS default.
     statusRatio: typeof persisted.statusRatio === 'number' ? persisted.statusRatio : null,
     banner: '',
+    // Scan/type-resolution notices get their own slot so they can't overwrite an
+    // org error (both used to share the single banner, last writer won).
+    scanBanner: '',
     // Org metadata browse state
     orgKeys: new Set(),      // "Type:Name" keys that exist on the org
     localKeys: new Set(),    // "Type:Name" keys that exist locally
@@ -165,6 +168,10 @@
         state.banner = msg.message || '';
         renderBanner();
         return;
+      case 'scanBanner':
+        state.scanBanner = msg.message || '';
+        renderBanner();
+        return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
         if (msg.key && msg.select) {
@@ -260,10 +267,12 @@
   }
 
   function renderBanner() {
-    const b = $('banner');
-    if (!state.banner) { b.style.display = 'none'; return; }
-    b.style.display = 'block';
-    b.textContent = state.banner;
+    for (const [id, text] of [['banner', state.banner], ['scanBanner', state.scanBanner]]) {
+      const el = $(id);
+      if (!text) { el.style.display = 'none'; continue; }
+      el.style.display = 'block';
+      el.textContent = text;
+    }
   }
 
   function renderSourceFilter() {

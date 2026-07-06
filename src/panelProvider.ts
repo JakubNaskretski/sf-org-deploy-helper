@@ -54,6 +54,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Folders whose type resolution via the CLI registry failed this session —
    *  skipped on rescans so a refresh doesn't respawn `sf` for a lost cause. */
   private unresolvableFolders = new Set<string>();
+  /** First underlying CLI error from the latest type-resolution run — shown in
+   *  the scan banner so wholesale failures name their cause in-panel. */
+  private resolveErrorSample: string | undefined;
+  private sfVersionLogged = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -350,6 +354,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  logged and skipped for the session. */
   private async learnRulesForFolders(folders: string[], root: string): Promise<FolderRule[]> {
     const learned: FolderRule[] = [];
+    this.resolveErrorSample = undefined;
     for (const folder of folders) {
       const label = path.basename(folder);
       try {
@@ -373,7 +378,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
       } catch (err) {
         this.unresolvableFolders.add(folder);
-        this.output.appendLine(`[typeResolve] ${label}: ${err instanceof Error ? err.message : String(err)}`);
+        const msg = stripAnsi(err instanceof Error ? err.message : String(err)).trim();
+        if (!this.resolveErrorSample) this.resolveErrorSample = msg;
+        this.logSfVersionOnce();
+        this.output.appendLine(`[typeResolve] ${label}: ${msg}`);
       }
     }
     return learned;
@@ -436,7 +444,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (fresh.length) scan = await scanWorkspace([...this.learnedRules(), ...fresh]);
       resolveFailures = pending.filter(f => this.unresolvableFolders.has(f)).map(f => path.basename(f));
     }
-    const { items, root, warning } = scan;
+    const scanNotice = resolveFailures.length
+      ? `Couldn't resolve metadata type for: ${resolveFailures.join(', ')}` +
+        (this.resolveErrorSample ? ` — ${this.resolveErrorSample}` : '') +
+        (this.resolveErrorSample && hintForError(new Error(this.resolveErrorSample)) ? ` — ${hintForError(new Error(this.resolveErrorSample))}` : '')
+      : scan.warning ?? (scan.items.length === 0 && scan.root ? 'No metadata found in workspace package directories.' : '');
+    this.post({ type: 'scanBanner', message: scanNotice });
+    const { items, root } = scan;
     this.items = items;
     this.workspaceRoot = root;
     this.post({
@@ -449,13 +463,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         files: i.files
       }))
     });
-    if (warning) this.post({ type: 'banner', message: warning });
-    else if (items.length === 0 && root) this.post({ type: 'banner', message: 'No metadata found in workspace package directories.' });
-    // Folders the registry couldn't type-resolve would otherwise vanish from the
-    // tree with the only trace buried in the output channel — surface it in-panel.
-    if (resolveFailures.length) {
-      this.post({ type: 'banner', message: `Couldn't resolve metadata type for: ${resolveFailures.join(', ')} — see Output › "SF Org Deploy Wrapper".` });
-    }
   }
 
   private sendActiveFile(notifyIfMissing = false, selectAndScroll = false): void {
@@ -1426,6 +1433,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const message = err instanceof Error ? err.message : String(err);
     this.output.appendLine(`[${context}] ${message}`);
     if (err instanceof SfCliError && err.stderr) this.output.appendLine(err.stderr);
+    this.logSfVersionOnce();
+  }
+
+  /** On the first CLI-related error of the session, log the sf CLI version —
+   *  the single most useful fact when diagnosing a report from another machine. */
+  private logSfVersionOnce(): void {
+    if (this.sfVersionLogged) return;
+    this.sfVersionLogged = true;
+    this.sf.runCancellable(['--version']).promise.then(
+      r => this.output.appendLine(`[diag] ${r.stdout.trim().split('\n')[0] || `sf --version exited ${r.code}`}`),
+      e => this.output.appendLine(`[diag] sf --version failed: ${e instanceof Error ? e.message : String(e)}`)
+    );
   }
 
   private reportError(action: string, err: unknown): void {
@@ -1527,6 +1546,9 @@ function hintForError(err: unknown): string | undefined {
   }
   if (/requiresproject|sfdx-project\.json/.test(txt)) {
     return 'This workspace is not a Salesforce DX project (sfdx-project.json not found).';
+  }
+  if (/nonexistent flag|is not a sf command|command [^\s]+ not found/.test(txt)) {
+    return 'Your sf CLI looks outdated for this command — run `sf update` (or reinstall @salesforce/cli), then reload VS Code.';
   }
   if (/enotfound|getaddrinfo|econnrefused|econnreset|etimedout|socket hang up/.test(txt)) {
     return 'Network problem reaching the org — check your connection/VPN and retry.';

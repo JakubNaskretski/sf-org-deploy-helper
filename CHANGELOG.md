@@ -3,6 +3,18 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.2
+
+- Fixed: **Type-resolution failures now say why.** When metadata types can't be resolved
+  through the CLI registry, the notice shows the underlying CLI error (and a suggested fix,
+  e.g. an outdated `sf` CLI) instead of only listing folder names and pointing at the
+  output channel.
+- Fixed: **Scan notices no longer overwrite org errors.** Type-resolution and workspace-scan
+  notices had shared one banner slot with org errors — whichever came last hid the other.
+  They now display independently.
+- Improved: on the first CLI-related error of a session, the installed `sf` CLI version is
+  logged to the output channel to make problem reports self-contained.
+
 ## 0.6.1
 
 - Fixed: **Errors now tell you what went wrong.** When listing orgs fails, the panel banner
