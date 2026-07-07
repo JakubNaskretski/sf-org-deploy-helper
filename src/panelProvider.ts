@@ -20,6 +20,8 @@ type Inbound =
   | { type: 'quickDeploy'; jobId: string }
   | { type: 'retrieve'; keys: string[] }
   | { type: 'diff'; keys: string[] }
+  | { type: 'openFile'; key: string }
+  | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
   | { type: 'cancel' };
 
@@ -252,6 +254,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       case 'diff':
         await this.runDiff(msg.keys);
+        return;
+      case 'openFile': {
+        const it = this.resolveKeys([msg.key])[0];
+        if (!it?.filePath) {
+          vscode.window.showInformationMessage('Org-only — retrieve it first to open it locally.');
+          return;
+        }
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(it.filePath), { preview: true });
+        return;
+      }
+      case 'openInOrg':
+        await this.openComponentInOrg(msg.keys?.[0]);
         return;
       case 'copyText':
         if (msg.text) {
@@ -681,6 +695,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           lines: [...errLines, ...testLines, ...skipLines]
         }
       });
+      this.failureToast(`${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`);
     }
   }
 
@@ -747,6 +762,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 lines: failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`)
               }
             });
+            this.failureToast(`Quick Deploy failed against ${orgLabel}.`);
           }
         });
       } catch (err) {
@@ -850,6 +866,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               lines
             }
           });
+          if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`);
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
@@ -864,6 +881,31 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       releaseBusy();
+    }
+  }
+
+  /** Open a component's page in the org via `sf org open --source-file` — the CLI
+   *  owns the type→Setup-page mapping; unmapped types open the org home. Quick and
+   *  read-only, so it deliberately does NOT take the busy slot. */
+  private async openComponentInOrg(key: string | undefined): Promise<void> {
+    if (!key) return;
+    const root = this.requireRoot();
+    if (!root) return;
+    const org = this.requireOrg();
+    if (!org) return;
+    const item = this.resolveKeys([key])[0];
+    if (!item?.filePath) {
+      vscode.window.showInformationMessage('Org-only — retrieve it first (the deep link is derived from the local file).');
+      return;
+    }
+    const cmdId = this.beginCmd(`sf org open --source-file ${/\s/.test(item.filePath) ? `"${item.filePath}"` : item.filePath} --target-org ${org}`);
+    const start = Date.now();
+    try {
+      await this.sf.openInOrg(item.filePath, org, root);
+      this.endCmd(cmdId, true, Date.now() - start);
+    } catch (err) {
+      this.endCmd(cmdId, false, Date.now() - start);
+      this.reportError('Open in Org', err);
     }
   }
 
@@ -1464,6 +1506,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       r => this.output.appendLine(`[diag] ${r.stdout.trim().split('\n')[0] || `sf --version exited ${r.code}`}`),
       e => this.output.appendLine(`[diag] sf --version failed: ${e instanceof Error ? e.message : String(e)}`)
     );
+  }
+
+  /** Native bottom-right notification for result-level failures (component/test
+   *  failures on a completed run). Exceptions already toast via reportError; this
+   *  covers the "command succeeded, deployment failed" outcomes. The status card
+   *  in the panel stays the durable, detailed record. */
+  private failureToast(message: string): void {
+    void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Output').then(choice => {
+      if (choice === 'Show Output') this.output.show(true);
+    });
   }
 
   private reportError(action: string, err: unknown): void {

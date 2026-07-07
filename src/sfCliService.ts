@@ -176,6 +176,16 @@ export class SfCliService extends KitSfCliService {
     );
   }
 
+  /** Open the org page for a local metadata file in the browser. The CLI maps the
+   *  file to its Setup page; files it can't map open the org home instead. */
+  async openInOrg(sourceFile: string, targetOrg: string, cwd: string, opts: { timeoutMs?: number } = {}): Promise<void> {
+    const json = await this.runJson<SfJsonEnvelope<{ url?: string }>>(
+      ['org', 'open', '--source-file', sourceFile, '--target-org', targetOrg, '--json'],
+      { timeoutMs: opts.timeoutMs ?? 30_000, cwd }
+    );
+    this.unwrapResult(json, 'org open');
+  }
+
   /**
    * Resolve metadata types for local paths via `sf project generate manifest` —
    * the CLI's own metadata registry, fully offline (no org call). Returns the

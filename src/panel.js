@@ -17,7 +17,6 @@
     progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
-    lastError: null, // most recent error card, mirrored into the full-width footer
     cmdLog: [],
     cmdLogCollapsed: !!persisted.cmdLogCollapsed,
     // Fraction of the body given to the Status pane (right/bottom). null = CSS default.
@@ -89,9 +88,7 @@
   });
   $('clearStatus').addEventListener('click', () => {
     state.statusCards = [];
-    state.lastError = null;
     renderStatus();
-    renderErrorFooter();
   });
   $('clearCmdLog').addEventListener('click', (e) => {
     e.stopPropagation();   // don't also toggle the log's collapse
@@ -101,7 +98,6 @@
   setupSplitter();
   // Close the right-click menu if the tree scrolls out from under it.
   $('tree').addEventListener('scroll', () => closeContextMenu());
-  renderErrorFooter();
   send('ready');
 
   function action(kind) {
@@ -201,10 +197,6 @@
         state.busy = !!msg.busy;
         state.busyAction = msg.action || null;
         if (state.busy) {
-          // A fresh op started — drop the previous error from the footer so a stale
-          // failure doesn't sit there looking like it belongs to the new run.
-          state.lastError = null;
-          renderErrorFooter();
           state.progress = { text: state.busyAction ? `${state.busyAction} running…` : 'Working…', startedAt: Date.now() };
           startProgressTimer();
         } else {
@@ -224,10 +216,6 @@
         // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint }
         state.statusCards.unshift(msg.card);
         if (state.statusCards.length > 25) state.statusCards.length = 25;
-        if (msg.card && msg.card.kind === 'err') {
-          state.lastError = msg.card;
-          renderErrorFooter();
-        }
         renderStatus();
         return;
       case 'cmd':
@@ -579,6 +567,9 @@
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, treeMenuSections([key], displayName));
     });
+    // Double-click opens the source file (the two single-click checkbox toggles
+    // cancel out, so the selection is left as it was).
+    row.addEventListener('dblclick', () => send('openFile', { key }));
     return row;
   }
 
@@ -907,6 +898,21 @@
         h.textContent = `Hint: ${card.hint}`;
         el.appendChild(h);
       }
+      // The card is the durable error record (failures also raise a native VS Code
+      // notification) — give it the Copy affordance the old footer used to carry.
+      if (card.kind === 'err') {
+        const cp = document.createElement('button');
+        cp.className = 'card-copy';
+        cp.textContent = 'Copy';
+        cp.title = 'Copy the full error to the clipboard';
+        cp.addEventListener('click', () => {
+          const parts = [card.title, card.meta, (card.lines || []).join('\n'), card.errText];
+          if (card.actions && card.actions.length) parts.push('Try:\n' + card.actions.map(a => '• ' + a).join('\n'));
+          if (card.hint) parts.push('Hint: ' + card.hint);
+          send('copyText', { text: parts.filter(Boolean).join('\n\n') });
+        });
+        el.appendChild(cp);
+      }
       // Quick Deploy affordance on a successful validate-only card: deploy the
       // already-validated components without re-running validation or tests.
       if (card.quickDeploy && card.quickDeploy.jobId && !card.quickDeployDone) {
@@ -1076,12 +1082,24 @@
     const hasLocal = arr.some(k => state.localKeys.has(k));
     const base = !state.busy && !!state.selectedOrg && arr.length > 0;
     const orgTip = state.selectedOrg ? '' : 'Select an org first';
-    return [
+    const items = [
       { label: 'Deploy', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : ''), run: () => runKeys('deploy', arr) },
       { label: 'Validate', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : 'Check-only deploy: validates and runs tests without deploying'), run: () => runKeys('validate', arr) },
       { label: 'Retrieve', disabled: !base, title: orgTip, run: () => runKeys('retrieve', arr) },
       { label: 'Diff', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to diff' : ''), run: () => runKeys('diff', arr) },
     ];
+    // Single component only — opening N browser tabs for a folder is never the intent.
+    if (arr.length === 1) {
+      items.push({
+        label: 'Open in Org',
+        disabled: !base || !hasLocal,
+        title: orgTip || (!hasLocal
+          ? 'Org-only — retrieve it first (the deep link is derived from the local file)'
+          : 'Open this component\'s page in the org (browser). Types without a mapped Setup page open the org home.'),
+        run: () => runKeys('openInOrg', arr)
+      });
+    }
+    return items;
   }
 
   // Sections for a right-clicked tree target. The target (a folder's items, or one
@@ -1100,72 +1118,4 @@
     return sections;
   }
 
-  // ---- Full-width error footer ----
-  function errorDetailText(card) {
-    if (card.errText) return card.errText;
-    if (card.lines && card.lines.length) return card.lines.join('\n');
-    return card.meta || '';
-  }
-
-  function renderErrorFooter() {
-    const f = $('errorFooter');
-    const card = state.lastError;
-    if (!card) { f.style.display = 'none'; f.innerHTML = ''; return; }
-    f.style.display = 'block';
-    f.innerHTML = '';
-
-    const head = document.createElement('div');
-    head.className = 'ef-head';
-    const ic = document.createElement('span');
-    ic.className = 'ef-icon';
-    ic.textContent = '✕';
-    head.appendChild(ic);
-    const title = document.createElement('span');
-    title.className = 'ef-title';
-    title.textContent = card.title || 'Error';
-    head.appendChild(title);
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'ef-btn';
-    copyBtn.textContent = 'Copy';
-    copyBtn.title = 'Copy the full error to the clipboard';
-    head.appendChild(copyBtn);
-    const dismissBtn = document.createElement('button');
-    dismissBtn.className = 'ef-btn';
-    dismissBtn.textContent = '✕';
-    dismissBtn.title = 'Dismiss';
-    dismissBtn.addEventListener('click', () => { state.lastError = null; renderErrorFooter(); });
-    head.appendChild(dismissBtn);
-    f.appendChild(head);
-
-    const detailText = errorDetailText(card);
-    if (detailText) {
-      const d = document.createElement('div');
-      d.className = 'ef-detail';
-      d.textContent = detailText;
-      f.appendChild(d);
-    }
-    if (card.actions && card.actions.length) {
-      const ul = document.createElement('ul');
-      ul.className = 'ef-actions';
-      for (const a of card.actions) {
-        const li = document.createElement('li');
-        li.textContent = a;
-        ul.appendChild(li);
-      }
-      f.appendChild(ul);
-    }
-    if (card.hint) {
-      const h = document.createElement('div');
-      h.className = 'ef-hint';
-      h.textContent = `Hint: ${card.hint}`;
-      f.appendChild(h);
-    }
-
-    copyBtn.addEventListener('click', () => {
-      const parts = [card.title, detailText];
-      if (card.actions && card.actions.length) parts.push('Try:\n' + card.actions.map(a => '• ' + a).join('\n'));
-      if (card.hint) parts.push('Hint: ' + card.hint);
-      send('copyText', { text: parts.filter(Boolean).join('\n\n') });
-    });
-  }
 })();

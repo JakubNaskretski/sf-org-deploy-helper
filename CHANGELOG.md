@@ -3,6 +3,20 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.4
+
+- New: **Open in Org.** Right-click a component → "Open in Org" opens its page in the org in
+  your browser (flows, objects, classes, permission sets, …). Types without a mapped Setup
+  page open the org home instead. One component at a time; org-only rows need a retrieve
+  first (the link is derived from the local file).
+- New: **Double-click a tree row to open its source file** in the editor. The checkbox
+  selection is left unchanged; org-only rows point to Retrieve instead.
+- Changed: **Failures notify like the rest of VS Code.** The full-width red error block at
+  the bottom of the panel is gone — it duplicated the status card and could cover half the
+  panel. Failed deploys, validations and retrieves now raise a standard VS Code error
+  notification with a **Show Output** button, and the status card — now with its own
+  **Copy** button — remains the detailed record.
+
 ## 0.6.3
 
 - Fixed: **Org compare opens the right way around.** The diff shows the org's copy on the

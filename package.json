@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",

@@ -322,33 +322,13 @@ body.resizing { cursor: row-resize; user-select: none; }
 .cmd-entry .status-dot.run { background: var(--warn); }
 .cmd-entry .dur { color: var(--muted); font-size: 10px; }
 
-/* Full-width error footer above the command log. The right-side Status cards can be
-   narrow; this surfaces the latest error across the whole panel width where a long
-   sf message is actually readable. Dismissable; replaced when a new op starts. */
-.error-footer {
-  border-top: 2px solid var(--err);
-  background: var(--vscode-inputValidation-errorBackground, rgba(244, 67, 54, 0.12));
-  color: var(--fg);
-  padding: 6px 8px; font-size: 12px;
-  max-height: 40%; overflow-y: auto; flex: none;
-}
-.error-footer .ef-head { display: flex; align-items: center; gap: 6px; }
-.error-footer .ef-icon { color: var(--err); font-weight: 700; flex: none; }
-.error-footer .ef-title { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; }
-.error-footer .ef-btn {
-  background: transparent; border: 1px solid var(--border); color: var(--fg);
+/* Copy affordance on error cards (the card is the durable error record; failures
+   additionally raise a native VS Code notification). */
+.status-card .card-copy {
+  margin-top: 4px; background: transparent; border: 1px solid var(--border); color: var(--fg);
   border-radius: 2px; padding: 1px 7px; cursor: pointer; font-size: 11px; font-family: inherit;
-  flex: none;
 }
-.error-footer .ef-btn:hover { background: var(--row-hover); }
-.error-footer .ef-detail {
-  margin-top: 4px; white-space: pre-wrap; word-break: break-word;
-  font-family: var(--vscode-editor-font-family); font-size: 11px;
-  color: var(--err); max-height: 160px; overflow-y: auto;
-}
-.error-footer .ef-actions { margin: 4px 0 0 0; padding-left: 16px; font-size: 11px; }
-.error-footer .ef-actions li { margin: 1px 0; }
-.error-footer .ef-hint { margin-top: 4px; font-size: 11px; color: var(--warn); }
+.status-card .card-copy:hover { background: var(--row-hover); }
 
 .spinner {
   display: inline-block; width: 10px; height: 10px;
@@ -466,8 +446,6 @@ body.resizing { cursor: row-resize; user-select: none; }
       </div>
     </div>
   </div>
-
-  <div id="errorFooter" class="error-footer" style="display:none;"></div>
 
   <div id="cmdlog" class="cmdlog">
     <div class="section-header" id="cmdlogHeader">
