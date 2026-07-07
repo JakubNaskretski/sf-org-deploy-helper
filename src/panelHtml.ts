@@ -363,11 +363,18 @@ body.resizing { cursor: row-resize; user-select: none; }
      base theme. The old inputValidation-warningBackground + general foreground
      mix rendered near-white text on bright yellow in themes that define the
      background but not inputValidation.warningForeground. */
-  padding: 6px 8px; background: var(--vscode-statusBarItem-warningBackground, #7a6400);
+  padding: 6px 12px; background: var(--vscode-statusBarItem-warningBackground, #7a6400);
   color: var(--vscode-statusBarItem-warningForeground, #ffffff);
   border-bottom: 1px solid var(--border);
   font-size: 12px;
+  gap: 8px; align-items: flex-start; /* flex layout when the notice carries a dismiss ✕ */
 }
+.banner .banner-text { flex: 1; min-width: 0; }
+.banner .banner-close {
+  flex: none; background: transparent; border: none; color: inherit;
+  cursor: pointer; padding: 0 2px; font-size: 12px; opacity: 0.8; line-height: 1.4;
+}
+.banner .banner-close:hover { opacity: 1; }
 
 /* Right-click context menu for the tree: deploy / retrieve / diff a whole folder
    (group) or a single component without first ticking checkboxes. Positioned at the

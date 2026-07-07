@@ -3,6 +3,26 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.3
+
+- Fixed: **Org compare opens the right way around.** The diff shows the org's copy on the
+  left (read-only) and your local file on the right, so the diff editor's copy-change arrows
+  pull org-side changes into your local file. Previously the sides were reversed and the
+  arrows copied local text into a throwaway temp file that never reached the org.
+- Fixed: **The test-level picker applies to every deploy.** Deploys started from the tree's
+  right-click menu or the editor context menu now honor the selected Apex test level —
+  previously only the action bar's Deploy/Validate buttons did, and the other paths silently
+  used the defaults. The picker's choice also survives closing and reopening the panel.
+- New: **Validate from the right-click menu.** Tree rows, folders and the current selection
+  offer check-only validation from the context menu, not just from the action bar.
+- Fixed: commands started from the status bar, Command Palette, or editor context menu could
+  fail without any message (for example when saving the org selection fails); they now show
+  an error notification with a **Show Output** button.
+- Improved: the "couldn't resolve metadata type" notice can be dismissed (✕) and stays
+  dismissed until its content changes; banner side padding improved.
+- Improved: starting an operation while another is running now tells you which one is
+  running; the type filter reads "0 of N types" when None is selected.
+
 ## 0.6.2
 
 - Fixed: **Type-resolution failures now say why.** When metadata types can't be resolved

@@ -16,6 +16,7 @@ type Inbound =
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
   | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel }
+  | { type: 'setTestLevel'; testLevel?: TestLevel }
   | { type: 'quickDeploy'; jobId: string }
   | { type: 'retrieve'; keys: string[] }
   | { type: 'diff'; keys: string[] }
@@ -54,6 +55,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Folders whose type resolution via the CLI registry failed this session —
    *  skipped on rescans so a refresh doesn't respawn `sf` for a lost cause. */
   private unresolvableFolders = new Set<string>();
+  /** Panel-chosen Apex test level, mirrored here so EVERY deploy entry point
+   *  (tree context menu, editor right-click, palette) honors it — previously only
+   *  the two bottom-bar buttons did, and the others silently used defaults. */
+  private testLevel: TestLevel | undefined;
   /** First underlying CLI error from the latest type-resolution run — shown in
    *  the scan banner so wholesale failures name their cause in-panel. */
   private resolveErrorSample: string | undefined;
@@ -210,6 +215,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // sidebar was collapsed) doesn't show enabled buttons during a running op.
         this.post({ type: 'busy', busy: this.busy, action: this.currentAction });
         if (this.busy && this.currentProgressText) this.post({ type: 'progress', text: this.currentProgressText });
+        // Restore the test-level select after a webview rebuild — the provider is
+        // the source of truth so a collapsed/reopened panel can't silently diverge.
+        this.post({ type: 'testLevel', value: this.testLevel ?? '' });
+        return;
+      case 'setTestLevel':
+        this.testLevel = msg.testLevel;
         return;
       case 'refreshOrgs':
         await this.loadOrgs(true);
@@ -520,6 +531,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // sandbox defaults to no tests. Validate-only always runs tests, so force at
       // least RunLocalTests there.
       const testLevel: TestLevel = opts.testLevel
+        ?? this.testLevel
         ?? (opts.validateOnly || isProd ? 'RunLocalTests' : 'NoTestRun');
       const testNote = testLevel === 'NoTestRun' ? '' : `\n\nTests: ${testLevel}`;
 
@@ -1347,7 +1359,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    */
   private reserveBusy(action: string): boolean {
     if (this.busy) {
-      vscode.window.showInformationMessage('Another operation is already running.');
+      vscode.window.showInformationMessage(this.currentAction
+        ? `${this.currentAction} is already running — cancel it from the panel or wait for it to finish.`
+        : 'Another operation is already running.');
       return false;
     }
     this.setBusy(true, action);
@@ -1388,8 +1402,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn): Promise<void> {
-    const title = `${item.type}:${item.name} — Local ↔ ${orgLabel}`;
-    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(item.filePath), vscode.Uri.file(remoteFile), title, { preview: false, viewColumn });
+    // Org copy LEFT (read-only staged temp), local file RIGHT (the editable side) —
+    // matches git / the official Salesforce extension, and makes the diff editor's
+    // copy-block arrows pull org changes INTO the local file. The reverse order made
+    // the arrows "copy" local blocks into a doomed temp file that never reaches the
+    // org (deploy is the only upload path).
+    const title = `${item.type}:${item.name} — ${orgLabel} ↔ Local`;
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(item.filePath), title, { preview: false, viewColumn });
   }
 
   private reportCancelled(action: string, note?: string): void {
@@ -1621,6 +1640,10 @@ async function stageDiffCopy(srcPath: string, item: MetadataItem): Promise<{ fil
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-diff-stage-'));
   const dest = path.join(dir, safeStagedName(item, path.basename(srcPath)));
   await fs.copyFile(srcPath, dest);
+  // Read-only so the org side of the diff can't be edited by mistake — edits there
+  // would die with the temp dir. (Cleanup uses rm(force); a failure is swallowed,
+  // worst case on Windows a staged file lingers until OS temp cleaning.)
+  await fs.chmod(dest, 0o444);
   return { file: dest, dir };
 }
 
@@ -1630,6 +1653,7 @@ async function stageDiffText(content: string, item: MetadataItem): Promise<{ fil
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-diff-stage-'));
   const file = path.join(dir, safeStagedName(item, path.basename(item.filePath)));
   await fs.writeFile(file, content, 'utf8');
+  await fs.chmod(file, 0o444); // read-only — see stageDiffCopy
   return { file, dir };
 }
 

@@ -40,13 +40,27 @@ export function activate(context: vscode.ExtensionContext): void {
       // apex editor plugins in this family.
       webviewOptions: { retainContextWhenHidden: true }
     }),
-    vscode.commands.registerCommand('sfOrgDeployWrapper.selectOrg', () => provider.pickOrg()),
-    vscode.commands.registerCommand('sfOrgDeployWrapper.refreshFiles', () => provider.refreshFiles()),
-    vscode.commands.registerCommand('sfOrgDeployWrapper.deployFile', (uri?: vscode.Uri) => provider.deployFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    vscode.commands.registerCommand('sfOrgDeployWrapper.retrieveFile', (uri?: vscode.Uri) => provider.retrieveFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    vscode.commands.registerCommand('sfOrgDeployWrapper.diffFile', (uri?: vscode.Uri) => provider.diffFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    vscode.commands.registerCommand('sfOrgDeployWrapper.diffFileWithOrg', (uri?: vscode.Uri) => provider.diffFileWithOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri))
+    registerSafe('sfOrgDeployWrapper.selectOrg', () => provider.pickOrg()),
+    registerSafe('sfOrgDeployWrapper.refreshFiles', () => provider.refreshFiles()),
+    registerSafe('sfOrgDeployWrapper.deployFile', (uri?: vscode.Uri) => provider.deployFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.retrieveFile', (uri?: vscode.Uri) => provider.retrieveFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.diffFile', (uri?: vscode.Uri) => provider.diffFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.diffFileWithOrg', (uri?: vscode.Uri) => provider.diffFileWithOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri))
   );
+
+  // A rejected command handler (e.g. the status-bar org pick failing to save the
+  // shared setting) is otherwise an unhandled rejection the user never sees.
+  function registerSafe(id: string, fn: (...args: [vscode.Uri?]) => Promise<void> | void): vscode.Disposable {
+    return vscode.commands.registerCommand(id, (...args: [vscode.Uri?]) => {
+      void Promise.resolve(fn(...args)).catch(err => {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[${id}] ${msg}`);
+        void vscode.window.showErrorMessage(`SF Deploy: ${msg}`, 'Show Output').then(choice => {
+          if (choice === 'Show Output') output.show(true);
+        });
+      });
+    });
+  }
 }
 
 export function deactivate(): void {

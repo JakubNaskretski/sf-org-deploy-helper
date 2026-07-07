@@ -26,6 +26,9 @@
     // Scan/type-resolution notices get their own slot so they can't overwrite an
     // org error (both used to share the single banner, last writer won).
     scanBanner: '',
+    // The exact notice text the user dismissed — the same recurring notice stays
+    // hidden across reloads, but any NEW text (different folders/reason) reappears.
+    scanBannerDismissed: persisted.scanBannerDismissed || null,
     // Org metadata browse state
     orgKeys: new Set(),      // "Type:Name" keys that exist on the org
     localKeys: new Set(),    // "Type:Name" keys that exist locally
@@ -40,7 +43,8 @@
       filter: state.filter,
       typeFilter: Array.from(state.typeFilter),
       cmdLogCollapsed: state.cmdLogCollapsed,
-      statusRatio: state.statusRatio
+      statusRatio: state.statusRatio,
+      scanBannerDismissed: state.scanBannerDismissed
     });
   }
 
@@ -64,6 +68,9 @@
     searchTimer = setTimeout(() => { state.filter = v; savePersisted(); renderTree(); }, 200);
   });
   $('search').value = state.filter;
+  // Mirror the chosen test level to the provider so context-menu and editor
+  // right-click deploys honor it too (they don't read this DOM).
+  $('testLevel').addEventListener('change', (e) => send('setTestLevel', { testLevel: e.target.value || undefined }));
   $('deployBtn').addEventListener('click', () => action('deploy'));
   $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
@@ -172,6 +179,9 @@
         state.scanBanner = msg.message || '';
         renderBanner();
         return;
+      case 'testLevel':
+        if ($('testLevel')) $('testLevel').value = msg.value || '';
+        return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
         if (msg.key && msg.select) {
@@ -267,12 +277,25 @@
   }
 
   function renderBanner() {
-    for (const [id, text] of [['banner', state.banner], ['scanBanner', state.scanBanner]]) {
-      const el = $(id);
-      if (!text) { el.style.display = 'none'; continue; }
-      el.style.display = 'block';
-      el.textContent = text;
-    }
+    const b = $('banner');
+    if (!state.banner) { b.style.display = 'none'; } else { b.style.display = 'block'; b.textContent = state.banner; }
+    // Scan notice is informational (folders hidden from the tree) — dismissible,
+    // unlike the org banner which reflects live actionable state.
+    const sb = $('scanBanner');
+    const show = state.scanBanner && state.scanBanner !== state.scanBannerDismissed;
+    if (!show) { sb.style.display = 'none'; return; }
+    sb.style.display = 'flex';
+    sb.replaceChildren();
+    const txt = document.createElement('span');
+    txt.className = 'banner-text';
+    txt.textContent = state.scanBanner;
+    const x = document.createElement('button');
+    x.className = 'banner-close';
+    x.textContent = '✕';
+    x.title = 'Dismiss — unresolved folders stay hidden from the tree; details in Output › "SF Org Deploy Wrapper"';
+    x.addEventListener('click', () => { state.scanBannerDismissed = state.scanBanner; savePersisted(); renderBanner(); });
+    sb.appendChild(txt);
+    sb.appendChild(x);
   }
 
   function renderSourceFilter() {
@@ -336,7 +359,9 @@
     list.appendChild(actions);
     label.textContent = state.typeFilter.size === 0
       ? `All types (${types.length})`
-      : `${state.typeFilter.size} of ${types.length} types`;
+      : state.typeFilter.has('__none__')
+        ? `0 of ${types.length} types`
+        : `${state.typeFilter.size} of ${types.length} types`;
   }
 
   function isTypeAllowed(type) {
@@ -1039,6 +1064,7 @@
 
   function runKeys(kind, keys) {
     if (state.busy || !state.selectedOrg || !keys || !keys.length) return;
+    if (kind === 'validate') return send('deploy', { keys, validateOnly: true });
     send(kind, { keys });
   }
 
@@ -1052,6 +1078,7 @@
     const orgTip = state.selectedOrg ? '' : 'Select an org first';
     return [
       { label: 'Deploy', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : ''), run: () => runKeys('deploy', arr) },
+      { label: 'Validate', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : 'Check-only deploy: validates and runs tests without deploying'), run: () => runKeys('validate', arr) },
       { label: 'Retrieve', disabled: !base, title: orgTip, run: () => runKeys('retrieve', arr) },
       { label: 'Diff', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to diff' : ''), run: () => runKeys('diff', arr) },
     ];
