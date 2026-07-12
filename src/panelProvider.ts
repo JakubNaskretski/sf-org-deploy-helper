@@ -29,6 +29,12 @@ interface OrgPayload { username: string; alias?: string; label: string; kind: 'p
 
 /** globalState key for folder→type rules learned from the sf CLI registry. */
 const LEARNED_RULES_KEY = 'learnedTypeRules';
+/** globalState key for folders whose type resolution failed — the negative cache
+ *  (same TTL as learned rules). Without it every NEW session re-paid the serial
+ *  30s-per-folder registry calls before a context-menu deploy could even confirm. */
+const UNRESOLVABLE_KEY = 'unresolvableTypeFolders';
+
+interface UnresolvableEntry { folder: string; at: number }
 
 export class DeployPanelProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'sfOrgDeployWrapper.panel';
@@ -54,9 +60,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The org username `orgMembers` was fetched from — guards against using a stale
    *  membership map after the user switches the target org. */
   private orgMembersOrg?: string;
-  /** Folders whose type resolution via the CLI registry failed this session —
-   *  skipped on rescans so a refresh doesn't respawn `sf` for a lost cause. */
-  private unresolvableFolders = new Set<string>();
+  /** Folders whose type resolution via the CLI registry failed — skipped on
+   *  rescans so a refresh doesn't respawn `sf` for a lost cause. Backed by
+   *  globalState with the learned-rules TTL; lazily loaded via `unresolvable()`.
+   *  An explicit Refresh Files clears it (the deliberate retry path). */
+  private unresolvableFolders?: Set<string>;
   /** Panel-chosen Apex test level, mirrored here so EVERY deploy entry point
    *  (tree context menu, editor right-click, palette) honors it — previously only
    *  the two bottom-bar buttons did, and the others silently used defaults. */
@@ -131,6 +139,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   async refreshFiles(): Promise<void> {
+    // Explicit refresh is the retry path: clear the negative cache so folders
+    // that failed resolution (CLI fixed, folder cleaned up, …) get another shot.
+    // Automatic rescans keep skipping them until the TTL expires.
+    // Storage first, then the in-memory set — the reverse order would leave the
+    // persisted junk in place if hydration ever failed, killing the repair path.
+    await this.context.globalState.update(UNRESOLVABLE_KEY, []);
+    this.unresolvable().clear();
     await this.loadFiles();
   }
 
@@ -158,8 +173,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       vscode.window.showInformationMessage('No file selected.');
       return;
     }
-    // Make sure the items list is fresh (the user may not have opened the panel yet).
-    if (this.items.length === 0) await this.loadFiles();
+    // Make sure the items list is fresh (the user may not have opened the panel
+    // yet) — but with a FAST scan (static + learned rules only). Resolving
+    // unknown folders via the CLI registry is the panel tree's concern; doing it
+    // here stalled context-menu ops for up to 30s per unknown folder before the
+    // confirm dialog could show. If the clicked file itself is in an unknown
+    // folder, resolveItemViaCli below resolves just that one file. When a full
+    // scan is already running (panel opening in parallel), share it instead.
+    if (this.items.length === 0) {
+      if (this.loadFilesInflight) await this.loadFilesInflight;
+      else {
+        const scan = await scanWorkspace(this.learnedRules());
+        this.items = scan.items;
+        this.workspaceRoot = scan.root;
+      }
+    }
     // Load orgs too so the production guard can classify the target on deploys
     // initiated from the explorer/editor context menu (panel may never have opened).
     if (this.orgs.length === 0) await this.loadOrgs();
@@ -228,7 +256,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await this.loadOrgs(true);
         return;
       case 'refreshFiles':
-        await this.loadFiles();
+        await this.refreshFiles();
         return;
       case 'fetchOrgMetadata':
         // Trust the org the webview has selected, applied before we read it back —
@@ -372,11 +400,51 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     await this.context.globalState.update(LEARNED_RULES_KEY, next);
   }
 
+  /** Negative-cache twin of `learnedRules()`: folders that failed resolution (or
+   *  yielded no derivable rule), persisted with the same TTL. Lazily hydrated
+   *  from globalState so a new session skips them too. Cache off (0 days) →
+   *  session-only behavior, as before. */
+  /** Stored negative-cache entries, shape-validated (the state DB can hand back
+   *  junk after corruption or manual edits — a raw `.filter` on it would throw
+   *  and take every scan down with it) and TTL-pruned. Never throws. */
+  private readUnresolvableEntries(cutoff: number): UnresolvableEntry[] {
+    const raw = this.context.globalState.get<unknown>(UNRESOLVABLE_KEY, []);
+    if (!Array.isArray(raw)) return [];
+    const valid = (e: unknown): e is UnresolvableEntry => {
+      const r = e as Partial<UnresolvableEntry> | null | undefined;
+      return !!r && typeof r.folder === 'string' && typeof r.at === 'number';
+    };
+    return raw.filter(valid).filter(e => e.at >= cutoff);
+  }
+
+  private unresolvable(): Set<string> {
+    if (!this.unresolvableFolders) {
+      const days = this.typeCacheDays();
+      const kept = days > 0 ? this.readUnresolvableEntries(Date.now() - days * 86_400_000) : [];
+      this.unresolvableFolders = new Set(kept.map(e => e.folder));
+    }
+    return this.unresolvableFolders;
+  }
+
+  private markUnresolvable(folder: string): void {
+    this.unresolvable().add(folder);
+    const days = this.typeCacheDays();
+    if (days <= 0) return;
+    const next = this.readUnresolvableEntries(Date.now() - days * 86_400_000).filter(e => e.folder !== folder);
+    next.push({ folder, at: Date.now() });
+    // Cap the persisted list so a workspace with thousands of junk folders can't
+    // bloat the state DB — entries are time-ordered, drop the oldest.
+    if (next.length > 500) next.splice(0, next.length - 500);
+    // A lost write only costs one retry next session — log, don't surface.
+    void Promise.resolve(this.context.globalState.update(UNRESOLVABLE_KEY, next))
+      .catch(err => this.output.appendLine(`[typeResolve] negative-cache write failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
   /** Resolve unknown folders' types via the CLI registry, one call per folder so
    *  a folder of junk (TypeInferenceError) can't block a legit one. Returns the
    *  learned rules (also cached) — returned directly so they reach the caller's
    *  rescan even when the cache is disabled (typeCacheDays 0). Failures are
-   *  logged and skipped for the session. */
+   *  logged and negative-cached for typeCacheDays (Refresh Files retries). */
   private async learnRulesForFolders(folders: string[], root: string): Promise<FolderRule[]> {
     const learned: FolderRule[] = [];
     this.resolveErrorSample = undefined;
@@ -398,11 +466,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (ruleFound) {
           this.output.appendLine(`[typeResolve] learned ${label} → ${types.map(t => t.type).join(', ')} (sf registry, cached ${this.typeCacheDays()}d)`);
         } else {
-          this.unresolvableFolders.add(folder);
+          this.markUnresolvable(folder);
           this.output.appendLine(`[typeResolve] ${label}: resolved ${types.map(t => t.type).join(', ') || 'nothing'} but no per-file rule derivable — not shown in tree (deploy via right-click still works)`);
         }
       } catch (err) {
-        this.unresolvableFolders.add(folder);
+        this.markUnresolvable(folder);
         const msg = stripAnsi(err instanceof Error ? err.message : String(err)).trim();
         if (!this.resolveErrorSample) this.resolveErrorSample = msg;
         this.logSfVersionOnce();
@@ -452,12 +520,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async loadFiles(): Promise<void> {
+  /** In-flight scan shared by concurrent callers — panel `ready` and a
+   *  context-menu command can both request a scan at once; without this each
+   *  spawned its own serial registry resolution (duplicate `sf` processes and
+   *  stacked "Resolving metadata types" progress toasts). */
+  private loadFilesInflight?: Promise<void>;
+
+  private loadFiles(): Promise<void> {
+    return this.loadFilesInflight ??= this.doLoadFiles().finally(() => { this.loadFilesInflight = undefined; });
+  }
+
+  private async doLoadFiles(): Promise<void> {
     let scan = await scanWorkspace(this.learnedRules());
     // Folders no rule covers: resolve their types via the CLI registry, then
-    // rescan so they land in the tree. Learned rules persist, so this spawns
-    // `sf` only for genuinely new folders (or after cache expiry).
-    const pending = scan.unknownFolders.filter(f => !this.unresolvableFolders.has(f));
+    // rescan so they land in the tree. Learned rules AND failures persist, so
+    // this spawns `sf` only for genuinely new folders (or after cache expiry).
+    const pending = scan.unknownFolders.filter(f => !this.unresolvable().has(f));
     let resolveFailures: string[] = [];
     if (pending.length && scan.root) {
       const scanRoot = scan.root;
@@ -467,7 +545,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // Fresh rules are passed directly (not just via the cache) so the rescan
       // sees them even with typeCacheDays 0.
       if (fresh.length) scan = await scanWorkspace([...this.learnedRules(), ...fresh]);
-      resolveFailures = pending.filter(f => this.unresolvableFolders.has(f)).map(f => path.basename(f));
+      resolveFailures = pending.filter(f => this.unresolvable().has(f)).map(f => path.basename(f));
     }
     const scanNotice = resolveFailures.length
       ? `Couldn't resolve metadata type for: ${resolveFailures.join(', ')}` +

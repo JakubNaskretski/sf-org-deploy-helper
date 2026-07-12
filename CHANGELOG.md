@@ -3,6 +3,23 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.6.5
+
+- Fixed: **Right-click deploys no longer stall in a fresh window.** Deploy, Retrieve and
+  Compare from the Explorer or editor context menu used to run the panel's full workspace
+  type-resolution (one `sf` call per unrecognized folder, up to 30 seconds each) before
+  showing the org confirmation — in a new VS Code session this looked like the extension
+  hanging, with only "Resolving metadata types" popups for feedback. Context-menu actions
+  now do a fast local scan and resolve only the file you clicked, so the confirmation
+  appears right away.
+- Fixed: **Folders that fail type resolution are remembered between sessions.** Previously
+  only successful lookups were cached, so every new window re-paid the slow failing ones.
+  Failures now follow the same `typeCacheDays` cache; **Refresh Files** clears it and
+  retries everything.
+- Fixed: **Concurrent scans no longer double up.** Opening the panel while a context-menu
+  action is already scanning shares the one scan instead of spawning duplicate `sf`
+  processes and stacked progress notifications.
+
 ## 0.6.4
 
 - New: **Open in Org.** Right-click a component → "Open in Org" opens its page in the org in
