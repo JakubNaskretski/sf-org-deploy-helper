@@ -3,6 +3,29 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.7.0
+
+- New: **Three tree views — All, Selected, Changed.** Tabs above the search box switch the
+  tree between everything, your current pick list, and the components whose files have
+  uncommitted git changes (new files included) — the "what do I need to deploy" view.
+  Checkboxes are one selection everywhere: tick things in Changed, prune them in Selected,
+  deploy from any tab. Changed refreshes on every file save and says why when git can't
+  answer; deleted files aren't listed (deploys can't delete). The selected-chips tray is
+  replaced by the Selected view — unchecking there keeps the row visible until you re-enter
+  the tab, so an accidental untick is one click to undo and double-click-to-open stays safe.
+- New: **Smarter search.** Word tokens match in any order (`acc trig`), camelCase initials
+  work (`avt` finds `AccountValidationTrigger`), and `type:flow` / `t:field` narrows by
+  metadata type.
+- Fixed: **Failure notifications lead somewhere useful.** The error toast now offers
+  **Show Panel** — the status card with the full per-component and test failures — alongside
+  Show Output, and those failure details are now also written to the output channel, which
+  previously contained nothing about a failed deployment. The last result card is replayed
+  when the panel opens, so a failed right-click deploy with the sidebar closed no longer
+  vanishes without a trace.
+- Fixed: **Rescan always rescans.** Clicking it while a scan was already running silently
+  joined that scan; it now queues a fresh one. Toolbar buttons locked during an operation
+  explain why in their tooltip.
+
 ## 0.6.5
 
 - Fixed: **Right-click deploys no longer stall in a fresh window.** Deploy, Retrieve and

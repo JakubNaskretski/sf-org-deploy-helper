@@ -23,7 +23,15 @@ type Inbound =
   | { type: 'openFile'; key: string }
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
+  | { type: 'refreshChanged' }
   | { type: 'cancel' };
+
+// Minimal structural slice of the built-in vscode.git extension's API (v1) —
+// just what change detection reads; no dependency on the full git.d.ts.
+interface GitChangeLite { uri?: vscode.Uri }
+interface GitRepoLite { state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[] } }
+interface GitApiLite { repositories: GitRepoLite[] }
+interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
 
@@ -95,7 +103,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       void this.handleMessage(m).catch(err => this.reportError(m?.type ?? 'panel action', err));
     });
     const editorChangeSub = vscode.window.onDidChangeActiveTextEditor(() => this.sendActiveFile());
-    view.onDidDispose(() => { editorChangeSub.dispose(); this.view = undefined; });
+    // Keep the "Changed" lens and its tab badge live through the edit→deploy loop:
+    // saving a file is the moment git-dirty state actually changes. Debounced —
+    // and cheap anyway (reads the git extension's in-memory state, no spawn).
+    const saveSub = vscode.workspace.onDidSaveTextDocument(() => this.scheduleChangedRefresh());
+    view.onDidDispose(() => {
+      editorChangeSub.dispose();
+      saveSub.dispose();
+      if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
+      this.view = undefined;
+    });
   }
 
   // ---- Public commands ----
@@ -146,6 +163,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // persisted junk in place if hydration ever failed, killing the repair path.
     await this.context.globalState.update(UNRESOLVABLE_KEY, []);
     this.unresolvable().clear();
+    // A refresh must RUN a fresh scan. Joining an in-flight one (what the plain
+    // single-flight would do) silently skips the retry the user just asked for —
+    // the click looks dead. Let the running scan finish, then go again.
+    if (this.loadFilesInflight) await this.loadFilesInflight.catch(() => undefined);
     await this.loadFiles();
   }
 
@@ -248,6 +269,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Restore the test-level select after a webview rebuild — the provider is
         // the source of truth so a collapsed/reopened panel can't silently diverge.
         this.post({ type: 'testLevel', value: this.testLevel ?? '' });
+        // Replay the last result card into a freshly-built webview, so opening
+        // the panel after a context-menu operation shows its outcome.
+        if (this.lastStatusCard) this.post(this.lastStatusCard);
         return;
       case 'setTestLevel':
         this.testLevel = msg.testLevel;
@@ -294,6 +318,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
       case 'openInOrg':
         await this.openComponentInOrg(msg.keys?.[0]);
+        return;
+      case 'refreshChanged':
+        await this.postChangedComponents();
         return;
       case 'copyText':
         if (msg.text) {
@@ -566,6 +593,79 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         files: i.files
       }))
     });
+    // Keep the "Changed" view honest against the fresh item list. Fire-and-forget:
+    // the method never throws, and the tree must not wait on git.
+    void this.postChangedComponents();
+  }
+
+  private changedRefreshTimer?: ReturnType<typeof setTimeout>;
+
+  private scheduleChangedRefresh(): void {
+    if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
+    this.changedRefreshTimer = setTimeout(() => { void this.postChangedComponents(); }, 500);
+  }
+
+  /** Compute which local components have uncommitted git changes (working tree +
+   *  index — includes untracked files, i.e. brand-new components) via the built-in
+   *  vscode.git extension, and post their keys for the "Changed" view. Posts
+   *  `keys: null` with a reason when git can't answer, so the view says why
+   *  instead of showing a false "no changes". Never throws. */
+  private async postChangedComponents(): Promise<void> {
+    try {
+      const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
+      if (!gitExt) {
+        this.post({ type: 'changed', keys: null, reason: 'Change detection unavailable — VS Code git extension is disabled.' });
+        return;
+      }
+      const api = (gitExt.isActive ? gitExt.exports : await gitExt.activate()).getAPI(1);
+      if (api.repositories.length === 0) {
+        this.post({ type: 'changed', keys: null, reason: 'Change detection unavailable — workspace is not a git repository.' });
+        return;
+      }
+      // A pathological repo can report tens of thousands of changed paths
+      // (untracked count too), and per-path findItemForPath scans would be
+      // O(paths × items) on the extension-host thread. Precompute lookup maps
+      // once — same matching (exact primary file > listed file > containing
+      // bundle folder, via ancestor walk) at O(items + paths).
+      const byPrimary = new Map<string, string>();
+      const byFile = new Map<string, string>();
+      const byDir = new Map<string, string>();
+      for (const item of this.items) {
+        const key = `${item.type}:${item.name}`;
+        if (item.filePath) {
+          const p = path.normalize(item.filePath);
+          if (!byPrimary.has(p)) byPrimary.set(p, key);
+          if (!byDir.has(p)) byDir.set(p, key); // bundles: filePath is the folder
+        }
+        for (const f of item.files) {
+          const p = path.normalize(f);
+          if (!byFile.has(p)) byFile.set(p, key);
+        }
+      }
+      const seen = new Set<string>();
+      const keys = new Set<string>();
+      for (const repo of api.repositories) {
+        for (const change of [...repo.state.workingTreeChanges, ...repo.state.indexChanges]) {
+          const fsPath = change.uri?.fsPath;
+          if (!fsPath) continue;
+          const p = path.normalize(fsPath);
+          if (seen.has(p)) continue; // a staged+modified file appears in both lists
+          seen.add(p);
+          let key = byPrimary.get(p) ?? byFile.get(p);
+          for (let dir = path.dirname(p); !key; ) {
+            key = byDir.get(dir);
+            const parent = path.dirname(dir);
+            if (parent === dir) break;
+            dir = parent;
+          }
+          if (key) keys.add(key);
+        }
+      }
+      this.post({ type: 'changed', keys: [...keys] });
+    } catch (err) {
+      this.output.appendLine(`[changed] git change detection failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.post({ type: 'changed', keys: null, reason: 'Change detection failed — see the output channel.' });
+    }
   }
 
   private sendActiveFile(notifyIfMissing = false, selectAndScroll = false): void {
@@ -773,7 +873,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           lines: [...errLines, ...testLines, ...skipLines]
         }
       });
-      this.failureToast(`${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`);
+      this.failureToast(
+        `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`,
+        [...errLines, ...testLines]
+      );
     }
   }
 
@@ -831,16 +934,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           } else {
             const failures = result.details?.componentFailures
               ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+            const failLines = failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
             this.post({
               type: 'status',
               card: {
                 kind: 'err',
                 title: `Quick Deploy failed against ${orgLabel}`,
                 meta: 'The validation may have expired (validated deployments are valid for ~10 days; the org may also have changed).',
-                lines: failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`)
+                lines: failLines
               }
             });
-            this.failureToast(`Quick Deploy failed against ${orgLabel}.`);
+            this.failureToast(`Quick Deploy failed against ${orgLabel}.`, failLines);
           }
         });
       } catch (err) {
@@ -944,7 +1048,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               lines
             }
           });
-          if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`);
+          if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
@@ -1548,7 +1652,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'orgs', orgs: payload, selected: this.orgStore.get() ?? null });
   }
 
+  /** Latest status card, retained so a panel opened AFTER an operation (e.g. a
+   *  context-menu deploy that failed with the sidebar closed) still shows the
+   *  result — posting into a closed webview is a silent no-op, and the "Show
+   *  Panel" toast button would otherwise open an empty panel. */
+  private lastStatusCard?: unknown;
+
   private post(msg: unknown): void {
+    const m = msg as { type?: string; card?: unknown } | null;
+    if (m?.type === 'status' && m.card) this.lastStatusCard = msg;
     this.view?.webview.postMessage(msg);
   }
 
@@ -1590,8 +1702,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  failures on a completed run). Exceptions already toast via reportError; this
    *  covers the "command succeeded, deployment failed" outcomes. The status card
    *  in the panel stays the durable, detailed record. */
-  private failureToast(message: string): void {
-    void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Output').then(choice => {
+  private failureToast(message: string, detailLines: string[] = []): void {
+    // The panel's status card is the detailed record — the toast points there
+    // first. The details are ALSO mirrored into the output channel: result-level
+    // failures previously wrote nothing to it, which made "Show Output" open a
+    // log that never mentioned the failure.
+    this.output.appendLine(`[result] ${message}`);
+    // Failure lines are org-controlled text — flatten control chars so a hostile
+    // org can't forge extra "[result] …" lines or splatter ANSI into the log.
+    for (const line of detailLines) this.output.appendLine(`  ${stripAnsi(line).replace(/[\x00-\x1f\x7f]/g, ' ')}`);
+    void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Panel', 'Show Output').then(choice => {
+      if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
       if (choice === 'Show Output') this.output.show(true);
     });
   }
@@ -1611,7 +1732,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         hint: hintForError(err)
       }
     });
-    vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Output').then(choice => {
+    vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
+      if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
       if (choice === 'Show Output') this.output.show(true);
     });
   }

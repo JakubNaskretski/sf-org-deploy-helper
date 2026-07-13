@@ -113,36 +113,29 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .tree-search input { width: 100%; }
 
-/* Pinned "Selected" tray above the tree: mirrors the checked components as removable
-   chips so the current selection is always visible without scrolling. Bounded height
-   + own scroll so growing the selection never pushes the page around — and the tree
-   below never reorders (items stay in their groups), so the layout stays stable. */
-.selected-tray {
-  flex: none; padding: 4px 8px; border-bottom: 1px solid var(--border);
-  max-height: 92px; overflow-y: auto;
-  display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start;
+/* View modes: All | Selected | Changed — one tree, three lenses (IntelliJ-style).
+   Replaces the selected-chip tray: the Selected view IS the selection, fully
+   navigable with live checkboxes, and Changed shows git-modified components. */
+.view-modes {
+  display: flex; gap: 2px; padding: 4px 8px 0 8px; border-bottom: 1px solid var(--border);
 }
-.selected-tray .tray-head {
-  width: 100%; display: flex; align-items: center; justify-content: space-between;
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted);
+.view-modes button {
+  flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); cursor: pointer; font-family: inherit; font-size: 12px;
+  padding: 3px 4px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.selected-tray .tray-clear {
-  background: transparent; border: none; color: var(--muted);
-  cursor: pointer; font-size: 11px; font-family: inherit; padding: 0;
+.view-modes button:hover { color: var(--fg); background: var(--row-hover); }
+.view-modes button.active { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+/* Slim per-mode header inside the tree (e.g. "5 selected — Clear all"). */
+.mode-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 2px 10px; font-size: 11px; color: var(--muted);
 }
-.selected-tray .tray-clear:hover { color: var(--fg); text-decoration: underline; }
-.chip {
-  display: inline-flex; align-items: center; gap: 2px; max-width: 100%;
-  background: var(--row-active); border: 1px solid var(--border);
-  border-radius: 10px; padding: 0 2px 0 8px; font-size: 11px; line-height: 18px;
+.mode-head button {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 11px; font-family: inherit; padding: 0;
 }
-.chip .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chip .chip-x {
-  flex: none; cursor: pointer; border: none; background: transparent;
-  color: var(--muted); font-size: 13px; line-height: 1; padding: 1px 3px;
-  border-radius: 8px; font-family: inherit;
-}
-.chip .chip-x:hover { color: var(--fg); background: var(--row-hover); }
+.mode-head button:hover { color: var(--fg); text-decoration: underline; }
 .type-filter-row { margin-top: 4px; font-size: 11px; }
 /* Custom disclosure caret: the native <summary> marker renders misaligned in the
    webview (pushed right), which made the whole filter list look skewed. */
@@ -398,8 +391,13 @@ body.resizing { cursor: row-resize; user-select: none; }
 
   <div class="body">
     <div class="left">
+      <div id="viewModes" class="view-modes" role="tablist">
+        <button id="modeAll" data-mode="all" role="tab">All</button>
+        <button id="modeSelected" data-mode="selected" role="tab">Selected</button>
+        <button id="modeChanged" data-mode="changed" role="tab" title="Components whose files have uncommitted git changes">Changed</button>
+      </div>
       <div class="tree-search">
-        <input id="search" type="text" placeholder="Filter… (type or name)" />
+        <input id="search" type="text" placeholder="Filter… tokens · initials (avt) · type:flow" />
         <div id="sourceFilterRow" style="display:none;">
           <select id="sourceFilter">
             <option value="all">All sources</option>
@@ -415,7 +413,6 @@ body.resizing { cursor: row-resize; user-select: none; }
           </details>
         </div>
       </div>
-      <div id="selectedTray" class="selected-tray" style="display:none;"></div>
       <div id="tree" class="tree"></div>
       <div class="actions" id="actionsBar">
         <button id="useActive" class="secondary" title="Select the file currently open in editor">Use active file</button>

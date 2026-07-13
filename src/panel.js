@@ -34,6 +34,18 @@
     orgOnlyItems: [],        // { type, name } items on org but not local
     orgLoaded: false,        // has org metadata been fetched this session?
     sourceFilter: 'all',     // 'all' | 'local-only' | 'org-only' | 'both'
+    // View mode: one tree, three lenses. 'selected' shows only checked items
+    // (replaces the old chip tray), 'changed' only git-modified components.
+    viewMode: ['all', 'selected', 'changed'].includes(persisted.viewMode) ? persisted.viewMode : 'all',
+    changedKeys: null,       // Set of "Type:Name" with git changes; null = unknown/unavailable
+    changedReason: '',       // why change detection is unavailable (when changedKeys is null)
+    // Snapshot of the selection taken on ENTERING the Selected lens (IntelliJ
+    // commit-window semantics): unchecking a row flips its checkbox but keeps the
+    // row visible — instant removal would break double-click (the re-render shifts
+    // rows under the cursor mid-gesture) and make an accidental uncheck
+    // unrecoverable without hunting the item down in All. Membership refreshes on
+    // re-entering the lens. null = rebuild lazily from the live selection.
+    selectedLensKeys: null,
   };
 
   function savePersisted() {
@@ -43,7 +55,8 @@
       typeFilter: Array.from(state.typeFilter),
       cmdLogCollapsed: state.cmdLogCollapsed,
       statusRatio: state.statusRatio,
-      scanBannerDismissed: state.scanBannerDismissed
+      scanBannerDismissed: state.scanBannerDismissed,
+      viewMode: state.viewMode
     });
   }
 
@@ -57,6 +70,21 @@
   $('refreshFiles').addEventListener('click', () => send('refreshFiles'));
   $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) send('fetchOrgMetadata', { username: state.selectedOrg }); });
   $('sourceFilter').addEventListener('change', (e) => { state.sourceFilter = e.target.value; renderTree(); });
+  document.querySelectorAll('#viewModes button').forEach((btn) => {
+    btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
+  });
+  function setViewMode(mode) {
+    if (state.viewMode === mode) return;
+    state.viewMode = mode;
+    savePersisted();
+    // Entering the Selected lens re-snapshots its membership from the live
+    // selection, so items unchecked during the previous visit drop out now.
+    if (mode === 'selected') state.selectedLensKeys = new Set(state.selected);
+    // Recompute against the CURRENT git state every time the lens is opened —
+    // edits made since the last scan must show up without a manual rescan.
+    if (mode === 'changed') send('refreshChanged');
+    renderTree();
+  }
   $('orgSelect').addEventListener('change', (e) => { state.selectedOrg = e.target.value || null; send('selectOrg', { username: state.selectedOrg }); });
   // Debounce the filter so a fast typist on a large org-metadata tree doesn't
   // trigger a full re-render on every keystroke.
@@ -78,6 +106,7 @@
   $('useActive').addEventListener('click', () => send('useActiveFile'));
   $('clearSel').addEventListener('click', () => {
     state.selected.clear();
+    state.selectedLensKeys = null; // the Selected lens empties too, not just checkboxes
     renderTree();
     renderActions();
   });
@@ -175,13 +204,24 @@
         state.scanBanner = msg.message || '';
         renderBanner();
         return;
+      case 'changed':
+        state.changedKeys = msg.keys === null ? null : new Set(msg.keys || []);
+        state.changedReason = msg.reason || '';
+        renderTree();
+        return;
       case 'testLevel':
         if ($('testLevel')) $('testLevel').value = msg.value || '';
         return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
         if (msg.key && msg.select) {
-          // explicit "Use active file" — expand its group path, select it, scroll into view
+          // explicit "Use active file" — expand its group path, select it, scroll into view.
+          // The Changed lens could hide the row entirely (file unmodified) — the reveal
+          // must be visible, and after selecting, the Selected lens shows it too, so
+          // only 'changed' needs hopping out of.
+          if (state.viewMode === 'changed') { state.viewMode = 'all'; savePersisted(); }
+          // In the Selected lens the reveal must be a member to be visible.
+          if (state.viewMode === 'selected' && state.selectedLensKeys) state.selectedLensKeys.add(msg.key);
           expandPathForKey(msg.key);
           state.selected.add(msg.key);
           savePersisted();
@@ -427,6 +467,44 @@
     }
   }
 
+  // ---- Search matching ----
+  // Query = whitespace-separated tokens, ALL of which must match (AND, any order):
+  //   type:xxx / t:xxx — constrains the metadata TYPE (substring, e.g. type:flow,
+  //                      t:field). Several type: tokens must all hold.
+  //   plain token      — substring of "Type Name", OR a match on the name's
+  //                      camelCase initials, so "avt" (or a piece of it) finds
+  //                      AccountValidationTrigger and "acc trig" finds it too.
+  function nameInitials(name) {
+    return name
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2') // split camelCase humps
+      .replace(/[^A-Za-z0-9]+/g, ' ')          // ., _, - etc. separate words
+      .split(' ')
+      .filter(Boolean)
+      .map((w) => w[0])
+      .join('')
+      .toLowerCase();
+  }
+
+  function matchesFilter(item, query) {
+    if (!query) return true;
+    let hay = null;
+    let initials = null;
+    for (const raw of query.split(/\s+/)) {
+      if (!raw) continue;
+      const typeTok = raw.startsWith('type:') ? raw.slice(5) : (raw.startsWith('t:') ? raw.slice(2) : null);
+      if (typeTok !== null) {
+        if (typeTok && !item.type.toLowerCase().includes(typeTok)) return false;
+        continue; // bare "type:" while still typing matches everything
+      }
+      if (hay === null) {
+        hay = `${item.type} ${item.name}`.toLowerCase();
+        initials = nameInitials(item.name);
+      }
+      if (!hay.includes(raw) && !initials.includes(raw)) return false;
+    }
+    return true;
+  }
+
   // Partition the (filtered) merged item list into the object tree and the flat type groups.
   function buildGroups() {
     const filter = state.filter;
@@ -440,7 +518,14 @@
     for (const item of buildMergedItems()) {
       if (!isTypeAllowed(item.type)) continue;
       if (!isSourceAllowed(item._source)) continue;
-      if (filter && !`${item.type} ${item.name}`.toLowerCase().includes(filter)) continue;
+      // View-mode lens first (cheap Set lookups), text filter within the lens.
+      if (state.viewMode === 'selected') {
+        // Lazy rebuild covers a webview restored straight into this lens.
+        const lens = state.selectedLensKeys ?? (state.selectedLensKeys = new Set(state.selected));
+        if (!lens.has(`${item.type}:${item.name}`)) continue;
+      }
+      if (state.viewMode === 'changed' && !(state.changedKeys && state.changedKeys.has(`${item.type}:${item.name}`))) continue;
+      if (!matchesFilter(item, filter)) continue;
       if (item.type === 'CustomObject') {
         getObj(item.name).obj = item;
       } else if (state.objectChildTypes.has(item.type)) {
@@ -580,51 +665,40 @@
     return keys;
   }
 
-  // Pinned chip tray mirroring the current selection. Rendered from state.selected
-  // (insertion order, so existing chips never reorder when you add/remove one) and
-  // independent of the tree's filter, so selected items stay visible even when a
-  // filter hides their row below.
-  function renderSelectedTray() {
-    const tray = $('selectedTray');
-    if (!tray) return;
-    tray.innerHTML = '';
-    if (state.selected.size === 0) { tray.style.display = 'none'; return; }
-    tray.style.display = '';
-    const head = document.createElement('div');
-    head.className = 'tray-head';
-    const lbl = document.createElement('span');
-    lbl.textContent = `Selected (${state.selected.size})`;
-    head.appendChild(lbl);
-    const clear = document.createElement('button');
-    clear.className = 'tray-clear';
-    clear.textContent = 'Clear all';
-    clear.title = 'Deselect everything';
-    clear.addEventListener('click', () => { state.selected.clear(); renderTree(); renderActions(); });
-    head.appendChild(clear);
-    tray.appendChild(head);
-    for (const key of state.selected) {
-      const ci = key.indexOf(':');
-      const chip = document.createElement('span');
-      chip.className = 'chip';
-      chip.title = key;
-      const text = document.createElement('span');
-      text.className = 'chip-label';
-      text.textContent = ci >= 0 ? key.slice(ci + 1) : key; // show name; type is in the tooltip
-      chip.appendChild(text);
-      const x = document.createElement('button');
-      x.className = 'chip-x';
-      x.textContent = '×';
-      x.title = `Deselect ${key}`;
-      x.setAttribute('aria-label', `Deselect ${key}`);
-      x.addEventListener('click', () => { state.selected.delete(key); renderTree(); renderActions(); });
-      chip.appendChild(x);
-      tray.appendChild(chip);
+  // View-mode tabs: highlight the active lens and show live counts on the other two.
+  function renderViewModes() {
+    const labels = { all: 'All', selected: 'Selected', changed: 'Changed' };
+    document.querySelectorAll('#viewModes button').forEach((btn) => {
+      const m = btn.dataset.mode;
+      btn.classList.toggle('active', state.viewMode === m);
+      const count = m === 'selected' ? state.selected.size
+        : (m === 'changed' && state.changedKeys ? state.changedKeys.size : null);
+      btn.textContent = count === null || count === 0 ? labels[m] : `${labels[m]} (${count})`;
+    });
+  }
+
+  // Explains an empty tree honestly for the active lens + filter combination.
+  function emptyTreeText(filter) {
+    if (state.viewMode === 'selected') {
+      const lensEmpty = state.selected.size === 0 && (!state.selectedLensKeys || state.selectedLensKeys.size === 0);
+      return lensEmpty
+        ? 'Nothing selected — switch to All and tick components.'
+        : 'No selected component matches the current filter.';
     }
+    if (state.viewMode === 'changed') {
+      // null + no reason = the provider simply hasn't answered yet (e.g. webview
+      // restored straight into this lens) — don't flash a false "unavailable".
+      if (state.changedKeys === null) return state.changedReason || 'Detecting changes…';
+      return filter && state.changedKeys.size > 0
+        ? 'No changed component matches the current filter.'
+        : 'No uncommitted git changes in workspace metadata.';
+    }
+    return 'No metadata matches the current filter.';
   }
 
   function renderTree() {
     closeContextMenu();
-    renderSelectedTray();
+    renderViewModes();
     const tree = $('tree');
     tree.innerHTML = '';
     const hasLocal = state.items.length > 0;
@@ -639,11 +713,31 @@
       return;
     }
     const filter = state.filter;
+    // The Selected/Changed lenses show small curated lists — auto-expand their
+    // groups like an active text filter does (NODE_CAP still bounds the render).
+    const forceExpand = state.viewMode !== 'all';
     const { objectMap, flatGroups } = buildGroups();
+    // Slim header for the Selected lens: the count and the one action the old
+    // chip tray provided that checkboxes don't cover in one click.
+    if (state.viewMode === 'selected' && (state.selected.size > 0 || (state.selectedLensKeys && state.selectedLensKeys.size > 0))) {
+      const head = document.createElement('div');
+      head.className = 'mode-head';
+      const lbl = document.createElement('span');
+      // Live count — can differ from the visible rows (snapshot semantics: rows
+      // unchecked in this visit stay listed until the lens is re-entered).
+      lbl.textContent = `${state.selected.size} selected`;
+      head.appendChild(lbl);
+      const clear = document.createElement('button');
+      clear.textContent = 'Clear all';
+      clear.title = 'Deselect everything';
+      clear.addEventListener('click', () => { state.selected.clear(); state.selectedLensKeys = null; renderTree(); renderActions(); });
+      head.appendChild(clear);
+      tree.appendChild(head);
+    }
     if (objectMap.size === 0 && flatGroups.size === 0) {
       const d = document.createElement('div');
       d.className = 'status-empty';
-      d.textContent = 'No metadata matches the current filter.';
+      d.textContent = emptyTreeText(filter);
       tree.appendChild(d);
       return;
     }
@@ -662,7 +756,7 @@
     if (objectMap.size > 0) {
       const objectNames = Array.from(objectMap.keys()).sort();
       const allKeys = objectNames.flatMap(n => keysUnderObject(objectMap.get(n)));
-      const objectsExpanded = state.expandedGroups.has('__OBJECTS__') || !!filter;
+      const objectsExpanded = state.expandedGroups.has('__OBJECTS__') || !!filter || forceExpand;
       const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: 0 });
       tree.appendChild(objectsNode.group); nodes++;
       if (objectsExpanded) {
@@ -670,7 +764,7 @@
           if (!budgetLeft()) { truncated = true; break; }
           const o = objectMap.get(name);
           const objKeys = keysUnderObject(o);
-          const objExpanded = state.expandedGroups.has('obj/' + name) || !!filter;
+          const objExpanded = state.expandedGroups.has('obj/' + name) || !!filter || forceExpand;
           const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: 1 });
           objectsNode.body.appendChild(objNode.group); nodes++;
           if (!objExpanded) continue;
@@ -684,7 +778,7 @@
             if (!budgetLeft()) { truncated = true; break; }
             const arr = o.children.get(ct).slice().sort((a, b) => a.name.localeCompare(b.name));
             const ctKeys = arr.map(it => `${it.type}:${it.name}`);
-            const ctExpanded = state.expandedGroups.has('objc/' + name + '/' + ct) || !!filter;
+            const ctExpanded = state.expandedGroups.has('objc/' + name + '/' + ct) || !!filter || forceExpand;
             const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: 2 });
             objNode.body.appendChild(ctNode.group); nodes++;
             if (!ctExpanded) continue;
@@ -702,7 +796,7 @@
       if (!budgetLeft()) { truncated = true; break; }
       const arr = flatGroups.get(type).slice().sort((a, b) => a.name.localeCompare(b.name));
       const keys = arr.map(it => `${it.type}:${it.name}`);
-      const expanded = state.expandedGroups.has(type) || !!filter;
+      const expanded = state.expandedGroups.has(type) || !!filter || forceExpand;
       const node = makeGroupNode({ key: type, label: type, count: arr.length, itemKeys: keys, expanded, depth: 0 });
       tree.appendChild(node.group); nodes++;
       if (expanded) for (const it of arr) {
@@ -773,12 +867,17 @@
       diffBtn.title = allOrgOnly ? 'Org-only items have no local file to diff against — retrieve them first.' : '';
     }
     // Lock org switching and fetch/refresh while an operation runs, so an in-flight
-    // Fetch Org can't be raced by an org change or a second fetch.
+    // Fetch Org can't be raced by an org change or a second fetch. Tooltip says WHY
+    // the button is dead — a silently-disabled Rescan reads as a broken button.
+    const lockTip = state.busy ? `Locked while ${state.busyAction || 'an operation'} is running — cancel it or wait` : '';
     const orgSelect = $('orgSelect');
-    if (orgSelect) orgSelect.disabled = state.busy || state.orgs.length === 0;
+    if (orgSelect) { orgSelect.disabled = state.busy || state.orgs.length === 0; orgSelect.title = lockTip; }
     $('fetchOrgBtn').disabled = state.busy;
+    $('fetchOrgBtn').title = lockTip;
     $('refreshOrgs').disabled = state.busy;
+    $('refreshOrgs').title = lockTip;
     $('refreshFiles').disabled = state.busy;
+    $('refreshFiles').title = lockTip || 'Rescan workspace files (also retries folders whose type resolution failed)';
   }
 
   // ---- Progress (busy) card ----
