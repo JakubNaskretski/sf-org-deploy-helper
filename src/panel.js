@@ -2,6 +2,12 @@
 (function () {
   const vscode = acquireVsCodeApi();
 
+  // Cap on status cards kept in the webview — mirrors the provider's
+  // CARD_HISTORY_MAX (panelProvider.ts) so the live view and the persisted history
+  // trim to the same length. Used by both the live 'status' unshift and the
+  // 'statusHistory' replay below.
+  const STATUS_HISTORY_MAX = 50;
+
   const persisted = vscode.getState() || {};
   const state = {
     orgs: [],
@@ -22,6 +28,10 @@
     // Fraction of the body given to the Status pane (right/bottom). null = CSS default.
     statusRatio: typeof persisted.statusRatio === 'number' ? persisted.statusRatio : null,
     banner: '',
+    // RunSpecifiedTests class list, mirrored here like `filter` so it survives a
+    // webview rebuild via savePersisted/getState — the provider keeps its OWN copy
+    // (this.runTests) for context-menu deploys, kept in sync via setTestLevel.
+    testClasses: persisted.testClasses || '',
     // Scan/type-resolution notices get their own slot so they can't overwrite an
     // org error (both used to share the single banner, last writer won).
     scanBanner: '',
@@ -39,6 +49,7 @@
     viewMode: ['all', 'selected', 'changed'].includes(persisted.viewMode) ? persisted.viewMode : 'all',
     changedKeys: null,       // Set of "Type:Name" with git changes; null = unknown/unavailable
     changedReason: '',       // why change detection is unavailable (when changedKeys is null)
+    changedBase: '',         // git ref the Changed lens compares against ('' = uncommitted only)
     // Snapshot of the selection taken on ENTERING the Selected lens (IntelliJ
     // commit-window semantics): unchecking a row flips its checkbox but keeps the
     // row visible — instant removal would break double-click (the re-render shifts
@@ -56,7 +67,8 @@
       cmdLogCollapsed: state.cmdLogCollapsed,
       statusRatio: state.statusRatio,
       scanBannerDismissed: state.scanBannerDismissed,
-      viewMode: state.viewMode
+      viewMode: state.viewMode,
+      testClasses: state.testClasses
     });
   }
 
@@ -67,6 +79,9 @@
   // ---- Init ----
   window.addEventListener('message', (ev) => handleMessage(ev.data));
   $('refreshOrgs').addEventListener('click', () => send('refreshOrgs'));
+  // Authenticate a new org (sf org login web) — busy-guarded like the other toolbar
+  // buttons so it can't be fired into a running operation.
+  $('addOrg').addEventListener('click', () => { if (!state.busy) send('loginOrg'); });
   $('refreshFiles').addEventListener('click', () => send('refreshFiles'));
   $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) send('fetchOrgMetadata', { username: state.selectedOrg }); });
   $('sourceFilter').addEventListener('change', (e) => { state.sourceFilter = e.target.value; renderTree(); });
@@ -95,15 +110,35 @@
     searchTimer = setTimeout(() => { state.filter = v; savePersisted(); renderTree(); }, 200);
   });
   $('search').value = state.filter;
-  // Mirror the chosen test level to the provider so context-menu and editor
-  // right-click deploys honor it too (they don't read this DOM).
-  $('testLevel').addEventListener('change', (e) => send('setTestLevel', { testLevel: e.target.value || undefined }));
+  if ($('testClasses')) $('testClasses').value = state.testClasses;
+  syncTestClassesVisibility();
+  // Mirror the chosen test level (+ RunSpecifiedTests classes) to the provider so
+  // context-menu and editor right-click deploys honor it too (they don't read this DOM).
+  $('testLevel').addEventListener('change', (e) => {
+    syncTestClassesVisibility();
+    send('setTestLevel', { testLevel: e.target.value || undefined, runTests: parseTestClasses() });
+  });
+  // Debounced like the search box: keeps the provider mirror current as the user
+  // types without a round-trip per keystroke.
+  let testClassesTimer = null;
+  if ($('testClasses')) {
+    $('testClasses').addEventListener('input', (e) => {
+      const v = e.target.value;
+      if (testClassesTimer) clearTimeout(testClassesTimer);
+      testClassesTimer = setTimeout(() => {
+        state.testClasses = v;
+        savePersisted();
+        send('setTestLevel', { testLevel: $('testLevel').value || undefined, runTests: parseTestClasses() });
+      }, 200);
+    });
+  }
   $('deployBtn').addEventListener('click', () => action('deploy'));
   $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
   $('diffBtn').addEventListener('click', () => action('diff'));
   $('cancelBtn').addEventListener('click', () => send('cancel'));
   $('useActive').addEventListener('click', () => send('useActiveFile'));
+  $('useOpenTabs').addEventListener('click', () => send('useOpenTabs'));
   $('clearSel').addEventListener('click', () => {
     state.selected.clear();
     state.selectedLensKeys = null; // the Selected lens empties too, not just checkboxes
@@ -130,17 +165,51 @@
   $('tree').addEventListener('scroll', () => closeContextMenu());
   send('ready');
 
+  // Show/hide the RunSpecifiedTests class-list input to match the current select
+  // value — called on user change AND on the provider's 'testLevel' restore, so a
+  // reload landing straight on RunSpecifiedTests doesn't hide the box it needs.
+  function syncTestClassesVisibility() {
+    const sel = $('testLevel');
+    const box = $('testClasses');
+    if (!sel || !box) return;
+    box.style.display = sel.value === 'RunSpecifiedTests' ? '' : 'none';
+  }
+
+  // Comma-separated → trimmed, empties dropped. The provider does the actual
+  // CLI-argv-safety check (regex); this is just splitting user input.
+  function parseTestClasses() {
+    const box = $('testClasses');
+    if (!box) return [];
+    return box.value.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  // An empty RunSpecifiedTests class list would just fail the deploy on the org —
+  // refuse locally instead, and make the problem obvious rather than a silent no-op.
+  function flagTestClassesError() {
+    const box = $('testClasses');
+    if (!box) return;
+    box.focus();
+    box.title = 'Enter at least one Apex test class name (comma-separated) to run RunSpecifiedTests.';
+    box.classList.add('input-error');
+    setTimeout(() => box.classList.remove('input-error'), 2000);
+  }
+
   function action(kind) {
     if (state.busy) return;
     const keys = Array.from(state.selected);
     if (keys.length === 0) return;
     if (!state.selectedOrg) return;
-    // The chosen test level applies to deploy and validate (empty → CLI/host default).
-    const testLevel = ($('testLevel') && $('testLevel').value) || undefined;
-    if (kind === 'deploy') return send('deploy', { keys, testLevel });
-    if (kind === 'validate') return send('deploy', { keys, validateOnly: true, testLevel });
     if (kind === 'retrieve') return send('retrieve', { keys });
-    return send('diff', { keys });
+    if (kind === 'diff') return send('diff', { keys });
+    // deploy / validate: the chosen test level applies (empty → provider's default).
+    const testLevel = ($('testLevel') && $('testLevel').value) || undefined;
+    let runTests;
+    if (testLevel === 'RunSpecifiedTests') {
+      runTests = parseTestClasses();
+      if (runTests.length === 0) { flagTestClassesError(); return; }
+    }
+    if (kind === 'deploy') return send('deploy', { keys, testLevel, runTests });
+    return send('deploy', { keys, validateOnly: true, testLevel, runTests });
   }
 
   // ---- Message handling ----
@@ -208,10 +277,31 @@
       case 'changed':
         state.changedKeys = msg.keys === null ? null : new Set(msg.keys || []);
         state.changedReason = msg.reason || '';
+        // Base ref (Feature 2): when the provider compares against a git ref it tags
+        // the message with `base`; empty/absent = the default uncommitted-only lens.
+        state.changedBase = msg.base || '';
         renderTree();
         return;
+      case 'selectKeys': {
+        // Batch selection (e.g. "Use open tabs") — same reveal rules as the
+        // single-key activeFile select: visible lens, expanded paths, scroll to first.
+        const keys = msg.keys || [];
+        if (!keys.length) return;
+        if (state.viewMode === 'changed') { state.viewMode = 'all'; savePersisted(); }
+        for (const k of keys) {
+          if (state.viewMode === 'selected' && state.selectedLensKeys) state.selectedLensKeys.add(k);
+          expandPathForKey(k);
+          state.selected.add(k);
+        }
+        savePersisted();
+        renderTree();
+        renderActions();
+        if (msg.scroll) scrollKeyIntoView(keys[0]);
+        return;
+      }
       case 'testLevel':
         if ($('testLevel')) $('testLevel').value = msg.value || '';
+        syncTestClassesVisibility();
         return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
@@ -256,13 +346,13 @@
       case 'status':
         // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint, at }
         state.statusCards.unshift(msg.card);
-        if (state.statusCards.length > 50) state.statusCards.length = 50;
+        if (state.statusCards.length > STATUS_HISTORY_MAX) state.statusCards.length = STATUS_HISTORY_MAX;
         renderStatus();
         return;
       case 'statusHistory':
         // Persisted card history replayed by the provider on ready (newest first) —
         // the Status pane doubles as the deployment history across window reloads.
-        state.statusCards = (msg.cards || []).slice(0, 50);
+        state.statusCards = (msg.cards || []).slice(0, STATUS_HISTORY_MAX);
         renderStatus();
         return;
       case 'cmd':
@@ -696,8 +786,11 @@
       // null + no reason = the provider simply hasn't answered yet (e.g. webview
       // restored straight into this lens) — don't flash a false "unavailable".
       if (state.changedKeys === null) return state.changedReason || 'Detecting changes…';
-      return filter && state.changedKeys.size > 0
-        ? 'No changed component matches the current filter.'
+      if (filter && state.changedKeys.size > 0) return 'No changed component matches the current filter.';
+      // With a base ref the lens answers "what differs from <ref>"; without it, the
+      // uncommitted-only default.
+      return state.changedBase
+        ? `No components differ from ${state.changedBase}.`
         : 'No uncommitted git changes in workspace metadata.';
     }
     return 'No metadata matches the current filter.';
@@ -739,6 +832,16 @@
       clear.title = 'Deselect everything';
       clear.addEventListener('click', () => { state.selected.clear(); state.selectedLensKeys = null; renderTree(); renderActions(); });
       head.appendChild(clear);
+      tree.appendChild(head);
+    }
+    // Changed lens against a base ref: label what the lens is comparing to, above
+    // the rows (and above the empty state, which also names the ref).
+    if (state.viewMode === 'changed' && state.changedBase) {
+      const head = document.createElement('div');
+      head.className = 'mode-head';
+      const lbl = document.createElement('span');
+      lbl.textContent = `Changed vs ${state.changedBase}`;
+      head.appendChild(lbl);
       tree.appendChild(head);
     }
     if (objectMap.size === 0 && flatGroups.size === 0) {
@@ -883,6 +986,8 @@
     $('fetchOrgBtn').title = lockTip;
     $('refreshOrgs').disabled = state.busy;
     $('refreshOrgs').title = lockTip;
+    $('addOrg').disabled = state.busy;
+    $('addOrg').title = lockTip || 'Authenticate a new org (sf org login web)';
     $('refreshFiles').disabled = state.busy;
     $('refreshFiles').title = lockTip || 'Rescan workspace files (also retries folders whose type resolution failed)';
   }
@@ -983,7 +1088,18 @@
         const visible = card.expanded ? card.lines : card.lines.slice(0, MAX_CARD_LINES);
         for (const line of visible) {
           const li = document.createElement('li');
-          li.textContent = line;
+          // Lines are plain strings, or {text, key, line?, column?} — the object
+          // form is clickable and opens the source at the error position.
+          if (line && typeof line === 'object') {
+            li.textContent = line.text || '';
+            if (line.key) {
+              li.classList.add('nav');
+              li.title = `Open ${line.key}${line.line ? ` at line ${line.line}` : ''}`;
+              li.addEventListener('click', () => send('openFile', { key: line.key, line: line.line, column: line.column }));
+            }
+          } else {
+            li.textContent = line;
+          }
           ul.appendChild(li);
         }
         el.appendChild(ul);
@@ -1162,7 +1278,8 @@
       }
       for (const it of sec.items) {
         const el = document.createElement('div');
-        el.className = 'ctx-item' + (it.disabled ? ' disabled' : '');
+        // `danger` paints destructive items (Delete from Org…) red via var(--err).
+        el.className = 'ctx-item' + (it.disabled ? ' disabled' : '') + (it.danger ? ' danger' : '');
         el.textContent = it.label;
         if (it.title) el.title = it.title;
         if (!it.disabled) el.addEventListener('click', () => { closeContextMenu(); it.run(); });
@@ -1196,6 +1313,14 @@
     send(kind, { keys });
   }
 
+  // Delete from Org: the provider previews (dry-run) and shows a destructive confirm
+  // before anything is removed. Org-only rows ARE valid targets (unlike deploy/diff),
+  // so there's no local-file gate here — only busy / no-org.
+  function runDelete(keys) {
+    if (state.busy || !state.selectedOrg || !keys || !keys.length) return;
+    send('deleteFromOrg', { keys });
+  }
+
   // Deploy/Retrieve/Diff menu items for a set of component keys. Deploy and Diff need a
   // local file, so they're disabled when every key is org-only (mirrors the toolbar
   // buttons); the provider would otherwise just skip those keys.
@@ -1224,19 +1349,38 @@
     return items;
   }
 
+  // The destructive Delete-from-Org item, kept in its own section (see
+  // treeMenuSections). No local-file gate — org-only components are valid targets;
+  // only busy / no-org disables it. The '…' signals a confirm step follows.
+  function deleteItems(keys) {
+    const arr = Array.from(keys);
+    const base = !state.busy && !!state.selectedOrg && arr.length > 0;
+    return [{
+      label: 'Delete from Org…',
+      danger: true,
+      disabled: !base,
+      title: state.selectedOrg
+        ? 'Deletes the component(s) from the org AND removes the local source files. Cannot be undone by the plugin.'
+        : 'Select an org first',
+      run: () => runDelete(arr)
+    }];
+  }
+
   // Sections for a right-clicked tree target. The target (a folder's items, or one
   // component) is primary; the current checkbox selection is offered as a second section
-  // when it differs — so "tick several, right-click, deploy" works too.
+  // when it differs — so "tick several, right-click, deploy" works too. A separated
+  // danger section for Delete-from-Org always sits last, acting on the SAME target keys
+  // Deploy uses (the right-clicked target).
   function treeMenuSections(targetKeys, targetLabel) {
     const sections = [{ head: targetLabel, items: actionItems(targetKeys), sep: true }];
     const sel = Array.from(state.selected);
     const tset = new Set(targetKeys);
     const sameAsTarget = sel.length === tset.size && sel.every(k => tset.has(k));
     if (sel.length > 0 && !sameAsTarget) {
-      sections.push({ head: `Selected (${sel.length})`, items: actionItems(sel) });
-    } else {
-      sections[0].sep = false;
+      sections.push({ head: `Selected (${sel.length})`, items: actionItems(sel), sep: true });
     }
+    // Danger zone — separated from the actions above, targets the right-clicked keys.
+    sections.push({ items: deleteItems(targetKeys) });
     return sections;
   }
 

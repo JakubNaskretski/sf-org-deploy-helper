@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { OrgStore } from './orgStore';
-import { DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
+import { DeleteResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
 import { FolderRule, LearnedRule, MetadataItem, OBJECT_CHILD_TYPES, deriveRule, findItemForPath, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
@@ -15,12 +15,15 @@ type Inbound =
   | { type: 'fetchOrgMetadata'; username?: string }
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
-  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel }
-  | { type: 'setTestLevel'; testLevel?: TestLevel }
+  | { type: 'useOpenTabs' }
+  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] }
+  | { type: 'setTestLevel'; testLevel?: TestLevel; runTests?: string[] }
   | { type: 'quickDeploy'; jobId: string }
   | { type: 'retrieve'; keys: string[] }
+  | { type: 'deleteFromOrg'; keys: string[] }
+  | { type: 'loginOrg' }
   | { type: 'diff'; keys: string[] }
-  | { type: 'openFile'; key: string }
+  | { type: 'openFile'; key: string; line?: number; column?: number }
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
@@ -29,8 +32,16 @@ type Inbound =
 
 // Minimal structural slice of the built-in vscode.git extension's API (v1) —
 // just what change detection reads; no dependency on the full git.d.ts.
+// `diffWith(ref)` matches the real API's `diffWith(ref: string): Promise<Change[]>`
+// (each Change carries a non-optional `uri`; we widen to optional defensively). It
+// returns the working tree diffed against `ref` — committed AND uncommitted tracked
+// differences (untracked files aren't included, which is why the caller also merges
+// in workingTreeChanges/indexChanges). Rejects for an unknown ref.
 interface GitChangeLite { uri?: vscode.Uri }
-interface GitRepoLite { state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[] } }
+interface GitRepoLite {
+  state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[] };
+  diffWith(ref: string): Promise<GitChangeLite[]>;
+}
 interface GitApiLite { repositories: GitRepoLite[] }
 interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 
@@ -46,6 +57,15 @@ const CARD_HISTORY_MAX = 50;
  *  (same TTL as learned rules). Without it every NEW session re-paid the serial
  *  30s-per-folder registry calls before a context-menu deploy could even confirm. */
 const UNRESOLVABLE_KEY = 'unresolvableTypeFolders';
+/** workspaceState key for the panel's last-picked Apex test level — restored on
+ *  window reload so a collapsed/reopened panel (and context-menu deploys fired
+ *  before the panel ever opens) keep honoring the user's last choice instead of
+ *  silently reverting to the smart default. */
+const TEST_LEVEL_KEY = 'testLevel';
+/** workspaceState key for the last RunSpecifiedTests class list typed in the panel —
+ *  persisted alongside TEST_LEVEL_KEY so a context-menu deploy fired after a reload
+ *  still has classes to run without the panel ever being reopened. */
+const RUN_TESTS_KEY = 'runTests';
 
 interface UnresolvableEntry { folder: string; at: number }
 
@@ -60,9 +80,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentCancel?: () => void;
   private currentAction?: string;
   private currentProgressText?: string;
-  /** Async job id of the running deploy, once the org has accepted it. Lets Cancel
-   *  ask the org to cancel the server-side deploy (not just kill the local process),
-   *  and lets a validated deployment be quick-deployed. */
+  /** Async job id of a deploy — captured only AFTER the deploy call resolves (the
+   *  `sf project deploy` call runs the deploy to completion in one shot, then
+   *  reports its id). So it is NOT set while a deploy is in flight: a mid-deploy
+   *  Cancel always sees it undefined. Used to quick-deploy a validated deployment,
+   *  and left as a best-effort anchor for an org-side cancel on any future path that
+   *  manages to capture it earlier. */
   private currentDeployJobId?: string;
   /** The org a `currentDeployJobId` belongs to (for the server-side cancel call). */
   private currentDeployOrg?: string;
@@ -82,6 +105,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  (tree context menu, editor right-click, palette) honors it — previously only
    *  the two bottom-bar buttons did, and the others silently used defaults. */
   private testLevel: TestLevel | undefined;
+  /** Panel-typed RunSpecifiedTests class list, mirrored here for the same reason
+   *  as `testLevel` — a context-menu / editor right-click deploy never touches the
+   *  webview's #testClasses input, so it has to read the classes from here. */
+  private runTests: string[] | undefined;
   /** First underlying CLI error from the latest type-resolution run — shown in
    *  the scan banner so wholesale failures name their cause in-panel. */
   private resolveErrorSample: string | undefined;
@@ -92,7 +119,35 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     private readonly orgStore: OrgStore,
     private readonly sf: SfCliService,
     private readonly output: vscode.OutputChannel
-  ) {}
+  ) {
+    // Restore the panel's last test-level pick (+ RunSpecifiedTests class list) so a
+    // window reload doesn't silently revert to the smart default. Shape-guarded (see
+    // the read helpers below) since workspaceState can hand back anything after a
+    // corrupted write or a hand-edited state DB.
+    this.testLevel = this.readStoredTestLevel();
+    this.runTests = this.readStoredRunTests();
+    // Follow EXTERNAL changes to the shared target-org setting (a sibling Skrety SF
+    // plugin, or a hand edit of settings.json): drop org metadata fetched for a
+    // different org so stale badges can't describe the new target, then resync the
+    // webview dropdown/state. NEVER write orgStore from here — the write is what
+    // fired this event, so setting it again would loop. Our own applyOrgSelection /
+    // pickOrg writes also land here; they've already reset metadata (making the guard
+    // a no-op) and a second postOrgs is harmless. This also closes the cross-plugin
+    // clobber: with the dropdown kept current, Fetch Org sends the ACTUAL selected
+    // org, so its applyOrgSelection no longer writes a stale org back over the
+    // sibling's switch.
+    context.subscriptions.push(orgStore.onDidChange(username => {
+      if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
+      this.postOrgs();
+    }));
+    // Recompute the Changed lens when its base ref changes — the setting flips the
+    // view between "uncommitted only" and "differs from <ref>" without a rescan.
+    // Fire-and-forget: postChangedComponents never throws. Disposed with the
+    // extension via context.subscriptions.
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('sfOrgDeployWrapper.changedBaseRef')) void this.postChangedComponents();
+    }));
+  }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -122,6 +177,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   // ---- Public commands ----
   async pickOrg(): Promise<void> {
+    // Reachable from the command palette even while an op runs (webview buttons are
+    // disabled, palette commands aren't). Refuse without taking the busy slot —
+    // switching the org mid-op would retarget a running deploy/fetch.
+    if (this.busy) { this.notifyBusy(); return; }
     const username = await this.promptForOrg('Select Salesforce org');
     if (username) {
       await this.orgStore.set(username);
@@ -161,6 +220,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   async refreshFiles(): Promise<void> {
+    // Palette-invocable during a running op (unlike the disabled webview button).
+    // Refuse without taking the busy slot — a rescan mid-op would spawn `sf`
+    // registry calls alongside the running command.
+    if (this.busy) { this.notifyBusy(); return; }
     // Explicit refresh is the retry path: clear the negative cache so folders
     // that failed resolution (CLI fixed, folder cleaned up, …) get another shot.
     // Automatic rescans keep skipping them until the TTL expires.
@@ -178,6 +241,71 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   async deployFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'deploy'); }
   async retrieveFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'retrieve'); }
   async diffFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'diff'); }
+
+  /**
+   * Deploy a package.xml manifest to the target org (`sf project deploy start
+   * --manifest`). Invoked from the explorer context menu (uri passed) or the
+   * command palette (no uri → an XML open-dialog). The file is validated and
+   * parsed up front, so an unreadable/empty manifest is refused honestly rather
+   * than handed to the CLI.
+   */
+  async deployManifest(uri?: vscode.Uri): Promise<void> {
+    const parsed = await this.pickAndParseManifest(uri, 'deploy');
+    if (parsed) await this.runManifestDeploy(parsed.path, parsed.types);
+  }
+
+  /** Retrieve a package.xml manifest from the target org (`sf project retrieve
+   *  start --manifest`). Same pick/validate flow as deployManifest. */
+  async retrieveManifest(uri?: vscode.Uri): Promise<void> {
+    const parsed = await this.pickAndParseManifest(uri, 'retrieve');
+    if (parsed) await this.runManifestRetrieve(parsed.path, parsed.types);
+  }
+
+  /** Resolve a manifest path (from a context-menu uri, or an XML open-dialog on a
+   *  palette invocation) and parse it with parseManifestTypes. Returns undefined —
+   *  with an honest message — when nothing is chosen, the file can't be read (also
+   *  the existence check before we spawn `sf`), or it yields zero metadata types
+   *  (not a real package.xml). */
+  private async pickAndParseManifest(
+    uri: vscode.Uri | undefined,
+    verb: 'deploy' | 'retrieve'
+  ): Promise<{ path: string; types: Array<{ type: string; members: string[] }> } | undefined> {
+    let manifestUri = uri;
+    if (!manifestUri || !manifestUri.fsPath) {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: verb === 'deploy' ? 'Deploy Manifest' : 'Retrieve Manifest',
+        filters: { 'Salesforce manifest (package.xml)': ['xml'] },
+        title: verb === 'deploy' ? 'Select a package.xml to deploy' : 'Select a package.xml to retrieve'
+      });
+      manifestUri = picked?.[0];
+      if (!manifestUri) return undefined;
+    }
+    const manifestPath = manifestUri.fsPath;
+    let content: string;
+    try {
+      // Reading both proves the file exists (before we ever spawn `sf`) and gives
+      // us the content to parse. Cap the size first: parseManifestTypes goes
+      // quadratic on pathological many-unclosed-<types> input, and a real
+      // package.xml is kilobytes — a multi-MB file is either corrupt or hostile
+      // (security review F1); refuse instead of freezing the extension host.
+      const stat = await fs.stat(manifestPath);
+      if (stat.size > 5_000_000) {
+        vscode.window.showErrorMessage(`SF Deploy: ${path.basename(manifestPath)} is ${(stat.size / 1_000_000).toFixed(1)} MB — too large for a package.xml manifest.`);
+        return undefined;
+      }
+      content = await fs.readFile(manifestPath, 'utf8');
+    } catch (err) {
+      vscode.window.showErrorMessage(`Couldn't read manifest ${path.basename(manifestPath)}: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+    const types = parseManifestTypes(content);
+    if (types.length === 0) {
+      vscode.window.showErrorMessage(`${path.basename(manifestPath)} is not a readable package.xml manifest (no metadata types found).`);
+      return undefined;
+    }
+    return { path: manifestPath, types };
+  }
 
   /**
    * Right-click "Compare with Org…": pick any authenticated org (not just the
@@ -273,7 +401,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (this.busy && this.currentProgressText) this.post({ type: 'progress', text: this.currentProgressText });
         // Restore the test-level select after a webview rebuild — the provider is
         // the source of truth so a collapsed/reopened panel can't silently diverge.
-        this.post({ type: 'testLevel', value: this.testLevel ?? '' });
+        // Falls back to the configured default so the picker shows what will
+        // actually apply when neither the panel nor this session has chosen yet.
+        this.post({ type: 'testLevel', value: this.testLevel ?? this.configuredTestLevel() ?? '' });
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
@@ -281,6 +411,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       case 'setTestLevel':
         this.testLevel = msg.testLevel;
+        this.runTests = msg.runTests;
+        this.persistTestLevelState();
         return;
       case 'refreshOrgs':
         await this.loadOrgs(true);
@@ -301,14 +433,50 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       case 'useActiveFile':
         this.sendActiveFile(true, true);
         return;
+      case 'useOpenTabs': {
+        // Select every open editor tab that maps to a scanned component — across
+        // ALL tab groups (visibleTextEditors only sees focused ones). Diff-editor
+        // tabs are skipped: their org side is a throwaway temp file.
+        const keys = new Set<string>();
+        let fileTabs = 0;
+        for (const group of vscode.window.tabGroups.all) {
+          for (const tab of group.tabs) {
+            const uri = tab.input instanceof vscode.TabInputText ? tab.input.uri
+              : tab.input instanceof vscode.TabInputCustom ? tab.input.uri : undefined;
+            if (!uri || uri.scheme !== 'file') continue;
+            fileTabs++;
+            const item = findItemForPath(this.items, uri.fsPath);
+            if (item) keys.add(`${item.type}:${item.name}`);
+          }
+        }
+        if (keys.size === 0) {
+          vscode.window.showInformationMessage(fileTabs === 0
+            ? 'No file tabs are open.'
+            : 'No open tab is a recognized SF metadata source under the workspace package directories.');
+          return;
+        }
+        this.post({ type: 'selectKeys', keys: [...keys], scroll: true });
+        const skipped = fileTabs - keys.size;
+        vscode.window.setStatusBarMessage(
+          `$(check) SF Deploy: selected ${keys.size} component${keys.size === 1 ? '' : 's'} from open tabs${skipped > 0 ? ` (${skipped} tab${skipped === 1 ? '' : 's'} not metadata)` : ''}`,
+          5000
+        );
+        return;
+      }
       case 'deploy':
-        await this.runDeploy(msg.keys, { validateOnly: msg.validateOnly, testLevel: msg.testLevel });
+        await this.runDeploy(msg.keys, { validateOnly: msg.validateOnly, testLevel: msg.testLevel, runTests: msg.runTests });
         return;
       case 'quickDeploy':
         await this.runQuickDeploy(msg.jobId);
         return;
       case 'retrieve':
         await this.runRetrieve(msg.keys);
+        return;
+      case 'deleteFromOrg':
+        await this.runDelete(msg.keys);
+        return;
+      case 'loginOrg':
+        await this.runLogin();
         return;
       case 'diff':
         await this.runDiff(msg.keys);
@@ -319,7 +487,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           vscode.window.showInformationMessage('Org-only — retrieve it first to open it locally.');
           return;
         }
-        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(it.filePath), { preview: true });
+        // Error-card lines carry the CLI-reported position — land the cursor
+        // there (VS Code clamps out-of-range positions to the document end).
+        const line = typeof msg.line === 'number' && msg.line > 0 ? msg.line - 1 : undefined;
+        const col = typeof msg.column === 'number' && msg.column > 0 ? msg.column - 1 : 0;
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(it.filePath), {
+          preview: true,
+          ...(line !== undefined ? { selection: new vscode.Range(line, col, line, col) } : {})
+        });
         return;
       }
       case 'openInOrg':
@@ -345,11 +520,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Cancel the running operation. Kills the local `sf` process, then — if a
-   * deploy has already been accepted by the org (we have its job id) — asks the
-   * org to cancel the server-side deploy too, so "Deploy cancelled" isn't a false
-   * safety signal on a PROD flow. If the deploy hasn't reached the org
-   * yet (no job id), killing the local process is enough.
+   * Cancel the running operation by killing the local `sf` process. IMPORTANT: for
+   * a deploy the job id is only captured after the deploy call resolves (see
+   * `currentDeployJobId`), so an in-flight deploy has no id here and the org-side
+   * cancel below CANNOT fire mid-deploy. Killing the local process stops us
+   * waiting, but the org-side deploy may still run to completion — the cancel notes
+   * say exactly that rather than claiming a server-side cancel we never requested.
+   * The deployCancel branch stays as a best-effort belt for any path that does hold
+   * a job id (none in the current flow).
    */
   private cancelCurrent(): void {
     const jobId = this.currentDeployJobId;
@@ -636,11 +814,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.changedRefreshTimer = setTimeout(() => { void this.postChangedComponents(); }, 500);
   }
 
-  /** Compute which local components have uncommitted git changes (working tree +
-   *  index — includes untracked files, i.e. brand-new components) via the built-in
-   *  vscode.git extension, and post their keys for the "Changed" view. Posts
-   *  `keys: null` with a reason when git can't answer, so the view says why
-   *  instead of showing a false "no changes". Never throws. */
+  /** Compute which local components differ, for the "Changed" view, via the built-in
+   *  vscode.git extension, and post their keys. Default: uncommitted changes only
+   *  (working tree + index — includes untracked files, i.e. brand-new components).
+   *  When `sfOrgDeployWrapper.changedBaseRef` is set, ALSO include everything that
+   *  differs from that ref (committed changes too — the release-promotion question),
+   *  and tag the posted message with `base: <ref>`. Posts `keys: null` with a reason
+   *  when git can't answer (or the ref is bad/unknown), so the view says why instead
+   *  of showing a false "no changes". Never throws. */
   private async postChangedComponents(): Promise<void> {
     try {
       const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
@@ -652,6 +833,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (api.repositories.length === 0) {
         this.post({ type: 'changed', keys: null, reason: 'Change detection unavailable — workspace is not a git repository.' });
         return;
+      }
+      // Optional base ref. Trim, and reject a value shaped like a git flag (leading
+      // '-') before it reaches `git diff <ref>` argv — execFile blocks shell
+      // injection, but a flag-shaped ref would still be mis-read as an option.
+      const rawBase = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<string>('changedBaseRef', '').trim();
+      let baseRef: string | undefined;
+      if (rawBase) {
+        if (rawBase.startsWith('-')) {
+          this.post({ type: 'changed', keys: null, reason: `Invalid changedBaseRef "${rawBase}" — a git ref can't start with '-'.` });
+          return;
+        }
+        baseRef = rawBase;
       }
       // A pathological repo can report tens of thousands of changed paths
       // (untracked count too), and per-path findItemForPath scans would be
@@ -675,24 +868,44 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
       const seen = new Set<string>();
       const keys = new Set<string>();
+      // Map one changed file path to its owning component key (exact primary >
+      // listed file > containing bundle folder), de-duping repeated paths.
+      const addPath = (fsPath: string | undefined): void => {
+        if (!fsPath) return;
+        const p = path.normalize(fsPath);
+        if (seen.has(p)) return; // a staged+modified (or ref+working) file recurs across lists
+        seen.add(p);
+        let key = byPrimary.get(p) ?? byFile.get(p);
+        for (let dir = path.dirname(p); !key; ) {
+          key = byDir.get(dir);
+          const parent = path.dirname(dir);
+          if (parent === dir) break;
+          dir = parent;
+        }
+        if (key) keys.add(key);
+      };
       for (const repo of api.repositories) {
-        for (const change of [...repo.state.workingTreeChanges, ...repo.state.indexChanges]) {
-          const fsPath = change.uri?.fsPath;
-          if (!fsPath) continue;
-          const p = path.normalize(fsPath);
-          if (seen.has(p)) continue; // a staged+modified file appears in both lists
-          seen.add(p);
-          let key = byPrimary.get(p) ?? byFile.get(p);
-          for (let dir = path.dirname(p); !key; ) {
-            key = byDir.get(dir);
-            const parent = path.dirname(dir);
-            if (parent === dir) break;
-            dir = parent;
+        if (baseRef) {
+          // `diffWith(ref)` = working tree vs the ref (committed + uncommitted
+          // tracked differences). An unknown ref rejects — name it rather than
+          // showing a false "no changes".
+          let refChanges: GitChangeLite[];
+          try {
+            refChanges = await repo.diffWith(baseRef);
+          } catch (err) {
+            this.output.appendLine(`[changed] diffWith(${baseRef}) failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.post({ type: 'changed', keys: null, reason: `Can't compare against "${baseRef}" — unknown git ref? (${stripAnsi(err instanceof Error ? err.message : String(err)).trim()})` });
+            return;
           }
-          if (key) keys.add(key);
+          for (const change of refChanges) addPath(change.uri?.fsPath);
+        }
+        // Uncommitted edits on top: diffWith(ref) omits untracked files (brand-new
+        // components), and with no ref this IS the whole answer.
+        for (const change of [...repo.state.workingTreeChanges, ...repo.state.indexChanges]) {
+          addPath(change.uri?.fsPath);
         }
       }
-      this.post({ type: 'changed', keys: [...keys] });
+      this.post({ type: 'changed', keys: [...keys], ...(baseRef ? { base: baseRef } : {}) });
     } catch (err) {
       this.output.appendLine(`[changed] git change detection failed: ${err instanceof Error ? err.message : String(err)}`);
       this.post({ type: 'changed', keys: null, reason: 'Change detection failed — see the output channel.' });
@@ -717,10 +930,54 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'activeFile', key: `${match.type}:${match.name}`, select: selectAndScroll, scroll: selectAndScroll });
   }
 
+  // ---- Test level ----
+  // this.testLevel/this.runTests are the panel's live picks (mirrored from the
+  // webview so context-menu/editor-right-click deploys see them too); the two
+  // read* helpers restore them from workspaceState on startup, and
+  // configuredTestLevel() reads the settings.json fallback that applies when
+  // neither the panel nor this session has chosen anything yet.
+
+  /** Restore the panel's last test level from workspaceState. Validated against the
+   *  full TestLevel union — a corrupted or hand-edited state DB entry degrades to
+   *  "no stored pick" (→ the configured/smart default), never a bogus CLI arg. */
+  private readStoredTestLevel(): TestLevel | undefined {
+    const raw = this.context.workspaceState.get<unknown>(TEST_LEVEL_KEY);
+    return isTestLevel(raw) ? raw : undefined;
+  }
+
+  /** Restore the panel's last RunSpecifiedTests class list from workspaceState.
+   *  Shape-guarded like readStoredTestLevel; the individual class-name syntax
+   *  check happens later, right before the classes reach CLI argv (runDeploy). */
+  private readStoredRunTests(): string[] | undefined {
+    const raw = this.context.workspaceState.get<unknown>(RUN_TESTS_KEY);
+    return Array.isArray(raw) && raw.every(c => typeof c === 'string') ? raw as string[] : undefined;
+  }
+
+  /** Persist the panel's test-level pick (+ RunSpecifiedTests classes) so it
+   *  survives a window reload. Fire-and-forget like pushCardHistory's history
+   *  write — a lost write only costs one stale default next session, never worth
+   *  failing the message handler over. */
+  private persistTestLevelState(): void {
+    void Promise.resolve(this.context.workspaceState.update(TEST_LEVEL_KEY, this.testLevel))
+      .catch(err => this.output.appendLine(`[testLevel] persist failed: ${err instanceof Error ? err.message : String(err)}`));
+    void Promise.resolve(this.context.workspaceState.update(RUN_TESTS_KEY, this.runTests))
+      .catch(err => this.output.appendLine(`[testLevel] runTests persist failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /** sfOrgDeployWrapper.defaultTestLevel, validated against the SETTING's own enum —
+   *  deliberately narrower than the full TestLevel union. RunSpecifiedTests needs a
+   *  per-deploy class list a single global setting has no way to carry, so it's
+   *  rejected here even if a hand-edited settings.json holds it. '' (and anything
+   *  else invalid) → undefined, meaning "fall through to the smart default". */
+  private configuredTestLevel(): TestLevel | undefined {
+    const raw = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<string>('defaultTestLevel', '');
+    return raw === 'NoTestRun' || raw === 'RunLocalTests' || raw === 'RunAllTestsInOrg' ? raw : undefined;
+  }
+
   // ---- Operations ----
   private async runDeploy(
     keys: string[],
-    opts: { sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel } = {}
+    opts: { sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] } = {}
   ): Promise<void> {
     // Reserve the busy slot synchronously, before the first await (the confirm
     // modal): otherwise a second deploy/retrieve/diff fired during the modal
@@ -752,11 +1009,36 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const verb = opts.validateOnly ? 'Validate' : 'Deploy';
       // Production defaults to running local tests (the org requires them anyway);
       // sandbox defaults to no tests. Validate-only always runs tests, so force at
-      // least RunLocalTests there.
+      // least RunLocalTests there. The configured default sits between the panel's
+      // own pick and that hardcoded smart fallback — it only kicks in when neither
+      // this call nor the panel/session has an opinion.
       const testLevel: TestLevel = opts.testLevel
         ?? this.testLevel
+        ?? this.configuredTestLevel()
         ?? (opts.validateOnly || isProd ? 'RunLocalTests' : 'NoTestRun');
-      const testNote = testLevel === 'NoTestRun' ? '' : `\n\nTests: ${testLevel}`;
+
+      // RunSpecifiedTests needs an actual class list — resolve it now (before the
+      // confirm modal) so an empty list can refuse the deploy outright instead of
+      // sending the org a validate/deploy that's certain to fail.
+      let runTests: string[] = [];
+      if (testLevel === 'RunSpecifiedTests') {
+        const candidates = opts.runTests ?? this.runTests ?? [];
+        // Class names become CLI argv (`--tests <name>`) — reject anything that
+        // isn't a bare Apex identifier (dots allowed for `Namespace.Class`) so a
+        // stray shell metacharacter typed into the panel can't inject an extra flag.
+        runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
+        if (runTests.length < candidates.length) {
+          this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
+        }
+        if (runTests.length === 0) {
+          vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
+          return; // early return before the confirm modal — releaseBusy() in the outer finally covers this
+        }
+      }
+
+      const testNote = testLevel === 'NoTestRun' ? ''
+        : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
+        : `\n\nTests: ${testLevel}`;
 
       const confirmLabel = opts.validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
       const confirm = isProd && !opts.validateOnly
@@ -777,7 +1059,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const ignoreConflicts = vscode.workspace
         .getConfiguration('sfOrgDeployWrapper')
         .get<boolean>('ignoreDeployConflicts', false);
-      const testArg = testLevel !== 'NoTestRun' ? ` --test-level ${testLevel}` : '';
+      // Echo the --tests flags too (one per class, matching how the CLI itself
+      // repeats the flag) so the command log names exactly what will run.
+      const testArg = testLevel !== 'NoTestRun'
+        ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
+        : '';
 
       const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
@@ -797,7 +1083,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               timeoutMs: this.timeoutMs(),
               sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined,
               validateOnly: opts.validateOnly,
-              testLevel: testLevel === 'NoTestRun' ? undefined : testLevel
+              testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
+              runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined
             }
           );
           this.currentCancel = handle.cancel;
@@ -814,11 +1101,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
+        // Org-labelled so exception cards stay attributable in the mixed-org history.
+        const labeledAction = `${verb} ${opts.validateOnly ? 'against' : 'to'} ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
-          this.reportCancelled(verb, this.currentDeployJobId
-            ? 'Asked the org to cancel the server-side deploy.'
-            : 'The org-side deploy may still complete — check the org.');
-        } else this.reportError(verb, err);
+          // No job id is ever captured mid-deploy (see cancelCurrent), so a cancel
+          // here never requested an org-side cancel — the deploy may still complete.
+          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
+        } else if (isTimeoutError(err)) {
+          // Killing the local process does NOT stop the org-side deploy.
+          this.reportDeployTimeout(labeledAction, err);
+        } else this.reportError(labeledAction, err);
       } finally {
         this.currentCancel = undefined;
         this.currentDeployJobId = undefined;
@@ -889,12 +1181,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       });
       this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
     } else {
+      // Structured lines: `key` (+ optional line/column) makes the row clickable
+      // in the panel — it opens the source in a preview tab at the error position.
       const errLines = failures.length
-        ? failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`)
+        ? failures.map(f => ({
+            text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`,
+            key: `${f.type}:${f.fullName}`,
+            ...(f.lineNumber ? { line: f.lineNumber, ...(f.columnNumber ? { column: f.columnNumber } : {}) } : {})
+          }))
         : (testFailures.length ? [] : ['Deploy reported failure with no per-component details.']);
-      const testLines = testFailures.map(t =>
-        `✗ test ${t.name ?? '?'}.${t.methodName ?? '?'} — ${stripAnsi(t.message ?? 'failed').split('\n')[0]}`
-      );
+      const testLines = testFailures.map(t => {
+        // Apex stack traces read "Class.Foo.testBar: line 12, column 1".
+        const pos = /line (\d+)(?:, column (\d+))?/.exec(t.stackTrace ?? '');
+        return {
+          text: `✗ test ${t.name ?? '?'}.${t.methodName ?? '?'} — ${stripAnsi(t.message ?? 'failed').split('\n')[0]}`,
+          ...(t.name ? { key: `ApexClass:${t.name}` } : {}),
+          ...(pos ? { line: Number(pos[1]), ...(pos[2] ? { column: Number(pos[2]) } : {}) } : {})
+        };
+      });
       this.post({
         type: 'status',
         card: {
@@ -965,7 +1269,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           } else {
             const failures = result.details?.componentFailures
               ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
-            const failLines = failures.map(f => `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
+            const failLines = failures.map(f => ({
+              text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`,
+              key: `${f.type}:${f.fullName}`
+            }));
             this.post({
               type: 'status',
               card: {
@@ -980,11 +1287,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
+        const labeledAction = `Quick Deploy to ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
-          this.reportCancelled('Deploy', this.currentDeployJobId
-            ? 'Asked the org to cancel the server-side deploy.'
-            : 'The org-side deploy may still complete — check the org.');
-        } else this.reportError('Quick Deploy', err);
+          // Quick deploy captures its job id only after the call resolves too, so a
+          // mid-flight cancel never reached the org-side deploy — say it may complete.
+          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
+        } else if (isTimeoutError(err)) {
+          this.reportDeployTimeout(labeledAction, err);
+        } else this.reportError(labeledAction, err);
       } finally {
         this.currentCancel = undefined;
         this.currentDeployJobId = undefined;
@@ -1086,14 +1396,471 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
-        if (err instanceof SfCliCancelledError) this.reportCancelled('Retrieve');
-        else this.reportError('Retrieve', err);
+        // Org-labelled so the exception card is attributable in the mixed-org history.
+        if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`);
+        else this.reportError(`Retrieve from ${orgLabel}`, err);
       } finally {
         this.currentCancel = undefined;
         this.setBusy(false);
       }
     } finally {
       releaseBusy();
+    }
+  }
+
+  /**
+   * Deploy a whole package.xml manifest (`sf project deploy start --manifest`).
+   * Mirrors runDeploy's discipline — synchronous reserveBusy, requireRoot/Org, prod
+   * guard + ⚠ confirm, the effective test-level chain (incl. RunSpecifiedTests),
+   * withWindowProgress, org-labelled status cards/history, cancel support, and the
+   * timeout-honesty path — keyed on a manifest file instead of a component
+   * selection. The parsed types drive the confirm noun and the status card's target
+   * list; the deploy result drives the counts, test failures and quick-deploy offer.
+   */
+  private async runManifestDeploy(manifestPath: string, types: Array<{ type: string; members: string[] }>): Promise<void> {
+    if (!this.reserveBusy('Deploy')) return;
+    let reserved = true;
+    const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
+    try {
+      const root = this.requireRoot();
+      if (!root) return;
+      const org = this.requireOrg();
+      if (!org) return;
+
+      const orgInfo = this.orgs.find(o => o.username === org);
+      const orgLabel = orgInfo?.alias ?? org;
+      // Kit classification: an unknown/unloaded org counts as PRODUCTION (over-warn).
+      const isProd = isLikelyProduction(orgInfo);
+      const basename = path.basename(manifestPath);
+      const typeCount = types.length;
+      const memberCount = types.reduce((sum, t) => sum + t.members.length, 0);
+      // Synthesize items from the manifest so the result card can list what was
+      // targeted; the deploy goes by --manifest, so none carry a local filePath and
+      // the actual per-component outcome comes from the deploy result.
+      const items: MetadataItem[] = types.flatMap(t => t.members.map(m => ({ type: t.type, name: m, filePath: '', files: [] })));
+      const noun = `manifest ${basename} — ${typeCount} type${typeCount === 1 ? '' : 's'}, ${memberCount} member${memberCount === 1 ? '' : 's'}`;
+
+      // Test-level chain, identical to runDeploy minus the validate-only branch (a
+      // manifest deploy is always the real thing): the panel's live pick, then the
+      // configured default, then the smart fallback (RunLocalTests on prod).
+      const testLevel: TestLevel = this.testLevel
+        ?? this.configuredTestLevel()
+        ?? (isProd ? 'RunLocalTests' : 'NoTestRun');
+      let runTests: string[] = [];
+      if (testLevel === 'RunSpecifiedTests') {
+        const candidates = this.runTests ?? [];
+        // Same CLI-argv safety filter as runDeploy: reject anything that isn't a
+        // bare Apex identifier before it becomes a `--tests` token.
+        runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
+        if (runTests.length < candidates.length) {
+          this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
+        }
+        if (runTests.length === 0) {
+          vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
+          return; // early return before the confirm modal — releaseBusy() in the outer finally covers this
+        }
+      }
+
+      const testNote = testLevel === 'NoTestRun' ? ''
+        : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
+        : `\n\nTests: ${testLevel}`;
+
+      const confirm = isProd
+        ? await vscode.window.showWarningMessage(
+            `⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.${testNote}`,
+            { modal: true, detail: orgInfo?.instanceUrl ?? '' },
+            'Deploy to PROD'
+          )
+        : await vscode.window.showWarningMessage(
+            `Deploy ${noun} — to ${orgLabel}?${testNote}`,
+            { modal: true },
+            'Deploy'
+          );
+      if (!confirm) return;
+
+      const ignoreConflicts = vscode.workspace
+        .getConfiguration('sfOrgDeployWrapper')
+        .get<boolean>('ignoreDeployConflicts', false);
+      const testArg = testLevel !== 'NoTestRun'
+        ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
+        : '';
+      const cmdId = this.beginCmd(`sf project deploy start --manifest ${/\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
+      reserved = false;
+      const start = Date.now();
+      const progressTitle = `Deploying ${noun} to ${orgLabel}`;
+      try {
+        await this.withWindowProgress(progressTitle, async () => {
+          this.postProgress(`${progressTitle}…`);
+          const handle = this.sf.deployMetadata([], org, root, {
+            manifest: manifestPath,
+            ignoreConflicts,
+            timeoutMs: this.timeoutMs(),
+            testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
+            runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined
+          });
+          this.currentCancel = handle.cancel;
+          this.currentDeployOrg = org;
+          const { result, cmd } = await handle.promise;
+          this.currentDeployJobId = result.id;
+          this.updateCmd(cmdId, cmd);
+          this.reportDeployResult(result, {
+            items, orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false
+          });
+        });
+      } catch (err) {
+        this.endCmd(cmdId, false, Date.now() - start);
+        const labeledAction = `Deploy to ${orgLabel}`;
+        if (err instanceof SfCliCancelledError) {
+          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
+        } else if (isTimeoutError(err)) {
+          this.reportDeployTimeout(labeledAction, err);
+        } else this.reportError(labeledAction, err);
+      } finally {
+        this.currentCancel = undefined;
+        this.currentDeployJobId = undefined;
+        this.currentDeployOrg = undefined;
+        this.setBusy(false);
+      }
+    } finally {
+      releaseBusy();
+    }
+  }
+
+  /**
+   * Retrieve a whole package.xml manifest (`sf project retrieve start --manifest`).
+   * Mirrors runRetrieve's discipline and reporting — the confirm warns it overwrites
+   * local files, and a successful retrieve rescans the workspace so tree/badges pick
+   * up the newly-landed components.
+   */
+  private async runManifestRetrieve(manifestPath: string, types: Array<{ type: string; members: string[] }>): Promise<void> {
+    if (!this.reserveBusy('Retrieve')) return;
+    let reserved = true;
+    const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
+    try {
+      const root = this.requireRoot();
+      if (!root) return;
+      const org = this.requireOrg();
+      if (!org) return;
+      const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
+      const basename = path.basename(manifestPath);
+      const typeCount = types.length;
+      const memberCount = types.reduce((sum, t) => sum + t.members.length, 0);
+      const noun = `manifest ${basename} — ${typeCount} type${typeCount === 1 ? '' : 's'}, ${memberCount} member${memberCount === 1 ? '' : 's'}`;
+
+      const confirm = await vscode.window.showWarningMessage(
+        `Retrieve ${noun} — from ${orgLabel}?`,
+        { modal: true, detail: 'This will overwrite your local files for the manifest\'s components.' },
+        'Retrieve'
+      );
+      if (confirm !== 'Retrieve') return;
+
+      const cmdId = this.beginCmd(`sf project retrieve start --manifest ${/\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath} --target-org ${org}`);
+      reserved = false;
+      const start = Date.now();
+      try {
+        await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
+          this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
+          const handle = this.sf.retrieveMetadata([], org, root, { manifest: manifestPath, timeoutMs: this.timeoutMs() });
+          this.currentCancel = handle.cancel;
+          const { result, cmd } = await handle.promise;
+          this.updateCmd(cmdId, cmd);
+          const files = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
+          const ok = files.filter(f => !f.problem && (f.state === undefined || f.state !== 'Failed'));
+          const failed = files.filter(f => f.problem || f.state === 'Failed');
+          const msgLines = (result.messages ?? []).filter(m => m.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
+          this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
+
+          if (failed.length === 0 && ok.length > 0) {
+            this.post({
+              type: 'status',
+              card: {
+                kind: 'ok',
+                title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
+                meta: `manifest ${basename}`,
+                lines: ok.map(f => `${f.type}:${f.fullName}`)
+              }
+            });
+            this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
+          } else if (ok.length === 0 && failed.length === 0) {
+            this.post({
+              type: 'status',
+              card: {
+                kind: 'warn',
+                title: `Nothing retrieved from ${orgLabel}`,
+                meta: `manifest ${basename}`,
+                lines: msgLines.length ? msgLines : ['The org returned no components for this manifest.']
+              }
+            });
+          } else {
+            const lines: string[] = [];
+            for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
+            for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
+            lines.push(...msgLines);
+            this.post({
+              type: 'status',
+              card: {
+                kind: failed.length > 0 ? 'err' : 'warn',
+                title: `Retrieve from ${orgLabel} completed with issues`,
+                meta: `${ok.length} ok · ${failed.length} failed`,
+                lines
+              }
+            });
+            if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
+          }
+          // refresh workspace scan (file count badges etc.), like runRetrieve.
+          this.loadFiles().catch(() => undefined);
+        });
+      } catch (err) {
+        this.endCmd(cmdId, false, Date.now() - start);
+        if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`);
+        else this.reportError(`Retrieve from ${orgLabel}`, err);
+      } finally {
+        this.currentCancel = undefined;
+        this.setBusy(false);
+      }
+    } finally {
+      releaseBusy();
+    }
+  }
+
+  /**
+   * Delete component(s) from the org AND remove their local source files
+   * (`sf project delete source`). DESTRUCTIVE and not undoable by the plugin, so it
+   * runs a preview (`--dry-run`) first and lists exactly what would go before a modal
+   * confirm. Org-only rows are valid targets (nothing local is removed for those).
+   * Follows runDeploy's busy discipline: reserve the slot synchronously, hold it
+   * across the preview + confirm + real run, release in the finally.
+   */
+  private async runDelete(keys: string[]): Promise<void> {
+    // Reserve the busy slot synchronously, before the first await (the preview and
+    // the confirm modal): the same busy-flag TOCTOU guard runDeploy documents.
+    if (!this.reserveBusy('Delete')) return;
+    let reserved = true;
+    const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
+    try {
+      const root = this.requireRoot();
+      if (!root) return;
+      const org = this.requireOrg();
+      if (!org) return;
+      // No local-source filter: org-only components are valid delete targets (the org
+      // side is removed; there's simply no local file to delete for those).
+      const items = this.resolveKeys(keys);
+      if (items.length === 0) {
+        vscode.window.showInformationMessage('No matching component(s) to delete.');
+        return;
+      }
+      const orgInfo = this.orgs.find(o => o.username === org);
+      const orgLabel = orgInfo?.alias ?? org;
+      // Kit classification: an unknown/unloaded org counts as PRODUCTION (over-warn).
+      const isProd = isLikelyProduction(orgInfo);
+      const metadata = items.map(i => `${i.type}:${i.name}`);
+      const n = items.length;
+      const noun = `${n} component${n === 1 ? '' : 's'}`;
+
+      // Stage 1 — preview via `--dry-run` (deletes nothing). It validates against the
+      // org too, so an auth/network/unknown-component error surfaces HERE, before the
+      // destructive confirm, instead of after the user has already committed.
+      let preview: string[];
+      const previewCmdId = this.beginCmd(`sf project delete source ${this.metadataArgs(items)} --target-org ${org} --no-prompt --dry-run`);
+      const previewStart = Date.now();
+      try {
+        const dry = await this.withWindowProgress(`Previewing delete of ${noun} from ${orgLabel}`, async () => {
+          this.postProgress(`Previewing delete of ${noun} from ${orgLabel}…`);
+          const handle = this.sf.deleteSource(metadata, org, root, { dryRun: true, timeoutMs: this.timeoutMs() });
+          this.currentCancel = handle.cancel;
+          const { result, cmd } = await handle.promise;
+          this.updateCmd(previewCmdId, cmd);
+          return result;
+        });
+        this.endCmd(previewCmdId, true, Date.now() - previewStart);
+        preview = deletedLines(dry);
+        // A dry run that reports nothing structured still gets an honest confirm —
+        // fall back to exactly the components we targeted.
+        if (preview.length === 0) preview = metadata.slice();
+      } catch (err) {
+        this.endCmd(previewCmdId, false, Date.now() - previewStart);
+        this.currentCancel = undefined;
+        const labeled = `Delete from ${orgLabel}`;
+        // The dry run is a check-only destructive deploy — a local timeout doesn't
+        // leave anything half-deleted, but reuse the deploy-timeout guidance for
+        // consistency (points at the org's status + the raise-timeout hint).
+        if (err instanceof SfCliCancelledError) this.reportCancelled(labeled);
+        else if (isTimeoutError(err)) this.reportDeployTimeout(labeled, err);
+        else this.reportError(labeled, err);
+        return; // releaseBusy() in the outer finally covers this
+      } finally {
+        this.currentCancel = undefined;
+      }
+
+      // Stage 2 — the destructive confirm. Be brutally honest in EVERY variant: this
+      // removes the component(s) from the org AND deletes the local source files.
+      const shown = preview.slice(0, 20);
+      const moreCount = preview.length - shown.length;
+      const previewBlock = `\n\nWill delete:\n${shown.map(l => `• ${l}`).join('\n')}${moreCount > 0 ? `\n• …and ${moreCount} more` : ''}`;
+      const hardTruth = `Deletes the component(s) from ${orgLabel} AND removes the local source files. This cannot be undone by the plugin.`;
+      const confirm = isProd
+        ? await vscode.window.showWarningMessage(
+            `⚠ Delete ${noun} from PRODUCTION (${orgLabel})?`,
+            { modal: true, detail: `${hardTruth}${orgInfo?.instanceUrl ? `\n${orgInfo.instanceUrl}` : ''}${previewBlock}` },
+            'Delete from PROD'
+          )
+        : await vscode.window.showWarningMessage(
+            `Delete ${noun} from ${orgLabel}?`,
+            { modal: true, detail: `${hardTruth}${previewBlock}` },
+            'Delete'
+          );
+      if (!confirm) return;
+
+      // Stage 3 — the real delete.
+      const cmdId = this.beginCmd(`sf project delete source ${this.metadataArgs(items)} --target-org ${org} --no-prompt`);
+      // From here the finally owns releasing the slot; stop the early-return releaser
+      // from double-firing.
+      reserved = false;
+      const start = Date.now();
+      try {
+        await this.withWindowProgress(`Deleting ${noun} from ${orgLabel}`, async () => {
+          this.postProgress(`Deleting ${noun} from ${orgLabel}…`);
+          const handle = this.sf.deleteSource(metadata, org, root, { timeoutMs: this.timeoutMs() });
+          this.currentCancel = handle.cancel;
+          const { result, cmd } = await handle.promise;
+          this.updateCmd(cmdId, cmd);
+          const failures = result.details?.componentFailures
+            ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+          const success = result.success
+            && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
+            && failures.length === 0;
+          this.endCmd(cmdId, success, Date.now() - start);
+          if (success) {
+            const removed = deletedLines(result);
+            this.post({
+              type: 'status',
+              card: {
+                kind: 'ok',
+                title: `Deleted ${noun} from ${orgLabel}`,
+                meta: 'Removed from the org and deleted locally',
+                lines: removed.length ? removed : metadata
+              }
+            });
+            this.notifySuccessIfPanelHidden(`Deleted ${noun} from ${orgLabel}`);
+            // The components are gone — prune them from the selection/tree/badges.
+            await this.afterDelete(metadata, org, orgLabel);
+          } else {
+            const failLines = failures.map(f => ({
+              text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`,
+              key: `${f.type}:${f.fullName}`
+            }));
+            this.post({
+              type: 'status',
+              card: {
+                kind: 'err',
+                title: `Delete failed against ${orgLabel}`,
+                meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}`,
+                lines: failLines.length ? failLines : ['Delete reported failure with no per-component details.']
+              }
+            });
+            this.failureToast(`Delete failed against ${orgLabel}.`, failLines);
+          }
+        });
+      } catch (err) {
+        this.endCmd(cmdId, false, Date.now() - start);
+        const labeled = `Delete from ${orgLabel}`;
+        if (err instanceof SfCliCancelledError) {
+          // Like a deploy, no job id is captured mid-flight, so a cancel here never
+          // requested an org-side cancel — the destructive deploy may still complete.
+          this.reportCancelled(labeled, 'The org-side delete may still complete — check the org.');
+        } else if (isTimeoutError(err)) {
+          // A delete IS a destructive deploy on the org — killing the local process
+          // does NOT stop it. Reuse the deploy-timeout guidance verbatim.
+          this.reportDeployTimeout(labeled, err);
+        } else this.reportError(labeled, err);
+      } finally {
+        this.currentCancel = undefined;
+        this.setBusy(false);
+      }
+    } finally {
+      releaseBusy();
+    }
+  }
+
+  /** After a successful delete: drop the removed keys from the selection, the local
+   *  tree, and cached org membership so nothing keeps describing components that no
+   *  longer exist. Order matters — update org membership FIRST (so the webview's
+   *  'files' pruning sees the deleted keys in neither local nor org and drops them
+   *  from the selection), then rescan local files and refresh the Changed view. */
+  private async afterDelete(deletedKeys: string[], org: string, orgLabel: string): Promise<void> {
+    // Drop the deleted keys from cached org membership, but only when the map belongs
+    // to the org we just deleted from (a stale map for another org must be left alone).
+    if (this.orgMembersOrg === org) {
+      for (const k of deletedKeys) this.orgMembers.delete(k);
+      const orgItems = [...this.orgMembers.keys()].map(k => {
+        const colon = k.indexOf(':');
+        return { type: k.slice(0, colon), name: k.slice(colon + 1) };
+      });
+      // Re-post so org-only rows / "on org" badges for the now-gone components vanish.
+      this.post({ type: 'orgMetadata', orgItems, orgLabel });
+    }
+    // Rescan: the deleted source files are gone, so the tree drops them and — via the
+    // webview's 'files' pruning against local+org keys — so does the selection. This
+    // also refreshes the Changed view; postChangedComponents again is belt-and-braces
+    // (a delete removes files, i.e. changes the working tree). Neither throws.
+    await this.loadFiles();
+    await this.postChangedComponents();
+  }
+
+  /**
+   * Authenticate a new org from the panel (`sf org login web`). Takes the busy slot
+   * ('Org Login') so a deploy/retrieve/fetch can't race the auth. On success: refresh
+   * the org list and select the new org as the target. The finally ALWAYS releases the
+   * slot, so a user who just closes the browser tab (login never completes → we time
+   * out or they Cancel) can never leave the panel stuck busy.
+   */
+  private async runLogin(): Promise<void> {
+    // No await between reserveBusy and the try (the cwd read is synchronous), so the
+    // reservation is race-free — same shape as loadOrgMetadata.
+    if (!this.reserveBusy('Org Login')) return;
+    // `sf org login web` authenticates globally (not project-scoped), so it doesn't
+    // need an SFDX project — fall back to process.cwd() so a user can add their FIRST
+    // org before any workspace metadata exists.
+    const cwd = this.workspaceRoot ?? process.cwd();
+    const cmdId = this.beginCmd('sf org login web');
+    const start = Date.now();
+    try {
+      const result = await this.withWindowProgress('Waiting for browser login…', async () => {
+        this.postProgress('Waiting for browser login…');
+        // No timeoutMs override on purpose — loginWeb defaults to 300s, since the
+        // browser round-trip is user-paced and the global commandTimeoutMs would
+        // kill a legitimate login mid-flow.
+        const handle = this.sf.loginWeb(cwd, {});
+        this.currentCancel = handle.cancel;
+        const { result, cmd } = await handle.promise;
+        this.updateCmd(cmdId, cmd);
+        return result;
+      });
+      this.endCmd(cmdId, true, Date.now() - start);
+      const username = result?.username;
+      // Always refresh the list — the org was added regardless of whether we got a
+      // username back to select.
+      await this.loadOrgs(true);
+      if (!username) {
+        this.post({
+          type: 'status',
+          card: { kind: 'warn', title: 'Login completed but returned no username', meta: 'Refreshed the org list — pick the new org from the dropdown.' }
+        });
+        return;
+      }
+      await this.applyOrgSelection(username);
+      this.post({
+        type: 'status',
+        card: { kind: 'ok', title: `Authenticated ${username}`, meta: 'Selected as the target org.' }
+      });
+      this.notifySuccessIfPanelHidden(`Authenticated ${username}`);
+    } catch (err) {
+      this.endCmd(cmdId, false, Date.now() - start);
+      if (err instanceof SfCliCancelledError) this.reportCancelled('Org Login', 'The browser sign-in was cancelled — no org was added.');
+      else this.reportError('Org Login', err);
+    } finally {
+      this.currentCancel = undefined;
+      this.setBusy(false);
     }
   }
 
@@ -1114,7 +1881,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const cmdId = this.beginCmd(`sf org open --source-file ${/\s/.test(item.filePath) ? `"${item.filePath}"` : item.filePath} --target-org ${org}`);
     const start = Date.now();
     try {
-      await this.sf.openInOrg(item.filePath, org, root);
+      // Honor the user's configured timeout instead of sfCliService's hardcoded 30s
+      // default — a slow network / large org page can exceed it.
+      await this.sf.openInOrg(item.filePath, org, root, { timeoutMs: this.timeoutMs() });
       this.endCmd(cmdId, true, Date.now() - start);
     } catch (err) {
       this.endCmd(cmdId, false, Date.now() - start);
@@ -1210,15 +1979,27 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             const arr = byType.get(i.type);
             if (arr) arr.push(i); else byType.set(i.type, [i]);
           }
+          // A Cancel landing BETWEEN two per-type queries used to be lost: currentCancel
+          // then points at the just-settled query handle, so calling it is a no-op and
+          // the loop rolls on to the next type. Mirror loadOrgMetadata's fetchCancelled —
+          // the wrapper flips a flag AND kills whatever query is in flight; the loop
+          // checks the flag before each query and bails out honestly.
+          let diffCancelled = false;
+          const activeQueryCancels = new Set<() => void>();
+          this.currentCancel = () => {
+            diffCancelled = true;
+            for (const c of activeQueryCancels) c();
+          };
           for (const [type, arr] of byType) {
+            if (diffCancelled) throw new SfCliCancelledError();
             const field = FAST_DIFF_FIELD[type];
             const inList = arr.map(i => `'${i.name.replace(/'/g, "\\'")}'`).join(', ');
             const soql = `SELECT Name, NamespacePrefix, ${field} FROM ${type} WHERE Name IN (${inList})`;
             const qStart = Date.now();
             const qCmdId = this.beginCmd(`sf data query --use-tooling-api --target-org ${org} --query "${soql}"`);
+            const q = this.sf.queryTooling<ToolingCodeRecord>(soql, org, root, { timeoutMs: this.timeoutMs() });
+            activeQueryCancels.add(q.cancel);
             try {
-              const q = this.sf.queryTooling<ToolingCodeRecord>(soql, org, root, { timeoutMs: this.timeoutMs() });
-              this.currentCancel = q.cancel;
               const { records } = await q.promise;
               this.endCmd(qCmdId, true, Date.now() - qStart);
               for (const item of arr) {
@@ -1240,6 +2021,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               if (e instanceof SfCliCancelledError) throw e;
               this.output.appendLine(`[Diff] Tooling query for ${type} failed — falling back to retrieve: ${e instanceof Error ? e.message : String(e)}`);
               slowItems.push(...arr);
+            } finally {
+              activeQueryCancels.delete(q.cancel);
             }
           }
         }
@@ -1333,16 +2116,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           card: {
             kind,
             title: opened.length > 0
-              ? `Diff opened for ${opened.length} component${opened.length === 1 ? '' : 's'}`
-              : (missing.length === items.length ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues`),
+              ? `Diff opened for ${opened.length} component${opened.length === 1 ? '' : 's'} against ${orgLabel}`
+              : (missing.length === items.length ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues against ${orgLabel}`),
             meta: `${opened.length} opened · ${missing.length} missing · ${errors.length} errors${unsupported.length ? ` · ${unsupported.length} unsupported` : ''}`,
             lines
           }
         });
       });
       } catch (err) {
-        if (err instanceof SfCliCancelledError) this.reportCancelled('Diff');
-        else this.reportError('Diff', err);
+        // Org-labelled so the exception card is attributable in the mixed-org history.
+        if (err instanceof SfCliCancelledError) this.reportCancelled(`Diff against ${orgLabel}`);
+        else this.reportError(`Diff against ${orgLabel}`, err);
       } finally {
         this.currentCancel = undefined;
         this.setBusy(false);
@@ -1510,6 +2294,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             hint: hintForError(first) ?? 'Check the org authentication and your connection, then retry.'
           }
         });
+        // Toast too — with auto-fetch on open (fetchOrgOnOpen) the card can land in a
+        // hidden webview, and this total wipe-out is how a user learns their auth
+        // expired. Mirror the result-failure path's notification + output mirroring.
+        this.failureToast(
+          `Fetch Org failed against ${orgLabel} — could not list metadata (${failures.length} type${failures.length === 1 ? '' : 's'} failed).`,
+          failures.slice(0, 6).map(f => `${f.label} — ${f.err instanceof Error ? f.err.message : String(f.err)}`)
+        );
         return;
       }
 
@@ -1539,6 +2330,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         card.lines = lines;
       }
       this.post({ type: 'status', card });
+      // An incomplete listing means some "local only" badges can be wrong — with
+      // auto-fetch the card may be hidden, so toast that the org view is partial.
+      if (incomplete) {
+        this.failureToast(
+          `Org metadata for ${orgLabel} is incomplete — a connection/auth error interrupted the listing; some "local only" badges may be wrong. Re-run Fetch Org.`,
+          failures.slice(0, 6).map(f => `${f.label} — ${f.err instanceof Error ? f.err.message : String(f.err)}`)
+        );
+      }
     } catch (err) {
       if (err instanceof SfCliCancelledError) this.reportCancelled('Fetch Org');
       else this.reportError('Fetch Org', err);
@@ -1600,7 +2399,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private timeoutMs(): number {
-    return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('commandTimeoutMs', 180_000);
+    // Clamp to a 10s floor: VS Code doesn't enforce the schema's minimum at runtime,
+    // so a hand-edited settings.json value of 0/500 would time EVERY command out
+    // instantly (the deploy never gets off the ground). A too-low value is a
+    // footgun; a too-high one is the user's call.
+    return Math.max(10_000, vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('commandTimeoutMs', 180_000));
   }
 
   private setBusy(b: boolean, action?: string): void {
@@ -1620,13 +2423,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    */
   private reserveBusy(action: string): boolean {
     if (this.busy) {
-      vscode.window.showInformationMessage(this.currentAction
-        ? `${this.currentAction} is already running — cancel it from the panel or wait for it to finish.`
-        : 'Another operation is already running.');
+      this.notifyBusy();
       return false;
     }
     this.setBusy(true, action);
     return true;
+  }
+
+  /** The "already running" info-message, shared by reserveBusy and the palette-only
+   *  commands (refreshFiles/pickOrg) that must refuse mid-op WITHOUT taking the slot. */
+  private notifyBusy(): void {
+    vscode.window.showInformationMessage(this.currentAction
+      ? `${this.currentAction} is already running — cancel it from the panel or wait for it to finish.`
+      : 'Another operation is already running.');
   }
 
   /** Run `body` under a cancellable VS Code progress notification so operations
@@ -1655,11 +2464,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private notifySuccessIfPanelHidden(message: string): void {
     if (this.view?.visible) return;
     vscode.window.setStatusBarMessage(`$(check) ${message}`, 8000);
-    vscode.window.showInformationMessage(`SF Deploy: ${message}`, 'Show Panel').then(choice => {
+    void vscode.window.showInformationMessage(`SF Deploy: ${message}`, 'Show Panel').then(choice => {
       if (choice === 'Show Panel') {
-        vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+        void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
       }
-    });
+    }, () => undefined);
   }
 
   private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn): Promise<void> {
@@ -1773,40 +2582,87 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  failures on a completed run). Exceptions already toast via reportError; this
    *  covers the "command succeeded, deployment failed" outcomes. The status card
    *  in the panel stays the durable, detailed record. */
-  private failureToast(message: string, detailLines: string[] = []): void {
-    // The panel's status card is the detailed record — the toast points there
-    // first. The details are ALSO mirrored into the output channel: result-level
-    // failures previously wrote nothing to it, which made "Show Output" open a
-    // log that never mentioned the failure.
-    this.output.appendLine(`[result] ${message}`);
-    // Failure lines are org-controlled text — flatten control chars so a hostile
-    // org can't forge extra "[result] …" lines or splatter ANSI into the log.
-    for (const line of detailLines) this.output.appendLine(`  ${stripAnsi(line).replace(/[\x00-\x1f\x7f]/g, ' ')}`);
-    void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Panel', 'Show Output').then(choice => {
-      if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-      if (choice === 'Show Output') this.output.show(true);
-    });
+  private failureToast(message: string, lines: Array<string | { text: string }> = []): void {
+    // Belt: this is a reporting path, so a synchronous throw from post()/output must
+    // not cascade into the caller's catch and mask the real failure. Fall back to the
+    // output channel, never rethrow.
+    try {
+      const detailLines = lines.map(l => (typeof l === 'string' ? l : l.text));
+      // The panel's status card is the detailed record — the toast points there
+      // first. The details are ALSO mirrored into the output channel: result-level
+      // failures previously wrote nothing to it, which made "Show Output" open a
+      // log that never mentioned the failure.
+      this.output.appendLine(`[result] ${message}`);
+      // Failure lines are org-controlled text — flatten control chars so a hostile
+      // org can't forge extra "[result] …" lines or splatter ANSI into the log.
+      for (const line of detailLines) this.output.appendLine(`  ${stripAnsi(line).replace(/[\x00-\x1f\x7f]/g, ' ')}`);
+      void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Panel', 'Show Output').then(choice => {
+        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+        if (choice === 'Show Output') this.output.show(true);
+      }, () => undefined);
+    } catch (e) {
+      this.output.appendLine(`[failureToast] failed to report "${message}": ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private reportError(action: string, err: unknown): void {
-    const message = err instanceof Error ? err.message : String(err);
-    this.handleError(action, err);
-    const stderr = err instanceof SfCliError ? err.stderr ?? '' : '';
-    this.post({
-      type: 'status',
-      card: {
-        kind: 'err',
-        title: `${action} failed`,
-        meta: 'See command log / output channel for details',
-        errText: stripAnsi([message, stderr].filter(Boolean).join('\n')).trim(),
-        actions: err instanceof SfCliError ? err.actions : undefined,
-        hint: hintForError(err)
-      }
-    });
-    vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
-      if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-      if (choice === 'Show Output') this.output.show(true);
-    });
+    // Belt: reportError is the last line of defense, so a synchronous throw from
+    // post()/history persistence here must not cascade into the caller's catch and
+    // mask the real error. Fall back to the output channel, never rethrow.
+    try {
+      const message = err instanceof Error ? err.message : String(err);
+      this.handleError(action, err);
+      const stderr = err instanceof SfCliError ? err.stderr ?? '' : '';
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'err',
+          title: `${action} failed`,
+          meta: 'See command log / output channel for details',
+          errText: stripAnsi([message, stderr].filter(Boolean).join('\n')).trim(),
+          actions: err instanceof SfCliError ? err.actions : undefined,
+          hint: hintForError(err)
+        }
+      });
+      void vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
+        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+        if (choice === 'Show Output') this.output.show(true);
+      }, () => undefined);
+    } catch (e) {
+      this.output.appendLine(`[reportError] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** Report a deploy/validate whose LOCAL process hit the timeout. Killing the sf
+   *  process does NOT stop the org-side deploy — it MAY STILL BE RUNNING — so this
+   *  is reported distinctly from a plain failure: a user who retries into that race
+   *  gets confusing conflicts. Card + toast point them at the org's status first,
+   *  alongside the raise-timeout hint. */
+  private reportDeployTimeout(action: string, err: unknown): void {
+    try {
+      const message = err instanceof Error ? err.message : String(err);
+      this.handleError(action, err);
+      const note = 'Killing the local command does not stop the deploy on the org — it MAY STILL BE RUNNING. Check the org\'s Deployment Status (Setup) or run `sf project deploy report` before retrying, to avoid deploying twice into a conflict.';
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'err',
+          title: `${action} timed out`,
+          meta: 'Local command timed out — the deploy may still be running on the org',
+          errText: stripAnsi(message).trim(),
+          hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large deployments.`
+        }
+      });
+      void vscode.window.showWarningMessage(
+        `SF Deploy: ${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
+        'Show Panel', 'Show Output'
+      ).then(choice => {
+        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+        if (choice === 'Show Output') this.output.show(true);
+      }, () => undefined);
+    } catch (e) {
+      this.output.appendLine(`[reportDeployTimeout] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
 
@@ -1906,6 +2762,44 @@ function isFatalFetchError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   const txt = `${name} ${message}`.toLowerCase();
   return /nodefaultenv|namedorgnotfound|noauthinfofound|invalid_grant|expired|refreshtokenauth|enotfound|getaddrinfo|econnrefused|econnreset|etimedout|socket hang up|timed out/.test(txt);
+}
+
+/** The local process-kill timeout (SfCliError whose message says it "timed out",
+ *  thrown by the CLI runner after SIGTERM→SIGKILL). Distinct from a genuine deploy
+ *  failure: killing the local `sf` does NOT stop the org-side deploy, so the caller
+ *  must steer the user to the org rather than a bare retry. Cancels are their own
+ *  SfCliCancelledError and are matched before this. */
+function isTimeoutError(err: unknown): boolean {
+  return err instanceof SfCliError && /timed out/i.test(err.message);
+}
+
+/** The `Type:Name` components a delete (or its dry-run) reports as removed. The shape
+ *  has drifted across sf versions, so read whichever is populated: `deletedSource`
+ *  (newer) or `deletes` (older) for the local removals, then the deploy-style `files`
+ *  and `details.componentSuccesses` as fallbacks. De-duplicated, junk rows skipped. */
+function deletedLines(result: DeleteResult): string[] {
+  const rows = result.deletedSource?.length ? result.deletedSource
+    : result.deletes?.length ? result.deletes
+    : result.files?.length ? result.files
+    : result.details?.componentSuccesses ?? [];
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    if (!r?.type || !r?.fullName) continue;
+    const key = `${r.type}:${r.fullName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(key);
+  }
+  return lines;
+}
+
+/** Type guard for the full TestLevel union — validates a workspaceState value that
+ *  could be anything after a corrupted write or a hand-edited state DB. Unlike
+ *  configuredTestLevel() (the settings.json default), this allows RunSpecifiedTests:
+ *  it's restoring the panel's own session pick, which legitimately can be it. */
+function isTestLevel(v: unknown): v is TestLevel {
+  return v === 'NoTestRun' || v === 'RunSpecifiedTests' || v === 'RunLocalTests' || v === 'RunAllTestsInOrg';
 }
 
 /** Map well-known sf CLI failures to a one-line actionable hint for the error card. */

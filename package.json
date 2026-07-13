@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -68,6 +68,14 @@
       {
         "command": "sfOrgDeployWrapper.diffFileWithOrg",
         "title": "SF Deploy: Compare with Org…"
+      },
+      {
+        "command": "sfOrgDeployWrapper.deployManifest",
+        "title": "SF Deploy: Deploy Manifest to Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.retrieveManifest",
+        "title": "SF Deploy: Retrieve Manifest from Org"
       }
     ],
     "menus": {
@@ -91,6 +99,16 @@
           "command": "sfOrgDeployWrapper.diffFileWithOrg",
           "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@4"
+        },
+        {
+          "command": "sfOrgDeployWrapper.deployManifest",
+          "when": "resourceFilename =~ /^package.*\\.xml$/",
+          "group": "sfdeploy@5"
+        },
+        {
+          "command": "sfOrgDeployWrapper.retrieveManifest",
+          "when": "resourceFilename =~ /^package.*\\.xml$/",
+          "group": "sfdeploy@6"
         }
       ],
       "editor/context": [
@@ -124,41 +142,60 @@
           "default": 180000,
           "minimum": 10000,
           "maximum": 900000,
-          "description": "Timeout in milliseconds for sf CLI deploy/retrieve commands."
+          "markdownDescription": "Timeout in milliseconds for the `sf` CLI commands this extension runs on your behalf: deploys, validations, quick deploys, retrieves, diff queries (the Tooling API fast path and the retrieve-based fallback), Fetch Org metadata listings, and Open in Org — not just deploy/retrieve. VS Code doesn't enforce the `minimum` below at runtime, so the extension itself clamps whatever you set here to a 10-second floor; anything lower would time out every command before it could get off the ground."
         },
         "sfOrgDeployWrapper.ignoreDeployConflicts": {
           "type": "boolean",
           "default": false,
-          "description": "Pass --ignore-conflicts to sf project deploy start. Off by default: the CLI will refuse to overwrite org changes that aren't in your local source."
+          "scope": "machine",
+          "markdownDescription": "Pass `--ignore-conflicts` to `sf project deploy start`. Off by default: the CLI will refuse to overwrite org changes that aren't in your local source. Machine-scoped so a committed `.vscode/settings.json` can't silently disable conflict protection for everyone who clones the repo."
         },
         "sfOrgDeployWrapper.fetchIncludeManaged": {
           "type": "boolean",
           "default": false,
-          "description": "When fetching org metadata, include components from installed managed packages. Off by default: managed-package components are read-only and add thousands of non-editable entries to the browse tree."
+          "markdownDescription": "When fetching org metadata, include components from installed managed packages. Off by default: managed-package components are read-only and add thousands of non-editable entries to the browse tree."
         },
         "sfOrgDeployWrapper.fetchOrgOnOpen": {
           "type": "boolean",
           "default": true,
-          "description": "Run Fetch Org automatically once per session when the panel first opens, so local/org badges and org-only components appear without a manual click. Later refreshes — including after switching orgs — stay manual via the Fetch Org button. Turn off to avoid the org API calls on panel open."
+          "markdownDescription": "Run Fetch Org automatically once per session when the panel first opens, so local/org badges and org-only components appear without a manual click. Later refreshes — including after switching orgs — stay manual via the Fetch Org button. Turn off to avoid the org API calls on panel open."
         },
         "sfOrgDeployWrapper.fetchConcurrency": {
           "type": "number",
           "default": 5,
           "minimum": 1,
           "maximum": 12,
-          "description": "How many metadata types to fetch in parallel when browsing org metadata. Lower this if Fetch Org strains your machine; raise it for faster fetches on a capable machine."
+          "scope": "machine",
+          "markdownDescription": "How many metadata types to fetch in parallel when browsing org metadata. Lower this if Fetch Org strains your machine; raise it for faster fetches on a capable machine. Machine-scoped — it's a machine-capability knob, so syncing one value across a desktop and a weak laptop would be wrong."
         },
         "sfOrgDeployWrapper.typeCacheDays": {
           "type": "number",
           "default": 7,
           "minimum": 0,
           "maximum": 365,
-          "description": "How many days to cache metadata-type rules learned from the sf CLI registry (types this extension doesn't know built-in are resolved via 'sf project generate manifest'). 0 disables the cache — types are re-resolved every time."
+          "markdownDescription": "How many days to cache metadata-type rules learned from the `sf` CLI registry (types this extension doesn't know built in are resolved via `sf project generate manifest`, run offline — no org call). The SAME cache/TTL also backs the negative side: folders where that resolution FAILED, so a lost cause isn't retried on every scan. Set to 0 to disable both — every type is re-resolved from scratch each scan, and every previously-failed folder is re-probed (up to 30 seconds each) on every session start and every refresh, instead of being remembered as a lost cause."
+        },
+        "sfOrgDeployWrapper.changedBaseRef": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "When set — e.g. `main` or `origin/main` — the **Changed** view shows components whose files differ from that git ref (committed changes included: the release-promotion question — \"what will this branch deploy?\"), instead of only uncommitted changes. Uncommitted edits are always included on top. Empty (the default) = uncommitted changes only."
         },
         "sfOrgDeployWrapper.openDiffInFloatingWindow": {
           "type": "boolean",
           "default": true,
-          "description": "Pop org-comparison diffs into their own OS window (auxiliary window). Turn off to keep them as diff tabs in the main window."
+          "markdownDescription": "Pop org-comparison diffs into their own OS window (auxiliary window). Turn off to keep them as diff tabs in the main window."
+        },
+        "sfOrgDeployWrapper.defaultTestLevel": {
+          "type": "string",
+          "enum": ["", "NoTestRun", "RunLocalTests", "RunAllTestsInOrg"],
+          "enumDescriptions": [
+            "Smart default — RunLocalTests against a production org, NoTestRun against a sandbox or scratch org.",
+            "Run no Apex tests. Salesforce rejects this test level for a production deploy.",
+            "Run all Apex tests in this org's own namespace (excludes installed managed packages).",
+            "Run every Apex test in the org, including tests belonging to installed managed packages."
+          ],
+          "default": "",
+          "markdownDescription": "The Apex test level preselected in the panel's picker, and used by context-menu / editor right-click deploys when the picker hasn't been touched yet this session. Empty (the default) means a smart default: `RunLocalTests` against a production org, `NoTestRun` against a sandbox. `RunSpecifiedTests` is deliberately not offered here — it needs a per-deploy list of test classes, which one global setting has no way to carry."
         },
         "skrety.salesforce.targetOrg": {
           "type": "string",

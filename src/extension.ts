@@ -9,8 +9,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const orgStore = new OrgStore(context.globalState);
   // Seed the shared setting from the legacy globalState key so the remembered org
   // survives the move to `skrety.salesforce.targetOrg`. Fire-and-forget: the
-  // status bar refreshes off the store's change event once the seed lands.
-  void orgStore.migrate();
+  // status bar refreshes off the store's change event once the seed lands. A failed
+  // seed only costs the remembered org — log it rather than leave a floating rejection.
+  void orgStore.migrate().catch(err =>
+    output.appendLine(`[migrate] ${err instanceof Error ? err.message : String(err)}`));
   const provider = new DeployPanelProvider(context, orgStore, sf, output);
 
   // Status bar org indicator (T13)
@@ -45,7 +47,12 @@ export function activate(context: vscode.ExtensionContext): void {
     registerSafe('sfOrgDeployWrapper.deployFile', (uri?: vscode.Uri) => provider.deployFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
     registerSafe('sfOrgDeployWrapper.retrieveFile', (uri?: vscode.Uri) => provider.retrieveFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
     registerSafe('sfOrgDeployWrapper.diffFile', (uri?: vscode.Uri) => provider.diffFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    registerSafe('sfOrgDeployWrapper.diffFileWithOrg', (uri?: vscode.Uri) => provider.diffFileWithOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri))
+    registerSafe('sfOrgDeployWrapper.diffFileWithOrg', (uri?: vscode.Uri) => provider.diffFileWithOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    // Manifest commands pass the uri straight through: from the explorer menu it's
+    // the clicked package.xml; from the palette it's undefined, so the provider
+    // opens an XML file dialog rather than assuming the active editor.
+    registerSafe('sfOrgDeployWrapper.deployManifest', (uri?: vscode.Uri) => provider.deployManifest(uri)),
+    registerSafe('sfOrgDeployWrapper.retrieveManifest', (uri?: vscode.Uri) => provider.retrieveManifest(uri))
   );
 
   // A rejected command handler (e.g. the status-bar org pick failing to save the

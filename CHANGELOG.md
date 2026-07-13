@@ -3,6 +3,36 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.9.0
+
+- New: **Delete from Org.** Right-click components → "Delete from Org…": a dry-run preview
+  first, then a confirmation listing exactly what will be removed — from the org AND the
+  local source files (that is how `sf project delete source` works) — with the extra
+  production guard on top.
+- New: **Deploy or retrieve a manifest.** Right-click any `package*.xml` in the Explorer
+  (or use the palette commands) to deploy or retrieve everything it lists — same
+  confirmations, test levels and PROD guard as tree deploys.
+- New: **Changed view against a branch.** Set `sfOrgDeployWrapper.changedBaseRef` (e.g.
+  `origin/main`) and the Changed tab shows components differing from that ref — committed
+  changes included — answering "what does this release deploy", not just "what's uncommitted".
+- New: **Authenticate from the panel.** The ＋ button beside the org list runs
+  `sf org login web` and selects the new org when the browser flow completes.
+- New: **Run specific Apex tests.** The test-level picker gained `RunSpecifiedTests` with a
+  class-name input, there's a `defaultTestLevel` setting for your standing policy, and the
+  picker's choice now survives window reloads.
+- Fixed: **Org switches made in sibling Skrety plugins update this panel immediately.**
+  Previously the tree kept the old org's badges (which could talk you into overwriting a
+  component that exists on the new org), and clicking Fetch Org in that state wrote the old
+  org back over the switch for every plugin.
+- Fixed: **Timed-out deploys tell the truth.** A deploy outliving the local timeout is
+  reported as possibly still running on the org — check its Deployment Status — instead of
+  a plain failure that invites a conflicting retry.
+- Fixed: **Failures during the automatic Fetch Org raise a notification** instead of landing
+  silently in a hidden panel, so expired auth is visible again.
+- Changed: **Safety settings are machine-scoped.** `ignoreDeployConflicts` and
+  `fetchConcurrency` can no longer be overridden by a repository's committed
+  `.vscode/settings.json`.
+
 ## 0.8.0
 
 - New: **The Status pane is now your deployment history.** Result cards — deploys,

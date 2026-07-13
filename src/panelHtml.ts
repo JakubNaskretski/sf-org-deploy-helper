@@ -244,6 +244,12 @@ body.resizing { cursor: row-resize; user-select: none; }
   padding: 3px 6px; font-family: inherit; font-size: inherit; flex: 1 1 100%;
 }
 .actions select:disabled { opacity: 0.5; cursor: not-allowed; }
+/* RunSpecifiedTests class-list input — same full-row treatment as #testLevel
+   (comment above) so it lands on its own row directly below the select, hidden
+   by default via the inline style on the element. Kept as minimal as
+   .tree-search input: just the sizing, no bespoke look. */
+.actions input#testClasses { flex: 1 1 100%; }
+.actions input#testClasses.input-error { border-color: var(--err); }
 #diffBtn, #retrieveBtn, #validateBtn, #deployBtn, #cancelBtn {
   flex: 1 1 0; min-width: 68px; white-space: nowrap;
 }
@@ -263,6 +269,8 @@ body.resizing { cursor: row-resize; user-select: none; }
 .status-card .title { font-weight: 600; margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
 .status-card .card-icon { font-weight: 700; flex: none; }
 .status-card .card-time { margin-left: auto; flex: none; color: var(--muted); font-size: 10px; font-weight: 400; }
+.status-card li.nav { cursor: pointer; }
+.status-card li.nav:hover { color: var(--fg); text-decoration: underline; }
 .status-card .card-icon.ok { color: var(--ok); }
 .status-card .card-icon.err { color: var(--err); }
 .status-card .card-icon.warn { color: var(--warn); }
@@ -376,6 +384,10 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .ctx-menu .ctx-item.disabled { opacity: 0.4; cursor: default; }
 .ctx-menu .ctx-item.disabled:hover { background: transparent; color: inherit; }
+/* Destructive items (Delete from Org…) read as danger — red text, kept red on the
+   selection-highlight hover so it can't be mistaken for a benign action. */
+.ctx-menu .ctx-item.danger { color: var(--err); }
+.ctx-menu .ctx-item.danger:hover { color: var(--err); }
 .ctx-menu .ctx-sep { height: 1px; margin: 4px 0; background: var(--vscode-menu-separatorBackground, var(--border)); }
 </style>
 </head>
@@ -384,6 +396,7 @@ body.resizing { cursor: row-resize; user-select: none; }
     <span title="Salesforce org">Org:</span>
     <select id="orgSelect" class="org" title="Authenticated orgs"></select>
     <button id="refreshOrgs" class="secondary" title="Refresh org list">⟳</button>
+    <button id="addOrg" class="secondary" title="Authenticate a new org (sf org login web)">＋</button>
     <button id="refreshFiles" class="secondary" title="Rescan workspace metadata">Rescan</button>
     <button id="fetchOrgBtn" class="secondary" title="Fetch all metadata from the connected org and merge with local workspace">Fetch Org</button>
   </div>
@@ -417,15 +430,18 @@ body.resizing { cursor: row-resize; user-select: none; }
       <div id="tree" class="tree"></div>
       <div class="actions" id="actionsBar">
         <button id="useActive" class="secondary" title="Select the file currently open in editor">Use active file</button>
+        <button id="useOpenTabs" class="secondary" title="Select every open editor tab that maps to a metadata component">Use open tabs</button>
         <span class="spacer"></span>
         <span id="selCount" class="selected-count">0 selected</span>
         <button id="clearSel" class="subtle" style="display:none;" title="Clear selection">✕</button>
         <select id="testLevel" class="org" title="Apex test level for deploy/validate">
           <option value="">Tests: default</option>
           <option value="NoTestRun">NoTestRun</option>
+          <option value="RunSpecifiedTests">RunSpecifiedTests</option>
           <option value="RunLocalTests">RunLocalTests</option>
           <option value="RunAllTestsInOrg">RunAllTestsInOrg</option>
         </select>
+        <input id="testClasses" type="text" placeholder="Test classes, comma-separated" title="Apex test classes to run (RunSpecifiedTests)" style="display:none;" />
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
         <button id="validateBtn" class="secondary" disabled title="Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.">Validate</button>

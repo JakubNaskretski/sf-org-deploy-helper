@@ -74,6 +74,25 @@ export interface DeployResult {
   files?: DeployFileResult[];
 }
 
+/** Result of `sf project delete source`. It's a destructive deploy under the hood,
+ *  so it shares DeployResult's success/counts/details/files; the LOCAL files it
+ *  removed are additionally reported under `deletedSource` (newer sf) or `deletes`
+ *  (older) — read both, plus the deploy-style `files`, since the shape has drifted
+ *  across CLI versions. */
+export interface DeleteResult extends DeployResult {
+  deletedSource?: DeployFileResult[];
+  deletes?: DeployFileResult[];
+}
+
+/** Result of `sf org login web`. Only `username` is consumed (to select the org);
+ *  the result also carries an access token, which is deliberately NOT typed here so
+ *  nothing is tempted to log or surface it. */
+export interface LoginResult {
+  username?: string;
+  orgId?: string;
+  instanceUrl?: string;
+}
+
 export interface RetrieveFileResult {
   fullName: string;
   type: string;
@@ -105,6 +124,9 @@ export interface DeployOptions {
   ignoreConflicts?: boolean;
   timeoutMs?: number;
   sourceDirs?: string[];
+  /** `--manifest <package.xml>` — deploy an entire manifest. Mutually exclusive
+   *  with sourceDirs/metadata: when set, those targets are ignored. */
+  manifest?: string;
   /** `sf project deploy validate` (check-only) instead of `deploy start`; the
    *  returned `id` can then be quick-deployed. Validation always runs tests, so
    *  callers should pass a non-NoTestRun level (the CLI enforces this). */
@@ -126,9 +148,14 @@ export class SfCliService extends KitSfCliService {
     // quick-deploy; `start` is the real thing. Both take the same arg shape.
     const verb = opts.validateOnly ? 'validate' : 'start';
     const args = ['project', 'deploy', verb];
-    // Deploy by explicit path when given (file may live outside the package
-    // directories, where --metadata Type:Name can't resolve it); else by metadata.
-    if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
+    // Target selection, in precedence order (mutually exclusive):
+    //   --manifest    a whole package.xml manifest
+    //   --source-dir  an explicit path (file may live outside the package dirs,
+    //                 where --metadata Type:Name can't resolve it)
+    //   --metadata    the per-component list
+    // A manifest wins: when set, the sourceDirs/metadata targets are ignored.
+    if (opts.manifest) args.push('--manifest', opts.manifest);
+    else if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
     else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
     if (opts.ignoreConflicts) args.push('--ignore-conflicts');
@@ -139,6 +166,35 @@ export class SfCliService extends KitSfCliService {
     const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
     const promise = inner.promise.then(json => ({
       result: this.unwrapResult(json, `project deploy ${verb}`),
+      cmd
+    }));
+    return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * Delete metadata component(s) from the org AND remove their local source files
+   * (`sf project delete source`). This is a DESTRUCTIVE operation: it runs a
+   * destructive deploy on the org and, for components that have local source,
+   * deletes those files too. `--no-prompt` suppresses the CLI's own interactive
+   * confirmation (the caller confirms in VS Code first, and stdin isn't wired up).
+   * With `opts.dryRun` it validates the delete without executing — used to preview
+   * exactly what would be removed before the destructive confirm.
+   */
+  deleteSource(
+    metadata: string[],
+    targetOrg: string,
+    cwd: string,
+    opts: { dryRun?: boolean; timeoutMs?: number } = {}
+  ): Cancellable<{ result: DeleteResult; cmd: string }> {
+    const args = ['project', 'delete', 'source'];
+    for (const m of metadata) args.push('--metadata', m);
+    args.push('--target-org', targetOrg, '--no-prompt');
+    if (opts.dryRun) args.push('--dry-run');
+    args.push('--json');
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<SfJsonEnvelope<DeleteResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => ({
+      result: this.unwrapResult(json, 'project delete source'),
       cmd
     }));
     return { promise, cancel: inner.cancel };
@@ -187,6 +243,25 @@ export class SfCliService extends KitSfCliService {
   }
 
   /**
+   * Authenticate a new org through the browser flow (`sf org login web`). Returns
+   * the new org's username so the caller can select it as the target.
+   *
+   * The browser round-trip is user-paced (open a tab, sign in, approve), so this
+   * defaults to a 300s timeout REGARDLESS of the extension's configured
+   * commandTimeoutMs — that global default (as low as the 3-minute out-of-box value,
+   * clamped no lower than 10s) is sized for CLI round-trips and would kill a
+   * legitimate login while the user is still completing it. Cancellable: killing the
+   * `sf` process aborts our wait; the browser tab is the user's to close.
+   */
+  loginWeb(cwd: string, opts: { timeoutMs?: number } = {}): Cancellable<{ result: LoginResult; cmd: string }> {
+    const args = ['org', 'login', 'web', '--json'];
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<SfJsonEnvelope<LoginResult>>(args, { timeoutMs: opts.timeoutMs ?? 300_000, cwd });
+    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'org login web'), cmd }));
+    return { promise, cancel: inner.cancel };
+  }
+
+  /**
    * Resolve metadata types for local paths via `sf project generate manifest` —
    * the CLI's own metadata registry, fully offline (no org call). Returns the
    * generated package.xml content. Throws SfCliError (TypeInferenceError) when a
@@ -218,10 +293,14 @@ export class SfCliService extends KitSfCliService {
     metadata: string[],
     targetOrg: string,
     cwd: string,
-    opts: { outputDir?: string; timeoutMs?: number; sourceDirs?: string[] } = {}
+    opts: { outputDir?: string; timeoutMs?: number; sourceDirs?: string[]; manifest?: string } = {}
   ): Cancellable<{ result: RetrieveResult; cmd: string }> {
     const args = ['project', 'retrieve', 'start'];
-    if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
+    // A manifest wins over the source-dir / per-component targets (mutually
+    // exclusive; when set the sourceDirs/metadata args are ignored). Mirrors
+    // deployMetadata's precedence.
+    if (opts.manifest) args.push('--manifest', opts.manifest);
+    else if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
     else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
     if (opts.outputDir) args.push('--target-metadata-dir', opts.outputDir, '--unzip');
