@@ -330,7 +330,13 @@ export function parseManifestTypes(xml: string): Array<{ type: string; members: 
   const out: Array<{ type: string; members: string[] }> = [];
   for (const block of xml.match(/<types>[\s\S]*?<\/types>/g) ?? []) {
     const type = /<name>([^<]+)<\/name>/.exec(block)?.[1]?.trim();
-    if (!type) continue;
+    // Real metadata type names are strictly alphanumeric. A crafted
+    // registryCustomizations block in a hostile sfdx-project.json can echo an
+    // arbitrary string here, and resolved types later become CLI argv tokens
+    // (--metadata-type) — reject anything shaped like a flag or containing
+    // whitespace before it enters the pipeline. (execFile already prevents
+    // injection; this is defense-in-depth per security review.)
+    if (!type || !/^[A-Za-z0-9_]+$/.test(type)) continue;
     const members = [...block.matchAll(/<members>([^<]+)<\/members>/g)].map(m => m[1].trim()).filter(Boolean);
     if (members.length) out.push({ type, members });
   }

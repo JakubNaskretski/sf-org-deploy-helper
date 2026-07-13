@@ -3,6 +3,24 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.8.0
+
+- New: **The Status pane is now your deployment history.** Result cards — deploys,
+  validations, retrieves, diffs, successes and failures with their full details — carry a
+  timestamp and survive window reloads: the last 50 operations per workspace stay in the
+  pane, newest first. **Clear** wipes the history too.
+- New: **Org badges appear on their own.** The panel runs Fetch Org automatically once per
+  session when it first opens, so local/org badges and org-only components show up without
+  a manual click. New setting `sfOrgDeployWrapper.fetchOrgOnOpen` (on by default) turns it
+  off; later refreshes and org switches stay manual.
+- New: **Nearly twice the metadata coverage.** Fetch Org now covers 86 metadata types (was
+  45), curated from the sf CLI's own registry — including OmniStudio (OmniScripts,
+  Integration Procedures, DataRaptors, FlexCards), Reports and Dashboards (with folder
+  support), approval processes, duplicate/assignment/sharing rules, connected apps,
+  permission set groups, platform events and more. Beyond the list, every metadata type
+  found in your workspace is now always fetched — so components of brand-new or unusual
+  types get their badges without waiting for a plugin update.
+
 ## 0.7.0
 
 - New: **Three tree views — All, Selected, Changed.** Tabs above the search box switch the

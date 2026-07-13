@@ -24,6 +24,7 @@ type Inbound =
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
+  | { type: 'clearStatusHistory' }
   | { type: 'cancel' };
 
 // Minimal structural slice of the built-in vscode.git extension's API (v1) —
@@ -37,6 +38,10 @@ interface OrgPayload { username: string; alias?: string; label: string; kind: 'p
 
 /** globalState key for folder→type rules learned from the sf CLI registry. */
 const LEARNED_RULES_KEY = 'learnedTypeRules';
+/** workspaceState key for the status-card history (newest first) — the Status
+ *  pane doubles as a per-workspace deployment history across window reloads. */
+const CARD_HISTORY_KEY = 'statusCardHistory';
+const CARD_HISTORY_MAX = 50;
 /** globalState key for folders whose type resolution failed — the negative cache
  *  (same TTL as learned rules). Without it every NEW session re-paid the serial
  *  30s-per-folder registry calls before a context-menu deploy could even confirm. */
@@ -269,9 +274,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Restore the test-level select after a webview rebuild — the provider is
         // the source of truth so a collapsed/reopened panel can't silently diverge.
         this.post({ type: 'testLevel', value: this.testLevel ?? '' });
-        // Replay the last result card into a freshly-built webview, so opening
-        // the panel after a context-menu operation shows its outcome.
-        if (this.lastStatusCard) this.post(this.lastStatusCard);
+        // Replay the persisted card history into the freshly-built webview — the
+        // Status pane is the deployment history (survives reloads, newest first).
+        if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        this.maybeAutoFetchOrg();
         return;
       case 'setTestLevel':
         this.testLevel = msg.testLevel;
@@ -322,6 +328,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       case 'refreshChanged':
         await this.postChangedComponents();
         return;
+      case 'clearStatusHistory':
+        this.cardHistoryCache = [];
+        await this.context.workspaceState.update(CARD_HISTORY_KEY, []);
+        return;
       case 'copyText':
         if (msg.text) {
           await vscode.env.clipboard.writeText(msg.text);
@@ -357,6 +367,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
       })();
     }
+  }
+
+  /** One automatic Fetch Org per session (`fetchOrgOnOpen`, default on), fired
+   *  after the panel's first ready — badges appear without a manual click.
+   *  Skipped silently when disabled, no org/root yet, or an operation is running
+   *  (no "already running" toast for an action the user didn't take; the next
+   *  panel open retries in that case). A webview rebuild does NOT re-trigger it,
+   *  and later org switches stay manual — Fetch Org remains the refresh. */
+  private autoFetchDone = false;
+
+  private maybeAutoFetchOrg(): void {
+    if (this.autoFetchDone) return;
+    if (!vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('fetchOrgOnOpen', true)) return;
+    if (this.busy || !this.workspaceRoot || !this.orgStore.get()) return;
+    this.autoFetchDone = true;
+    void this.loadOrgMetadata().catch(err =>
+      this.output.appendLine(`[Fetch Org] auto-fetch failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   // ---- Loaders ----
@@ -416,7 +443,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const days = this.typeCacheDays();
     if (days <= 0) return [];
     const cutoff = Date.now() - days * 86_400_000;
-    return this.context.globalState.get<LearnedRule[]>(LEARNED_RULES_KEY, []).filter(r => r.learnedAt >= cutoff);
+    // Shape + charset guard: stored rules feed CLI argv tokens; a corrupted or
+    // tampered state DB entry must degrade to "rule ignored", never flow onward.
+    return this.context.globalState.get<LearnedRule[]>(LEARNED_RULES_KEY, [])
+      .filter(r => !!r && typeof r.folder === 'string' && typeof r.type === 'string'
+        && /^[A-Za-z0-9_]+$/.test(r.type) && r.learnedAt >= cutoff);
   }
 
   private async rememberRule(rule: FolderRule): Promise<void> {
@@ -1402,24 +1433,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Folder-based types (EmailTemplate) return nothing without --folder: first
         // enumerate the folders, then fetch each folder's members. fullNames come back
         // as `Folder/Name`, matching the local scanner's key for the same component.
+        // Curated list UNION whatever types the workspace scan actually produced —
+        // a type resolved via the CLI registry (new platform types, OmniStudio
+        // extras, …) gets badged without waiting for a plugin release. Types this
+        // org doesn't support fail per-type and are reported, never fatal.
+        const fetchTypes = new Set<string>(FETCH_ORG_TYPES);
+        for (const i of this.items) fetchTypes.add(i.type);
         const tasks: Array<{ type: string; label: string; folder?: string }> = [];
-        for (const type of FETCH_ORG_TYPES) {
-          if (type === 'EmailTemplate') continue;
-          tasks.push({ type, label: type });
+        for (const type of fetchTypes) {
+          if (!(type in FOLDERED_TYPES)) tasks.push({ type, label: type });
         }
-        if (FETCH_ORG_TYPES.includes('EmailTemplate')) {
+        for (const [type, folderType] of Object.entries(FOLDERED_TYPES)) {
+          if (!fetchTypes.has(type)) continue;
           try {
-            const fh = this.sf.listMetadata('EmailTemplateFolder', org, root, { timeoutMs });
+            const fh = this.sf.listMetadata(folderType, org, root, { timeoutMs });
             activeCancels.add(fh.cancel);
             const { members } = await fh.promise;
             activeCancels.delete(fh.cancel);
             for (const f of members) {
-              if (f.fullName) tasks.push({ type: 'EmailTemplate', label: `EmailTemplate (${f.fullName})`, folder: f.fullName });
+              if (f.fullName) tasks.push({ type, label: `${type} (${f.fullName})`, folder: f.fullName });
             }
           } catch (err) {
             if (fetchCancelled || err instanceof SfCliCancelledError) throw err;
-            failures.push({ label: 'EmailTemplateFolder', err });
-            this.output.appendLine(`[Fetch Org] EmailTemplateFolder: ${err instanceof Error ? err.message : String(err)}`);
+            failures.push({ label: folderType, err });
+            this.output.appendLine(`[Fetch Org] ${folderType}: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
 
@@ -1652,16 +1689,50 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'orgs', orgs: payload, selected: this.orgStore.get() ?? null });
   }
 
-  /** Latest status card, retained so a panel opened AFTER an operation (e.g. a
-   *  context-menu deploy that failed with the sidebar closed) still shows the
-   *  result — posting into a closed webview is a silent no-op, and the "Show
-   *  Panel" toast button would otherwise open an empty panel. */
-  private lastStatusCard?: unknown;
-
   private post(msg: unknown): void {
-    const m = msg as { type?: string; card?: unknown } | null;
-    if (m?.type === 'status' && m.card) this.lastStatusCard = msg;
+    const m = msg as { type?: string; card?: Record<string, unknown> } | null;
+    if (m?.type === 'status' && m.card) {
+      // Stamp and persist every result card — the Status pane doubles as the
+      // deployment history, surviving webview rebuilds AND window reloads (so a
+      // failed context-menu deploy with the sidebar closed leaves a durable trace).
+      m.card.at ??= Date.now();
+      this.pushCardHistory(m.card);
+    }
     this.view?.webview.postMessage(msg);
+  }
+
+  /** In-memory mirror of the persisted card history (newest first, capped). */
+  private cardHistoryCache?: Array<Record<string, unknown>>;
+
+  /** Persisted history, shape-guarded (a corrupted workspaceState value must
+   *  degrade to an empty history, never throw scans down). */
+  private cardHistory(): Array<Record<string, unknown>> {
+    if (!this.cardHistoryCache) {
+      const raw = this.context.workspaceState.get<unknown>(CARD_HISTORY_KEY, []);
+      this.cardHistoryCache = Array.isArray(raw)
+        ? raw.filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+        : [];
+    }
+    return this.cardHistoryCache;
+  }
+
+  private pushCardHistory(card: Record<string, unknown>): void {
+    // Strip the quickDeploy affordance from the persisted copy: its validation
+    // anchor (`lastValidated`) is in-memory, so after a reload the button would
+    // be dead. The LIVE card posted to the webview keeps it.
+    const { quickDeploy: _dropped, ...persistable } = card;
+    // Bound the persisted copy: errText can carry full CLI stderr and a card can
+    // list hundreds of components — 50 unbounded cards would bloat the state DB.
+    if (typeof persistable.errText === 'string' && persistable.errText.length > 8_000) {
+      persistable.errText = `${persistable.errText.slice(0, 8_000)}\n… (truncated in history)`;
+    }
+    if (Array.isArray(persistable.lines) && persistable.lines.length > 100) {
+      persistable.lines = [...persistable.lines.slice(0, 100), `… ${persistable.lines.length - 100} more (truncated in history)`];
+    }
+    this.cardHistoryCache = [persistable, ...this.cardHistory()].slice(0, CARD_HISTORY_MAX);
+    // A lost write costs one history entry — log, don't surface.
+    void Promise.resolve(this.context.workspaceState.update(CARD_HISTORY_KEY, this.cardHistoryCache))
+      .catch(err => this.output.appendLine(`[history] card-history write failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   // command log helpers
@@ -1763,7 +1834,40 @@ const FETCH_ORG_TYPES: readonly string[] = [
   'NamedCredential', 'ExternalDataSource', 'RemoteSiteSetting',
   // Misc
   'EmailTemplate', 'Settings',
+  // OmniStudio (standard runtime — where these are real metadata types; on
+  // classic managed-runtime orgs the list call fails per-type and is reported,
+  // like any other unsupported type)
+  'OmniScript', 'OmniIntegrationProcedure', 'OmniDataTransform', 'OmniUiCard',
+  // ---- 2026-07 expansion, curated from the sf CLI's own metadata registry ----
+  // Picklists & translations
+  'StandardValueSet', 'GlobalValueSetTranslation', 'Translations', 'CustomObjectTranslation',
+  // Automation & guidance
+  'ApprovalProcess', 'FlowTest', 'PathAssistant',
+  // Data quality & record routing
+  'DuplicateRule', 'MatchingRules', 'AssignmentRules', 'AutoResponseRules', 'EscalationRules', 'SharingRules',
+  // Access & auth
+  'PermissionSetGroup', 'MutingPermissionSet', 'ConnectedApp', 'AuthProvider',
+  'ExternalCredential', 'Certificate', 'CspTrustedSite', 'CorsWhitelistOrigin',
+  // UI & branding
+  'AppMenu', 'CustomNotificationType', 'LightningExperienceTheme', 'BrandingSet', 'ContentAsset',
+  // Analytics (Report/Dashboard are folder-based — see FOLDERED_TYPES)
+  'Report', 'Dashboard', 'ReportType',
+  // Integration & platform
+  'PlatformEventChannel', 'PlatformEventSubscriberConfig', 'PlatformCachePartition',
+  'ExternalServiceRegistration', 'EmailServicesFunction', 'DataWeaveResource',
+  // Experience Cloud & Service
+  'ExperienceBundle', 'Network', 'CustomSite', 'EntitlementProcess', 'MilestoneType', 'Bot',
 ];
+
+/** Folder-based types: their members only list per folder, so the folders are
+ *  enumerated first. Members come back as `Folder/Name`, matching local keys.
+ *  (EmailTemplateFolder is the long-standing alias of EmailFolder — kept because
+ *  it's what this plugin has always queried successfully.) */
+const FOLDERED_TYPES: Record<string, string> = {
+  EmailTemplate: 'EmailTemplateFolder',
+  Report: 'ReportFolder',
+  Dashboard: 'DashboardFolder'
+};
 
 function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
   if (o.isScratch) return 'scratch';

@@ -117,6 +117,7 @@
   });
   $('clearStatus').addEventListener('click', () => {
     state.statusCards = [];
+    send('clearStatusHistory'); // also drop the persisted history, or it resurrects on reload
     renderStatus();
   });
   $('clearCmdLog').addEventListener('click', (e) => {
@@ -253,9 +254,15 @@
         }
         return;
       case 'status':
-        // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint }
+        // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint, at }
         state.statusCards.unshift(msg.card);
-        if (state.statusCards.length > 25) state.statusCards.length = 25;
+        if (state.statusCards.length > 50) state.statusCards.length = 50;
+        renderStatus();
+        return;
+      case 'statusHistory':
+        // Persisted card history replayed by the provider on ready (newest first) —
+        // the Status pane doubles as the deployment history across window reloads.
+        state.statusCards = (msg.cards || []).slice(0, 50);
         renderStatus();
         return;
       case 'cmd':
@@ -903,6 +910,15 @@
   const CARD_ICONS = { ok: '✓', err: '✕', warn: '⚠' };
   const MAX_CARD_LINES = 8;
 
+  // Card timestamp: time-only for today, date + time for older history entries.
+  function fmtCardTime(at) {
+    const d = new Date(at);
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return d.toDateString() === new Date().toDateString()
+      ? hm
+      : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hm}`;
+  }
+
   function renderStatus() {
     const st = $('status');
     st.innerHTML = '';
@@ -948,6 +964,13 @@
       const ttxt = document.createElement('span');
       ttxt.textContent = card.title || '';
       t.appendChild(ttxt);
+      if (card.at) {
+        const time = document.createElement('span');
+        time.className = 'card-time';
+        time.textContent = fmtCardTime(card.at);
+        time.title = new Date(card.at).toLocaleString();
+        t.appendChild(time);
+      }
       el.appendChild(t);
       if (card.meta) {
         const m = document.createElement('div');

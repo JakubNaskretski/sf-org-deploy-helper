@@ -262,6 +262,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 .status-card.progress { border-left: 3px solid var(--accent); }
 .status-card .title { font-weight: 600; margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
 .status-card .card-icon { font-weight: 700; flex: none; }
+.status-card .card-time { margin-left: auto; flex: none; color: var(--muted); font-size: 10px; font-weight: 400; }
 .status-card .card-icon.ok { color: var(--ok); }
 .status-card .card-icon.err { color: var(--err); }
 .status-card .card-icon.warn { color: var(--warn); }

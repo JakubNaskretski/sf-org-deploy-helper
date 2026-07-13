@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -135,6 +135,11 @@
           "type": "boolean",
           "default": false,
           "description": "When fetching org metadata, include components from installed managed packages. Off by default: managed-package components are read-only and add thousands of non-editable entries to the browse tree."
+        },
+        "sfOrgDeployWrapper.fetchOrgOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run Fetch Org automatically once per session when the panel first opens, so local/org badges and org-only components appear without a manual click. Later refreshes — including after switching orgs — stay manual via the Fetch Org button. Turn off to avoid the org API calls on panel open."
         },
         "sfOrgDeployWrapper.fetchConcurrency": {
           "type": "number",
