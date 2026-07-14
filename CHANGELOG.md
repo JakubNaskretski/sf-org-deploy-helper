@@ -3,6 +3,14 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.11.1
+
+- Fixed: **The diff window never touches your tabs — properly this time.** Instead of
+  moving an editor group (which could carry your own tabs, or skip floating entirely),
+  the first diff is moved to the new window on its own — moving a single editor can't
+  drag anything else — and the remaining diffs open straight into that window. If the
+  move isn't possible, diffs just stay as normal tabs.
+
 ## 0.11.0
 
 - New: **Backup buttons.** Retrieve result cards now carry **Restore backup…** and

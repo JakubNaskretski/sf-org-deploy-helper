@@ -2389,15 +2389,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const opened: string[] = [];
         const errors: string[] = [];
 
-        // When floating is on, open every diff into ONE dedicated editor group
-        // beside the user's tabs (first diff → Beside, rest → Active land in that
-        // same new group). Moving *that* group to a new window then carries only
-        // the diffs — never the user's pre-existing open tabs.
+        // Float strategy: open the FIRST diff as a normal tab, then move JUST that
+        // editor to a new window (`moveEditorToNewWindow` moves the active editor
+        // only — the user's tabs structurally cannot travel with it, split or not).
+        // The floating window then has focus, so the remaining diffs open into it
+        // via ViewColumn.Active. If the move fails, diffs simply stay as tabs.
         const floatDiff = vscode.workspace
           .getConfiguration('sfOrgDeployWrapper')
           .get<boolean>('openDiffInFloatingWindow', true);
         const diffColumn = (): vscode.ViewColumn | undefined =>
-          floatDiff ? (opened.length === 0 ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active) : undefined;
+          floatDiff ? vscode.ViewColumn.Active : undefined;
+        let floated = false;
+        const floatFirstDiff = async (): Promise<void> => {
+          if (!floatDiff || floated) return;
+          floated = true;
+          await Promise.resolve(
+            vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow')
+          ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed — diffs stay as tabs: ${String(e)}`));
+        };
 
         // Fast path: Apex/Visualforce bodies come back from a single Tooling API
         // query in ~1-2s, vs a Metadata API retrieve round-trip. Anything the query
@@ -2448,6 +2457,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 tmpPaths.push(staged.dir);
                 await this.openDiff(item, staged.file, orgLabel, diffColumn());
                 opened.push(`${item.type}:${item.name}`);
+                await floatFirstDiff();
               }
             } catch (e) {
               this.endCmd(qCmdId, false, Date.now() - qStart);
@@ -2524,26 +2534,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             tmpPaths.push(staged.dir);
             await this.openDiff(item, staged.file, orgLabel, diffColumn());
             opened.push(`${item.type}:${item.name}`);
-          }
-        }
-
-        if (opened.length > 0 && floatDiff) {
-          // The diffs were AIMED at a dedicated group beside the user's tabs (see
-          // diffColumn above) — but ViewColumn.Beside REUSES an existing neighbor
-          // group when the editor is already split, and moving that group to a new
-          // window would drag the user's own tabs along with the diffs. Float only
-          // when the active group holds nothing but diff editors and no more tabs
-          // than we just opened; otherwise leave the diffs in place.
-          const active = vscode.window.tabGroups.activeTabGroup;
-          const onlyOurDiffs = active.tabs.length <= opened.length
-            && active.tabs.every(t => t.input instanceof vscode.TabInputTextDiff);
-          if (onlyOurDiffs) {
-            // No setTimeout tick: vscode.diff is awaited so the diff editor is active.
-            await Promise.resolve(
-              vscode.commands.executeCommand('workbench.action.moveEditorGroupToNewWindow')
-            ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed: ${String(e)}`));
-          } else {
-            this.output.appendLine('[Diff] floating window skipped — the target editor group contains other tabs.');
+            await floatFirstDiff();
           }
         }
 
