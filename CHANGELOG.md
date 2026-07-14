@@ -3,6 +3,24 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.10.0
+
+- New: **Deploys no longer tie up the window — or die at a timeout.** Deploys, validations
+  and quick deploys are submitted asynchronously: the job id arrives in seconds, progress
+  shows live component and test counts, and the 15-minute waiting cap is gone — the panel
+  simply follows the org until it finishes. Reload the window (or close it for an hour)
+  and the panel reattaches to the running deploy on next open, reporting its result even
+  if it finished in the meantime. **Cancel now genuinely asks the org to cancel** the
+  deployment and reports the real final state — including "it finished anyway".
+- New: **Retrieves are undoable.** Before a retrieve overwrites local files, the current
+  copies are backed up (the last 5 retrieves per workspace are kept). **SF Deploy: Restore
+  Retrieve Backup** brings a picked backup back — and the restore backs up the current
+  state first, so it's undoable too. If the backup can't be written, the retrieve refuses
+  to run unprotected. Setting: `sfOrgDeployWrapper.backupBeforeRetrieve` (on by default).
+- Fixed: **Org messages name their org.** "No metadata found in workspace or on uat" and
+  the source badges' tooltips now say which org they describe, so a message arriving late
+  after quick org switches is never ambiguous.
+
 ## 0.9.0
 
 - New: **Delete from Org.** Right-click components → "Delete from Org…": a dry-run preview

@@ -242,6 +242,10 @@
         renderActions();
         return;
       case 'orgMetadata':
+        // Remember which org this membership came from — every message derived
+        // from it (empty states, badge tooltips) names the org, so a delayed
+        // arrival after another quick org switch is never ambiguous.
+        state.orgMetaLabel = msg.orgLabel || null;
         state.localKeys = new Set(state.items.map(i => `${i.type}:${i.name}`));
         state.orgKeys = new Set((msg.orgItems || []).map(i => `${i.type}:${i.name}`));
         state.orgOnlyItems = (msg.orgItems || []).filter(i => !state.localKeys.has(`${i.type}:${i.name}`));
@@ -257,6 +261,7 @@
         state.orgKeys = new Set();
         state.orgOnlyItems = [];
         state.orgLoaded = false;
+        state.orgMetaLabel = null;
         state.sourceFilter = 'all';
         if ($('sourceFilter')) $('sourceFilter').value = 'all';
         // Drop any selected org-only keys that no longer exist locally.
@@ -723,9 +728,9 @@
       srcBadge.className = `source-badge ${item._source}`;
       const labels = { both: 'local+org', local: 'local', org: 'org' };
       const tips = {
-        both: 'Exists locally and on org',
-        local: 'Local only — not found on org',
-        org: 'On org — not retrieved locally yet'
+        both: `Exists locally and on ${state.orgMetaLabel || 'org'}`,
+        local: `Local only — not found on ${state.orgMetaLabel || 'org'}`,
+        org: `On ${state.orgMetaLabel || 'org'} — not retrieved locally yet`
       };
       srcBadge.textContent = labels[item._source] || item._source;
       srcBadge.title = tips[item._source] || '';
@@ -807,7 +812,7 @@
       const d = document.createElement('div');
       d.className = 'status-empty';
       d.textContent = state.orgLoaded
-        ? 'No metadata found in workspace or on org.'
+        ? `No metadata found in workspace or on ${state.orgMetaLabel || 'the org'}.`
         : 'No metadata found in workspace. Open a Salesforce project or click "Fetch Org" to browse org metadata.';
       tree.appendChild(d);
       return;

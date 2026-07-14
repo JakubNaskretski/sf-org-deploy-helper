@@ -52,7 +52,11 @@ export function activate(context: vscode.ExtensionContext): void {
     // the clicked package.xml; from the palette it's undefined, so the provider
     // opens an XML file dialog rather than assuming the active editor.
     registerSafe('sfOrgDeployWrapper.deployManifest', (uri?: vscode.Uri) => provider.deployManifest(uri)),
-    registerSafe('sfOrgDeployWrapper.retrieveManifest', (uri?: vscode.Uri) => provider.retrieveManifest(uri))
+    registerSafe('sfOrgDeployWrapper.retrieveManifest', (uri?: vscode.Uri) => provider.retrieveManifest(uri)),
+    // Palette-only: undo the last (or an earlier) retrieve overwrite from the
+    // pre-retrieve backups. No menu entry — it operates on the workspace, not a
+    // clicked file.
+    registerSafe('sfOrgDeployWrapper.restoreRetrieveBackup', () => provider.restoreRetrieveBackup())
   );
 
   // A rejected command handler (e.g. the status-bar org pick failing to save the

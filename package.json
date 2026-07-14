@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -76,6 +76,10 @@
       {
         "command": "sfOrgDeployWrapper.retrieveManifest",
         "title": "SF Deploy: Retrieve Manifest from Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.restoreRetrieveBackup",
+        "title": "SF Deploy: Restore Retrieve Backup"
       }
     ],
     "menus": {
@@ -196,6 +200,11 @@
           ],
           "default": "",
           "markdownDescription": "The Apex test level preselected in the panel's picker, and used by context-menu / editor right-click deploys when the picker hasn't been touched yet this session. Empty (the default) means a smart default: `RunLocalTests` against a production org, `NoTestRun` against a sandbox. `RunSpecifiedTests` is deliberately not offered here — it needs a per-deploy list of test classes, which one global setting has no way to carry."
+        },
+        "sfOrgDeployWrapper.backupBeforeRetrieve": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Before a retrieve overwrites your local files, save the current copies first so the overwrite is undoable via **SF Deploy: Restore Retrieve Backup**. Backups are kept for the last 5 retrieves per workspace (older ones are pruned). A retrieve is aborted if its backup can't be written — the safety net is the whole point, so proceeding without it silently would be worse."
         },
         "skrety.salesforce.targetOrg": {
           "type": "string",

@@ -54,7 +54,14 @@ export interface DeployResult {
   /** Async job id of the deploy/validation — needed for quick-deploy of a
    *  validated deployment and for a server-side `deploy cancel`. */
   id?: string;
+  /** Metadata API deploy status: a STRING on `deploy report`/async output
+   *  (`Pending`/`InProgress`/`Canceling`/`Succeeded`/`SucceededPartial`/`Failed`/
+   *  `Canceled`), a number on some older envelopes. */
   status: number | string;
+  /** True once the org considers the deploy finished (terminal), from
+   *  `deploy report`/async output. Used as the terminal signal for statuses we
+   *  don't explicitly enumerate. */
+  done?: boolean;
   success: boolean;
   numberComponentsDeployed?: number;
   numberComponentsTotal?: number;
@@ -135,6 +142,12 @@ export interface DeployOptions {
   testLevel?: TestLevel;
   /** Class names for RunSpecifiedTests (`--tests`). */
   runTests?: string[];
+  /** `--async`: submit the deploy/validation and return AS SOON AS it's enqueued
+   *  (job id + `Queued` status, in seconds) instead of blocking until the org
+   *  finishes. Client-side conflict detection still runs at submit. The caller
+   *  then polls `deployReport(id)` for progress/completion — this is what lets a
+   *  long prod deploy outlive the local wait cap and survive a window reload. */
+  background?: boolean;
 }
 
 export class SfCliService extends KitSfCliService {
@@ -161,6 +174,9 @@ export class SfCliService extends KitSfCliService {
     if (opts.ignoreConflicts) args.push('--ignore-conflicts');
     if (opts.testLevel) args.push('--test-level', opts.testLevel);
     if (opts.testLevel === 'RunSpecifiedTests') for (const t of opts.runTests ?? []) args.push('--tests', t);
+    // `--async` returns once the org has enqueued the job (id + `Queued`), so the
+    // caller polls `deployReport` instead of blocking the whole deploy on one wait.
+    if (opts.background) args.push('--async');
     args.push('--json');
     const cmd = this.formatCmd(args);
     const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
@@ -168,6 +184,28 @@ export class SfCliService extends KitSfCliService {
       result: this.unwrapResult(json, `project deploy ${verb}`),
       cmd
     }));
+    return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * Report the current state of an async deploy/validate/quick-deploy job
+   * (`sf project deploy report --job-id`). A SHORT call — used to poll a job
+   * submitted with `background: true` for progress and completion. The `result`
+   * is the same MetadataApiDeploy status shape `deploy start` returns (id, status,
+   * the numberComponents/numberTests counts, `done`, and `details.componentFailures`
+   * / `details.runTestResult`), so it feeds straight into the same result reporting.
+   * Cancellable so an in-flight poll can be killed on Cancel.
+   */
+  deployReport(
+    jobId: string,
+    targetOrg: string,
+    cwd: string,
+    opts: { timeoutMs?: number } = {}
+  ): Cancellable<{ result: DeployResult; cmd: string }> {
+    const args = ['project', 'deploy', 'report', '--job-id', jobId, '--target-org', targetOrg, '--json'];
+    const cmd = this.formatCmd(args);
+    const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
+    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project deploy report'), cmd }));
     return { promise, cancel: inner.cancel };
   }
 
@@ -209,9 +247,14 @@ export class SfCliService extends KitSfCliService {
     jobId: string,
     targetOrg: string,
     cwd: string,
-    opts: { timeoutMs?: number } = {}
+    opts: { timeoutMs?: number; background?: boolean } = {}
   ): Cancellable<{ result: DeployResult; cmd: string }> {
-    const args = ['project', 'deploy', 'quick', '--job-id', jobId, '--target-org', targetOrg, '--json'];
+    const args = ['project', 'deploy', 'quick', '--job-id', jobId, '--target-org', targetOrg];
+    // `--async` submits the (new) quick-deploy job and returns its id to poll, the
+    // same as deployMetadata — the org already validated, but a big quick deploy
+    // still shouldn't block the local wait.
+    if (opts.background) args.push('--async');
+    args.push('--json');
     const cmd = this.formatCmd(args);
     const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
     const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project deploy quick'), cmd }));

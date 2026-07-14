@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
+import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
@@ -67,7 +68,57 @@ const TEST_LEVEL_KEY = 'testLevel';
  *  still has classes to run without the panel ever being reopened. */
 const RUN_TESTS_KEY = 'runTests';
 
+/** workspaceState key for the async deploy currently being polled. Persisted right
+ *  after a successful submit so a window reload (or a hidden panel) can REATTACH to
+ *  the still-running org-side job instead of losing it, and cleared on any terminal
+ *  outcome. Shape: ActiveDeployJob. */
+const ACTIVE_JOB_KEY = 'activeDeployJob';
+/** Don't reattach to a persisted job older than this — a day-old id almost
+ *  certainly finished long ago, and reattaching would just report stale state. */
+const ACTIVE_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** How long to wait between `deploy report` polls of a running job. */
+const DEPLOY_POLL_INTERVAL_MS = 5000;
+/** Consecutive poll failures tolerated before we declare contact lost. A single
+ *  failed/timed-out poll is transient (network blip, CLI hiccup); five in a row
+ *  means we've genuinely lost the job — stop, but KEEP it persisted for reattach. */
+const DEPLOY_POLL_MAX_FAILURES = 5;
+
+/** The three async-deploy flows, as shown on cards and persisted with the job. */
+type DeployVerb = 'Deploy' | 'Validate' | 'Quick Deploy';
+
+/** A submitted async deploy we're polling, persisted so a reload can reattach. */
+interface ActiveDeployJob {
+  jobId: string;
+  org: string;
+  orgLabel: string;
+  startedAt: number;
+  verb: DeployVerb;
+  noun: string;
+}
+
+/** How a poll loop ended: `terminal` (the org finished — render the result),
+ *  `cancelled` (the user cancelled; the org was asked to stop but the final state
+ *  couldn't be confirmed), or `lost` (contact lost — keep the job for reattach). */
+type PollOutcome =
+  | { kind: 'terminal'; result: DeployResult }
+  | { kind: 'cancelled'; note: string }
+  | { kind: 'lost' };
+
 interface UnresolvableEntry { folder: string; at: number }
+
+/** Pre-retrieve backup limits. A retrieve that would overwrite more than
+ *  BACKUP_MAX_FILES local files skips the backup (a copy that large is almost
+ *  certainly a whole-package pull, not the targeted retrieve the safety net is for).
+ *  BACKUP_KEEP backup dirs are retained per workspace; older ones are pruned. */
+const BACKUP_MAX_FILES = 2000;
+const BACKUP_KEEP = 5;
+/** Reserved manifest filename at the root of every backup dir — describes the
+ *  backup (see BackupManifest) and is skipped when restoring files. */
+const BACKUP_MANIFEST = 'backup.json';
+
+interface BackupManifest { at: number; org: string; fileCount: number; workspaceRoot: string }
+/** One backup offered for restore: its on-disk dir plus the manifest fields. */
+interface BackupEntry { dir: string; at: number; org: string; fileCount: number }
 
 export class DeployPanelProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'sfOrgDeployWrapper.panel';
@@ -80,12 +131,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentCancel?: () => void;
   private currentAction?: string;
   private currentProgressText?: string;
-  /** Async job id of a deploy — captured only AFTER the deploy call resolves (the
-   *  `sf project deploy` call runs the deploy to completion in one shot, then
-   *  reports its id). So it is NOT set while a deploy is in flight: a mid-deploy
-   *  Cancel always sees it undefined. Used to quick-deploy a validated deployment,
-   *  and left as a best-effort anchor for an org-side cancel on any future path that
-   *  manages to capture it earlier. */
+  /** Async job id of the deploy/validate/quick-deploy currently being polled. Now
+   *  that deploys submit with `--async` and return an id in seconds, this is set
+   *  IMMEDIATELY after submit and held for the whole poll — so a mid-deploy Cancel
+   *  genuinely reaches the org-side job (see cancelCurrent/pollDeployJob), and a
+   *  window reload can reattach to it. Undefined only during the brief submit call
+   *  and between operations. */
   private currentDeployJobId?: string;
   /** The org a `currentDeployJobId` belongs to (for the server-side cancel call). */
   private currentDeployOrg?: string;
@@ -407,6 +458,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        // Reattach to an async deploy still running on the org (window reloaded, or
+        // the panel was closed and reopened) BEFORE auto-fetch, so a live deploy wins
+        // the busy slot over a metadata refresh. No-op when there's no pending job.
+        this.maybeReattachDeploy();
         this.maybeAutoFetchOrg();
         return;
       case 'setTestLevel':
@@ -520,31 +575,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Cancel the running operation by killing the local `sf` process. IMPORTANT: for
-   * a deploy the job id is only captured after the deploy call resolves (see
-   * `currentDeployJobId`), so an in-flight deploy has no id here and the org-side
-   * cancel below CANNOT fire mid-deploy. Killing the local process stops us
-   * waiting, but the org-side deploy may still run to completion — the cancel notes
-   * say exactly that rather than claiming a server-side cancel we never requested.
-   * The deployCancel branch stays as a best-effort belt for any path that does hold
-   * a job id (none in the current flow).
+   * Cancel the running operation via its installed `currentCancel` handler. For a
+   * NON-deploy op (retrieve, diff, fetch, delete, login) that handler just kills the
+   * in-flight `sf` process. For an async deploy being polled it's the graceful-cancel
+   * closure pollDeployJob installs, which kills the in-flight poll, asks the ORG to
+   * cancel the job (`deploy cancel`), then reads the real final state and reports it
+   * honestly (Canceled vs it finished anyway). So — unlike before, when the job id
+   * only arrived after the deploy finished and this could never reach the org — a
+   * mid-deploy Cancel now genuinely stops the org-side job.
    */
   private cancelCurrent(): void {
-    const jobId = this.currentDeployJobId;
-    const org = this.currentDeployOrg;
     if (this.currentCancel) this.currentCancel();
-    if (jobId && org) {
-      const root = this.workspaceRoot;
-      // Best-effort, out of band: the local kill already rejected the op.
-      void (async () => {
-        try {
-          await this.sf.deployCancel(jobId, org, root ?? process.cwd());
-          this.output.appendLine(`[Cancel] requested org-side cancel of deploy ${jobId} on ${org}`);
-        } catch (e) {
-          this.output.appendLine(`[Cancel] org-side deploy cancel failed for ${jobId}: ${e instanceof Error ? e.message : String(e)}. The deploy may still complete on the org.`);
-        }
-      })();
-    }
   }
 
   /** One automatic Fetch Org per session (`fetchOrgOnOpen`, default on), fired
@@ -1006,7 +1047,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const isProd = isLikelyProduction(orgInfo);
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
-      const verb = opts.validateOnly ? 'Validate' : 'Deploy';
+      const verb: DeployVerb = opts.validateOnly ? 'Validate' : 'Deploy';
       // Production defaults to running local tests (the org requires them anyway);
       // sandbox defaults to no tests. Validate-only always runs tests, so force at
       // least RunLocalTests there. The configured default sits between the panel's
@@ -1071,9 +1112,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       reserved = false;
       const start = Date.now();
       const progressTitle = opts.validateOnly ? `Validating ${noun} against ${orgLabel}` : `Deploying ${noun} to ${orgLabel}`;
+      // `keepPersisted` survives the withWindowProgress body so the finally knows
+      // whether contact was lost (keep the job for reattach) or the run ended
+      // terminally (clear it).
+      let keepPersisted = false;
       try {
-        await this.withWindowProgress(progressTitle, async () => {
+        await this.withWindowProgress(progressTitle, async report => {
           this.postProgress(`${progressTitle}…`);
+          // Submit ASYNC: the CLI enqueues the deploy (client-side conflict check
+          // still runs here) and returns a job id in seconds. Cancel during this
+          // brief window kills the submit before any job exists.
           const handle = this.sf.deployMetadata(
             items.map(i => `${i.type}:${i.name}`),
             org,
@@ -1084,34 +1132,41 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined,
               validateOnly: opts.validateOnly,
               testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
-              runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined
+              runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined,
+              background: true
             }
           );
           this.currentCancel = handle.cancel;
           this.currentDeployOrg = org;
-          const { result, cmd } = await handle.promise;
-          // Capture the job id so Cancel can reach the org-side deploy and a
-          // validated deployment can be quick-deployed.
-          this.currentDeployJobId = result.id;
+          const { result: submit, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
-          this.reportDeployResult(result, {
-            items, orgOnlySkipped, orgLabel, org, noun, cmdId, start,
-            validateOnly: !!opts.validateOnly
-          });
+          const jobId = submit.id;
+          if (!jobId) throw new SfCliError(`${verb} submitted but the CLI returned no job id to track.`);
+          // The job now exists on the org — pin it (makes Cancel org-side-live) and
+          // persist it so a window reload can reattach.
+          this.currentDeployJobId = jobId;
+          this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb, noun });
+          const outcome = await this.drivePolledDeploy(
+            { jobId, org, orgLabel, root, verb, noun, cmdId, start, progressTitle }, report,
+            result => this.reportPolledDeploy(result, { items, orgOnlySkipped, orgLabel, org, noun, cmdId, start, validateOnly: !!opts.validateOnly, verb })
+          );
+          keepPersisted = outcome.keepPersisted;
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
         // Org-labelled so exception cards stay attributable in the mixed-org history.
         const labeledAction = `${verb} ${opts.validateOnly ? 'against' : 'to'} ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
-          // No job id is ever captured mid-deploy (see cancelCurrent), so a cancel
-          // here never requested an org-side cancel — the deploy may still complete.
+          // A cancel this far out means the ASYNC SUBMIT was killed before it
+          // returned a job id — the org may still have enqueued it.
           this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
         } else if (isTimeoutError(err)) {
-          // Killing the local process does NOT stop the org-side deploy.
+          // Only the short submit call can time out now (polls are handled inside
+          // drivePolledDeploy); killing it does NOT stop an already-enqueued deploy.
           this.reportDeployTimeout(labeledAction, err);
         } else this.reportError(labeledAction, err);
       } finally {
+        if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
         this.currentDeployJobId = undefined;
         this.currentDeployOrg = undefined;
@@ -1215,6 +1270,280 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ---- Async deploy: poll / cancel / reattach ----
+
+  /**
+   * Drive an already-submitted async job to completion: poll for progress (mirrored
+   * to the notification + the in-panel card), then dispatch the outcome. Terminal →
+   * `onTerminal(result)` renders the caller's result card. Lost contact → the
+   * lost-contact card, and returns `keepPersisted: true` so the caller KEEPS the
+   * persisted job for reattach. Cancelled-but-unconfirmed → an honest cancelled card.
+   * Never throws (pollDeployJob owns its own errors), so the caller's catch is left
+   * for the SUBMIT only.
+   */
+  private async drivePolledDeploy(
+    args: { jobId: string; org: string; orgLabel: string; root: string; verb: DeployVerb; noun: string; cmdId: string; start: number; progressTitle: string },
+    report: (message: string) => void,
+    onTerminal: (result: DeployResult) => void
+  ): Promise<{ keepPersisted: boolean }> {
+    const { jobId, org, orgLabel, root, verb, cmdId, start, progressTitle } = args;
+    const outcome = await this.pollDeployJob(jobId, org, root, result => {
+      const msg = this.formatDeployProgress(result);
+      report(msg);
+      this.postProgress(`${progressTitle}: ${msg}`);
+    });
+    const prep = verb === 'Validate' ? 'against' : 'to';
+    if (outcome.kind === 'lost') {
+      this.endCmd(cmdId, false, Date.now() - start);
+      this.reportDeployLostContact(jobId, orgLabel, verb);
+      return { keepPersisted: true };
+    }
+    if (outcome.kind === 'cancelled') {
+      this.endCmd(cmdId, false, Date.now() - start);
+      this.reportCancelled(`${verb} ${prep} ${orgLabel}`, outcome.note);
+      return { keepPersisted: false };
+    }
+    onTerminal(outcome.result);
+    return { keepPersisted: false };
+  }
+
+  /**
+   * Poll `deploy report` for a submitted job until it reaches a terminal state,
+   * calling `progress` with each fresh snapshot. Installs the graceful-cancel
+   * closure into `currentCancel`: a Cancel kills the in-flight poll, then
+   * `cancelDeployJob` asks the org to stop and reads the REAL final state. A single
+   * failed/timed-out poll is transient (retry next tick); DEPLOY_POLL_MAX_FAILURES
+   * in a row → `{ kind: 'lost' }` (the caller keeps the job persisted). Never throws.
+   */
+  private async pollDeployJob(
+    jobId: string,
+    org: string,
+    root: string,
+    progress: (result: DeployResult) => void
+  ): Promise<PollOutcome> {
+    let cancelRequested = false;
+    let activePollCancel: (() => void) | undefined;
+    let wake: (() => void) | undefined;
+    // Cancel = flag it, kill any in-flight poll, and wake an inter-poll sleep so the
+    // loop reaches the cancel branch immediately instead of after the full interval.
+    this.currentCancel = () => {
+      cancelRequested = true;
+      if (activePollCancel) activePollCancel();
+      if (wake) wake();
+    };
+    const sleep = (ms: number): Promise<void> => new Promise(resolve => {
+      const t = setTimeout(() => { wake = undefined; resolve(); }, ms);
+      wake = () => { clearTimeout(t); wake = undefined; resolve(); };
+    });
+
+    let consecutiveFailures = 0;
+    for (;;) {
+      if (cancelRequested) return this.cancelDeployJob(jobId, org, root);
+      let result: DeployResult;
+      try {
+        const h = this.sf.deployReport(jobId, org, root, { timeoutMs: this.timeoutMs() });
+        activePollCancel = h.cancel;
+        try {
+          result = (await h.promise).result;
+        } finally {
+          activePollCancel = undefined;
+        }
+      } catch (err) {
+        // A cancel killed this poll → loop back so the cancel branch runs.
+        if (cancelRequested) continue;
+        consecutiveFailures++;
+        this.output.appendLine(`[deploy report] poll of ${jobId} failed (${consecutiveFailures}/${DEPLOY_POLL_MAX_FAILURES}): ${err instanceof Error ? err.message : String(err)}`);
+        if (consecutiveFailures >= DEPLOY_POLL_MAX_FAILURES) return { kind: 'lost' };
+        await sleep(DEPLOY_POLL_INTERVAL_MS);
+        continue;
+      }
+      consecutiveFailures = 0;
+      progress(result);
+      if (isTerminalDeploy(result)) return { kind: 'terminal', result };
+      await sleep(DEPLOY_POLL_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * The user cancelled a running job: ask the org to cancel it (`deploy cancel`),
+   * then poll (bounded) for the REAL final state so the card is honest — a job that
+   * had already finished reports its actual Succeeded/Failed result, one the org
+   * stops reports Canceled, and one still `Canceling` after the bound reports as
+   * cancelled-in-progress. If the confirming reports themselves fail, say so rather
+   * than claim a state we couldn't read.
+   */
+  private async cancelDeployJob(jobId: string, org: string, root: string): Promise<PollOutcome> {
+    this.output.appendLine(`[Cancel] requesting org-side cancel of deploy ${jobId} on ${org}`);
+    try {
+      await this.sf.deployCancel(jobId, org, root);
+    } catch (e) {
+      // The cancel call itself failed — still read the state below; the job may have
+      // finished on its own, and the report tells us the truth either way.
+      this.output.appendLine(`[Cancel] deploy cancel call failed for ${jobId}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // Cancellation isn't instant (InProgress → Canceling → Canceled), so read a few
+    // times until terminal before giving up.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const { result } = await this.sf.deployReport(jobId, org, root, { timeoutMs: this.timeoutMs() }).promise;
+        if (isTerminalDeploy(result)) return { kind: 'terminal', result };
+      } catch (e) {
+        this.output.appendLine(`[Cancel] confirming report for ${jobId} failed: ${e instanceof Error ? e.message : String(e)}`);
+        return { kind: 'cancelled', note: 'Asked the org to cancel the deploy, but couldn\'t read the final state — check the org\'s Deployment Status (Setup).' };
+      }
+      await new Promise(r => setTimeout(r, DEPLOY_POLL_INTERVAL_MS));
+    }
+    return { kind: 'cancelled', note: 'Asked the org to cancel the deploy — it\'s still finishing cancellation; check the org\'s Deployment Status (Setup).' };
+  }
+
+  /** Progress line for a running deploy: "InProgress · components 12/40 · tests 100/321". */
+  private formatDeployProgress(result: DeployResult): string {
+    const status = typeof result.status === 'string' && result.status ? result.status : 'In progress';
+    const parts: string[] = [];
+    const cTotal = result.numberComponentsTotal ?? 0;
+    if (cTotal > 0) parts.push(`components ${result.numberComponentsDeployed ?? 0}/${cTotal}`);
+    const tTotal = result.numberTestsTotal ?? 0;
+    if (tTotal > 0) parts.push(`tests ${result.numberTestsCompleted ?? 0}/${tTotal}`);
+    return parts.length ? `${status} · ${parts.join(' · ')}` : status;
+  }
+
+  /** Render the terminal card for a polled deploy/validate. A `Canceled` status gets
+   *  an honest "cancelled" card (the org actually stopped it); everything else goes
+   *  through the normal result renderer. */
+  private reportPolledDeploy(
+    result: DeployResult,
+    ctx: { items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number; validateOnly: boolean; verb: DeployVerb }
+  ): void {
+    if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
+      this.endCmd(ctx.cmdId, false, Date.now() - ctx.start);
+      this.reportCancelled(`${ctx.verb} ${ctx.validateOnly ? 'against' : 'to'} ${ctx.orgLabel}`, 'The org cancelled the deploy.');
+      return;
+    }
+    this.reportDeployResult(result, ctx);
+  }
+
+  /** Honest card when we lose contact with a running job (5 failed polls in a row):
+   *  it may still be running, the job is kept persisted, and reopening the panel
+   *  reattaches. */
+  private reportDeployLostContact(jobId: string, orgLabel: string, verb: DeployVerb): void {
+    const prep = verb === 'Validate' ? 'against' : 'to';
+    this.post({
+      type: 'status',
+      card: {
+        kind: 'err',
+        title: `Lost contact with ${verb.toLowerCase()} ${prep} ${orgLabel}`,
+        meta: `Job ${jobId} may still be running on the org`,
+        hint: `Reopen the panel to reattach, or check the org's Deployment Status (Setup) / run \`sf project deploy report --job-id ${jobId}\`.`
+      }
+    });
+    this.failureToast(`Lost contact with the ${verb.toLowerCase()} ${prep} ${orgLabel} — it may still be running. Reopen the panel to reattach.`);
+  }
+
+  /** Synthesize a MetadataItem list from a deploy report's per-component rows, so a
+   *  REATTACHED deploy (whose original selection is gone after a reload) still gets a
+   *  populated result card. The `package.xml` pseudo-row is skipped. */
+  private itemsFromReport(result: DeployResult): MetadataItem[] {
+    const rows = [
+      ...(result.details?.componentSuccesses ?? []),
+      ...(result.details?.componentFailures ?? []),
+      ...(result.files ?? [])
+    ];
+    const seen = new Set<string>();
+    const items: MetadataItem[] = [];
+    for (const r of rows) {
+      if (!r?.type || !r?.fullName) continue;
+      if (r.type === 'package.xml' || r.fullName === 'package.xml') continue;
+      const key = `${r.type}:${r.fullName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ type: r.type, name: r.fullName, filePath: '', files: [] });
+    }
+    return items;
+  }
+
+  // ---- Async deploy: persistence + reattach ----
+
+  /** Persist the in-flight async job so a reload can reattach. Fire-and-forget like
+   *  the other workspaceState writes — a lost write only forgoes one reattach. */
+  private persistActiveJob(job: ActiveDeployJob): void {
+    void Promise.resolve(this.context.workspaceState.update(ACTIVE_JOB_KEY, job))
+      .catch(err => this.output.appendLine(`[activeJob] persist failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /** Clear the persisted job on any terminal outcome. */
+  private clearActiveJob(): void {
+    void Promise.resolve(this.context.workspaceState.update(ACTIVE_JOB_KEY, undefined))
+      .catch(err => this.output.appendLine(`[activeJob] clear failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /** Read the persisted job, shape- and charset-guarded (the state DB can hand back
+   *  anything after corruption or a hand edit, and jobId becomes a `--job-id` argv
+   *  token). Returns undefined on any mismatch. */
+  private readActiveJob(): ActiveDeployJob | undefined {
+    const raw = this.context.workspaceState.get<unknown>(ACTIVE_JOB_KEY);
+    if (!raw || typeof raw !== 'object') return undefined;
+    const j = raw as Partial<ActiveDeployJob>;
+    if (typeof j.jobId !== 'string' || !/^[A-Za-z0-9]+$/.test(j.jobId)) return undefined;
+    // `org` becomes a `--target-org` argv token: inert under execFile, but a
+    // flag-shaped value from a tampered state DB has no honest reading — reject.
+    if (typeof j.org !== 'string' || j.org.startsWith('-') || /\s/.test(j.org)) return undefined;
+    if (typeof j.orgLabel !== 'string' || typeof j.noun !== 'string') return undefined;
+    if (typeof j.startedAt !== 'number') return undefined;
+    if (j.verb !== 'Deploy' && j.verb !== 'Validate' && j.verb !== 'Quick Deploy') return undefined;
+    return { jobId: j.jobId, org: j.org, orgLabel: j.orgLabel, startedAt: j.startedAt, verb: j.verb, noun: j.noun };
+  }
+
+  /** On panel `ready`: if a still-recent async job is persisted and the busy slot is
+   *  free, reattach and resume polling it. If the slot is busy, leave it persisted —
+   *  the next ready retries. A finished job's `deploy report` still returns its
+   *  result, so reattaching after completion simply reports the outcome and clears. */
+  private maybeReattachDeploy(): void {
+    const job = this.readActiveJob();
+    if (!job) return;
+    if (Date.now() - job.startedAt > ACTIVE_JOB_MAX_AGE_MS) { this.clearActiveJob(); return; }
+    if (this.busy) return; // an op holds the slot — leave the job for the next ready
+    if (!this.reserveBusy(job.verb)) return;
+    void this.reattachDeployJob(job);
+  }
+
+  /** Resume polling a persisted job under a fresh progress notification, reporting
+   *  its outcome exactly like a live deploy. Mirrors runDeploy's finally discipline
+   *  (clear cancel/job pins, release the slot; keep the persisted job only on lost
+   *  contact). The original component selection is gone, so the result card's list is
+   *  synthesized from the report (itemsFromReport). */
+  private async reattachDeployJob(job: ActiveDeployJob): Promise<void> {
+    const root = this.workspaceRoot ?? process.cwd();
+    const prep = job.verb === 'Validate' ? 'against' : 'to';
+    const cmdId = this.beginCmd(`sf project deploy report --job-id ${job.jobId} --target-org ${job.org}`);
+    const start = Date.now();
+    const progressTitle = `Reattaching to ${job.verb.toLowerCase()} of ${job.noun} ${prep} ${job.orgLabel}`;
+    this.currentDeployJobId = job.jobId;
+    this.currentDeployOrg = job.org;
+    let keepPersisted = false;
+    try {
+      await this.withWindowProgress(progressTitle, async report => {
+        this.postProgress(`${progressTitle}…`);
+        const outcome = await this.drivePolledDeploy(
+          { jobId: job.jobId, org: job.org, orgLabel: job.orgLabel, root, verb: job.verb, noun: job.noun, cmdId, start, progressTitle }, report,
+          result => this.reportPolledDeploy(result, {
+            items: this.itemsFromReport(result), orgOnlySkipped: [], orgLabel: job.orgLabel, org: job.org,
+            noun: job.noun, cmdId, start, validateOnly: job.verb === 'Validate', verb: job.verb
+          })
+        );
+        keepPersisted = outcome.keepPersisted;
+      });
+    } catch (err) {
+      this.endCmd(cmdId, false, Date.now() - start);
+      this.reportError(`${job.verb} ${prep} ${job.orgLabel}`, err);
+    } finally {
+      if (!keepPersisted) this.clearActiveJob();
+      this.currentCancel = undefined;
+      this.currentDeployJobId = undefined;
+      this.currentDeployOrg = undefined;
+      this.setBusy(false);
+    }
+  }
+
   /** Quick-deploy a previously-validated deployment by its job id — no re-run of
    *  validation or tests. Guarded to the same org the validation ran against. */
   private async runQuickDeploy(jobId: string): Promise<void> {
@@ -1243,59 +1572,43 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       reserved = false;
       const cmdId = this.beginCmd(`sf project deploy quick --job-id ${jobId} --target-org ${org}`);
       const start = Date.now();
+      const noun = `${validated.count} component${validated.count === 1 ? '' : 's'}`;
+      const progressTitle = `Quick-deploying ${noun} to ${orgLabel}`;
+      let keepPersisted = false;
       try {
-        await this.withWindowProgress(`Quick-deploying to ${orgLabel}`, async () => {
-          this.postProgress(`Quick-deploying validated components to ${orgLabel}…`);
-          const handle = this.sf.quickDeploy(jobId, org, root, { timeoutMs: this.timeoutMs() });
+        await this.withWindowProgress(progressTitle, async report => {
+          this.postProgress(`${progressTitle}…`);
+          // Submit the quick deploy ASYNC — it creates a NEW deployment job on the
+          // org (its own id, distinct from the validation's) that we then poll.
+          const handle = this.sf.quickDeploy(jobId, org, root, { timeoutMs: this.timeoutMs(), background: true });
           this.currentCancel = handle.cancel;
           this.currentDeployOrg = org;
-          const { result, cmd } = await handle.promise;
-          this.currentDeployJobId = result.id ?? jobId;
+          const { result: submit, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
-          // The quick deploy consumes the validation — clear it either way.
+          // The quick deploy consumes the validation — clear it now we've committed.
           this.lastValidated = undefined;
-          const noun = `${validated.count} component${validated.count === 1 ? '' : 's'}`;
-          this.endCmd(cmdId, !!result.success, Date.now() - start);
-          if (result.success) {
-            this.post({
-              type: 'status',
-              card: {
-                kind: 'ok',
-                title: `Quick-deployed ${noun} to ${orgLabel}`,
-                meta: `${result.numberComponentsDeployed ?? validated.count} deployed`
-              }
-            });
-            this.notifySuccessIfPanelHidden(`Quick-deployed ${noun} to ${orgLabel}`);
-          } else {
-            const failures = result.details?.componentFailures
-              ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
-            const failLines = failures.map(f => ({
-              text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`,
-              key: `${f.type}:${f.fullName}`
-            }));
-            this.post({
-              type: 'status',
-              card: {
-                kind: 'err',
-                title: `Quick Deploy failed against ${orgLabel}`,
-                meta: 'The validation may have expired (validated deployments are valid for ~10 days; the org may also have changed).',
-                lines: failLines
-              }
-            });
-            this.failureToast(`Quick Deploy failed against ${orgLabel}.`, failLines);
-          }
+          const quickJobId = submit.id;
+          if (!quickJobId) throw new SfCliError('Quick Deploy submitted but the CLI returned no job id to track.');
+          this.currentDeployJobId = quickJobId;
+          this.persistActiveJob({ jobId: quickJobId, org, orgLabel, startedAt: Date.now(), verb: 'Quick Deploy', noun });
+          const outcome = await this.drivePolledDeploy(
+            { jobId: quickJobId, org, orgLabel, root, verb: 'Quick Deploy', noun, cmdId, start, progressTitle }, report,
+            result => this.reportQuickDeployResult(result, { orgLabel, count: validated.count, cmdId, start })
+          );
+          keepPersisted = outcome.keepPersisted;
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
         const labeledAction = `Quick Deploy to ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
-          // Quick deploy captures its job id only after the call resolves too, so a
-          // mid-flight cancel never reached the org-side deploy — say it may complete.
+          // A cancel here means the ASYNC SUBMIT was killed before it returned a job
+          // id — the org may still have enqueued the quick deploy.
           this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
         } else if (isTimeoutError(err)) {
           this.reportDeployTimeout(labeledAction, err);
         } else this.reportError(labeledAction, err);
       } finally {
+        if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
         this.currentDeployJobId = undefined;
         this.currentDeployOrg = undefined;
@@ -1303,6 +1616,53 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       if (reserved) this.setBusy(false);
+    }
+  }
+
+  /** Terminal card for a polled quick deploy. `Canceled` → honest cancelled card;
+   *  otherwise the quick-deploy-specific success/failure card. */
+  private reportQuickDeployResult(
+    result: DeployResult,
+    ctx: { orgLabel: string; count: number; cmdId: string; start: number }
+  ): void {
+    const { orgLabel, count, cmdId, start } = ctx;
+    const noun = `${count} component${count === 1 ? '' : 's'}`;
+    if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
+      this.endCmd(cmdId, false, Date.now() - start);
+      this.reportCancelled(`Quick Deploy to ${orgLabel}`, 'The org cancelled the deploy.');
+      return;
+    }
+    const failures = result.details?.componentFailures
+      ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+    const success = result.success
+      && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
+      && failures.length === 0;
+    this.endCmd(cmdId, success, Date.now() - start);
+    if (success) {
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'ok',
+          title: `Quick-deployed ${noun} to ${orgLabel}`,
+          meta: `${result.numberComponentsDeployed ?? count} deployed`
+        }
+      });
+      this.notifySuccessIfPanelHidden(`Quick-deployed ${noun} to ${orgLabel}`);
+    } else {
+      const failLines = failures.map(f => ({
+        text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`,
+        key: `${f.type}:${f.fullName}`
+      }));
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'err',
+          title: `Quick Deploy failed against ${orgLabel}`,
+          meta: 'The validation may have expired (validated deployments are valid for ~10 days; the org may also have changed).',
+          lines: failLines
+        }
+      });
+      this.failureToast(`Quick Deploy failed against ${orgLabel}.`, failLines);
     }
   }
 
@@ -1335,6 +1695,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       );
       if (confirm !== 'Retrieve') return;
 
+      // Pre-retrieve backup: save the local copies about to be overwritten so the
+      // retrieve is undoable. Only local files matter — org-only/new items have none.
+      // A FAILED backup ABORTS the retrieve (see backupBeforeRetrieve): shipping the
+      // overwrite without the safety net the user was promised is worse than not
+      // having the feature. Runs inside the already-reserved slot.
+      let backupNote: string | undefined;
+      try {
+        backupNote = await this.maybeBackupBeforeRetrieve(root, items.flatMap(i => [i.filePath, ...i.files]), orgLabel);
+      } catch (err) {
+        this.reportError(`Backup before retrieve from ${orgLabel}`, err);
+        return; // releaseBusy() in the outer finally frees the slot
+      }
+
       const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}`);
       reserved = false;
       const start = Date.now();
@@ -1360,6 +1733,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             card: {
               kind: 'ok',
               title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
+              ...(backupNote ? { meta: backupNote } : {}),
               lines: ok.map(f => `${f.type}:${f.fullName}`)
             }
           });
@@ -1385,7 +1759,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             card: {
               kind: failed.length > 0 ? 'err' : 'warn',
               title: `Retrieve from ${orgLabel} completed with issues`,
-              meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing`,
+              meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing${backupNote ? ` · ${backupNote}` : ''}`,
               lines
             }
           });
@@ -1488,24 +1862,32 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       reserved = false;
       const start = Date.now();
       const progressTitle = `Deploying ${noun} to ${orgLabel}`;
+      let keepPersisted = false;
       try {
-        await this.withWindowProgress(progressTitle, async () => {
+        await this.withWindowProgress(progressTitle, async report => {
           this.postProgress(`${progressTitle}…`);
+          // Submit ASYNC (see runDeploy) — the manifest deploy returns a job id we poll.
           const handle = this.sf.deployMetadata([], org, root, {
             manifest: manifestPath,
             ignoreConflicts,
             timeoutMs: this.timeoutMs(),
             testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
-            runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined
+            runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined,
+            background: true
           });
           this.currentCancel = handle.cancel;
           this.currentDeployOrg = org;
-          const { result, cmd } = await handle.promise;
-          this.currentDeployJobId = result.id;
+          const { result: submit, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
-          this.reportDeployResult(result, {
-            items, orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false
-          });
+          const jobId = submit.id;
+          if (!jobId) throw new SfCliError('Deploy submitted but the CLI returned no job id to track.');
+          this.currentDeployJobId = jobId;
+          this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb: 'Deploy', noun });
+          const outcome = await this.drivePolledDeploy(
+            { jobId, org, orgLabel, root, verb: 'Deploy', noun, cmdId, start, progressTitle }, report,
+            result => this.reportPolledDeploy(result, { items, orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false, verb: 'Deploy' })
+          );
+          keepPersisted = outcome.keepPersisted;
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
@@ -1516,6 +1898,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.reportDeployTimeout(labeledAction, err);
         } else this.reportError(labeledAction, err);
       } finally {
+        if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
         this.currentDeployJobId = undefined;
         this.currentDeployOrg = undefined;
@@ -1554,6 +1937,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       );
       if (confirm !== 'Retrieve') return;
 
+      // Pre-retrieve backup (see runRetrieve). The manifest deploy goes by
+      // --manifest, so resolve which LOCAL components it names via the workspace
+      // scan and back only those up — org-only/new members have no local file to
+      // save. A wildcard member (`*`) means "every local component of this type".
+      // A failed backup aborts the retrieve.
+      const wildcardTypes = new Set(types.filter(t => t.members.includes('*')).map(t => t.type));
+      const exactKeys = new Set(types.flatMap(t => t.members.filter(m => m !== '*').map(m => `${t.type}:${m}`)));
+      const backupPaths = this.items
+        .filter(i => wildcardTypes.has(i.type) || exactKeys.has(`${i.type}:${i.name}`))
+        .flatMap(i => [i.filePath, ...i.files]);
+      let backupNote: string | undefined;
+      try {
+        backupNote = await this.maybeBackupBeforeRetrieve(root, backupPaths, orgLabel);
+      } catch (err) {
+        this.reportError(`Backup before retrieve from ${orgLabel}`, err);
+        return; // releaseBusy() in the outer finally frees the slot
+      }
+
       const cmdId = this.beginCmd(`sf project retrieve start --manifest ${/\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath} --target-org ${org}`);
       reserved = false;
       const start = Date.now();
@@ -1576,7 +1977,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               card: {
                 kind: 'ok',
                 title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
-                meta: `manifest ${basename}`,
+                meta: `manifest ${basename}${backupNote ? ` · ${backupNote}` : ''}`,
                 lines: ok.map(f => `${f.type}:${f.fullName}`)
               }
             });
@@ -1601,7 +2002,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               card: {
                 kind: failed.length > 0 ? 'err' : 'warn',
                 title: `Retrieve from ${orgLabel} completed with issues`,
-                meta: `${ok.length} ok · ${failed.length} failed`,
+                meta: `${ok.length} ok · ${failed.length} failed${backupNote ? ` · ${backupNote}` : ''}`,
                 lines
               }
             });
@@ -2664,9 +3065,247 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[reportDeployTimeout] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
+  // ---- Pre-retrieve backup / restore ----
+
+  private backupsEnabled(): boolean {
+    return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('backupBeforeRetrieve', true);
+  }
+
+  /** Root of all per-workspace backup dirs, under the extension's global storage. */
+  private backupsRoot(): string {
+    return vscode.Uri.joinPath(this.context.globalStorageUri, 'backups').fsPath;
+  }
+
+  /** Stable, collision-free key for one workspace's backups: sanitized basename +
+   *  short hash of the absolute root, so two workspaces that share a basename never
+   *  land in the same backup dir. */
+  private workspaceBackupKey(root: string): string {
+    const hash = crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 8);
+    return `${sanitizeSegment(path.basename(root))}-${hash}`;
+  }
+
+  /**
+   * Back up the given local files before a retrieve overwrites them, when the feature
+   * is enabled. Returns a note for the result card (files saved, or the over-limit
+   * skip), or undefined when disabled / nothing needed saving. THROWS on any
+   * copy/write failure so the caller can abort the retrieve — silently proceeding
+   * would strip the safety net the setting promises.
+   */
+  private async maybeBackupBeforeRetrieve(root: string, candidatePaths: string[], orgLabel: string): Promise<string | undefined> {
+    if (!this.backupsEnabled()) return undefined;
+    const result = await this.writeBackup(root, candidatePaths, orgLabel);
+    if (result.skippedTooMany) {
+      this.output.appendLine(`[backup] skipped — more than ${BACKUP_MAX_FILES} files would be backed up before retrieve`);
+      return `backup skipped — over ${BACKUP_MAX_FILES} files`;
+    }
+    if (result.count === 0) return undefined;
+    return `backed up ${result.count} file${result.count === 1 ? '' : 's'} — restore via 'SF Deploy: Restore Retrieve Backup'`;
+  }
+
+  /**
+   * Copy every existing regular file among `candidatePaths` (deduped, confined to
+   * `root`) into a fresh timestamped backup dir, preserving each path RELATIVE to
+   * root, alongside a backup.json manifest. Prunes to the newest BACKUP_KEEP dirs
+   * afterwards. Creates no dir when there's nothing to copy or the count exceeds
+   * BACKUP_MAX_FILES. Rejects (throws) if a copy fails. `opts.protect` names a dir the
+   * prune must keep regardless (so a pre-restore backup can't delete its own source).
+   */
+  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean }> {
+    const rootResolved = path.resolve(root);
+    const seen = new Set<string>();
+    const toCopy: string[] = [];
+    for (const p of candidatePaths) {
+      if (!p) continue; // org-only items carry '' — nothing local to save
+      const abs = path.resolve(p);
+      if (seen.has(abs)) continue;
+      seen.add(abs);
+      if (!isUnder(rootResolved, abs)) continue; // never reach outside the workspace
+      // lstat, not stat: a hostile workspace can plant an in-tree symlink whose
+      // target lives OUTSIDE the workspace — following it would copy that target
+      // into extension storage (security review LOW). Links are skipped, not
+      // resolved: a retrieve overwrites the link path itself anyway.
+      let st: Awaited<ReturnType<typeof fs.lstat>>;
+      try { st = await fs.lstat(abs); } catch { continue; } // already gone — nothing to save
+      if (st.isSymbolicLink() || !st.isFile()) continue; // bundle dirs listed separately; links skipped
+      toCopy.push(abs);
+    }
+    if (toCopy.length === 0) return { count: 0 };
+    if (toCopy.length > BACKUP_MAX_FILES) return { count: 0, skippedTooMany: true };
+
+    const key = this.workspaceBackupKey(root);
+    const dirName = `${sanitizeSegment(new Date().toISOString())}__${sanitizeSegment(orgLabel)}`;
+    const destRoot = path.join(this.backupsRoot(), key, dirName);
+    for (const abs of toCopy) {
+      const dest = path.join(destRoot, path.relative(rootResolved, abs));
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.copyFile(abs, dest);
+    }
+    const manifest: BackupManifest = { at: Date.now(), org: orgLabel, fileCount: toCopy.length, workspaceRoot: rootResolved };
+    await fs.mkdir(destRoot, { recursive: true }); // belt-and-braces before the manifest write
+    await fs.writeFile(path.join(destRoot, BACKUP_MANIFEST), JSON.stringify(manifest, null, 2), 'utf8');
+    await this.pruneBackups(key, opts.protect);
+    return { count: toCopy.length };
+  }
+
+  /** Keep only the newest BACKUP_KEEP backup dirs for a workspace key (dir names are
+   *  sanitized ISO timestamps, so lexical order == chronological). `protect` is a dir
+   *  name kept regardless — so a pre-restore backup can't prune the very backup being
+   *  restored. Never throws: a failed prune only leaves stale dirs, it must not fail
+   *  the backup that just succeeded. */
+  private async pruneBackups(key: string, protect?: string): Promise<void> {
+    const base = path.join(this.backupsRoot(), key);
+    let names: string[];
+    try {
+      names = (await fs.readdir(base, { withFileTypes: true })).filter(e => e.isDirectory()).map(e => e.name);
+    } catch { return; }
+    const doomed = names.sort().reverse().slice(BACKUP_KEEP).filter(n => n !== protect);
+    for (const name of doomed) {
+      await fs.rm(path.join(base, name), { recursive: true, force: true })
+        .catch(err => this.output.appendLine(`[backup] prune failed for ${name}: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+
+  /** All valid backups for a workspace, newest first, read from each dir's manifest.
+   *  Dirs without a readable backup.json are skipped (a partial/interrupted backup
+   *  isn't offered for restore). */
+  private async listBackups(key: string): Promise<BackupEntry[]> {
+    const base = path.join(this.backupsRoot(), key);
+    let names: string[];
+    try {
+      names = (await fs.readdir(base, { withFileTypes: true })).filter(e => e.isDirectory()).map(e => e.name);
+    } catch { return []; }
+    const out: BackupEntry[] = [];
+    for (const name of names) {
+      const dir = path.join(base, name);
+      try {
+        const raw = JSON.parse(await fs.readFile(path.join(dir, BACKUP_MANIFEST), 'utf8')) as Partial<BackupManifest>;
+        out.push({
+          dir,
+          at: typeof raw.at === 'number' ? raw.at : 0,
+          org: typeof raw.org === 'string' ? raw.org : '(unknown org)',
+          fileCount: typeof raw.fileCount === 'number' ? raw.fileCount : 0
+        });
+      } catch { /* no/broken manifest — not a restorable backup */ }
+    }
+    return out.sort((a, b) => b.at - a.at);
+  }
+
+  /** Every backed-up file in a dir, as paths relative to that dir, excluding the
+   *  top-level manifest. */
+  private async listBackupFiles(backupDir: string): Promise<string[]> {
+    const out: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+        const abs = path.join(dir, e.name);
+        if (e.isDirectory()) await walk(abs);
+        else if (e.isFile()) out.push(path.relative(backupDir, abs));
+      }
+    };
+    await walk(backupDir);
+    return out.filter(rel => rel !== BACKUP_MANIFEST);
+  }
+
+  /**
+   * Restore local files from a pre-retrieve backup — the undo for a retrieve
+   * overwrite. Busy-refuses WITHOUT taking the slot (like refreshFiles/pickOrg) so
+   * the picker can't block a running op; reserves the 'Restore' slot only around the
+   * copy phase. Before overwriting, the CURRENT copies of the same files are backed
+   * up (so a restore is itself undoable), then the backup is copied back. Every
+   * destination is confined to the workspace root — a tampered backup dir can't write
+   * outside it.
+   */
+  async restoreRetrieveBackup(): Promise<void> {
+    if (this.busy) { this.notifyBusy(); return; }
+    const root = this.requireRoot();
+    if (!root) return;
+    const key = this.workspaceBackupKey(root);
+    const backups = await this.listBackups(key);
+    if (backups.length === 0) {
+      vscode.window.showInformationMessage('SF Deploy: no retrieve backups for this workspace yet.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      backups.map(b => ({
+        label: `${new Date(b.at).toLocaleString()} — ${b.org}`,
+        description: `${b.fileCount} file${b.fileCount === 1 ? '' : 's'}`,
+        backup: b
+      })),
+      { placeHolder: 'Restore local files from which retrieve backup?' }
+    );
+    if (!picked) return;
+    const backup = picked.backup;
+    const when = new Date(backup.at).toLocaleString();
+    const confirm = await vscode.window.showWarningMessage(
+      `Overwrite the current local files with the backup from ${when} (${backup.fileCount} file${backup.fileCount === 1 ? '' : 's'})? The current copies are themselves backed up first.`,
+      { modal: true },
+      'Restore'
+    );
+    if (confirm !== 'Restore') return;
+
+    // Reserve the slot only for the copy phase (finally-release), matching the
+    // discipline the deploy/retrieve paths use.
+    if (!this.reserveBusy('Restore')) return;
+    try {
+      const rootResolved = path.resolve(root);
+      const relFiles = await this.listBackupFiles(backup.dir);
+      // Undo-of-the-undo: back up the CURRENT state of the same files first. Protect
+      // the source dir from that backup's prune so we can't delete what we're about
+      // to restore from. A failure here THROWS before anything is overwritten.
+      const orgLabel = this.orgs.find(o => o.username === this.orgStore.get())?.alias ?? this.orgStore.get() ?? 'restore';
+      await this.writeBackup(root, relFiles.map(rel => path.join(rootResolved, rel)), orgLabel, { protect: path.basename(backup.dir) });
+
+      const restored: string[] = [];
+      const rejected: string[] = [];
+      for (const rel of relFiles) {
+        const dest = path.resolve(rootResolved, rel);
+        // Path-safety: a hand-tampered backup dir could hold a `../` escape; refuse
+        // anything that resolves outside the workspace root.
+        if (!isUnder(rootResolved, dest)) { rejected.push(rel); continue; }
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        await fs.copyFile(path.join(backup.dir, rel), dest);
+        restored.push(rel);
+      }
+      // Re-scan the tree and refresh the Changed lens against the restored files.
+      await this.loadFiles();
+      await this.postChangedComponents();
+
+      const lines = [...restored, ...rejected.map(r => `✗ ${r} — outside workspace, skipped`)];
+      this.post({
+        type: 'status',
+        card: {
+          kind: rejected.length ? 'warn' : 'ok',
+          title: `Restored ${restored.length} file${restored.length === 1 ? '' : 's'} from backup`,
+          meta: `${when} — ${backup.org}${rejected.length ? ` · ${rejected.length} skipped` : ''}`,
+          lines
+        }
+      });
+      this.notifySuccessIfPanelHidden(`Restored ${restored.length} file${restored.length === 1 ? '' : 's'} from backup`);
+    } catch (err) {
+      this.reportError('Restore Retrieve Backup', err);
+    } finally {
+      this.setBusy(false);
+    }
+  }
 }
 
 // ---- module-local helpers ----
+
+/** Sanitize one path segment WE generate (timestamp, org label, workspace key) into a
+ *  safe directory name: keep [A-Za-z0-9._-], replace the rest with '-'. Empty or
+ *  dot-only results ('' / '.' / '..') collapse to '_' so a segment can never become a
+ *  traversal or a meaningless name. */
+function sanitizeSegment(s: string): string {
+  const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '-');
+  return /^\.*$/.test(cleaned) ? '_' : cleaned;
+}
+
+/** True when `abs` is `root` itself or nested beneath it — the confinement check for
+ *  both writing backups and restoring them. Both args must already be resolved
+ *  absolute paths. */
+function isUnder(root: string, abs: string): boolean {
+  return abs === root || abs.startsWith(root + path.sep);
+}
 
 /** All metadata types the extension supports — fetched in one batch when the user clicks "Fetch Org". */
 const FETCH_ORG_TYPES: readonly string[] = [
@@ -2771,6 +3410,17 @@ function isFatalFetchError(err: unknown): boolean {
  *  SfCliCancelledError and are matched before this. */
 function isTimeoutError(err: unknown): boolean {
   return err instanceof SfCliError && /timed out/i.test(err.message);
+}
+
+/** Terminal Metadata API deploy statuses — the poll loop stops on any of these.
+ *  (`Pending`/`Queued`/`InProgress`/`Canceling` are the non-terminal ones.) */
+const TERMINAL_DEPLOY_STATUSES = new Set(['Succeeded', 'SucceededPartial', 'Failed', 'Canceled', 'Error']);
+
+/** True once a polled deploy has finished on the org: a known terminal status, or
+ *  any state the CLI flags `done: true` (belt for a status string we don't list). */
+function isTerminalDeploy(result: DeployResult): boolean {
+  const status = typeof result.status === 'string' ? result.status : '';
+  return TERMINAL_DEPLOY_STATUSES.has(status) || result.done === true;
 }
 
 /** The `Type:Name` components a delete (or its dry-run) reports as removed. The shape
