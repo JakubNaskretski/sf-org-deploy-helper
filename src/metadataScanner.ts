@@ -247,18 +247,33 @@ async function scanObjectChildren(objectsDir: string, items: MetadataItem[]): Pr
   await walk(objectsDir, 0);
 }
 
+/**
+ * Canonical comparison key for a filesystem path. Windows filesystems are
+ * case-insensitive AND VS Code's URI sources disagree about drive-letter casing
+ * (the workspace folder, the vscode.git extension, and open/save dialogs can each
+ * hand back a different case for the same file) — so every cross-source path
+ * COMPARISON must run both sides through this, or a mere casing drift reads as a
+ * different file. Display strings keep their original casing; only comparison keys
+ * are folded. The `platform` param defaults to the host but is overridable so
+ * win32 folding is testable off Windows.
+ */
+export function foldPathKey(p: string, platform: NodeJS.Platform = process.platform): string {
+  const n = path.normalize(p);
+  return platform === 'win32' ? n.toLowerCase() : n;
+}
+
 /** Find the workspace metadata item that owns the given absolute file path, if any. */
-export function findItemForPath(items: MetadataItem[], absPath: string): MetadataItem | undefined {
-  const normalized = path.normalize(absPath);
+export function findItemForPath(items: MetadataItem[], absPath: string, platform: NodeJS.Platform = process.platform): MetadataItem | undefined {
+  const key = foldPathKey(absPath, platform);
   // 1. Prefer the component whose primary file IS this file — picks the specific
   //    leaf (e.g. a CustomField) over the CustomObject bundle that also contains it.
-  let match = items.find(i => path.normalize(i.filePath) === normalized);
+  let match = items.find(i => foldPathKey(i.filePath, platform) === key);
   if (match) return match;
   // 2. Any component that lists this exact file (e.g. a sidecar -meta.xml).
-  match = items.find(i => i.files.some(f => path.normalize(f) === normalized));
+  match = items.find(i => i.files.some(f => foldPathKey(f, platform) === key));
   if (match) return match;
   // 3. The containing bundle/folder.
-  match = items.find(i => normalized.startsWith(path.normalize(i.filePath) + path.sep));
+  match = items.find(i => key.startsWith(foldPathKey(i.filePath, platform) + path.sep));
   return match;
 }
 

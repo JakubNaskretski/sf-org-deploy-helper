@@ -11,15 +11,16 @@ import * as path from 'path';
  * Base: sf-org-deploy-helper's `src/sfCliService.ts` (cancellable spawn,
  * `--skip-connection-status`, error-envelope `actions[]`, SIGTERM→SIGKILL
  * cancel escalation). Family-wide fixes folded in for the kit:
- *  - Windows: the `sf` launcher is a `.cmd`/`.ps1` shim that Node refuses to
- *    spawn directly (EINVAL since the CVE-2024-27980 hardening). We resolve the
- *    real shim path ONCE via PATHEXT / `where sf` and spawn that absolute path
- *    with `shell:false` — never `shell:true` (which would need per-arg cmd.exe
- *    quoting and is a shell-injection surface). Previously every plugin
- *    misreported this as "sf not found on PATH".
+ *  - Windows: the `sf` launcher is usually a `.cmd` shim, and Node refuses to
+ *    spawn `.cmd`/`.bat` without `shell:true` (EINVAL since the CVE-2024-27980
+ *    hardening) — an absolute path does not lift that block. We resolve the
+ *    shim ONCE via PATHEXT / `where sf`, then `planSpawn` bypasses it: prefer
+ *    `sf.exe`, else run the npm-layout `bin/run.js` with node, else fall back
+ *    to `cmd.exe /d /s /c` with strict arg validation. Never `shell:true`.
  *  - Timeout: SIGTERM then SIGKILL escalation after 5s (the deploy-helper
  *    timeout path was SIGTERM-only); the error message says
- *    "timed out after Nms".
+ *    "timed out after Nms". The escalation timer survives the promise's own
+ *    rejection — it is cleared only when the process actually exits.
  *  - "sf not found" is inferred ONLY from a spawn `error` ENOENT — never from
  *    stderr contents (sf plugins print ENOENT warnings on exit 0; the
  *    sf-log-reader MED bug misfired on those).
@@ -118,11 +119,10 @@ export interface Cancellable<T> {
 }
 
 /**
- * Resolve the absolute path of the `sf` executable once. On Windows the real
- * launcher is `sf.cmd` (or `sf.ps1`); Node's `spawn('sf', …, {shell:false})`
- * cannot start it (EINVAL) and `spawn('sf', …, {shell:true})` opens a
- * shell-injection surface — so we look up the shim's absolute path and spawn
- * that directly with `shell:false`.
+ * Resolve the absolute path of the `sf` launcher once. On Windows that is
+ * usually the `sf.cmd` shim; the resolved path is fed to `planSpawn`, which
+ * decides how to actually start it — Node cannot spawn `.cmd`/`.bat` with
+ * `shell:false`, and `shell:true` is a shell-injection surface we never use.
  *
  * On non-Windows, `sf` is a real executable that spawns fine, so we return
  * `'sf'` and let PATH resolution happen in `spawn`.
@@ -168,15 +168,68 @@ export function resolveSfCommand(
   return 'sf';
 }
 
+export interface SpawnPlan {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+}
+
+/**
+ * Turn a resolved command + args into something `spawn(…, {shell:false})` can
+ * actually start. Only `.cmd`/`.bat` on Windows needs rewriting: Node throws
+ * EINVAL for those without `shell:true` regardless of path. Preference order:
+ *  1. Not a `.cmd`/`.bat` (or not win32) — spawn as-is.
+ *  2. npm layout: `<shimdir>/node_modules/@salesforce/cli/bin/run.js` exists —
+ *     spawn `node run.js …` directly (node is present wherever npm installed sf).
+ *  3. `cmd.exe /d /s /c "<quoted line>"` with windowsVerbatimArguments. Args
+ *     containing `"` or control chars are rejected (they cannot be framed
+ *     safely); `%VAR%` expansion inside quotes is a cmd.exe fact we accept —
+ *     an undefined %token% passes through literally in /c context.
+ *
+ * Exported for tests.
+ */
+export function planSpawn(
+  command: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = existsSync
+): SpawnPlan {
+  if (platform !== 'win32' || !/\.(cmd|bat)$/i.test(command)) return { command, args };
+  const win = path.win32;
+  const runJs = win.join(win.dirname(command), 'node_modules', '@salesforce', 'cli', 'bin', 'run.js');
+  try {
+    if (exists(runJs)) return { command: 'node', args: [runJs, ...args] };
+  } catch { /* unreadable — use the cmd.exe fallback */ }
+
+  for (const a of [command, ...args]) {
+    if (/["\r\n]/.test(a)) {
+      throw new SfCliError(`Cannot pass this argument through cmd.exe safely: ${a}`);
+    }
+  }
+  // Quote everything that isn't a plainly safe token, so cmd metacharacters
+  // (& | < > ^) always sit inside quotes. /s makes cmd strip only the outer pair.
+  const quote = (a: string): string => (/^[A-Za-z0-9_\-.:\\/=,@+]+$/.test(a) ? a : `"${a}"`);
+  const line = [`"${command}"`, ...args.map(quote)].join(' ');
+  return {
+    command: env.ComSpec || 'cmd.exe',
+    args: ['/d', '/s', '/c', `"${line}"`],
+    windowsVerbatimArguments: true,
+  };
+}
+
 export class SfCliService {
   private readonly defaultTimeoutMs: number;
+  /** Delay before SIGTERM escalates to SIGKILL. Injectable so tests don't wait 5s. */
+  private readonly killEscalationMs: number;
   /** Default 512 MB cap on buffered stdout+stderr. A runaway/huge response is
    *  killed instead of exhausting the extension host's heap. */
   private readonly defaultMaxBuffer = 512 * 1024 * 1024;
   private resolvedSf: string | undefined;
 
-  constructor(opts: { defaultTimeoutMs?: number } = {}) {
+  constructor(opts: { defaultTimeoutMs?: number; killEscalationMs?: number } = {}) {
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 180_000;
+    this.killEscalationMs = opts.killEscalationMs ?? 5000;
   }
 
   /** Cache the resolved `sf` launcher path so we pay the Windows lookup once. */
@@ -280,7 +333,12 @@ export class SfCliService {
   runCancellable(args: string[], options: RunOptions = {}): Cancellable<RunResult> {
     let cancelFn: () => void = () => undefined;
     const promise = new Promise<RunResult>((resolve, reject) => {
-      const child = spawn(this.sfCommand(), args, { shell: false, cwd: options.cwd });
+      const plan = planSpawn(this.sfCommand(), args);
+      const child = spawn(plan.command, plan.args, {
+        shell: false,
+        cwd: options.cwd,
+        windowsVerbatimArguments: plan.windowsVerbatimArguments,
+      });
       const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
       const maxBuffer = options.maxBuffer ?? this.defaultMaxBuffer;
       let settled = false;
@@ -288,11 +346,14 @@ export class SfCliService {
       let termination: RunTermination = 'exit';
       let killTimer: NodeJS.Timeout | undefined;
 
-      // Single teardown path so the timeout, cancel-kill, and abort timers are
-      // always cleared exactly once (no stray SIGKILL timer after settle).
+      // Single teardown path for the timeout timer and abort listener. The
+      // SIGKILL escalation timer is deliberately NOT cleared here: settle()
+      // runs when the promise resolves/rejects, which on the timeout and
+      // maxBuffer paths is BEFORE the process has died — clearing it there
+      // would let a SIGTERM-ignoring process linger forever. It is cleared on
+      // 'close'/'error', when the process is actually gone.
       const cleanup = (): void => {
         clearTimeout(timer);
-        if (killTimer) clearTimeout(killTimer);
         if (options.signal) options.signal.removeEventListener('abort', onAbort);
       };
       const settle = (fn: () => void): void => {
@@ -308,7 +369,7 @@ export class SfCliService {
         try { child.kill('SIGTERM'); } catch { /* ignore */ }
         killTimer = setTimeout(() => {
           try { child.kill('SIGKILL'); } catch { /* ignore */ }
-        }, 5000);
+        }, this.killEscalationMs);
       };
 
       const timer = setTimeout(() => {
@@ -348,7 +409,9 @@ export class SfCliService {
       child.stdout.on('data', c => onChunk(stdoutChunks, Buffer.from(c)));
       child.stderr.on('data', c => onChunk(stderrChunks, Buffer.from(c)));
 
-      child.on('error', err => settle(() => {
+      child.on('error', err => {
+        if (killTimer) { clearTimeout(killTimer); killTimer = undefined; }
+        settle(() => {
         if (cancelled) return reject(new SfCliCancelledError());
         // "sf not found" is ONLY inferred here, from a spawn ENOENT — never from
         // stderr contents (sf plugins print ENOENT warnings on exit 0).
@@ -356,10 +419,13 @@ export class SfCliService {
         const detail = isEnoent
           ? 'Salesforce CLI (sf) not found on PATH. Install it and reload VS Code.'
           : `Failed to launch sf CLI: ${(err as Error).message}`;
-        reject(new SfCliError(detail, undefined, undefined, err));
-      }));
+          reject(new SfCliError(detail, undefined, undefined, err));
+        });
+      });
 
-      child.on('close', code => settle(() => {
+      child.on('close', code => {
+        if (killTimer) { clearTimeout(killTimer); killTimer = undefined; }
+        settle(() => {
         if (cancelled) return reject(new SfCliCancelledError());
         // On a timeout/maxBuffer kill we've already rejected above; this close
         // is the dying process. `settled` guards it. On a NORMAL exit we resolve
@@ -368,8 +434,9 @@ export class SfCliService {
         if (termination !== 'exit') return;
         const stdout = Buffer.concat(stdoutChunks).toString('utf8');
         const stderr = Buffer.concat(stderrChunks).toString('utf8');
-        resolve({ stdout, stderr, code: code ?? -1 });
-      }));
+          resolve({ stdout, stderr, code: code ?? -1 });
+        });
+      });
     });
     return { promise, cancel: () => cancelFn() };
   }

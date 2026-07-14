@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { FolderRule, LearnedRule, MetadataItem, OBJECT_CHILD_TYPES, deriveRule, findItemForPath, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
+import { FolderRule, LearnedRule, MetadataItem, OBJECT_CHILD_TYPES, deriveRule, findItemForPath, foldPathKey, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -29,6 +29,12 @@ type Inbound =
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
   | { type: 'clearStatusHistory' }
+  // Card-button affordances on a retrieve result that made a pre-retrieve backup
+  // (see backupCardButtons). `dir` is the webview's copy of the backup's absolute
+  // path — untrusted until resolveBackupDir confines it to this workspace's own
+  // backup root. Omitted only if a hand-built message reaches us some other way.
+  | { type: 'restoreBackup'; dir?: string }
+  | { type: 'discardBackup'; dir?: string }
   | { type: 'cancel' };
 
 // Minimal structural slice of the built-in vscode.git extension's API (v1) —
@@ -562,6 +568,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.cardHistoryCache = [];
         await this.context.workspaceState.update(CARD_HISTORY_KEY, []);
         return;
+      case 'restoreBackup':
+        await this.restoreRetrieveBackup(msg.dir);
+        return;
+      case 'discardBackup':
+        await this.discardBackup(msg.dir);
+        return;
       case 'copyText':
         if (msg.text) {
           await vscode.env.clipboard.writeText(msg.text);
@@ -612,7 +624,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       // One env line so a "works in terminal, fails in panel" report is
       // diagnosable from the log alone (extension-host PATH ≠ shell PATH).
-      this.output.appendLine(`[list orgs] diag cwd=${this.workspaceRoot ?? process.cwd()} PATH=${(process.env.PATH ?? '').split(':').slice(0, 6).join(':')}`);
+      this.output.appendLine(`[list orgs] diag cwd=${this.workspaceRoot ?? process.cwd()} PATH=${(process.env.PATH ?? '').split(path.delimiter).slice(0, 6).join(path.delimiter)}`);
       const msg = stripAnsi(err instanceof Error ? err.message : String(err)).trim();
       const hint = hintForError(err);
       // The banner carries the real reason — "see output channel" alone strands
@@ -698,16 +710,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!this.unresolvableFolders) {
       const days = this.typeCacheDays();
       const kept = days > 0 ? this.readUnresolvableEntries(Date.now() - days * 86_400_000) : [];
-      this.unresolvableFolders = new Set(kept.map(e => e.folder));
+      // Fold on hydrate so a folder cached under one drive-letter casing still
+      // matches this session's scan paths (Windows) — and so entries persisted
+      // before folding was introduced keep working. Every .has()/.add() below
+      // folds to match; only the comparison key is folded, not the stored value.
+      this.unresolvableFolders = new Set(kept.map(e => foldPathKey(e.folder)));
     }
     return this.unresolvableFolders;
   }
 
   private markUnresolvable(folder: string): void {
-    this.unresolvable().add(folder);
+    const key = foldPathKey(folder);
+    this.unresolvable().add(key);
     const days = this.typeCacheDays();
     if (days <= 0) return;
-    const next = this.readUnresolvableEntries(Date.now() - days * 86_400_000).filter(e => e.folder !== folder);
+    // Dedupe case-insensitively (folded) but persist the ORIGINAL path — the
+    // stored casing is display/debug fidelity; membership always folds at read.
+    const next = this.readUnresolvableEntries(Date.now() - days * 86_400_000).filter(e => foldPathKey(e.folder) !== key);
     next.push({ folder, at: Date.now() });
     // Cap the persisted list so a workspace with thousands of junk folders can't
     // bloat the state DB — entries are time-ordered, drop the oldest.
@@ -812,7 +831,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Folders no rule covers: resolve their types via the CLI registry, then
     // rescan so they land in the tree. Learned rules AND failures persist, so
     // this spawns `sf` only for genuinely new folders (or after cache expiry).
-    const pending = scan.unknownFolders.filter(f => !this.unresolvable().has(f));
+    const pending = scan.unknownFolders.filter(f => !this.unresolvable().has(foldPathKey(f)));
     let resolveFailures: string[] = [];
     if (pending.length && scan.root) {
       const scanRoot = scan.root;
@@ -822,7 +841,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // Fresh rules are passed directly (not just via the cache) so the rescan
       // sees them even with typeCacheDays 0.
       if (fresh.length) scan = await scanWorkspace([...this.learnedRules(), ...fresh]);
-      resolveFailures = pending.filter(f => this.unresolvable().has(f)).map(f => path.basename(f));
+      resolveFailures = pending.filter(f => this.unresolvable().has(foldPathKey(f))).map(f => path.basename(f));
     }
     const scanNotice = resolveFailures.length
       ? `Couldn't resolve metadata type for: ${resolveFailures.join(', ')}` +
@@ -895,15 +914,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const byPrimary = new Map<string, string>();
       const byFile = new Map<string, string>();
       const byDir = new Map<string, string>();
+      // Keys are folded (foldPathKey): vscode.git reports fsPaths whose casing can
+      // differ from the scanner root's on Windows, so an unfolded map would leave
+      // the Changed lens silently empty. Values keep the original component key.
       for (const item of this.items) {
         const key = `${item.type}:${item.name}`;
         if (item.filePath) {
-          const p = path.normalize(item.filePath);
+          const p = foldPathKey(item.filePath);
           if (!byPrimary.has(p)) byPrimary.set(p, key);
           if (!byDir.has(p)) byDir.set(p, key); // bundles: filePath is the folder
         }
         for (const f of item.files) {
-          const p = path.normalize(f);
+          const p = foldPathKey(f);
           if (!byFile.has(p)) byFile.set(p, key);
         }
       }
@@ -913,7 +935,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // listed file > containing bundle folder), de-duping repeated paths.
       const addPath = (fsPath: string | undefined): void => {
         if (!fsPath) return;
-        const p = path.normalize(fsPath);
+        const p = foldPathKey(fsPath);
         if (seen.has(p)) return; // a staged+modified (or ref+working) file recurs across lists
         seen.add(p);
         let key = byPrimary.get(p) ?? byFile.get(p);
@@ -1701,8 +1723,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // overwrite without the safety net the user was promised is worse than not
       // having the feature. Runs inside the already-reserved slot.
       let backupNote: string | undefined;
+      let backupDir: string | undefined;
       try {
-        backupNote = await this.maybeBackupBeforeRetrieve(root, items.flatMap(i => [i.filePath, ...i.files]), orgLabel);
+        const backupResult = await this.maybeBackupBeforeRetrieve(root, items.flatMap(i => [i.filePath, ...i.files]), orgLabel);
+        backupNote = backupResult?.note;
+        backupDir = backupResult?.dir;
       } catch (err) {
         this.reportError(`Backup before retrieve from ${orgLabel}`, err);
         return; // releaseBusy() in the outer finally frees the slot
@@ -1734,7 +1759,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: 'ok',
               title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
               ...(backupNote ? { meta: backupNote } : {}),
-              lines: ok.map(f => `${f.type}:${f.fullName}`)
+              lines: ok.map(f => `${f.type}:${f.fullName}`),
+              ...this.backupCardButtons(backupDir)
             }
           });
           this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
@@ -1760,7 +1786,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: failed.length > 0 ? 'err' : 'warn',
               title: `Retrieve from ${orgLabel} completed with issues`,
               meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing${backupNote ? ` · ${backupNote}` : ''}`,
-              lines
+              lines,
+              ...this.backupCardButtons(backupDir)
             }
           });
           if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
@@ -1948,8 +1975,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         .filter(i => wildcardTypes.has(i.type) || exactKeys.has(`${i.type}:${i.name}`))
         .flatMap(i => [i.filePath, ...i.files]);
       let backupNote: string | undefined;
+      let backupDir: string | undefined;
       try {
-        backupNote = await this.maybeBackupBeforeRetrieve(root, backupPaths, orgLabel);
+        const backupResult = await this.maybeBackupBeforeRetrieve(root, backupPaths, orgLabel);
+        backupNote = backupResult?.note;
+        backupDir = backupResult?.dir;
       } catch (err) {
         this.reportError(`Backup before retrieve from ${orgLabel}`, err);
         return; // releaseBusy() in the outer finally frees the slot
@@ -1978,7 +2008,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 kind: 'ok',
                 title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
                 meta: `manifest ${basename}${backupNote ? ` · ${backupNote}` : ''}`,
-                lines: ok.map(f => `${f.type}:${f.fullName}`)
+                lines: ok.map(f => `${f.type}:${f.fullName}`),
+                ...this.backupCardButtons(backupDir)
               }
             });
             this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
@@ -2003,7 +2034,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 kind: failed.length > 0 ? 'err' : 'warn',
                 title: `Retrieve from ${orgLabel} completed with issues`,
                 meta: `${ok.length} ok · ${failed.length} failed${backupNote ? ` · ${backupNote}` : ''}`,
-                lines
+                lines,
+                ...this.backupCardButtons(backupDir)
               }
             });
             if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
@@ -2496,13 +2528,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
 
         if (opened.length > 0 && floatDiff) {
-          // The diffs opened into a dedicated group beside the user's tabs (see
-          // diffColumn above), so that group is now active and holds ONLY the diffs.
-          // Pop it into its own OS window — the user's original tabs stay put. No
-          // setTimeout tick: vscode.diff is awaited so the diff editor is already active.
-          await Promise.resolve(
-            vscode.commands.executeCommand('workbench.action.moveEditorGroupToNewWindow')
-          ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed: ${String(e)}`));
+          // The diffs were AIMED at a dedicated group beside the user's tabs (see
+          // diffColumn above) — but ViewColumn.Beside REUSES an existing neighbor
+          // group when the editor is already split, and moving that group to a new
+          // window would drag the user's own tabs along with the diffs. Float only
+          // when the active group holds nothing but diff editors and no more tabs
+          // than we just opened; otherwise leave the diffs in place.
+          const active = vscode.window.tabGroups.activeTabGroup;
+          const onlyOurDiffs = active.tabs.length <= opened.length
+            && active.tabs.every(t => t.input instanceof vscode.TabInputTextDiff);
+          if (onlyOurDiffs) {
+            // No setTimeout tick: vscode.diff is awaited so the diff editor is active.
+            await Promise.resolve(
+              vscode.commands.executeCommand('workbench.action.moveEditorGroupToNewWindow')
+            ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed: ${String(e)}`));
+          } else {
+            this.output.appendLine('[Diff] floating window skipped — the target editor group contains other tabs.');
+          }
         }
 
         const lines: string[] = [];
@@ -3092,15 +3134,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * copy/write failure so the caller can abort the retrieve — silently proceeding
    * would strip the safety net the setting promises.
    */
-  private async maybeBackupBeforeRetrieve(root: string, candidatePaths: string[], orgLabel: string): Promise<string | undefined> {
+  private async maybeBackupBeforeRetrieve(root: string, candidatePaths: string[], orgLabel: string): Promise<{ note: string; dir?: string } | undefined> {
     if (!this.backupsEnabled()) return undefined;
     const result = await this.writeBackup(root, candidatePaths, orgLabel);
     if (result.skippedTooMany) {
       this.output.appendLine(`[backup] skipped — more than ${BACKUP_MAX_FILES} files would be backed up before retrieve`);
-      return `backup skipped — over ${BACKUP_MAX_FILES} files`;
+      return { note: `backup skipped — over ${BACKUP_MAX_FILES} files` };
     }
     if (result.count === 0) return undefined;
-    return `backed up ${result.count} file${result.count === 1 ? '' : 's'} — restore via 'SF Deploy: Restore Retrieve Backup'`;
+    // `dir` rides along so the caller can offer the card's Restore/Discard buttons
+    // (backupCardButtons) against this EXACT backup — never a re-derived "latest".
+    return {
+      note: `backed up ${result.count} file${result.count === 1 ? '' : 's'} — restore via 'SF Deploy: Restore Retrieve Backup'`,
+      dir: result.dir
+    };
   }
 
   /**
@@ -3110,8 +3157,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * afterwards. Creates no dir when there's nothing to copy or the count exceeds
    * BACKUP_MAX_FILES. Rejects (throws) if a copy fails. `opts.protect` names a dir the
    * prune must keep regardless (so a pre-restore backup can't delete its own source).
+   * Returns the fresh backup's absolute `dir` when count > 0, so a caller (e.g. the
+   * retrieve flows) can offer it straight back for a scoped restore/discard.
    */
-  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean }> {
+  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean; dir?: string }> {
     const rootResolved = path.resolve(root);
     const seen = new Set<string>();
     const toCopy: string[] = [];
@@ -3130,11 +3179,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (st.isSymbolicLink() || !st.isFile()) continue; // bundle dirs listed separately; links skipped
       toCopy.push(abs);
     }
-    if (toCopy.length === 0) return { count: 0 };
+    if (toCopy.length === 0) {
+      // A safety net that silently doesn't fire is worse than none. When real
+      // candidates were offered (org-only '' entries excluded) but every one was
+      // missing or resolved outside the workspace — e.g. a mis-cased inferred path
+      // that isUnder now folds, or a file already gone — leave a trace.
+      const offered = candidatePaths.filter(Boolean).length;
+      if (offered > 0) this.output.appendLine(`[backup] backup skipped ${offered} candidate(s): missing or outside the workspace`);
+      return { count: 0 };
+    }
     if (toCopy.length > BACKUP_MAX_FILES) return { count: 0, skippedTooMany: true };
 
     const key = this.workspaceBackupKey(root);
-    const dirName = `${sanitizeSegment(new Date().toISOString())}__${sanitizeSegment(orgLabel)}`;
+    // Random tail: two same-millisecond backups for one org (restore's undo backup
+    // colliding with its own source — security review DH-1) must never share a dir.
+    const dirName = `${sanitizeSegment(new Date().toISOString())}__${sanitizeSegment(orgLabel)}__${crypto.randomBytes(3).toString('hex')}`;
     const destRoot = path.join(this.backupsRoot(), key, dirName);
     for (const abs of toCopy) {
       const dest = path.join(destRoot, path.relative(rootResolved, abs));
@@ -3145,7 +3204,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     await fs.mkdir(destRoot, { recursive: true }); // belt-and-braces before the manifest write
     await fs.writeFile(path.join(destRoot, BACKUP_MANIFEST), JSON.stringify(manifest, null, 2), 'utf8');
     await this.pruneBackups(key, opts.protect);
-    return { count: toCopy.length };
+    return { count: toCopy.length, dir: destRoot };
   }
 
   /** Keep only the newest BACKUP_KEEP backup dirs for a workspace key (dir names are
@@ -3166,6 +3225,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Read one backup dir's manifest into a BackupEntry, or undefined when the dir is
+   *  missing or its manifest is unreadable/broken — a pruned, in-progress, or
+   *  never-written backup. Callers surface this as "backup no longer exists". */
+  private async readBackupManifest(dir: string): Promise<BackupEntry | undefined> {
+    try {
+      const raw = JSON.parse(await fs.readFile(path.join(dir, BACKUP_MANIFEST), 'utf8')) as Partial<BackupManifest>;
+      return {
+        dir,
+        at: typeof raw.at === 'number' ? raw.at : 0,
+        org: typeof raw.org === 'string' ? raw.org : '(unknown org)',
+        fileCount: typeof raw.fileCount === 'number' ? raw.fileCount : 0
+      };
+    } catch { return undefined; } // no/broken manifest — not a restorable backup
+  }
+
   /** All valid backups for a workspace, newest first, read from each dir's manifest.
    *  Dirs without a readable backup.json are skipped (a partial/interrupted backup
    *  isn't offered for restore). */
@@ -3177,16 +3251,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch { return []; }
     const out: BackupEntry[] = [];
     for (const name of names) {
-      const dir = path.join(base, name);
-      try {
-        const raw = JSON.parse(await fs.readFile(path.join(dir, BACKUP_MANIFEST), 'utf8')) as Partial<BackupManifest>;
-        out.push({
-          dir,
-          at: typeof raw.at === 'number' ? raw.at : 0,
-          org: typeof raw.org === 'string' ? raw.org : '(unknown org)',
-          fileCount: typeof raw.fileCount === 'number' ? raw.fileCount : 0
-        });
-      } catch { /* no/broken manifest — not a restorable backup */ }
+      const entry = await this.readBackupManifest(path.join(base, name));
+      if (entry) out.push(entry);
     }
     return out.sort((a, b) => b.at - a.at);
   }
@@ -3207,37 +3273,107 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Restore local files from a pre-retrieve backup — the undo for a retrieve
-   * overwrite. Busy-refuses WITHOUT taking the slot (like refreshFiles/pickOrg) so
-   * the picker can't block a running op; reserves the 'Restore' slot only around the
-   * copy phase. Before overwriting, the CURRENT copies of the same files are backed
-   * up (so a restore is itself undoable), then the backup is copied back. Every
-   * destination is confined to the workspace root — a tampered backup dir can't write
-   * outside it.
+   * Validate a webview-supplied backup dir BEFORE any fs use. Card buttons round-trip
+   * `dir` through postMessage (and through the persisted card history, across
+   * reloads) — the webview is a potentially compromised caller, so that string must
+   * never reach fs.rm/fs.readFile/fs.copyFile unchecked. Requires the resolved path
+   * to be a DIRECT child of this workspace's own backup root
+   * (`backupsRoot()/workspaceBackupKey(root)`) — not merely nested somewhere under
+   * it, and not another workspace's key. Returns the resolved absolute dir, or
+   * undefined when `dir` is missing or fails that check.
    */
-  async restoreRetrieveBackup(): Promise<void> {
+  private resolveBackupDir(root: string, dir: string | undefined): string | undefined {
+    if (!dir) return undefined;
+    const base = path.resolve(path.join(this.backupsRoot(), this.workspaceBackupKey(root)));
+    const resolved = path.resolve(dir);
+    return path.dirname(resolved) === base ? resolved : undefined;
+  }
+
+  /**
+   * Restore local files from a pre-retrieve backup — the undo for a retrieve
+   * overwrite. Shared by the palette command (`SF Deploy: Restore Retrieve Backup`,
+   * `dir` undefined — shows the backup picker first) and a status card's "Restore
+   * backup…" button (`dir` already names the exact backup that retrieve made, so the
+   * picker is skipped and we go straight to picking which files to restore).
+   *
+   * Busy-refuses WITHOUT taking the slot (like refreshFiles/pickOrg) so the pickers
+   * can't block a running op; reserves the 'Restore' slot only around the copy
+   * phase. Before overwriting, the CURRENT copies of the chosen files are backed up
+   * (so a restore is itself undoable), then the backup is copied back. Every
+   * destination is confined to the workspace root — a tampered backup dir can't
+   * write outside it.
+   */
+  async restoreRetrieveBackup(dir?: string): Promise<void> {
     if (this.busy) { this.notifyBusy(); return; }
     const root = this.requireRoot();
     if (!root) return;
-    const key = this.workspaceBackupKey(root);
-    const backups = await this.listBackups(key);
-    if (backups.length === 0) {
-      vscode.window.showInformationMessage('SF Deploy: no retrieve backups for this workspace yet.');
+
+    let backup: BackupEntry | undefined;
+    if (dir !== undefined) {
+      // Card-button path: dir names the specific backup a retrieve just made.
+      // SECURITY: resolve + confine it before any fs use (see resolveBackupDir).
+      const resolved = this.resolveBackupDir(root, dir);
+      if (!resolved) {
+        vscode.window.showWarningMessage('SF Deploy: that backup directory is not valid for this workspace.');
+        return;
+      }
+      backup = await this.readBackupManifest(resolved);
+      if (!backup) {
+        vscode.window.showWarningMessage(`SF Deploy: backup no longer exists (backups keep the last ${BACKUP_KEEP}).`);
+        return;
+      }
+    } else {
+      // Palette path: no dir yet — offer the list of backups for this workspace.
+      const key = this.workspaceBackupKey(root);
+      const backups = await this.listBackups(key);
+      if (backups.length === 0) {
+        vscode.window.showInformationMessage('SF Deploy: no retrieve backups for this workspace yet.');
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        backups.map(b => ({
+          label: `${new Date(b.at).toLocaleString()} — ${b.org}`,
+          description: `${b.fileCount} file${b.fileCount === 1 ? '' : 's'}`,
+          backup: b
+        })),
+        { placeHolder: 'Restore local files from which retrieve backup?' }
+      );
+      if (!picked) return;
+
+      // Follow-up step: offer discarding as an alternative to restoring, before
+      // committing to the file picker — same confirm + rm path as the card button
+      // (discardBackup), just reached from the palette.
+      type BackupChoice = vscode.QuickPickItem & { action: 'restore' | 'discard' };
+      const next = await vscode.window.showQuickPick<BackupChoice>(
+        [
+          { label: 'Restore files from this backup…', action: 'restore' },
+          { label: 'Discard this backup', description: 'Deletes it permanently — cannot be undone.', action: 'discard' }
+        ],
+        { placeHolder: `${new Date(picked.backup.at).toLocaleString()} — ${picked.backup.org} · ${picked.backup.fileCount} file${picked.backup.fileCount === 1 ? '' : 's'}` }
+      );
+      if (!next) return;
+      if (next.action === 'discard') { await this.discardBackup(picked.backup.dir); return; }
+      backup = picked.backup;
+    }
+
+    const when = new Date(backup.at).toLocaleString();
+    const relFiles = await this.listBackupFiles(backup.dir);
+    if (relFiles.length === 0) {
+      vscode.window.showInformationMessage('SF Deploy: this backup has no files to restore.');
       return;
     }
-    const picked = await vscode.window.showQuickPick(
-      backups.map(b => ({
-        label: `${new Date(b.at).toLocaleString()} — ${b.org}`,
-        description: `${b.fileCount} file${b.fileCount === 1 ? '' : 's'}`,
-        backup: b
-      })),
-      { placeHolder: 'Restore local files from which retrieve backup?' }
+    // canPickMany, ALL preselected — restoring the full backup is the common case
+    // (accept the defaults), but any subset can be unchecked first.
+    type FilePick = vscode.QuickPickItem & { rel: string };
+    const filePicks = await vscode.window.showQuickPick<FilePick>(
+      relFiles.map(rel => ({ label: rel, picked: true, rel })),
+      { canPickMany: true, placeHolder: `Restore which files from ${when} — ${backup.org}?` }
     );
-    if (!picked) return;
-    const backup = picked.backup;
-    const when = new Date(backup.at).toLocaleString();
+    if (!filePicks || filePicks.length === 0) return;
+    const chosen = filePicks.map(f => f.rel);
+
     const confirm = await vscode.window.showWarningMessage(
-      `Overwrite the current local files with the backup from ${when} (${backup.fileCount} file${backup.fileCount === 1 ? '' : 's'})? The current copies are themselves backed up first.`,
+      `Overwrite ${chosen.length} current local file${chosen.length === 1 ? '' : 's'} with the backup from ${when} (${backup.org})? The current copies are themselves backed up first.`,
       { modal: true },
       'Restore'
     );
@@ -3248,16 +3384,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!this.reserveBusy('Restore')) return;
     try {
       const rootResolved = path.resolve(root);
-      const relFiles = await this.listBackupFiles(backup.dir);
-      // Undo-of-the-undo: back up the CURRENT state of the same files first. Protect
-      // the source dir from that backup's prune so we can't delete what we're about
-      // to restore from. A failure here THROWS before anything is overwritten.
+      // Undo-of-the-undo: back up the CURRENT state of the chosen files first.
+      // Protect the source dir from that backup's prune so we can't delete what
+      // we're about to restore from. A failure here THROWS before anything is
+      // overwritten.
       const orgLabel = this.orgs.find(o => o.username === this.orgStore.get())?.alias ?? this.orgStore.get() ?? 'restore';
-      await this.writeBackup(root, relFiles.map(rel => path.join(rootResolved, rel)), orgLabel, { protect: path.basename(backup.dir) });
+      await this.writeBackup(root, chosen.map(rel => path.join(rootResolved, rel)), orgLabel, { protect: path.basename(backup.dir) });
 
       const restored: string[] = [];
       const rejected: string[] = [];
-      for (const rel of relFiles) {
+      for (const rel of chosen) {
         const dest = path.resolve(rootResolved, rel);
         // Path-safety: a hand-tampered backup dir could hold a `../` escape; refuse
         // anything that resolves outside the workspace root.
@@ -3287,6 +3423,67 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.setBusy(false);
     }
   }
+
+  /**
+   * Discard a pre-retrieve backup permanently (no undo) — the counterpart to
+   * restoreRetrieveBackup, reached from the status-card "Discard backup" button and
+   * from the palette restore flow's "Discard this backup" alternative. `dir` is
+   * validated exactly like restoreRetrieveBackup's, before any fs use.
+   *
+   * Busy-refuses WITHOUT taking the slot: discarding is a single fast, local
+   * fs.rm — there's no multi-step phase worth a progress slot for, unlike restore's
+   * copy phase.
+   */
+  private async discardBackup(dir: string | undefined): Promise<void> {
+    if (this.busy) { this.notifyBusy(); return; }
+    const root = this.requireRoot();
+    if (!root) return;
+    const resolved = this.resolveBackupDir(root, dir);
+    if (!resolved) {
+      vscode.window.showWarningMessage('SF Deploy: that backup directory is not valid for this workspace.');
+      return;
+    }
+    const entry = await this.readBackupManifest(resolved);
+    if (!entry) {
+      vscode.window.showWarningMessage(`SF Deploy: backup no longer exists (backups keep the last ${BACKUP_KEEP}).`);
+      return;
+    }
+    const when = new Date(entry.at).toLocaleString();
+    const confirm = await vscode.window.showWarningMessage(
+      `Discard this backup (${entry.fileCount} file${entry.fileCount === 1 ? '' : 's'}, ${when})? This cannot be undone.`,
+      { modal: true },
+      'Discard'
+    );
+    if (confirm !== 'Discard') return;
+    try {
+      await fs.rm(resolved, { recursive: true, force: true });
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'ok',
+          title: 'Backup discarded',
+          meta: `${when} — ${entry.org} · ${entry.fileCount} file${entry.fileCount === 1 ? '' : 's'}`
+        }
+      });
+    } catch (err) {
+      this.reportError('Discard backup', err);
+    }
+  }
+
+  /** Card `buttons` for a retrieve result that made a backup — spreads to nothing
+   *  when no backup was made this run (dir undefined). Both buttons round-trip the
+   *  SAME dir through the webview; the provider re-validates it against this
+   *  workspace's backup root before acting (resolveBackupDir), so neither a stale
+   *  dir (pruned since) nor a tampered one can reach fs directly. */
+  private backupCardButtons(dir: string | undefined): { buttons: Array<{ label: string; send: { type: string; dir: string } }> } | Record<string, never> {
+    if (!dir) return {};
+    return {
+      buttons: [
+        { label: 'Restore backup…', send: { type: 'restoreBackup', dir } },
+        { label: 'Discard backup', send: { type: 'discardBackup', dir } }
+      ]
+    };
+  }
 }
 
 // ---- module-local helpers ----
@@ -3296,15 +3493,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
  *  dot-only results ('' / '.' / '..') collapse to '_' so a segment can never become a
  *  traversal or a meaningless name. */
 function sanitizeSegment(s: string): string {
-  const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '-');
-  return /^\.*$/.test(cleaned) ? '_' : cleaned;
+  // Win32 silently strips trailing dots from path components — an org label
+  // ending in '.' would make the backup dir's on-disk name diverge from the
+  // string this code tracks. Strip them here instead.
+  const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '-').replace(/\.+$/, '_');
+  return /^\.*$/.test(cleaned) || cleaned === '' ? '_' : cleaned;
 }
 
 /** True when `abs` is `root` itself or nested beneath it — the confinement check for
  *  both writing backups and restoring them. Both args must already be resolved
- *  absolute paths. */
+ *  absolute paths. Compares via foldPathKey so a drive-letter/casing drift between
+ *  a dialog- or infer-sourced path and the workspace root can't drop an in-tree
+ *  file on Windows; callers keep using their ORIGINAL paths for the fs operations. */
 function isUnder(root: string, abs: string): boolean {
-  return abs === root || abs.startsWith(root + path.sep);
+  const r = foldPathKey(root);
+  const a = foldPathKey(abs);
+  return a === r || a.startsWith(r + path.sep);
 }
 
 /** All metadata types the extension supports — fetched in one batch when the user clicks "Fetch Org". */
@@ -3561,12 +3765,20 @@ async function stageDiffText(content: string, item: MetadataItem): Promise<{ fil
 function scheduleTmpCleanup(paths: string[]): void {
   if (paths.length === 0) return;
   const targets = paths.map(p => path.normalize(p));
+  // Folded twin for the "still referenced?" test only — fs.rm below must run on
+  // the ORIGINAL (unfolded) targets, since an editor's fsPath casing can differ
+  // from the staged path's on Windows and a lowercased path would be the wrong
+  // thing to delete.
+  const foldedTargets = targets.map(t => foldPathKey(t));
   const cleanup = () => Promise.all(targets.map(t => fs.rm(t, { recursive: true, force: true }))).catch(() => undefined);
 
   let disposed = false;
   const disposable = vscode.window.onDidChangeVisibleTextEditors(editors => {
     if (disposed) return;
-    const stillOpen = editors.some(e => targets.some(t => path.normalize(e.document.uri.fsPath).startsWith(t)));
+    const stillOpen = editors.some(e => {
+      const ef = foldPathKey(e.document.uri.fsPath);
+      return foldedTargets.some(t => ef.startsWith(t));
+    });
     if (!stillOpen) {
       disposed = true;
       disposable.dispose();

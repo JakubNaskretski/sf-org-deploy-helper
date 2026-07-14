@@ -332,6 +332,16 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .status-card .card-copy:hover { background: var(--row-hover); }
 
+/* Card-defined action buttons (Restore backup…/Discard backup on a retrieve result)
+   — same small secondary treatment as .card-copy, laid out in a row. */
+.status-card .card-buttons { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.status-card .card-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--fg);
+  border-radius: 2px; padding: 1px 7px; cursor: pointer; font-size: 11px; font-family: inherit;
+}
+.status-card .card-btn:hover:not(:disabled) { background: var(--row-hover); }
+.status-card .card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .spinner {
   display: inline-block; width: 10px; height: 10px;
   border: 2px solid var(--muted); border-top-color: transparent;

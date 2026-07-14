@@ -3,6 +3,22 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.11.0
+
+- New: **Backup buttons.** Retrieve result cards now carry **Restore backup…** and
+  **Discard backup** buttons, restore lets you pick individual files (all preselected),
+  and the palette flow offers discard too.
+- Fixed: **Windows support.** The `sf` CLI now launches on Windows (recent VS Code
+  builds refused to start `sf.cmd`), path comparisons are case-insensitive there — so
+  the Changed tab, backups, active-file sync and Use open tabs work regardless of
+  drive-letter casing — and backup folder names are Windows-safe.
+- Fixed: **Cancelling a browser login works.** Cancel now force-kills a login that
+  ignores the polite termination — previously the panel could stay stuck on
+  "Waiting for browser login…" forever, even after closing the browser.
+- Fixed: **Diff floating window can't kidnap your tabs.** When the editor is already
+  split, org diffs no longer drag your own tabs into the new window — the float is
+  skipped unless the target group contains only the freshly opened diffs.
+
 ## 0.10.0
 
 - New: **Deploys no longer tie up the window — or die at a timeout.** Deploys, validations

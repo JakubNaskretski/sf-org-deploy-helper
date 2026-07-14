@@ -1172,6 +1172,26 @@
         });
         el.appendChild(qd);
       }
+      // Card-defined action buttons (e.g. Restore backup… / Discard backup on a
+      // retrieve result) — each posts its own `send` payload verbatim, spread
+      // through the same send() every toolbar/tree control uses. Disabled while
+      // busy, like the toolbar, so a click can't race a running operation.
+      if (card.buttons && card.buttons.length) {
+        const bwrap = document.createElement('div');
+        bwrap.className = 'card-buttons';
+        for (const b of card.buttons) {
+          const cb = document.createElement('button');
+          cb.className = 'card-btn';
+          cb.textContent = b.label || '';
+          cb.disabled = state.busy;
+          cb.addEventListener('click', () => {
+            if (state.busy) return;
+            send(b.send.type, b.send);
+          });
+          bwrap.appendChild(cb);
+        }
+        el.appendChild(bwrap);
+      }
       st.appendChild(el);
     }
   }
