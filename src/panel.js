@@ -57,6 +57,11 @@
     // unrecoverable without hunting the item down in All. Membership refreshes on
     // re-entering the lens. null = rebuild lazily from the live selection.
     selectedLensKeys: null,
+    // Deploy-queue strip mirror (Feature: deploy queue) — purely a passive
+    // display of the provider's `deployQueue`; every change arrives via a fresh
+    // 'queue' message (also replayed on 'ready'), so this is never persisted
+    // here either. Each item: { id, noun, orgLabel }.
+    queue: [],
   };
 
   function savePersisted() {
@@ -195,7 +200,12 @@
   }
 
   function action(kind) {
-    if (state.busy) return;
+    // Deploy/Validate stay usable while busy — the click still sends; the
+    // provider queues it behind whatever's running instead of refusing (see
+    // renderActions above and the provider's runDeploy). Retrieve/Diff still
+    // need the slot free.
+    const queueableWhileBusy = kind === 'deploy' || kind === 'validate';
+    if (state.busy && !queueableWhileBusy) return;
     const keys = Array.from(state.selected);
     if (keys.length === 0) return;
     if (!state.selectedOrg) return;
@@ -369,6 +379,12 @@
         else state.cmdLog.unshift(msg.entry);
         if (state.cmdLog.length > 50) state.cmdLog.length = 50;
         renderCmdLog();
+        return;
+      case 'queue':
+        // msg.items = [{ id, noun, orgLabel }] — the provider's deployQueue,
+        // authoritative and re-sent on every change (incl. 'ready').
+        state.queue = msg.items || [];
+        renderQueue();
         return;
     }
   }
@@ -939,11 +955,16 @@
 
   function renderActions() {
     $('selCount').textContent = `${state.selected.size} selected`;
-    const hasOrg = !!state.selectedOrg && !state.busy;
-    const anySelected = state.selected.size > 0 && hasOrg;
-    // Deploy and Diff require at least one locally-present file.
-    const hasLocalSelected = anySelected && Array.from(state.selected).some(k => state.localKeys.has(k));
-    const allOrgOnly = anySelected && Array.from(state.selected).every(k => !state.localKeys.has(k));
+    const hasOrg = !!state.selectedOrg;
+    // Deploy/Validate stay usable while busy — a click still sends; the provider
+    // queues it behind whatever's running instead of refusing (see action() /
+    // runKeys() below, and the provider's runDeploy). Retrieve/Diff still need
+    // the slot free, so THEIR enabled-ness keeps gating on !state.busy.
+    const anySelectedNow = state.selected.size > 0 && hasOrg;
+    const anySelectedIdle = anySelectedNow && !state.busy;
+    const hasLocalSelectedNow = anySelectedNow && Array.from(state.selected).some(k => state.localKeys.has(k));
+    const hasLocalSelectedIdle = anySelectedIdle && Array.from(state.selected).some(k => state.localKeys.has(k));
+    const allOrgOnly = anySelectedNow && Array.from(state.selected).every(k => !state.localKeys.has(k));
     const deployBtn = $('deployBtn');
     const validateBtn = $('validateBtn');
     const retrieveBtn = $('retrieveBtn');
@@ -952,33 +973,40 @@
     const testLevel = $('testLevel');
     const useActive = $('useActive');
     const clearSel = $('clearSel');
+
+    // Deploy/Validate: always visible, enabled purely on selection+org+local-file
+    // — independent of state.busy, since a click while busy queues instead of
+    // being refused.
+    deployBtn.style.display = '';
+    if (validateBtn) validateBtn.style.display = '';
+    deployBtn.disabled = !hasLocalSelectedNow;
+    if (validateBtn) validateBtn.disabled = !hasLocalSelectedNow;
+    const orgOnlyTip = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : '';
+    const queueTip = state.busy && hasLocalSelectedNow ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
+    deployBtn.title = queueTip || orgOnlyTip;
+    if (validateBtn) {
+      validateBtn.title = queueTip || orgOnlyTip || 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
+    }
+
     if (state.busy) {
-      deployBtn.style.display = 'none';
-      if (validateBtn) validateBtn.style.display = 'none';
       retrieveBtn.style.display = 'none';
+      retrieveBtn.disabled = true;
       diffBtn.style.display = 'none';
+      diffBtn.disabled = true;
       if (testLevel) testLevel.style.display = 'none';
       useActive.style.display = 'none';
       clearSel.style.display = 'none';
       cancelBtn.style.display = '';
       cancelBtn.textContent = state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel';
     } else {
-      deployBtn.style.display = '';
-      if (validateBtn) validateBtn.style.display = '';
       retrieveBtn.style.display = '';
       diffBtn.style.display = '';
-      if (testLevel) { testLevel.style.display = ''; testLevel.disabled = !hasLocalSelected; }
+      if (testLevel) { testLevel.style.display = ''; testLevel.disabled = !hasLocalSelectedIdle; }
       useActive.style.display = '';
       clearSel.style.display = state.selected.size > 0 ? '' : 'none';
       cancelBtn.style.display = 'none';
-      deployBtn.disabled = !hasLocalSelected;
-      if (validateBtn) {
-        validateBtn.disabled = !hasLocalSelected;
-        validateBtn.title = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
-      }
-      retrieveBtn.disabled = !anySelected;
-      diffBtn.disabled = !hasLocalSelected;
-      deployBtn.title = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : '';
+      retrieveBtn.disabled = !anySelectedIdle;
+      diffBtn.disabled = !hasLocalSelectedIdle;
       diffBtn.title = allOrgOnly ? 'Org-only items have no local file to diff against — retrieve them first.' : '';
     }
     // Lock org switching and fetch/refresh while an operation runs, so an in-flight
@@ -995,6 +1023,36 @@
     $('addOrg').title = lockTip || 'Authenticate a new org (sf org login web)';
     $('refreshFiles').disabled = state.busy;
     $('refreshFiles').title = lockTip || 'Rescan workspace files (also retries folders whose type resolution failed)';
+  }
+
+  // ---- Deploy queue strip (Feature: deploy queue) ----
+  // Slim list of deploys/validations deferred behind the single busy slot,
+  // between the action bar and the Status pane. Purely a passive display: all
+  // ordering/org-pinning/cap logic lives server-side (panelProvider's
+  // deployQueue/drainQueue) — a row's ✕ just asks the provider to remove it,
+  // and the provider re-posts the authoritative list either way.
+  function renderQueue() {
+    const strip = $('queueStrip');
+    if (!strip) return;
+    strip.innerHTML = '';
+    if (state.queue.length === 0) { strip.style.display = 'none'; return; }
+    strip.style.display = 'flex';
+    for (const item of state.queue) {
+      // Reuses .mode-head's row styling (see the Selected-lens header above)
+      // rather than inventing a new look for a second "slim strip with a label
+      // and a subtle button" row.
+      const row = document.createElement('div');
+      row.className = 'mode-head';
+      const lbl = document.createElement('span');
+      lbl.textContent = `⏳ ${item.noun} → ${item.orgLabel}`;
+      row.appendChild(lbl);
+      const x = document.createElement('button');
+      x.textContent = '✕';
+      x.title = 'Remove from queue';
+      x.addEventListener('click', () => send('cancelQueued', { id: item.id }));
+      row.appendChild(x);
+      strip.appendChild(row);
+    }
   }
 
   // ---- Progress (busy) card ----
@@ -1336,7 +1394,10 @@
   }
 
   function runKeys(kind, keys) {
-    if (state.busy || !state.selectedOrg || !keys || !keys.length) return;
+    // Deploy/Validate queue behind a running op instead of refusing (mirrors
+    // action() above); Retrieve/Diff/Delete/Open-in-Org still need the slot free.
+    const queueableWhileBusy = kind === 'deploy' || kind === 'validate';
+    if ((state.busy && !queueableWhileBusy) || !state.selectedOrg || !keys || !keys.length) return;
     if (kind === 'validate') return send('deploy', { keys, validateOnly: true });
     send(kind, { keys });
   }
@@ -1355,11 +1416,17 @@
   function actionItems(keys) {
     const arr = Array.from(keys);
     const hasLocal = arr.some(k => state.localKeys.has(k));
-    const base = !state.busy && !!state.selectedOrg && arr.length > 0;
+    const hasOrgAndKeys = !!state.selectedOrg && arr.length > 0;
+    // Retrieve/Diff/Open-in-Org still need the slot free; Deploy/Validate can
+    // queue behind a running op instead (queueBase — mirrors the toolbar's
+    // busy-tolerant Deploy/Validate buttons in renderActions).
+    const base = !state.busy && hasOrgAndKeys;
+    const queueBase = hasOrgAndKeys;
     const orgTip = state.selectedOrg ? '' : 'Select an org first';
+    const queueTip = state.busy ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
     const items = [
-      { label: 'Deploy', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : ''), run: () => runKeys('deploy', arr) },
-      { label: 'Validate', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : 'Check-only deploy: validates and runs tests without deploying'), run: () => runKeys('validate', arr) },
+      { label: 'Deploy', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : queueTip), run: () => runKeys('deploy', arr) },
+      { label: 'Validate', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : (queueTip || 'Check-only deploy: validates and runs tests without deploying')), run: () => runKeys('validate', arr) },
       { label: 'Retrieve', disabled: !base, title: orgTip, run: () => runKeys('retrieve', arr) },
       { label: 'Diff', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to diff' : ''), run: () => runKeys('diff', arr) },
     ];

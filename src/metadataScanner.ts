@@ -384,6 +384,64 @@ export function deriveRule(folderName: string, type: string, members: string[], 
   return undefined;
 }
 
+/**
+ * Parse deploy-failure problem strings for references to components that are
+ * MISSING on the target org but exist LOCALLY — feeds the "Retry + N missing"
+ * button (panelProvider's reportDeployResult) so a dependency the org couldn't
+ * find gets added to the next attempt instead of making the user hunt it down.
+ *
+ * Two org-reported shapes are recognized (one real example each, below). A
+ * parsed candidate only becomes a result key when it matches a REAL local item
+ * in `items` — exact `type`+`name`, or (falling back) the same `type` with a
+ * case-insensitive `name` match, in which case the ITEM's own casing is
+ * returned, never the error text's. This means org-controlled error text can
+ * NEVER mint a key for a component that isn't actually part of this workspace's
+ * scan — it can only ever surface a key that was already going to be a valid
+ * `--metadata Type:Name`. Keys already in `deployedKeys` (this attempt's own
+ * component list — they failed for some OTHER reason, they're not "missing")
+ * are excluded. Result is deduped, first-seen order preserved.
+ */
+export function detectMissingDependencies(
+  problems: string[],
+  items: MetadataItem[],
+  deployedKeys: Set<string>
+): string[] {
+  const byExact = new Map<string, MetadataItem>();
+  const byCiName = new Map<string, MetadataItem>(); // `${type}:${name.toLowerCase()}` -> item
+  for (const it of items) {
+    byExact.set(`${it.type}:${it.name}`, it);
+    const ciKey = `${it.type}:${it.name.toLowerCase()}`;
+    if (!byCiName.has(ciKey)) byCiName.set(ciKey, it);
+  }
+
+  const candidates: Array<{ type: string; name: string }> = [];
+  for (const problem of problems) {
+    if (!problem) continue;
+    // e.g. a FlexiPage referencing a QuickAction that doesn't exist on the org:
+    // "In field: action - no QuickAction named Account.Foo found"
+    for (const m of problem.matchAll(/no ([A-Za-z0-9_]+) named ([\w.\-/]+) found/g)) {
+      candidates.push({ type: m[1], name: m[2] });
+    }
+    // e.g. an Apex class whose own dependency wasn't part of this same batch:
+    // "Dependent class is invalid and needs recompilation: Class MyHelper: Invalid type: Bar"
+    for (const m of problem.matchAll(/[Dd]ependent class is invalid and needs recompilation:?\s*(?:Class\s+)?([\w.]+)/g)) {
+      candidates.push({ type: 'ApexClass', name: m[1] });
+    }
+  }
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const c of candidates) {
+    const item = byExact.get(`${c.type}:${c.name}`) ?? byCiName.get(`${c.type}:${c.name.toLowerCase()}`);
+    if (!item) continue; // no matching local component — the error text alone is never trusted
+    const key = `${item.type}:${item.name}`; // canonical casing from the ITEM, never the error text
+    if (deployedKeys.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    result.push(key);
+  }
+  return result;
+}
+
 function matchExt(name: string, exts: string[]): string | undefined {
   for (const e of exts) if (name.endsWith(e)) return e;
   return undefined;

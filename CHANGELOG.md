@@ -3,6 +3,20 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.13.0
+
+- New: **Deploy queue.** Starting a deploy or validation while another operation runs no
+  longer refuses — you confirm it right away (org named, production guard included) and it
+  queues, shown in a strip above the status pane with a per-item ✕. Each queued deploy runs
+  against the org you confirmed, even if you switch orgs while waiting; if that org's
+  authentication disappears meanwhile, the item is skipped with a note. Retrieve, diff and
+  delete still wait their turn the old way.
+- New: **Retry with missing dependencies.** When a deploy fails because a referenced
+  component wasn't included — "no QuickAction named X found" on a FlexiPage, or an Apex
+  class needing recompilation — and that component exists in your workspace, the failure
+  card offers **Retry + N missing**: one click re-deploys the original set plus what it
+  needed. Only components actually found in your local project are ever added.
+
 ## 0.12.0
 
 - New: **Retry from the card.** Failed deploys and validations carry a **Retry** button —

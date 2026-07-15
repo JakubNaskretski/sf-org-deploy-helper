@@ -7,7 +7,7 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
-const { inferItemForPath, parseManifestTypes, deriveRule } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { inferItemForPath, parseManifestTypes, deriveRule, findItemForPath, foldPathKey, detectMissingDependencies } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep); // build OS-native paths
 
 const cases = [
@@ -113,5 +113,93 @@ try {
   assert.strictEqual(deriveRule('somemadeup', 'Whatever', ['A'], ['B.x-meta.xml']), undefined);
 } catch (e) { failed++; console.error('FAIL deriveRule:', e.message); }
 
+// foldPathKey + findItemForPath case-folding. Windows filesystems are
+// case-insensitive and VS Code's URI sources disagree about drive-letter casing;
+// the platform param lets us exercise win32 folding on this non-Windows host.
+try {
+  // win32: normalize + lowercase, so a case/drive-letter drift folds together
+  // (the exact drive-letter case from the audit).
+  assert.strictEqual(foldPathKey('C:\\Ws\\a.CLS', 'win32'), foldPathKey('c:\\ws\\A.cls', 'win32'), 'win32 fold must ignore case');
+  // darwin: normalize only — case preserved (case-sensitive filesystem).
+  const dwn = p('Ws', 'A.CLS');
+  assert.strictEqual(foldPathKey(dwn, 'darwin'), path.normalize(dwn), 'darwin fold must keep case');
+  assert.notStrictEqual(foldPathKey(p('Ws', 'A.CLS'), 'darwin'), foldPathKey(p('Ws', 'a.cls'), 'darwin'), 'darwin treats differing case as different');
+
+  // findItemForPath honors the fold: a mis-cased query matches under win32, not darwin.
+  const item = {
+    type: 'ApexClass', name: 'MyClass',
+    filePath: p('Ws', 'classes', 'MyClass.cls'),
+    files: [p('Ws', 'classes', 'MyClass.cls'), p('Ws', 'classes', 'MyClass.cls-meta.xml')]
+  };
+  const items = [item];
+  // pass 1 (exact primary file), pass 2 (listed sidecar) — mis-cased, win32 matches
+  assert.strictEqual(findItemForPath(items, p('ws', 'CLASSES', 'myclass.cls'), 'win32'), item, 'win32 primary-file fold');
+  assert.strictEqual(findItemForPath(items, p('WS', 'classes', 'MyClass.CLS-META.XML'), 'win32'), item, 'win32 listed-file fold');
+  // darwin: same mis-cased query must NOT match; exact case still does (control)
+  assert.strictEqual(findItemForPath(items, p('ws', 'CLASSES', 'myclass.cls'), 'darwin'), undefined, 'darwin must not fold case');
+  assert.strictEqual(findItemForPath(items, p('Ws', 'classes', 'MyClass.cls'), 'darwin'), item, 'darwin exact match');
+  // pass 3 (containing bundle folder) — mis-cased dir prefix, win32 matches, darwin doesn't
+  const bundle = { type: 'LightningComponentBundle', name: 'myCmp', filePath: p('Ws', 'lwc', 'myCmp'), files: [] };
+  assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'win32'), bundle, 'win32 bundle-dir fold');
+  assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'darwin'), undefined, 'darwin bundle-dir no fold');
+} catch (e) { failed++; console.error('FAIL foldPathKey/findItemForPath:', e.message); }
+
+// detectMissingDependencies: org-reported failures resolved against LOCAL items
+// only — the error text alone can never mint a key for a component that isn't
+// really part of this workspace's scan.
+try {
+  const items = [
+    { type: 'QuickAction', name: 'Account.Foo', filePath: p('x', 'quickActions', 'Account.Foo.quickAction-meta.xml'), files: [] },
+    { type: 'ApexClass', name: 'MyHelper', filePath: p('x', 'classes', 'MyHelper.cls'), files: [] }
+  ];
+  // "no X named Y found" — e.g. a FlexiPage failing to find a QuickAction it references.
+  const qaProblem = 'In field: action - no QuickAction named Account.Foo found';
+  assert.deepStrictEqual(
+    detectMissingDependencies([qaProblem], items, new Set()),
+    ['QuickAction:Account.Foo'],
+    'QuickAction dependency resolves when the item exists locally'
+  );
+  // Unresolvable — no matching local item — must yield nothing: a hostile or merely
+  // unknown problem string can't mint a key for a component that isn't really there.
+  assert.deepStrictEqual(
+    detectMissingDependencies(['no BogusType named Nothing.Here found'], items, new Set()),
+    [],
+    'hostile/unresolvable name yields nothing'
+  );
+  // Already part of THIS deploy's own key set — it failed for some OTHER reason,
+  // it's not "missing", so it must be excluded.
+  assert.deepStrictEqual(
+    detectMissingDependencies([qaProblem], items, new Set(['QuickAction:Account.Foo'])),
+    [],
+    'already-deployed key excluded'
+  );
+  // Recompilation pattern maps to the local ApexClass.
+  assert.deepStrictEqual(
+    detectMissingDependencies(
+      ['Dependent class is invalid and needs recompilation: Class MyHelper: Invalid type: Bar'],
+      items, new Set()
+    ),
+    ['ApexClass:MyHelper'],
+    'recompilation pattern maps to the local ApexClass'
+  );
+  // Case-insensitive fallback: org text differs in NAME casing only (type stays
+  // exact) — the result uses the ITEM's canonical local casing, never the error
+  // text's.
+  assert.deepStrictEqual(
+    detectMissingDependencies(['no QuickAction named account.foo found'], items, new Set()),
+    ['QuickAction:Account.Foo'],
+    'case-insensitive name fallback returns the canonical local casing'
+  );
+  // Dedupe + first-seen order across multiple problem strings / patterns.
+  assert.deepStrictEqual(
+    detectMissingDependencies(
+      [qaProblem, qaProblem, 'Dependent class is invalid and needs recompilation: Class MyHelper: x'],
+      items, new Set()
+    ),
+    ['QuickAction:Account.Foo', 'ApexClass:MyHelper'],
+    'dedupes and preserves first-seen order'
+  );
+} catch (e) { failed++; console.error('FAIL detectMissingDependencies:', e.message); }
+
 if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
-console.log(`inferItemForPath/parseManifestTypes/deriveRule: all checks passed (${cases.length + noMatch.length} infer cases + learned-rule + parser + derive)`);
+console.log(`inferItemForPath/parseManifestTypes/deriveRule/foldPathKey/detectMissingDependencies: all checks passed (${cases.length + noMatch.length} infer cases + learned-rule + parser + derive + fold + dependency-detector)`);

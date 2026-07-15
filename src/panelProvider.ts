@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { FolderRule, LearnedRule, MetadataItem, OBJECT_CHILD_TYPES, deriveRule, findItemForPath, foldPathKey, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
+import { FolderRule, LearnedRule, MetadataItem, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -29,6 +29,9 @@ type Inbound =
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
   | { type: 'retryDeploy'; request?: RetryRequest }
+  // Deploy-queue strip ✕ (Feature: deploy queue) — `id` is validated as a string
+  // before use; an unknown id is simply a no-op removal.
+  | { type: 'cancelQueued'; id?: string }
   | { type: 'clearStatusHistory' }
   // Card-button affordances on a retrieve result that made a pre-retrieve backup
   // (see backupCardButtons). `dir` is the webview's copy of the backup's absolute
@@ -74,6 +77,11 @@ const TEST_LEVEL_KEY = 'testLevel';
  *  persisted alongside TEST_LEVEL_KEY so a context-menu deploy fired after a reload
  *  still has classes to run without the panel ever being reopened. */
 const RUN_TESTS_KEY = 'runTests';
+
+/** Cap on the deploy queue (Feature: deploy queue). Generous for a human clicking
+ *  Deploy/Validate repeatedly while something else runs; an 11th request gets an
+ *  honest "queue full" message rather than growing without bound. */
+const DEPLOY_QUEUE_MAX = 10;
 
 /** workspaceState key for the async deploy currently being polled. Persisted right
  *  after a successful submit so a window reload (or a hidden panel) can REATTACH to
@@ -183,6 +191,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  the scan banner so wholesale failures name their cause in-panel. */
   private resolveErrorSample: string | undefined;
   private sfVersionLogged = false;
+  /** Deploys/validations deferred behind the single busy slot (Feature: deploy
+   *  queue) — session-only, NOT persisted to workspaceState/globalState. A
+   *  queued deploy surviving a window reload would silently fire later against
+   *  an org the user may no longer expect; dropping it on reload is the safe
+   *  default. The org is PINNED at enqueue time (drainQueue targets it via
+   *  runDeploy's orgOverride, never the panel's live org selection). */
+  private deployQueue: Array<{
+    id: string;
+    keys: string[];
+    opts: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string };
+    org: string;
+    orgLabel: string;
+    noun: string;
+  }> = [];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -477,6 +499,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        // Re-sync the deploy-queue strip too — a webview rebuilt mid-session (e.g.
+        // sidebar collapsed/reopened) must not show an empty strip while the
+        // provider's in-memory queue still has items waiting.
+        this.postQueue();
         // Reattach to an async deploy still running on the org (window reloaded, or
         // the panel was closed and reopened) BEFORE auto-fetch, so a live deploy wins
         // the busy slot over a metadata refresh. No-op when there's no pending job.
@@ -538,6 +564,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       }
       case 'deploy':
+        // Fields built explicitly, one by one — NEVER spread `msg` into runDeploy's
+        // opts. runDeploy's opts type also carries internal-only `orgOverride` /
+        // `preConfirmed` fields that drainQueue uses to replay a queued deploy
+        // without a second confirm; spreading the raw webview message would let a
+        // compromised webview forge those and skip the confirm modal / retarget
+        // the org.
         await this.runDeploy(msg.keys, { validateOnly: msg.validateOnly, testLevel: msg.testLevel, runTests: msg.runTests });
         return;
       case 'quickDeploy':
@@ -605,6 +637,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         });
         return;
       }
+      case 'cancelQueued':
+        if (typeof msg.id !== 'string') return;
+        this.deployQueue = this.deployQueue.filter(q => q.id !== msg.id);
+        this.postQueue();
+        return;
       case 'clearStatusHistory':
         this.cardHistoryCache = [];
         await this.context.workspaceState.update(CARD_HISTORY_KEY, []);
@@ -1081,8 +1118,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   // ---- Operations ----
   private async runDeploy(
     keys: string[],
-    opts: { sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] } = {}
+    opts: {
+      sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[];
+      /** Internal only — set by drainQueue to run a previously-queued deploy
+       *  against the org PINNED at enqueue time, bypassing the currently-selected
+       *  org. The 'deploy' Inbound handler builds its opts explicitly (see the
+       *  comment there) and never spreads the raw webview message, so a
+       *  compromised webview can never set this itself. */
+      orgOverride?: string;
+      /** Internal only — set by drainQueue to skip the confirm modal for a
+       *  deploy the user already confirmed at enqueue time. Same invariant as
+       *  orgOverride: only drainQueue sets it. */
+      preConfirmed?: boolean;
+    } = {}
   ): Promise<void> {
+    // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
+    // deploy/validate that arrives while it's held is deferred onto the queue
+    // instead of refused outright (retrieve/diff/delete/fetch/login still refuse —
+    // see their own reserveBusy/notifyBusy calls, untouched). drainQueue re-enters
+    // HERE with preConfirmed once the slot frees, so this check must not re-queue
+    // a call that's already been dequeued.
+    if (this.busy && !opts.preConfirmed) {
+      await this.enqueueDeploy(keys, opts);
+      return;
+    }
     // Reserve the busy slot synchronously, before the first await (the confirm
     // modal): otherwise a second deploy/retrieve/diff fired during the modal
     // passes the entry check and two ops run at once, clobbering currentCancel and
@@ -1094,7 +1153,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     try {
       const root = this.requireRoot();
       if (!root) return;
-      const org = this.requireOrg();
+      // A drained queue entry targets the org PINNED at enqueue time, not
+      // whatever the panel's org selector shows now.
+      const org = opts.orgOverride ?? this.requireOrg();
       if (!org) return;
       const allResolved = this.resolveKeys(keys);
       const orgOnlySkipped = allResolved.filter(i => !i.filePath);
@@ -1111,54 +1172,26 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
       const verb: DeployVerb = opts.validateOnly ? 'Validate' : 'Deploy';
-      // Production defaults to running local tests (the org requires them anyway);
-      // sandbox defaults to no tests. Validate-only always runs tests, so force at
-      // least RunLocalTests there. The configured default sits between the panel's
-      // own pick and that hardcoded smart fallback — it only kicks in when neither
-      // this call nor the panel/session has an opinion.
-      const testLevel: TestLevel = opts.testLevel
-        ?? this.testLevel
-        ?? this.configuredTestLevel()
-        ?? (opts.validateOnly || isProd ? 'RunLocalTests' : 'NoTestRun');
 
-      // RunSpecifiedTests needs an actual class list — resolve it now (before the
+      // RunSpecifiedTests needs an actual class list — resolved now (before the
       // confirm modal) so an empty list can refuse the deploy outright instead of
-      // sending the org a validate/deploy that's certain to fail.
-      let runTests: string[] = [];
-      if (testLevel === 'RunSpecifiedTests') {
-        const candidates = opts.runTests ?? this.runTests ?? [];
-        // Class names become CLI argv (`--tests <name>`) — reject anything that
-        // isn't a bare Apex identifier (dots allowed for `Namespace.Class`) so a
-        // stray shell metacharacter typed into the panel can't inject an extra flag.
-        runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
-        if (runTests.length < candidates.length) {
-          this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
-        }
-        if (runTests.length === 0) {
-          vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
-          return; // early return before the confirm modal — releaseBusy() in the outer finally covers this
-        }
+      // sending the org a validate/deploy that's certain to fail. Shared with
+      // enqueueDeploy so a queued confirm's test-level note is exactly the one
+      // that will actually run.
+      const plan = this.resolveTestPlan(opts, isProd);
+      if (!plan) return; // resolveTestPlan already showed its own warning
+      const { testLevel, runTests, testNote } = plan;
+
+      // A drained (pre-confirmed) deploy skips the modal entirely — the user
+      // already confirmed it, against this same pinned org, at enqueue time.
+      if (!opts.preConfirmed) {
+        const modal = this.deployConfirmModal(
+          { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl },
+          false
+        );
+        const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
+        if (!confirm) return;
       }
-
-      const testNote = testLevel === 'NoTestRun' ? ''
-        : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
-        : `\n\nTests: ${testLevel}`;
-
-      const confirmLabel = opts.validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
-      const confirm = isProd && !opts.validateOnly
-        ? await vscode.window.showWarningMessage(
-            `⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.${testNote}`,
-            { modal: true, detail: orgInfo?.instanceUrl ?? '' },
-            confirmLabel
-          )
-        : await vscode.window.showWarningMessage(
-            opts.validateOnly
-              ? `Validate ${noun} against ${orgLabel}? (check-only — nothing is deployed)${testNote}`
-              : `Deploy ${noun} to ${orgLabel}?${testNote}`,
-            { modal: true, ...(isProd ? { detail: orgInfo?.instanceUrl ?? '' } : {}) },
-            confirmLabel
-          );
-      if (!confirm) return;
 
       const ignoreConflicts = vscode.workspace
         .getConfiguration('sfOrgDeployWrapper')
@@ -1249,6 +1282,176 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Resolve the effective Apex test level + class list (and its confirm-modal
+   *  note) for a deploy/validate request — shared by the immediate path
+   *  (runDeploy) and the enqueue path (enqueueDeploy) so a queued confirm's
+   *  test-level note is exactly the plan that will actually run. Returns
+   *  undefined (after showing its own warning) when RunSpecifiedTests has no
+   *  valid class name — the caller must bail without proceeding. */
+  private resolveTestPlan(
+    opts: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] },
+    isProd: boolean
+  ): { testLevel: TestLevel; runTests: string[]; testNote: string } | undefined {
+    // Production defaults to running local tests (the org requires them anyway);
+    // sandbox defaults to no tests. Validate-only always runs tests, so force at
+    // least RunLocalTests there. The configured default sits between the panel's
+    // own pick and that hardcoded smart fallback — it only kicks in when neither
+    // this call nor the panel/session has an opinion.
+    const testLevel: TestLevel = opts.testLevel
+      ?? this.testLevel
+      ?? this.configuredTestLevel()
+      ?? (opts.validateOnly || isProd ? 'RunLocalTests' : 'NoTestRun');
+
+    let runTests: string[] = [];
+    if (testLevel === 'RunSpecifiedTests') {
+      const candidates = opts.runTests ?? this.runTests ?? [];
+      // Class names become CLI argv (`--tests <name>`) — reject anything that
+      // isn't a bare Apex identifier (dots allowed for `Namespace.Class`) so a
+      // stray shell metacharacter typed into the panel can't inject an extra flag.
+      runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
+      if (runTests.length < candidates.length) {
+        this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
+      }
+      if (runTests.length === 0) {
+        vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
+        return undefined;
+      }
+    }
+
+    const testNote = testLevel === 'NoTestRun' ? ''
+      : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
+      : `\n\nTests: ${testLevel}`;
+    return { testLevel, runTests, testNote };
+  }
+
+  /** Build the deploy/validate confirm modal's message/options/label — shared by
+   *  the immediate path (runDeploy) and the enqueue path (enqueueDeploy) so a
+   *  queued confirm shows EXACTLY the same information an immediate one would.
+   *  `queued` is the only branching input: it adds a "Queue: " message prefix
+   *  and a detail line noting the deploy waits for the current operation to
+   *  finish; with `queued: false` this reproduces the pre-existing modal
+   *  byte-for-byte. */
+  private deployConfirmModal(
+    args: { noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string; instanceUrl?: string },
+    queued: boolean
+  ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl } = args;
+    const prefix = queued ? 'Queue: ' : '';
+    const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
+    const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
+    if (isProd && !validateOnly) {
+      return {
+        message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.${testNote}`,
+        options: { modal: true, detail: [instanceUrl ?? '', queueNote].filter(Boolean).join('\n') },
+        confirmLabel
+      };
+    }
+    const detail = isProd ? [instanceUrl ?? '', queueNote].filter(Boolean).join('\n') : queueNote;
+    return {
+      message: `${prefix}${validateOnly
+        ? `Validate ${noun} against ${orgLabel}? (check-only — nothing is deployed)`
+        : `Deploy ${noun} to ${orgLabel}?`}${testNote}`,
+      options: { modal: true, ...(detail !== undefined ? { detail } : {}) },
+      confirmLabel
+    };
+  }
+
+  /** A deploy/validate that arrived while the busy slot was taken (see the top of
+   *  runDeploy): the single busy slot stays the invariant — retrieve/diff/
+   *  delete/fetch/login still refuse outright — but a deploy/validate is
+   *  deferred onto `deployQueue` instead, to run automatically once the running
+   *  operation frees the slot (setBusy(false) schedules drainQueue). Resolves
+   *  items/org/labels exactly like the immediate path in runDeploy and shows the
+   *  SAME confirm modal (PROD warning + test-level note included) via
+   *  deployConfirmModal — just prefixed "Queue: " with a note that it waits for
+   *  the current operation. The target org is PINNED right now (named in the
+   *  modal, and used again by drainQueue) — a later org switch in the panel
+   *  can't retarget an already-queued deploy. */
+  private async enqueueDeploy(
+    keys: string[],
+    opts: { sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] }
+  ): Promise<void> {
+    const root = this.requireRoot();
+    if (!root) return;
+    const org = this.requireOrg();
+    if (!org) return;
+    const items = this.resolveKeys(keys).filter(i => !!i.filePath);
+    if (items.length === 0) {
+      vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
+      return;
+    }
+
+    const orgInfo = this.orgs.find(o => o.username === org);
+    const orgLabel = orgInfo?.alias ?? org;
+    const isProd = isLikelyProduction(orgInfo);
+    const n = items.length;
+    const noun = `${n} component${n === 1 ? '' : 's'}`;
+
+    const plan = this.resolveTestPlan(opts, isProd);
+    if (!plan) return;
+    const { testLevel, runTests, testNote } = plan;
+
+    const modal = this.deployConfirmModal(
+      { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl },
+      true
+    );
+    const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
+    if (!confirm) return;
+
+    if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
+      vscode.window.showInformationMessage(`SF Deploy: queue full (${DEPLOY_QUEUE_MAX} max) — wait for a queued operation to run before adding another.`);
+      return;
+    }
+    this.deployQueue.push({
+      id: crypto.randomBytes(8).toString('hex'),
+      keys: items.map(i => `${i.type}:${i.name}`),
+      opts: { validateOnly: opts.validateOnly, testLevel, runTests: runTests.length ? runTests : undefined, sourceDir: opts.sourceDir },
+      org,
+      orgLabel,
+      noun: `${opts.validateOnly ? 'Validate' : 'Deploy'} ${noun}`
+    });
+    this.postQueue();
+    vscode.window.setStatusBarMessage(`$(watch) SF Deploy: queued (position ${this.deployQueue.length})`, 5000);
+  }
+
+  /** Run the next queued deploy/validate now that the busy slot is free (see
+   *  setBusy). No-op if something already re-took the slot or the queue is
+   *  empty. The org pinned at enqueue time must still be authenticated; if it
+   *  dropped off `this.orgs` (session ended, org removed) since, skip that entry
+   *  with an honest card and try the next one instead of silently discarding it
+   *  or firing against the wrong org. Otherwise re-enters runDeploy with
+   *  preConfirmed+orgOverride so it runs WITHOUT a second confirm, strictly
+   *  against the pinned org — even if the panel's org selector has since moved
+   *  on to something else. */
+  private drainQueue(): void {
+    if (this.busy || this.deployQueue.length === 0) return;
+    const next = this.deployQueue.shift()!;
+    this.postQueue();
+    if (!this.orgs.some(o => o.username === next.org)) {
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'warn',
+          title: `Queued deploy skipped — ${next.orgLabel} is no longer authenticated`,
+          lines: next.keys
+        }
+      });
+      this.drainQueue();
+      return;
+    }
+    void this.runDeploy(next.keys, { ...next.opts, orgOverride: next.org, preConfirmed: true });
+  }
+
+  /** Push the current queue to the webview — on every change, AND from the
+   *  `ready` handler, so the queue strip is never stale across a webview
+   *  rebuild (e.g. the sidebar collapsed and reopened mid-session). */
+  private postQueue(): void {
+    this.post({
+      type: 'queue',
+      items: this.deployQueue.map(q => ({ id: q.id, noun: q.noun, orgLabel: q.orgLabel }))
+    });
+  }
+
   /** Render the status card for a completed deploy/validate, including Apex test
    *  failures (surfaced when a test-level ran) and a Quick Deploy affordance for a
    *  successful validation. */
@@ -1327,14 +1530,42 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           ...(pos ? { line: Number(pos[1]), ...(pos[2] ? { column: Number(pos[2]) } : {}) } : {})
         };
       });
+
+      // A failed deploy can reference a component that's missing on the org but
+      // DOES exist locally (e.g. a FlexiPage's QuickAction, or an Apex class
+      // whose dependency didn't make it into this same batch) — offer to retry
+      // WITH it added, instead of making the user hunt it down and re-select it
+      // by hand. Only offered when there's a discrete key list to extend (a
+      // manifest-based retry has none).
+      const retryKeys = ctx.retry?.keys;
+      const missing = retryKeys
+        ? detectMissingDependencies(failures.map(f => f.problem ?? ''), this.items, new Set(retryKeys))
+        : [];
+      const buttons = ctx.retry
+        ? [
+            { label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } },
+            ...(missing.length && retryKeys
+              ? [{
+                  label: `Retry + ${missing.length} missing`,
+                  send: { type: 'retryDeploy', request: { ...ctx.retry, keys: [...retryKeys, ...missing] } }
+                }]
+              : [])
+          ]
+        : undefined;
+
       this.post({
         type: 'status',
         card: {
           kind: 'err',
           title: validateOnly ? `Validation failed against ${orgLabel}` : `Deploy failed against ${orgLabel}`,
           meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}, ${successes.length} success${testFailures.length ? ` · ${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}` : ''}`,
-          lines: [...errLines, ...testLines, ...skipLines],
-          ...(ctx.retry ? { buttons: [{ label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } }] } : {})
+          lines: [
+            ...errLines,
+            ...testLines,
+            ...skipLines,
+            ...(missing.length ? [`Missing but available locally: ${missing.join(', ')}`] : [])
+          ],
+          ...(buttons ? { buttons } : {})
         }
       });
       this.failureToast(
@@ -2906,6 +3137,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.currentAction = b ? action : undefined;
     if (!b) this.currentProgressText = undefined;
     this.post({ type: 'busy', busy: b, action: this.currentAction });
+    // Drain the next queued deploy/validate once the slot frees (Feature: deploy
+    // queue). A microtask — never synchronous inside the caller's `finally` —
+    // so the operation that just finished unwinds its OWN cleanup
+    // (currentCancel/currentDeployJobId/currentDeployOrg, etc.) before
+    // drainQueue's reserveBusy can reserve the slot again for the next item.
+    if (!b) queueMicrotask(() => this.drainQueue());
   }
 
   /**

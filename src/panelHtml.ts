@@ -136,6 +136,16 @@ body.resizing { cursor: row-resize; user-select: none; }
   font-size: 11px; font-family: inherit; padding: 0;
 }
 .mode-head button:hover { color: var(--fg); text-decoration: underline; }
+/* Deploy-queue strip (Feature: deploy queue): one row per deploy/validate
+   deferred behind the single busy slot, between the action bar and the Status
+   pane. Rows reuse .mode-head itself (see panel.js renderQueue) rather than a
+   parallel look; this rule only styles the CONTAINER. Hidden (toggled in JS)
+   when the queue is empty. */
+.queue-strip {
+  display: none; flex-direction: column;
+  border-top: 1px solid var(--border);
+  padding: 2px 0;
+}
 .type-filter-row { margin-top: 4px; font-size: 11px; }
 /* Custom disclosure caret: the native <summary> marker renders misaligned in the
    webview (pushed right), which made the whole filter list look skewed. */
@@ -459,6 +469,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         <button id="cancelBtn" class="danger" style="display:none;">Cancel</button>
       </div>
     </div>
+    <div id="queueStrip" class="queue-strip" style="display:none;"></div>
     <div id="splitter" class="splitter" title="Drag to resize · double-click to reset"></div>
     <div class="right">
       <div class="section-header" id="statusHeader">
