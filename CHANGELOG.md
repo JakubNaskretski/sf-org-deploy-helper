@@ -3,6 +3,14 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.12.0
+
+- New: **Retry from the card.** Failed deploys and validations carry a **Retry** button —
+  including cards restored from history and deploys reattached after a reload — re-running
+  the same components, test level and options through the normal confirmation.
+- Fixed: **Copy copies the actual error.** Since error rows became clickable, the card's
+  Copy button put `[object Object]` on the clipboard instead of the failure text.
+
 ## 0.11.1
 
 - Fixed: **The diff window never touches your tabs — properly this time.** Instead of

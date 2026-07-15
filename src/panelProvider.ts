@@ -28,6 +28,7 @@ type Inbound =
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
+  | { type: 'retryDeploy'; request?: RetryRequest }
   | { type: 'clearStatusHistory' }
   // Card-button affordances on a retrieve result that made a pre-retrieve backup
   // (see backupCardButtons). `dir` is the webview's copy of the backup's absolute
@@ -111,6 +112,18 @@ type PollOutcome =
   | { kind: 'lost' };
 
 interface UnresolvableEntry { folder: string; at: number }
+
+/** Everything needed to re-run a failed deploy from its status card — carried on
+ *  the card's Retry button and validated again when it comes back (the payload
+ *  round-trips through the webview and persisted history). */
+interface RetryRequest {
+  keys?: string[];
+  manifest?: string;
+  sourceDir?: string;
+  validateOnly?: boolean;
+  testLevel?: TestLevel;
+  runTests?: string[];
+}
 
 /** Pre-retrieve backup limits. A retrieve that would overwrite more than
  *  BACKUP_MAX_FILES local files skips the backup (a copy that large is almost
@@ -564,6 +577,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       case 'refreshChanged':
         await this.postChangedComponents();
         return;
+      case 'retryDeploy': {
+        // The request round-trips through the webview (and persisted history) —
+        // re-validate every field; runDeploy's own confirm modal + org guard then
+        // gate the actual deploy exactly like a fresh one.
+        const r = msg.request;
+        if (!r || typeof r !== 'object') return;
+        if (typeof r.manifest === 'string' && r.manifest) {
+          await this.deployManifest(vscode.Uri.file(r.manifest));
+          return;
+        }
+        const keys = Array.isArray(r.keys) ? r.keys.filter(k => typeof k === 'string' && k.includes(':')) : [];
+        if (keys.length === 0) {
+          vscode.window.showInformationMessage('Nothing to retry — the original deploy request is no longer available.');
+          return;
+        }
+        let sourceDir: string | undefined;
+        if (typeof r.sourceDir === 'string' && r.sourceDir && this.workspaceRoot
+          && isUnder(foldPathKey(path.resolve(this.workspaceRoot)), foldPathKey(path.resolve(r.sourceDir)))) {
+          sourceDir = r.sourceDir;
+        }
+        await this.runDeploy(keys, {
+          validateOnly: r.validateOnly === true,
+          testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
+          runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined,
+          sourceDir
+        });
+        return;
+      }
       case 'clearStatusHistory':
         this.cardHistoryCache = [];
         await this.context.workspaceState.update(CARD_HISTORY_KEY, []);
@@ -1170,7 +1211,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb, noun });
           const outcome = await this.drivePolledDeploy(
             { jobId, org, orgLabel, root, verb, noun, cmdId, start, progressTitle }, report,
-            result => this.reportPolledDeploy(result, { items, orgOnlySkipped, orgLabel, org, noun, cmdId, start, validateOnly: !!opts.validateOnly, verb })
+            result => this.reportPolledDeploy(result, {
+              items, orgOnlySkipped, orgLabel, org, noun, cmdId, start, validateOnly: !!opts.validateOnly, verb,
+              retry: {
+                keys: items.map(i => `${i.type}:${i.name}`),
+                sourceDir: opts.sourceDir,
+                validateOnly: !!opts.validateOnly,
+                testLevel,
+                runTests: runTests.length ? runTests : undefined
+              }
+            })
           );
           keepPersisted = outcome.keepPersisted;
         });
@@ -1213,6 +1263,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       cmdId: string;
       start: number;
       validateOnly: boolean;
+      retry?: RetryRequest;
     }
   ): void {
     const { items, orgOnlySkipped, orgLabel, org, cmdId, start, validateOnly } = ctx;
@@ -1282,7 +1333,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           kind: 'err',
           title: validateOnly ? `Validation failed against ${orgLabel}` : `Deploy failed against ${orgLabel}`,
           meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}, ${successes.length} success${testFailures.length ? ` · ${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}` : ''}`,
-          lines: [...errLines, ...testLines, ...skipLines]
+          lines: [...errLines, ...testLines, ...skipLines],
+          ...(ctx.retry ? { buttons: [{ label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } }] } : {})
         }
       });
       this.failureToast(
@@ -1434,7 +1486,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  through the normal result renderer. */
   private reportPolledDeploy(
     result: DeployResult,
-    ctx: { items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number; validateOnly: boolean; verb: DeployVerb }
+    ctx: { items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number; validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest }
   ): void {
     if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
       this.endCmd(ctx.cmdId, false, Date.now() - ctx.start);
@@ -1547,10 +1599,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.postProgress(`${progressTitle}…`);
         const outcome = await this.drivePolledDeploy(
           { jobId: job.jobId, org: job.org, orgLabel: job.orgLabel, root, verb: job.verb, noun: job.noun, cmdId, start, progressTitle }, report,
-          result => this.reportPolledDeploy(result, {
-            items: this.itemsFromReport(result), orgOnlySkipped: [], orgLabel: job.orgLabel, org: job.org,
-            noun: job.noun, cmdId, start, validateOnly: job.verb === 'Validate', verb: job.verb
-          })
+          result => {
+            const items = this.itemsFromReport(result);
+            this.reportPolledDeploy(result, {
+              items, orgOnlySkipped: [], orgLabel: job.orgLabel, org: job.org,
+              noun: job.noun, cmdId, start, validateOnly: job.verb === 'Validate', verb: job.verb,
+              // Reattached cards synthesize their component list from the report —
+              // retry re-deploys that set under the CURRENT panel defaults.
+              retry: { keys: items.map(i => `${i.type}:${i.name}`), validateOnly: job.verb === 'Validate' }
+            });
+          }
         );
         keepPersisted = outcome.keepPersisted;
       });
@@ -1912,7 +1970,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb: 'Deploy', noun });
           const outcome = await this.drivePolledDeploy(
             { jobId, org, orgLabel, root, verb: 'Deploy', noun, cmdId, start, progressTitle }, report,
-            result => this.reportPolledDeploy(result, { items, orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false, verb: 'Deploy' })
+            result => this.reportPolledDeploy(result, {
+              items, orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false, verb: 'Deploy',
+              retry: { manifest: manifestPath, testLevel }
+            })
           );
           keepPersisted = outcome.keepPersisted;
         });

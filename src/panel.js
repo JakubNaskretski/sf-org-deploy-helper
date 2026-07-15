@@ -1149,7 +1149,10 @@
         cp.textContent = 'Copy';
         cp.title = 'Copy the full error to the clipboard';
         cp.addEventListener('click', () => {
-          const parts = [card.title, card.meta, (card.lines || []).join('\n'), card.errText];
+          // Lines can be {text, key, line} objects (clickable error rows) — a raw
+          // join stringifies those to "[object Object]"; copy their text instead.
+          const lineText = (l) => (l && typeof l === 'object' ? l.text || '' : l);
+          const parts = [card.title, card.meta, (card.lines || []).map(lineText).join('\n'), card.errText];
           if (card.actions && card.actions.length) parts.push('Try:\n' + card.actions.map(a => '• ' + a).join('\n'));
           if (card.hint) parts.push('Hint: ' + card.hint);
           send('copyText', { text: parts.filter(Boolean).join('\n\n') });
