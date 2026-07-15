@@ -1244,9 +1244,14 @@
           const cb = document.createElement('button');
           cb.className = 'card-btn';
           cb.textContent = b.label || '';
-          cb.disabled = state.busy;
+          // Retry rides the deploy pipeline, which QUEUES while busy — keeping it
+          // clickable matches the Deploy/Validate buttons. Everything else
+          // (restore/discard) still waits for the slot.
+          const queueable = b.send && b.send.type === 'retryDeploy';
+          cb.disabled = state.busy && !queueable;
+          if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
           cb.addEventListener('click', () => {
-            if (state.busy) return;
+            if (state.busy && !queueable) return;
             send(b.send.type, b.send);
           });
           bwrap.appendChild(cb);

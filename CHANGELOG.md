@@ -3,6 +3,17 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.13.1
+
+- Fixed: **A queued deploy can no longer strand.** If the running operation finished while
+  you were still reading the queue confirmation, the confirmed deploy used to sit in the
+  queue until some unrelated operation happened to run — it now starts immediately.
+- Fixed: **The queue cap holds under simultaneous requests**, the "queue full" answer comes
+  before the confirmation dialog instead of after it, and the queued production warning
+  says "live as soon as it runs" instead of "immediately".
+- Changed: **Retry buttons queue too.** Retry on a failure card is clickable during a
+  running operation and queues behind it, matching the Deploy/Validate buttons.
+
 ## 0.13.0
 
 - New: **Deploy queue.** Starting a deploy or validation while another operation runs no

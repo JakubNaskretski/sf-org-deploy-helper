@@ -1341,7 +1341,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
     if (isProd && !validateOnly) {
       return {
-        message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.${testNote}`,
+        message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
         options: { modal: true, detail: [instanceUrl ?? '', queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
@@ -1395,11 +1395,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl },
       true
     );
-    const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
-    if (!confirm) return;
-
+    // Cap BEFORE the modal — confirming a deploy only to be told "queue full"
+    // wastes the user's read of a modal that could never be honored.
     if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
       vscode.window.showInformationMessage(`SF Deploy: queue full (${DEPLOY_QUEUE_MAX} max) — wait for a queued operation to run before adding another.`);
+      return;
+    }
+    const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
+    if (!confirm) return;
+    // Re-check at the push: the early check avoids showing a doomed modal, but
+    // the await above is a TOCTOU window — concurrent enqueues could all pass
+    // the early check and overshoot the cap (safety gate finding, probe-proven).
+    if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
+      vscode.window.showInformationMessage(`SF Deploy: the queue filled up while the confirmation was open (${DEPLOY_QUEUE_MAX} max) — this deploy was NOT queued.`);
       return;
     }
     this.deployQueue.push({
@@ -1412,6 +1420,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     });
     this.postQueue();
     vscode.window.setStatusBarMessage(`$(watch) SF Deploy: queued (position ${this.deployQueue.length})`, 5000);
+    // The running operation may have FINISHED while the confirm modal was open —
+    // its setBusy(false) drain then saw an empty queue, and nothing else would
+    // ever run this item (post-release review, MED). If the slot is already
+    // free, kick the drain ourselves.
+    if (!this.busy) queueMicrotask(() => this.drainQueue());
   }
 
   /** Run the next queued deploy/validate now that the busy slot is free (see
