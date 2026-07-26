@@ -652,7 +652,9 @@ export function detectMissingDependencies(
     if (!problem) continue;
     // A FlexiPage referencing a QuickAction that doesn't exist on the org:
     // "In field: action - no QuickAction named Account.Foo found"
-    for (const m of problem.matchAll(/no ([A-Za-z0-9_]+) named ([\w.\-/]+) found/g)) {
+    // Also matches the destructive-changes variant (org-verified, note the
+    // capital and the colon): "No ApexClass named: Foo found".
+    for (const m of problem.matchAll(/[Nn]o ([A-Za-z0-9_]+) named:? ([\w.\-/]+) found/g)) {
       candidates.push({ display: `${m[1]}:${m[2]}`, tries: [{ type: m[1], name: m[2] }] });
     }
     // An Apex class whose own dependency wasn't part of this same batch:

@@ -37,9 +37,19 @@ export interface DeployFileResult {
   state: string;
   filePath?: string;
   problem?: string;
+  /** Modern `sf` puts the failure text here (with a trailing " (line:col)"),
+   *  and omits `problem` entirely — org-verified on CLI 2.137. Callers should
+   *  read via fileProblem(), never `f.problem` directly. */
+  error?: string;
   problemType?: string;
   lineNumber?: number;
   columnNumber?: number;
+}
+
+/** The failure text of a files[] entry across CLI generations: older output
+ *  uses `problem`, modern output uses `error` and leaves `problem` unset. */
+export function fileProblem(f: DeployFileResult): string | undefined {
+  return f.problem ?? f.error;
 }
 
 /** A single Apex test failure from a deploy that ran tests (RunLocalTests etc.). */

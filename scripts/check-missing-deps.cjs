@@ -438,5 +438,63 @@ check('a failure naming many bare names stays fast on a large workspace', () => 
   assert.ok(ms < 1000, `took ${ms}ms — the bare-name lookup regressed to a per-candidate scan`);
 });
 
+// ==================================================== org-verified real strings
+// Captured verbatim from `sf project deploy start --json` (CLI 2.137) against a
+// real org, 2026-07. These pin the EXACT wording the platform emits so the
+// patterns can never drift from reality without a test failing.
+
+check('ORG-VERIFIED: Invalid type for a missing __mdt', () => {
+  const items2 = [item('CustomObject', 'DepProbeType__mdt', 'objects/DepProbeType__mdt')];
+  const out = detectMissingDependencies(
+    ['Invalid type: DepProbeType__mdt'], items2, new Set(['ApexClass:DepProbeMissingMdt']));
+  assert.deepStrictEqual(out.keys, ['CustomObject:DepProbeType__mdt']);
+});
+
+check('ORG-VERIFIED: the cascading System.debug error is suppressed as platform noise', () => {
+  // A missing type produces a SECOND failure row naming the System namespace —
+  // it must not pollute the report.
+  const out = detectMissingDependencies(
+    ['Method does not exist or incorrect signature: void debug(DepProbeType__mdt) from the type System'],
+    [], new Set());
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('ORG-VERIFIED: missing field via dot access reports as Variable does not exist', () => {
+  // NOT "Invalid field X for SObject Y" — the real compiler emits the bare-name form.
+  const items2 = [item('CustomField', 'Account.DepProbeField__c', 'objects/Account/fields/DepProbeField__c.field-meta.xml')];
+  const out = detectMissingDependencies(
+    ['Variable does not exist: DepProbeField__c'], items2, new Set(['ApexClass:DepProbeFieldDot']));
+  assert.deepStrictEqual(out.keys, ['CustomField:Account.DepProbeField__c']);
+});
+
+check('ORG-VERIFIED: SOQL missing column arrives inside a multi-line caret block', () => {
+  const real = "SELECT Id, DepProbeField__c FROM Account LIMIT\n           ^\nERROR at Row:1:Column:12\nNo such column 'DepProbeField__c' on entity 'Account'. If you are attempting to use a custom field, be sure to append the '__c' after the custom field name. Please reference your WSDL or the describe call for the appropriate names.";
+  const items2 = [item('CustomField', 'Account.DepProbeField__c', 'objects/Account/fields/DepProbeField__c.field-meta.xml')];
+  const out = detectMissingDependencies([real], items2, new Set(['ApexClass:DepProbeSoql']));
+  assert.deepStrictEqual(out.keys, ['CustomField:Account.DepProbeField__c']);
+});
+
+check('ORG-VERIFIED: modern files[].error carries a "(line:col)" suffix and still parses', () => {
+  const items2 = [item('CustomObject', 'DepProbeType__mdt', 'objects/DepProbeType__mdt')];
+  const out = detectMissingDependencies(
+    ['Invalid type: DepProbeType__mdt (3:9)'], items2, new Set());
+  assert.deepStrictEqual(out.keys, ['CustomObject:DepProbeType__mdt']);
+});
+
+check('ORG-VERIFIED: destructive-changes variant "No X named: Y found" matches', () => {
+  const items2 = [item('ApexClass', 'DepProbeSoql', 'classes/DepProbeSoql.cls')];
+  const out = detectMissingDependencies(['No ApexClass named: DepProbeSoql found'], items2, new Set());
+  assert.deepStrictEqual(out.keys, ['ApexClass:DepProbeSoql']);
+});
+
+check('ORG-VERIFIED: wrong method signature names the callee type', () => {
+  const items2 = [item('ApexClass', 'DepProbeBase', 'classes/DepProbeBase.cls')];
+  const out = detectMissingDependencies(
+    ['Method does not exist or incorrect signature: void noSuchMethod() from the type DepProbeBase'],
+    items2, new Set(['ApexClass:DepProbeWrongMethod']));
+  assert.deepStrictEqual(out.keys, ['ApexClass:DepProbeBase']);
+});
+
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }
 console.log(`detectMissingDependencies: all ${ran} checks passed`);

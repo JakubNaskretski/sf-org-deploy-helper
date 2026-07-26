@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
-import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi } from './sfCliService';
+import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
 import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
 import { generateNonce, getPanelHtml } from './panelHtml';
@@ -1716,8 +1716,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // (and the success gate accounts for both).
     const detailFailures = result.details?.componentFailures ?? [];
     const detailSuccesses = result.details?.componentSuccesses ?? [];
-    const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
-    const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !f.problem);
+    const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!fileProblem(f));
+    const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !fileProblem(f));
     const failures = detailFailures.length ? detailFailures : fileFailures;
     const successes = detailSuccesses.length ? detailSuccesses : fileSuccesses;
     const testFailures: DeployTestFailure[] = result.details?.runTestResult?.failures ?? [];
@@ -1763,7 +1763,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         ? failures.map(f => {
             const key = this.localFailureKey(f, items);
             return {
-              text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`,
+              text: `${f.type}:${f.fullName} — ${fileProblem(f) ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`,
               ...(key ? { key } : {}),
               ...(f.lineNumber ? { line: f.lineNumber, ...(f.columnNumber ? { column: f.columnNumber } : {}) } : {})
             };
@@ -1795,7 +1795,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // useful for every failed deploy, and it's the only feedback the user gets
       // when the missing dependency isn't in the workspace at all.
       const deps = detectMissingDependencies(
-        failures.map(f => f.problem ?? ''),
+        failures.map(f => fileProblem(f) ?? ''),
         this.items,
         new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
       );
@@ -2256,7 +2256,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     const failures = result.details?.componentFailures
-      ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+      ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!fileProblem(f));
     const success = result.success
       && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
       && failures.length === 0;
@@ -2275,7 +2275,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const failLines = failures.map(f => {
         const key = this.localFailureKey(f);
         return {
-          text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`,
+          text: `${f.type}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
           ...(key ? { key } : {})
         };
       });
@@ -2763,7 +2763,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const { result, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
           const failures = result.details?.componentFailures
-            ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!f.problem);
+            ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!fileProblem(f));
           const success = result.success
             && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
             && failures.length === 0;
@@ -2786,7 +2786,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             const failLines = failures.map(f => {
               const key = this.localFailureKey(f, items);
               return {
-                text: `${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`,
+                text: `${f.type}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
                 ...(key ? { key } : {})
               };
             });
