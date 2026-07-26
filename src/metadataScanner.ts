@@ -15,6 +15,24 @@ export interface MetadataItem {
   files: string[];
 }
 
+export interface ProjectRootDiscovery {
+  /** Directory containing the one discovered sfdx-project.json. */
+  root?: string;
+  /** De-duplicated sfdx-project.json paths found below the open workspace folders. */
+  projectFiles: string[];
+  /** User-facing reason discovery could not select exactly one project. */
+  error?: string;
+}
+
+export interface WorkspaceScan {
+  items: MetadataItem[];
+  root?: string;
+  warning?: string;
+  /** A root-discovery failure. No sf command may run when this is set. */
+  projectError?: string;
+  unknownFolders: string[];
+}
+
 export interface FolderRule {
   folder: string;
   type: string;
@@ -110,12 +128,73 @@ export async function resolvePackageDirs(root: string): Promise<string[]> {
   return ['force-app'];
 }
 
-export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<{ items: MetadataItem[]; root?: string; warning?: string; unknownFolders: string[] }> {
+/**
+ * Reduce file-search results to one project root. Kept separate from the VS Code
+ * search so the duplicate/multiple-project contract is directly testable.
+ */
+export function selectProjectRoot(projectFiles: string[]): Pick<ProjectRootDiscovery, 'root' | 'projectFiles'> {
+  const byPath = new Map<string, string>();
+  for (const file of projectFiles) {
+    const normalized = path.normalize(file);
+    byPath.set(foldPathKey(normalized), normalized);
+  }
+  const unique = [...byPath.values()].sort((a, b) => a.localeCompare(b));
+  return {
+    root: unique.length === 1 ? path.dirname(unique[0]) : undefined,
+    projectFiles: unique
+  };
+}
+
+/**
+ * Find the Salesforce project below the open workspace folder(s). The extension
+ * intentionally accepts a parent folder as the workspace, but it refuses to
+ * guess when that parent contains multiple sfdx-project.json files.
+ */
+export async function discoverProjectRoot(): Promise<ProjectRootDiscovery> {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
-    return { items: [], warning: 'No workspace folder open.', unknownFolders: [] };
+    return { projectFiles: [], error: 'No workspace folder is open.' };
   }
-  const root = folders[0].uri.fsPath;
+
+  let found: vscode.Uri[];
+  try {
+    const perFolder = await Promise.all(folders.map(folder => vscode.workspace.findFiles(
+      new vscode.RelativePattern(folder, '**/sfdx-project.json'),
+      '**/{node_modules,.git}/**',
+      100
+    )));
+    found = perFolder.flat();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { projectFiles: [], error: `Couldn't search this workspace for Salesforce DX projects: ${message}` };
+  }
+
+  const selected = selectProjectRoot(found.map(uri => uri.fsPath));
+  if (selected.root) return selected;
+  if (selected.projectFiles.length === 0) {
+    return {
+      ...selected,
+      error: 'No Salesforce DX project found in this workspace. Expected exactly one sfdx-project.json.'
+    };
+  }
+
+  const includeWorkspaceFolder = folders.length > 1;
+  const labels = selected.projectFiles.slice(0, 6).map(file =>
+    vscode.workspace.asRelativePath(vscode.Uri.file(file), includeWorkspaceFolder)
+  );
+  const remainder = selected.projectFiles.length - labels.length;
+  return {
+    ...selected,
+    error: `Found more than one Salesforce DX project in this workspace. Expected exactly one sfdx-project.json. Found: ${labels.join(', ')}${remainder > 0 ? `, and ${remainder} more` : ''}.`
+  };
+}
+
+export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<WorkspaceScan> {
+  const discovery = await discoverProjectRoot();
+  if (!discovery.root) {
+    return { items: [], projectError: discovery.error, unknownFolders: [] };
+  }
+  const root = discovery.root;
   const pkgDirs = await resolvePackageDirs(root);
   const items: MetadataItem[] = [];
   // Static rules first, learned rules after — a duplicate folder match produces
@@ -384,62 +463,293 @@ export function deriveRule(folderName: string, type: string, members: string[], 
   return undefined;
 }
 
+/** What detectMissingDependencies found in a batch of org failure messages.
+ *  `keys` are safe `--metadata Type:Name` targets (every one matched a real local
+ *  item); `unresolved` is display-only text for referents the org named but this
+ *  workspace doesn't contain — the user still needs to SEE those, because they
+ *  are exactly the case where the extension can't help and the person has to
+ *  retrieve the component or fix the reference. */
+export interface MissingDependencies {
+  keys: string[];
+  unresolved: string[];
+}
+
+/** Custom-object suffixes: a bare type name ending in one of these is an sObject
+ *  (custom object, custom metadata type, platform event, big object, external
+ *  object), never an Apex class — so `Invalid type: Foo__mdt` resolves against
+ *  CustomObject rather than guessing across every metadata type. */
+const SOBJECT_SUFFIX = /__(mdt|c|e|b|x)$/i;
+
+/** Cap on org-controlled text echoed back into the panel card. The webview sets
+ *  it via textContent (no HTML risk) but the output channel and status history
+ *  take it verbatim, so bound the length and strip control characters. */
+const UNRESOLVED_MAX = 5;
+// 100, not 60: the ambiguous-candidate line ("Status__c (ambiguous: Account.Status__c,
+// Case.Status__c)") is the actionable one, and a 60-char cap truncated it
+// mid-identifier into noise. Still bounded — this is org-controlled text.
+const UNRESOLVED_MAX_LEN = 100;
+
+/** Apex built-ins and platform types. A compile failure names these constantly
+ *  ("Method does not exist ... from the type List<String>"), and they are NOT
+ *  deployable components — telling the user to "retrieve String from an org" is
+ *  nonsense, and with only UNRESOLVED_MAX slots the noise would crowd out the one
+ *  custom component the report exists to surface.
+ *  This is a static list, not the full Apex type registry — extend it when a
+ *  real message surfaces a type that shouldn't be reported. */
+const APEX_BUILTIN_TYPES = new Set([
+  'blob', 'boolean', 'date', 'datetime', 'decimal', 'double', 'id', 'integer', 'long',
+  'object', 'string', 'time', 'list', 'set', 'map', 'iterator', 'iterable', 'sobject',
+  'exception', 'type', 'trigger', 'test', 'system', 'database', 'schema', 'json',
+  'math', 'limits', 'userinfo', 'pattern', 'matcher', 'http', 'httprequest',
+  'httpresponse', 'pagereference', 'savepoint', 'version', 'comparable', 'queueable',
+  'batchable', 'schedulable', 'callable'
+]);
+
+/** Namespaces whose members are platform-provided, so `System.JSONParser` or
+ *  `Schema.SObjectType` is never something the user can deploy. */
+const PLATFORM_NAMESPACES = new Set([
+  'system', 'schema', 'database', 'messaging', 'connectapi', 'apex', 'auth', 'cache',
+  'canvas', 'chatteranswers', 'datacloud', 'dom', 'eventbus', 'flow', 'functions',
+  'kbmanagement', 'metadata', 'process', 'quickaction', 'reports', 'search', 'sfc',
+  'sfdc_surveys', 'site', 'support', 'territorymgmt', 'txnsecurity', 'userprovisioning', 'wave'
+]);
+
+/** Standard sObjects and standard field names the org always has — referencing one
+ *  that isn't in the workspace is not a missing dependency. Same noise argument as
+ *  APEX_BUILTIN_TYPES; a resolvable LOCAL item of the same name still wins, because
+ *  this list only ever suppresses the unresolved REPORT, never a lookup. */
+const STANDARD_NAMES = new Set([
+  'account', 'contact', 'lead', 'opportunity', 'case', 'user', 'task', 'event',
+  'campaign', 'product2', 'pricebook2', 'pricebookentry', 'order', 'orderitem',
+  'quote', 'contract', 'asset', 'attachment', 'note', 'document', 'folder', 'group',
+  'profile', 'recordtype', 'organization', 'contentversion', 'contentdocument',
+  'opportunitylineitem', 'campaignmember', 'name', 'createddate', 'lastmodifieddate',
+  'ownerid', 'isdeleted', 'createdbyid', 'lastmodifiedbyid', 'systemmodstamp'
+]);
+
+/** True when a referent is platform-provided and so must never be reported as a
+ *  missing workspace component. Applied ONLY to the unresolved report — never to
+ *  key resolution, so a genuinely local component with a colliding name still
+ *  resolves normally. */
+function isPlatformName(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  if (APEX_BUILTIN_TYPES.has(lower) || STANDARD_NAMES.has(lower)) return true;
+  const dot = lower.indexOf('.');
+  if (dot > 0) {
+    const head = lower.slice(0, dot);
+    if (PLATFORM_NAMESPACES.has(head)) return true;
+    // "Account.Name" — a standard field on a standard object.
+    if (STANDARD_NAMES.has(head) && STANDARD_NAMES.has(lower.slice(dot + 1))) return true;
+  }
+  return false;
+}
+
+/** One referent parsed out of an org error message. `tries` is an ordered list of
+ *  (type, name) lookups — first hit wins. `bareName` is the no-type-given case
+ *  ("Variable does not exist: X"), which resolves ONLY on a unique match. */
+interface Candidate {
+  display: string;
+  tries?: Array<{ type: string; name: string }>;
+  bareName?: string;
+}
+
+/** Type guesses for a bare type token from an Apex compile error. A dotted name
+ *  is an inner class/enum reference (`Outer.Inner`) whose deployable unit is the
+ *  OUTER class; a `__c`/`__mdt`/… suffix is an sObject; anything else is an Apex
+ *  class. Each guess is only ever a LOOKUP — an unmatched guess resolves to
+ *  nothing, so a wrong shape rule can't mint a bogus key. */
+function typeGuesses(raw: string): Array<{ type: string; name: string }> {
+  const dot = raw.indexOf('.');
+  if (dot > 0) {
+    const head = raw.slice(0, dot);
+    // `Foo__c.Bar__c` in a type position is an sObject-qualified reference; a
+    // plain `Outer.Inner` is Apex. Try both heads, sObject first when it looks it.
+    return SOBJECT_SUFFIX.test(head)
+      ? [{ type: 'CustomObject', name: head }, { type: 'ApexClass', name: head }]
+      : [{ type: 'ApexClass', name: head }];
+  }
+  return SOBJECT_SUFFIX.test(raw)
+    ? [{ type: 'CustomObject', name: raw }]
+    : [{ type: 'ApexClass', name: raw }];
+}
+
+/** Split a captured type token into the names actually worth resolving:
+ *  `List<Widget__c>` -> ['Widget__c'], `Map<Id, Foo__c>` -> ['Id', 'Foo__c'].
+ *  Without this the collection wrapper is all we would ever see, and the real
+ *  missing component inside it would be invisible. A bare token returns itself. */
+function splitTypeTokens(raw: string): string[] {
+  const open = raw.indexOf('<');
+  if (open < 0) return [raw];
+  const inner = raw.slice(open + 1).replace(/>+\s*$/, '');
+  const parts = inner.split(',').map(t => t.trim()).filter(Boolean);
+  // Keep the outer name too when it isn't a plain collection — a generic custom
+  // Apex class is itself deployable.
+  const outer = raw.slice(0, open).trim();
+  return (outer ? [outer] : []).concat(parts.flatMap(splitTypeTokens));
+}
+
+/** Render an ambiguous candidate list so it survives the length cap intact —
+ *  truncating mid-identifier turns the one actionable line into noise. */
+function describeCandidates(hits: MetadataItem[]): string {
+  const shown = hits.slice(0, 2).map(h => h.name);
+  const rest = hits.length - shown.length;
+  return rest > 0 ? `${shown.join(', ')} +${rest} more` : shown.join(', ');
+}
+
+function sanitizeUnresolved(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  const flat = text.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return flat.length > UNRESOLVED_MAX_LEN ? `${flat.slice(0, UNRESOLVED_MAX_LEN - 1)}…` : flat;
+}
+
 /**
  * Parse deploy-failure problem strings for references to components that are
- * MISSING on the target org but exist LOCALLY — feeds the "Retry + N missing"
- * button (panelProvider's reportDeployResult) so a dependency the org couldn't
- * find gets added to the next attempt instead of making the user hunt it down.
+ * MISSING on the target org — feeding both the "Retry + N missing" button and
+ * the card's "referenced but not in your workspace" diagnosis (panelProvider's
+ * reportDeployResult), so a dependency the org couldn't find gets added to the
+ * next attempt instead of making the user hunt it down.
  *
- * Two org-reported shapes are recognized (one real example each, below). A
- * parsed candidate only becomes a result key when it matches a REAL local item
- * in `items` — exact `type`+`name`, or (falling back) the same `type` with a
- * case-insensitive `name` match, in which case the ITEM's own casing is
+ * A parsed candidate only becomes a `keys` entry when it matches a REAL local
+ * item in `items` — exact `type`+`name`, or (falling back) the same `type` with
+ * a case-insensitive `name` match, in which case the ITEM's own casing is
  * returned, never the error text's. This means org-controlled error text can
  * NEVER mint a key for a component that isn't actually part of this workspace's
  * scan — it can only ever surface a key that was already going to be a valid
- * `--metadata Type:Name`. Keys already in `deployedKeys` (this attempt's own
- * component list — they failed for some OTHER reason, they're not "missing")
- * are excluded. Result is deduped, first-seen order preserved.
+ * `--metadata Type:Name`. A candidate that resolves to nothing is NOT discarded:
+ * it lands in `unresolved` as display-only text, which is the only feedback the
+ * user gets when the missing dependency isn't in the workspace at all.
+ *
+ * Keys already in `deployedKeys` (this attempt's own component list — they
+ * failed for some OTHER reason, they're not "missing") are excluded from both
+ * lists. Both lists are deduped, first-seen order preserved.
  */
 export function detectMissingDependencies(
   problems: string[],
   items: MetadataItem[],
   deployedKeys: Set<string>
-): string[] {
+): MissingDependencies {
   const byExact = new Map<string, MetadataItem>();
   const byCiName = new Map<string, MetadataItem>(); // `${type}:${name.toLowerCase()}` -> item
+  // Bare-name index for the "Variable does not exist" branch. Built ONCE: filtering
+  // `items` per candidate was O(candidates x items) and measured at ~32s of
+  // synchronous extension-host block on a failure message naming ~190 bare names
+  // in a 20k-component workspace.
+  const byBareName = new Map<string, MetadataItem[]>();
+  const pushBare = (name: string, it: MetadataItem): void => {
+    const list = byBareName.get(name);
+    if (list) list.push(it); else byBareName.set(name, [it]);
+  };
   for (const it of items) {
     byExact.set(`${it.type}:${it.name}`, it);
     const ciKey = `${it.type}:${it.name.toLowerCase()}`;
     if (!byCiName.has(ciKey)) byCiName.set(ciKey, it);
+    if (it.type === 'CustomField') pushBare((it.name.split('.').pop() ?? '').toLowerCase(), it);
+    else if (it.type === 'ApexClass') pushBare(it.name.toLowerCase(), it);
   }
 
-  const candidates: Array<{ type: string; name: string }> = [];
+  const candidates: Candidate[] = [];
   for (const problem of problems) {
     if (!problem) continue;
-    // e.g. a FlexiPage referencing a QuickAction that doesn't exist on the org:
+    // A FlexiPage referencing a QuickAction that doesn't exist on the org:
     // "In field: action - no QuickAction named Account.Foo found"
     for (const m of problem.matchAll(/no ([A-Za-z0-9_]+) named ([\w.\-/]+) found/g)) {
-      candidates.push({ type: m[1], name: m[2] });
+      candidates.push({ display: `${m[1]}:${m[2]}`, tries: [{ type: m[1], name: m[2] }] });
     }
-    // e.g. an Apex class whose own dependency wasn't part of this same batch:
+    // An Apex class whose own dependency wasn't part of this same batch:
     // "Dependent class is invalid and needs recompilation: Class MyHelper: Invalid type: Bar"
+    // Captures the class being RECOMPILED — including it forces a rebuild against
+    // the local copy. The inner cause ("Invalid type: Bar") is the real missing
+    // dependency and is picked up by the Invalid-type rule below, which scans the
+    // same string; both are needed, neither alone is sufficient.
     for (const m of problem.matchAll(/[Dd]ependent class is invalid and needs recompilation:?\s*(?:Class\s+)?([\w.]+)/g)) {
-      candidates.push({ type: 'ApexClass', name: m[1] });
+      candidates.push({ display: `ApexClass:${m[1]}`, tries: [{ type: 'ApexClass', name: m[1] }] });
+    }
+    // SOQL against a field the org doesn't have. Fully typed AND parented, so
+    // there is no ambiguity: "No such column 'Status__c' on entity 'Account'".
+    for (const m of problem.matchAll(/No such column '([A-Za-z0-9_]+)' on entity '([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)'/g)) {
+      candidates.push({ display: `${m[2]}.${m[1]}`, tries: [{ type: 'CustomField', name: `${m[2]}.${m[1]}` }] });
+    }
+    // Same shape from the other Salesforce phrasing:
+    // "Invalid field Status__c for SObject Account".
+    for (const m of problem.matchAll(/Invalid field ([A-Za-z0-9_]+) for SObject ([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)/g)) {
+      candidates.push({ display: `${m[2]}.${m[1]}`, tries: [{ type: 'CustomField', name: `${m[2]}.${m[1]}` }] });
+    }
+    // The user's reported case: "Invalid type: smth__mdt" — an Apex reference to
+    // an sObject or class the org doesn't have. No type in the text, so resolve
+    // by NAME SHAPE (see typeGuesses) rather than scanning every metadata type.
+    for (const m of problem.matchAll(/Invalid type:\s*([A-Za-z_][\w.]*(?:<[^>\n]{0,200}>)?)/g)) {
+      for (const tok of splitTypeTokens(m[1])) candidates.push({ display: tok, tries: typeGuesses(tok) });
+    }
+    // "Method does not exist or incorrect signature: void foo() from the type Bar"
+    for (const m of problem.matchAll(/Method does not exist or incorrect signature:.*?from the type ([A-Za-z_][\w.]*(?:<[^>\n]{0,200}>)?)/g)) {
+      for (const tok of splitTypeTokens(m[1])) candidates.push({ display: tok, tries: typeGuesses(tok) });
+    }
+    // The hard one: "Variable does not exist: Status__c" gives NO type and no
+    // parent, so a bare name can match Account.Status__c and Case.Status__c
+    // equally. Resolved unique-match-only (see below) — never guessed.
+    for (const m of problem.matchAll(/Variable does not exist:\s*([A-Za-z_]\w*)/g)) {
+      candidates.push({ display: m[1], bareName: m[1] });
     }
   }
 
   const seen = new Set<string>();
-  const result: string[] = [];
+  const seenUnresolved = new Set<string>();
+  const keys: string[] = [];
+  const unresolved: string[] = [];
+
+  const addUnresolved = (text: string, referent?: string): void => {
+    if (unresolved.length >= UNRESOLVED_MAX) return;
+    // A platform type is not a missing component, and with only UNRESOLVED_MAX
+    // slots the noise would crowd out the custom one that matters.
+    if (referent !== undefined && isPlatformName(referent)) return;
+    const clean = sanitizeUnresolved(text);
+    if (!clean || seenUnresolved.has(clean)) return;
+    seenUnresolved.add(clean);
+    unresolved.push(clean);
+  };
+
   for (const c of candidates) {
-    const item = byExact.get(`${c.type}:${c.name}`) ?? byCiName.get(`${c.type}:${c.name.toLowerCase()}`);
-    if (!item) continue; // no matching local component — the error text alone is never trusted
+    let item: MetadataItem | undefined;
+    if (c.tries) {
+      for (const t of c.tries) {
+        item = byExact.get(`${t.type}:${t.name}`) ?? byCiName.get(`${t.type}:${t.name.toLowerCase()}`);
+        if (item) break;
+      }
+    } else if (c.bareName) {
+      // A field is scanned as `CustomField:Object.Field`, so match on the segment
+      // after the dot; a static class reference reports as "Variable does not
+      // exist" too, hence ApexClass by exact name. EXACTLY ONE hit is required —
+      // two objects with the same field name must never be guessed between.
+      // Uniqueness is judged over ALL local matches, not just the ones not already
+      // deploying: a name whose only matches are already in this deploy is NOT
+      // "missing from your workspace", and the shared tail below drops it via
+      // deployedKeys. Filtering first would have reported it as not-found.
+      const hits = byBareName.get(c.bareName.toLowerCase()) ?? [];
+      if (hits.length === 1) {
+        item = hits[0];
+      } else if (hits.length > 1) {
+        const fresh = hits.filter(h => !deployedKeys.has(`${h.type}:${h.name}`));
+        if (fresh.length === 0) continue; // every candidate is already deploying
+        if (fresh.length === 1) {
+          item = fresh[0];
+        } else {
+          // Ambiguous: name the candidates so the user picks, rather than adding
+          // the wrong object's field to their deploy.
+          addUnresolved(`${c.display} (ambiguous: ${describeCandidates(fresh)})`, c.display);
+          continue;
+        }
+      }
+    }
+    if (!item) {
+      addUnresolved(c.display, c.display); // the error text alone is never trusted to mint a key
+      continue;
+    }
     const key = `${item.type}:${item.name}`; // canonical casing from the ITEM, never the error text
     if (deployedKeys.has(key) || seen.has(key)) continue;
     seen.add(key);
-    result.push(key);
+    keys.push(key);
   }
-  return result;
+  return { keys, unresolved };
 }
 
 function matchExt(name: string, exts: string[]): string | undefined {

@@ -62,6 +62,9 @@
     // 'queue' message (also replayed on 'ready'), so this is never persisted
     // here either. Each item: { id, noun, orgLabel }.
     queue: [],
+    // Machine-scoped provider setting. Never persisted in webview state: the
+    // provider re-sends the authoritative value on ready and on Settings changes.
+    ignoreDeployConflicts: false,
   };
 
   function savePersisted() {
@@ -137,6 +140,11 @@
       }, 200);
     });
   }
+  $('ignoreDeployConflicts').addEventListener('change', (e) => {
+    state.ignoreDeployConflicts = e.target.checked === true;
+    renderIgnoreDeployConflicts();
+    send('setIgnoreDeployConflicts', { enabled: state.ignoreDeployConflicts });
+  });
   $('deployBtn').addEventListener('click', () => action('deploy'));
   $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
@@ -250,6 +258,10 @@
         renderTypeFilter();
         renderTree();
         renderActions();
+        // Error-card navigation depends on localKeys too. A rescan can add,
+        // remove, or rename source files, so refresh existing cards immediately
+        // instead of leaving a stale clickable row until the panel is reopened.
+        renderStatus();
         return;
       case 'orgMetadata':
         // Remember which org this membership came from — every message derived
@@ -317,6 +329,10 @@
       case 'testLevel':
         if ($('testLevel')) $('testLevel').value = msg.value || '';
         syncTestClassesVisibility();
+        return;
+      case 'ignoreDeployConflicts':
+        state.ignoreDeployConflicts = msg.enabled === true;
+        renderIgnoreDeployConflicts();
         return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
@@ -973,6 +989,11 @@
     const testLevel = $('testLevel');
     const useActive = $('useActive');
     const clearSel = $('clearSel');
+    const ignoreConflicts = $('ignoreDeployConflicts');
+    const ignoreConflictsControl = $('ignoreConflictsControl');
+
+    if (ignoreConflicts) ignoreConflicts.disabled = state.busy;
+    if (ignoreConflictsControl) ignoreConflictsControl.classList.toggle('disabled', state.busy);
 
     // Deploy/Validate: always visible, enabled purely on selection+org+local-file
     // — independent of state.busy, since a click while busy queues instead of
@@ -1023,6 +1044,17 @@
     $('addOrg').title = lockTip || 'Authenticate a new org (sf org login web)';
     $('refreshFiles').disabled = state.busy;
     $('refreshFiles').title = lockTip || 'Rescan workspace files (also retries folders whose type resolution failed)';
+  }
+
+  function renderIgnoreDeployConflicts() {
+    const checkbox = $('ignoreDeployConflicts');
+    const control = $('ignoreConflictsControl');
+    if (!checkbox || !control) return;
+    checkbox.checked = state.ignoreDeployConflicts;
+    control.classList.toggle('enabled', state.ignoreDeployConflicts);
+    control.title = state.ignoreDeployConflicts
+      ? 'Overwrite mode is ON. Deploys use --ignore-conflicts and can replace newer changes in the selected org.'
+      : 'Deploy with --ignore-conflicts. Local source can overwrite newer changes in the selected org.';
   }
 
   // ---- Deploy queue strip (Feature: deploy queue) ----
@@ -1155,7 +1187,11 @@
           // form is clickable and opens the source at the error position.
           if (line && typeof line === 'object') {
             li.textContent = line.text || '';
-            if (line.key) {
+            // A CLI failure can name org/package-level metadata that has no local
+            // source file. Only advertise navigation when the current workspace
+            // scan says the key is local; older persisted cards may still carry
+            // keys created before the provider began filtering them.
+            if (line.key && state.localKeys.has(line.key)) {
               li.classList.add('nav');
               li.title = `Open ${line.key}${line.line ? ` at line ${line.line}` : ''}`;
               li.addEventListener('click', () => send('openFile', { key: line.key, line: line.line, column: line.column }));
@@ -1245,8 +1281,8 @@
           cb.className = 'card-btn';
           cb.textContent = b.label || '';
           // Retry rides the deploy pipeline, which QUEUES while busy — keeping it
-          // clickable matches the Deploy/Validate buttons. Everything else
-          // (restore/discard) still waits for the slot.
+          // clickable matches the Deploy/Validate buttons. Resume monitoring and
+          // the restore/discard actions need the single operation slot themselves.
           const queueable = b.send && b.send.type === 'retryDeploy';
           cb.disabled = state.busy && !queueable;
           if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;

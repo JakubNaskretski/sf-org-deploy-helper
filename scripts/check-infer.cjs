@@ -7,8 +7,30 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
-const { inferItemForPath, parseManifestTypes, deriveRule, findItemForPath, foldPathKey, detectMissingDependencies } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { inferItemForPath, parseManifestTypes, deriveRule, findItemForPath, foldPathKey, detectMissingDependencies, selectProjectRoot } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep); // build OS-native paths
+let failed = 0;
+
+// Project-root selection: the opened workspace may be a parent of the real SFDX
+// project, but zero/multiple project files must never produce a guessed cwd.
+try {
+  assert.deepStrictEqual(selectProjectRoot([]), { root: undefined, projectFiles: [] });
+  const nestedConfig = p('workspace', 'nested', 'salesforce-app', 'sfdx-project.json');
+  assert.deepStrictEqual(selectProjectRoot([nestedConfig]), {
+    root: p('workspace', 'nested', 'salesforce-app'),
+    projectFiles: [nestedConfig]
+  });
+  // Overlapping VS Code workspace folders can return the same file twice; that is
+  // still one project, not an ambiguity.
+  assert.deepStrictEqual(selectProjectRoot([nestedConfig, nestedConfig]), {
+    root: p('workspace', 'nested', 'salesforce-app'),
+    projectFiles: [nestedConfig]
+  });
+  const otherConfig = p('workspace', 'other-app', 'sfdx-project.json');
+  const multiple = selectProjectRoot([otherConfig, nestedConfig]);
+  assert.strictEqual(multiple.root, undefined, 'multiple projects must not select a cwd');
+  assert.deepStrictEqual(multiple.projectFiles, [nestedConfig, otherConfig].sort((a, b) => a.localeCompare(b)));
+} catch (e) { failed++; console.error('FAIL selectProjectRoot:', e.message); }
 
 const cases = [
   // [input path, expected type, expected name, expected filePath (default = input)]
@@ -33,7 +55,6 @@ const cases = [
   [p('e', 'email', 'Marketing', 'Welcome.email-meta.xml'), 'EmailTemplate', 'Marketing/Welcome'],
 ];
 
-let failed = 0;
 for (const [input, type, name, filePath] of cases) {
   const got = inferItemForPath(input);
   try {
@@ -144,61 +165,14 @@ try {
   assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'darwin'), undefined, 'darwin bundle-dir no fold');
 } catch (e) { failed++; console.error('FAIL foldPathKey/findItemForPath:', e.message); }
 
-// detectMissingDependencies: org-reported failures resolved against LOCAL items
-// only — the error text alone can never mint a key for a component that isn't
-// really part of this workspace's scan.
+// detectMissingDependencies: shape contract only — the exhaustive pattern and
+// resolution cases live in scripts/check-missing-deps.cjs.
 try {
   const items = [
-    { type: 'QuickAction', name: 'Account.Foo', filePath: p('x', 'quickActions', 'Account.Foo.quickAction-meta.xml'), files: [] },
-    { type: 'ApexClass', name: 'MyHelper', filePath: p('x', 'classes', 'MyHelper.cls'), files: [] }
+    { type: 'QuickAction', name: 'Account.Foo', filePath: p('x', 'quickActions', 'Account.Foo.quickAction-meta.xml'), files: [] }
   ];
-  // "no X named Y found" — e.g. a FlexiPage failing to find a QuickAction it references.
-  const qaProblem = 'In field: action - no QuickAction named Account.Foo found';
-  assert.deepStrictEqual(
-    detectMissingDependencies([qaProblem], items, new Set()),
-    ['QuickAction:Account.Foo'],
-    'QuickAction dependency resolves when the item exists locally'
-  );
-  // Unresolvable — no matching local item — must yield nothing: a hostile or merely
-  // unknown problem string can't mint a key for a component that isn't really there.
-  assert.deepStrictEqual(
-    detectMissingDependencies(['no BogusType named Nothing.Here found'], items, new Set()),
-    [],
-    'hostile/unresolvable name yields nothing'
-  );
-  // Already part of THIS deploy's own key set — it failed for some OTHER reason,
-  // it's not "missing", so it must be excluded.
-  assert.deepStrictEqual(
-    detectMissingDependencies([qaProblem], items, new Set(['QuickAction:Account.Foo'])),
-    [],
-    'already-deployed key excluded'
-  );
-  // Recompilation pattern maps to the local ApexClass.
-  assert.deepStrictEqual(
-    detectMissingDependencies(
-      ['Dependent class is invalid and needs recompilation: Class MyHelper: Invalid type: Bar'],
-      items, new Set()
-    ),
-    ['ApexClass:MyHelper'],
-    'recompilation pattern maps to the local ApexClass'
-  );
-  // Case-insensitive fallback: org text differs in NAME casing only (type stays
-  // exact) — the result uses the ITEM's canonical local casing, never the error
-  // text's.
-  assert.deepStrictEqual(
-    detectMissingDependencies(['no QuickAction named account.foo found'], items, new Set()),
-    ['QuickAction:Account.Foo'],
-    'case-insensitive name fallback returns the canonical local casing'
-  );
-  // Dedupe + first-seen order across multiple problem strings / patterns.
-  assert.deepStrictEqual(
-    detectMissingDependencies(
-      [qaProblem, qaProblem, 'Dependent class is invalid and needs recompilation: Class MyHelper: x'],
-      items, new Set()
-    ),
-    ['QuickAction:Account.Foo', 'ApexClass:MyHelper'],
-    'dedupes and preserves first-seen order'
-  );
+  const out = detectMissingDependencies(['In field: action - no QuickAction named Account.Foo found'], items, new Set());
+  assert.deepStrictEqual(out, { keys: ['QuickAction:Account.Foo'], unresolved: [] }, 'returns {keys, unresolved}');
 } catch (e) { failed++; console.error('FAIL detectMissingDependencies:', e.message); }
 
 if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }

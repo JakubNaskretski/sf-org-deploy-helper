@@ -22,9 +22,11 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
 
 - Salesforce CLI (`sf`) installed and on `PATH`.
 - At least one org authenticated via `sf org login web`.
-- A workspace with an `sfdx-project.json` (or a `force-app/` directory).
+- An opened folder containing exactly one Salesforce DX project somewhere below it
+  (identified by `sfdx-project.json`). The project itself does not have to be the
+  opened workspace folder.
 
 ## Settings
 
 - `sfOrgDeployWrapper.commandTimeoutMs` — timeout for deploy/retrieve commands (default 180000).
-- `sfOrgDeployWrapper.ignoreDeployConflicts` — pass `--ignore-conflicts` to deploys. **Off by default** so the CLI refuses to overwrite org-side changes that aren't in your local source.
+- `sfOrgDeployWrapper.ignoreDeployConflicts` — pass `--ignore-conflicts` to deploys. **Off by default** so the CLI refuses to overwrite org-side changes that aren't in your local source. Also available as **Overwrite org changes** in the panel.

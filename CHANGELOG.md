@@ -3,6 +3,40 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.14.0
+
+- New: **Failed deploys tell you what they were missing.** When the org rejects a deploy
+  because it references something it doesn't have — `Invalid type: Some__mdt`,
+  `Variable does not exist: Field__c`, `No such column … on entity …`, an unknown method's
+  type — the failure card now names it. If the component is in your project, a
+  **Retry + N missing** button redeploys the original set with it added; if it isn't, the
+  card says so plainly ("Referenced but not found in your workspace") so you know to
+  retrieve it or fix the reference instead of guessing.
+- New: **Retry keeps resolving across dependency layers.** The org only reports one layer of
+  missing dependencies per attempt, so adding one component can reveal the next. Retry now
+  keeps going for up to three rounds, adding what the org names each time, and reports once
+  at the end. Each round still asks for confirmation, because each one deploys a larger set.
+  Nothing lands until a round succeeds — a failed Salesforce deploy rolls back entirely.
+- New: **Open a parent folder, not just the project folder.** The extension searches below
+  the folder you opened for a single `sfdx-project.json` and works from there. If it finds
+  none — or more than one — it refuses to guess: a banner names what it found and org
+  operations stay blocked, instead of quietly running Salesforce CLI commands in the wrong
+  directory.
+- New: **"Overwrite org changes" is a visible checkbox** in the panel instead of a buried
+  setting. Ticking it warns that deploys can overwrite newer changes in the org, and it
+  stays on for every workspace on this machine until you turn it off. The box always
+  reflects what deploys will actually do, right-click deploys included.
+- New: **Resume monitoring.** A deploy card that lost contact with the org now carries a
+  button to pick the tracking back up, instead of telling you to reopen the panel.
+- Fixed: **Retry + missing actually deploys what it added.** For a component deployed by
+  file path from the right-click menu, the retry re-sent the same single path and silently
+  dropped every component it had just added. That combination is no longer offered at all,
+  and the card names the missing components so you can add them yourself.
+- Fixed: **Failure rows only link when the file is really there.** Clicking an error on a
+  failure card no longer lands on a dead link or an "Org-only" message, and failures inside
+  Lightning or Aura bundles now open the right source file. Rows refresh straight after a
+  rescan instead of going stale.
+
 ## 0.13.1
 
 - Fixed: **A queued deploy can no longer strand.** If the running operation finished while

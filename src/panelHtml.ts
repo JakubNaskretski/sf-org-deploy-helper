@@ -260,8 +260,33 @@ body.resizing { cursor: row-resize; user-select: none; }
    .tree-search input: just the sizing, no bespoke look. */
 .actions input#testClasses { flex: 1 1 100%; }
 .actions input#testClasses.input-error { border-color: var(--err); }
-#diffBtn, #retrieveBtn, #validateBtn, #deployBtn, #cancelBtn {
+.conflict-toggle {
+  display: flex; align-items: center; gap: 6px; flex: 1 1 100%;
+  min-height: 24px; padding: 3px 7px; box-sizing: border-box;
+  border: 1px solid var(--border); border-radius: 2px;
+  color: var(--muted); cursor: pointer; user-select: none;
+}
+.conflict-toggle:hover { color: var(--fg); background: var(--row-hover); }
+.conflict-toggle:focus-within {
+  outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px;
+}
+.conflict-toggle input { margin: 0; }
+.conflict-toggle.enabled {
+  color: var(--vscode-inputValidation-warningForeground, var(--fg));
+  border-color: var(--vscode-inputValidation-warningBorder, var(--warn));
+  background: var(--vscode-inputValidation-warningBackground, transparent);
+}
+.conflict-toggle.disabled { opacity: 0.5; cursor: not-allowed; }
+#diffBtn, #retrieveBtn, #validateBtn, #deployBtn {
   flex: 1 1 0; min-width: 68px; white-space: nowrap;
+}
+/* Cancel carries the active operation name (for example "Cancel Fetch Org").
+   Keep it on its own row so that longer names never compete with the queueable
+   Deploy/Validate buttons; at exceptionally narrow sidebar widths, wrap inside
+   the button instead of letting the final word escape past the panel edge. */
+#cancelBtn {
+  flex: 1 1 100%; width: 100%; min-width: 0; max-width: 100%;
+  white-space: normal; overflow-wrap: anywhere; line-height: 1.25;
 }
 
 .status {
@@ -462,6 +487,10 @@ body.resizing { cursor: row-resize; user-select: none; }
           <option value="RunAllTestsInOrg">RunAllTestsInOrg</option>
         </select>
         <input id="testClasses" type="text" placeholder="Test classes, comma-separated" title="Apex test classes to run (RunSpecifiedTests)" style="display:none;" />
+        <label id="ignoreConflictsControl" class="conflict-toggle" title="Deploy with --ignore-conflicts. Local source can overwrite newer changes in the selected org.">
+          <input id="ignoreDeployConflicts" type="checkbox" />
+          <span>Overwrite org changes</span>
+        </label>
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
         <button id="validateBtn" class="secondary" disabled title="Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.">Validate</button>
