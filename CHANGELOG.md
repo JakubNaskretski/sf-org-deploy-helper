@@ -3,6 +3,31 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.15.0
+
+- New: **Dependency suggestions on failure cards.** When a deploy fails because it
+  references components that exist in your project but weren't included, the failure card
+  offers **Try with dependencies (N)**. Opening it swaps the error list for a compact
+  checklist — each row pairs the failing component with the missing one it needs
+  (`OrderSvc → add Billing__mdt`), pre-ticked. Deploy with your selection in one click, or
+  untick what you don't want; anything referenced but not in your project at all is listed
+  so you know what to retrieve by hand. This replaces 0.14.0's "Retry + N missing" button.
+- New: **Suggestion feedback log.** Every suggestion records what you chose and whether the
+  retry worked. **SF Deploy: Show Suggestion Log** (command palette) opens a short summary
+  you can copy — after declining a suggestion, the card asks one small "was this off?"
+  question so quality is easy to judge later.
+- New: **Retry + changed vs branch.** A failed deploy can be retried together with
+  everything git says you changed — the missing piece is very often a component from the
+  same branch. Computed when you click, capped at 100 components, and respects the
+  `changedBaseRef` setting (unset = your uncommitted changes).
+- New: **Deploy File + Dependencies** (right-click / command palette). Scans the Apex
+  class or trigger you picked for references to other components in your project — classes,
+  custom objects and metadata types, fields — follows them a few levels deep, and deploys
+  the whole set through the usual confirmation. Best-effort by design: anything it can't
+  see ends up caught by the failure card's suggestions instead.
+- Changed: suggestions and retries never queue silently behind a running deployment — the
+  card waits until the pipeline is free, so what the log says matches what actually ran.
+
 ## 0.14.0
 
 - New: **Failed deploys tell you what they were missing.** When the org rejects a deploy
