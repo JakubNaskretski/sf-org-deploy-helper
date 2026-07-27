@@ -34,6 +34,10 @@ export { Cancellable, OrgInfo, SfCliCancelledError, SfCliError, stripAnsi };
 export interface DeployFileResult {
   fullName: string;
   type: string;
+  /** `details.componentFailures` entries carry the metadata type HERE, not in
+   *  `type` — org-verified. Read via fileType(), never `f.type` directly, or a
+   *  detail failure renders "undefined:Name". */
+  componentType?: string;
   state: string;
   filePath?: string;
   problem?: string;
@@ -50,6 +54,12 @@ export interface DeployFileResult {
  *  uses `problem`, modern output uses `error` and leaves `problem` unset. */
 export function fileProblem(f: DeployFileResult): string | undefined {
   return f.problem ?? f.error;
+}
+
+/** The metadata type of a failure entry across result shapes: files[] entries
+ *  use `type`, details.componentFailures entries use `componentType`. */
+export function fileType(f: Pick<DeployFileResult, 'type' | 'componentType'>): string {
+  return f.componentType ?? f.type ?? '?';
 }
 
 /** A single Apex test failure from a deploy that ran tests (RunLocalTests etc.). */

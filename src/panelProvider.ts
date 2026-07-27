@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
-import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem } from './sfCliService';
+import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
 import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
@@ -899,6 +899,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           accepted: picked, declined: declined.length ? declined : undefined,
           verdict: undefined, outcome: undefined
         });
+        // Reflect the acceptance in the component tree IMMEDIATELY (before the
+        // deploy settles): the added components join the selection and scroll
+        // into view, so the retry's contents are visible, not just implied.
+        this.post({ type: 'selectKeys', keys: picked, scroll: true });
         const outcome = await this.runDeploy([...new Set([...baseKeys, ...picked])], {
           validateOnly: live.retry.validateOnly === true,
           testLevel: isTestLevel(live.retry.testLevel) ? live.retry.testLevel : undefined,
@@ -1967,7 +1971,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         ? failures.map(f => {
             const key = this.localFailureKey(f, items);
             return {
-              text: `${f.type}:${f.fullName} — ${fileProblem(f) ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`,
+              text: `${fileType(f)}:${f.fullName} — ${fileProblem(f) ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`,
               ...(key ? { key } : {}),
               ...(f.lineNumber ? { line: f.lineNumber, ...(f.columnNumber ? { column: f.columnNumber } : {}) } : {})
             };
@@ -2005,21 +2009,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       );
       const buttons = ctx.retry
         ? [
-            { label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } },
-            // The missing dependency is very often something changed on this
-            // same branch (a new class and its new __mdt land together), and git
-            // already knows that set — no error-text parsing involved, so this
-            // is offered even when detection above found nothing. Not offered
-            // when the original deploy was pinned to a sourceDir: that happens
-            // for a file OUTSIDE the package directories, which --metadata
-            // cannot address at all, and `--source-dir` beats `--metadata` in
-            // the CLI argv (sfCliService.deployMetadata) so added keys would be
-            // silently discarded. Deliberately NO async work here: the changed
-            // set is computed at click time (retryDeployChanged handler), so
-            // it's fresh when used and free while unclicked.
-            ...(retryKeys && !ctx.retry.sourceDir
-              ? [{ label: 'Retry + changed vs branch', send: { type: 'retryDeployChanged', request: ctx.retry } }]
-              : [])
+            { label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } }
+            // "Retry + changed vs branch" was offered here in 0.15.0 and removed
+            // on user feedback — the Changed lens already owns that workflow. The
+            // retryDeployChanged handler stays: persisted 0.15.0 cards still
+            // carry the button, and it may return in some future form.
           ]
         : undefined;
       // Per-row suggestion candidates for the card's "Try with dependencies"
@@ -2030,7 +2024,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // webview's clicks are validated against.
       const suggest = retryKeys && !ctx.retry?.sourceDir
         ? buildSuggestionCandidates(
-            failures.map(f => ({ from: `${f.type}:${f.fullName}`, problem: fileProblem(f) ?? '' })),
+            failures.map(f => ({ from: `${fileType(f)}:${f.fullName}`, problem: fileProblem(f) ?? '' })),
             this.items,
             new Set(retryKeys)
           )
@@ -2496,7 +2490,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const failLines = failures.map(f => {
         const key = this.localFailureKey(f);
         return {
-          text: `${f.type}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
+          text: `${fileType(f)}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
           ...(key ? { key } : {})
         };
       });
@@ -3007,7 +3001,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             const failLines = failures.map(f => {
               const key = this.localFailureKey(f, items);
               return {
-                text: `${f.type}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
+                text: `${fileType(f)}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
                 ...(key ? { key } : {})
               };
             });
@@ -3656,11 +3650,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  key (notably individual files inside bundles). No local match means the
    *  status row stays plain text instead of advertising a dead navigation link. */
   private localFailureKey(
-    failure: Pick<DeployFileResult, 'type' | 'fullName' | 'filePath'>,
+    failure: Pick<DeployFileResult, 'type' | 'componentType' | 'fullName' | 'filePath'>,
     preferredItems: MetadataItem[] = []
   ): string | undefined {
     const candidates = [...preferredItems, ...this.items].filter(i => !!i.filePath);
-    const exact = candidates.find(i => i.type === failure.type && i.name === failure.fullName);
+    const exact = candidates.find(i => i.type === fileType(failure) && i.name === failure.fullName);
     if (exact) return `${exact.type}:${exact.name}`;
 
     if (!failure.filePath) return undefined;

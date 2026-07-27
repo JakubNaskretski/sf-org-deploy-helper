@@ -3,6 +3,24 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.15.1
+
+- Fixed: **Failure rows show the real component type** — a failing FlexiPage (or any
+  component reported through the detailed result) rendered as `undefined:Name`.
+- New: **FlexiPage missing-field errors now produce suggestions.** "Something went wrong.
+  We couldn't retrieve or load the information on the field: Record.Foo__c" means the page
+  references a field the org doesn't have — if that field is in your project, the failure
+  card now offers to deploy it along; if two objects have a field by that name, both are
+  listed instead of guessing.
+- Fixed: **"Use active file" and "Use open tabs" behave the same while busy** — both stay
+  visible and disabled during an operation (with a tooltip saying why), instead of one
+  disappearing and the other staying clickable.
+- Changed: **accepted suggestions appear in the component tree immediately.** Agreeing to
+  deploy with a dependency selects it in the tree and scrolls it into view, so the retry's
+  contents are visible at a glance.
+- Removed: **the "Retry + changed vs branch" button** — the Changed lens already covers
+  deploying what you've changed, and the extra button on every failure card was noise.
+
 ## 0.15.0
 
 - New: **Dependency suggestions on failure cards.** When a deploy fails because it

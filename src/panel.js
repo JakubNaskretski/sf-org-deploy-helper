@@ -1002,6 +1002,7 @@
     const cancelBtn = $('cancelBtn');
     const testLevel = $('testLevel');
     const useActive = $('useActive');
+    const useOpenTabs = $('useOpenTabs');
     const clearSel = $('clearSel');
     const ignoreConflicts = $('ignoreDeployConflicts');
     const ignoreConflictsControl = $('ignoreConflictsControl');
@@ -1023,13 +1024,21 @@
       validateBtn.title = queueTip || orgOnlyTip || 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
     }
 
+    // Selection helpers stay VISIBLE while busy, just disabled — a control that
+    // vanishes reads as gone/broken, and "Use open tabs" previously stayed fully
+    // clickable while "Use active file" disappeared, which read as two different
+    // features rather than one busy panel.
+    const busyTip = state.busy ? `Locked while ${state.busyAction || 'an operation'} is running` : '';
+    useActive.disabled = state.busy;
+    useActive.title = state.busy ? busyTip : 'Select the file currently open in editor';
+    useOpenTabs.disabled = state.busy;
+    useOpenTabs.title = state.busy ? busyTip : 'Select every open editor tab that maps to a metadata component';
     if (state.busy) {
       retrieveBtn.style.display = 'none';
       retrieveBtn.disabled = true;
       diffBtn.style.display = 'none';
       diffBtn.disabled = true;
       if (testLevel) testLevel.style.display = 'none';
-      useActive.style.display = 'none';
       clearSel.style.display = 'none';
       cancelBtn.style.display = '';
       cancelBtn.textContent = state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel';
@@ -1037,7 +1046,6 @@
       retrieveBtn.style.display = '';
       diffBtn.style.display = '';
       if (testLevel) { testLevel.style.display = ''; testLevel.disabled = !hasLocalSelectedIdle; }
-      useActive.style.display = '';
       clearSel.style.display = state.selected.size > 0 ? '' : 'none';
       cancelBtn.style.display = 'none';
       retrieveBtn.disabled = !anySelectedIdle;

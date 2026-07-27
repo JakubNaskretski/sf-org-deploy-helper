@@ -482,6 +482,35 @@ check('ORG-VERIFIED: modern files[].error carries a "(line:col)" suffix and stil
   assert.deepStrictEqual(out.keys, ['CustomObject:DepProbeType__mdt']);
 });
 
+check('ORG-VERIFIED (user report): FlexiPage missing-field error resolves via bare name', () => {
+  // "Record." is the page's assigned object, not a name — bare-name rules apply.
+  const items2 = [item('CustomField', 'Widget__c.TotalEstimatedRevenue__c', 'objects/Widget__c/fields/TotalEstimatedRevenue__c.field-meta.xml')];
+  const real = "Something went wrong. We couldn't retrieve or load the information on the field: Record.TotalEstimatedRevenue__c";
+  assert.deepStrictEqual(
+    detectMissingDependencies([real], items2, new Set(['FlexiPage:Widget_Record_Page'])).keys,
+    ['CustomField:Widget__c.TotalEstimatedRevenue__c']
+  );
+  // Wording drift: "of" + trailing period, as reported from the panel.
+  const drift = "Something went wrong. We couldnt retrieve or load the information of field. Record.TotalEstimatedRevenue__c.";
+  assert.deepStrictEqual(
+    detectMissingDependencies([drift], items2, new Set()).keys,
+    ['CustomField:Widget__c.TotalEstimatedRevenue__c']
+  );
+});
+
+check('FlexiPage field error with TWO same-named local fields stays ambiguous', () => {
+  const items2 = [
+    item('CustomField', 'Widget__c.TotalEstimatedRevenue__c', 'objects/Widget__c/fields/a.field-meta.xml'),
+    item('CustomField', 'Order__c.TotalEstimatedRevenue__c', 'objects/Order__c/fields/b.field-meta.xml')
+  ];
+  const out = detectMissingDependencies(
+    ["We couldn't retrieve or load the information on the field: Record.TotalEstimatedRevenue__c"],
+    items2, new Set()
+  );
+  assert.deepStrictEqual(out.keys, [], 'two candidate objects — never guessed');
+  assert.ok(out.unresolved[0].includes('ambiguous'), JSON.stringify(out.unresolved));
+});
+
 check('ORG-VERIFIED: destructive-changes variant "No X named: Y found" matches', () => {
   const items2 = [item('ApexClass', 'DepProbeSoql', 'classes/DepProbeSoql.cls')];
   const out = detectMissingDependencies(['No ApexClass named: DepProbeSoql found'], items2, new Set());

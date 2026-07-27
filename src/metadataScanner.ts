@@ -699,6 +699,15 @@ export function detectMissingDependencies(
     for (const m of problem.matchAll(/Variable does not exist:\s*([A-Za-z_]\w*)/g)) {
       candidates.push({ display: m[1], bareName: m[1] });
     }
+    // A FlexiPage referencing a field the org doesn't have (org-verified via a
+    // user report): "Something went wrong. We couldn't retrieve or load the
+    // information on the field: Record.TotalEstimatedRevenue__c". "Record" is
+    // the page's assigned object, not a name — so this is a bare-name referent
+    // like the Variable case, resolved unique-match-only. The wording drifts
+    // ("on"/"of", with/without "the", punctuation), so match tolerantly.
+    for (const m of problem.matchAll(/retrieve or load the information (?:on|of) (?:the )?field[:.]?\s*(?:Record\.)?([A-Za-z_]\w*)/gi)) {
+      candidates.push({ display: m[1], bareName: m[1] });
+    }
   }
 
   const seen = new Set<string>();
