@@ -11,7 +11,7 @@ const path = require('path');
 const ts = require('typescript');
 
 const ROOT = path.join(__dirname, '..');
-const files = ['extension.ts', 'metadataScanner.ts', 'orgStore.ts', 'panelHtml.ts', 'panelProvider.ts', 'sfCliService.ts']
+const files = ['depGraph.ts', 'extension.ts', 'metadataScanner.ts', 'orgStore.ts', 'panelHtml.ts', 'panelProvider.ts', 'sfCliService.ts', 'suggestionLog.ts']
   .map(f => path.join(ROOT, 'src', f));
 
 const violations = [];

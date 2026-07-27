@@ -70,6 +70,14 @@
         "title": "SF Deploy: Compare with Org…"
       },
       {
+        "command": "sfOrgDeployWrapper.deployFileWithDeps",
+        "title": "SF Deploy: Deploy File + Dependencies"
+      },
+      {
+        "command": "sfOrgDeployWrapper.showSuggestionLog",
+        "title": "SF Deploy: Show Suggestion Log"
+      },
+      {
         "command": "sfOrgDeployWrapper.deployManifest",
         "title": "SF Deploy: Deploy Manifest to Org"
       },
@@ -105,6 +113,11 @@
           "group": "sfdeploy@4"
         },
         {
+          "command": "sfOrgDeployWrapper.deployFileWithDeps",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "group": "sfdeploy@5"
+        },
+        {
           "command": "sfOrgDeployWrapper.deployManifest",
           "when": "resourceFilename =~ /^package.*\\.xml$/",
           "group": "sfdeploy@5"
@@ -135,6 +148,11 @@
           "command": "sfOrgDeployWrapper.diffFileWithOrg",
           "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@4"
+        },
+        {
+          "command": "sfOrgDeployWrapper.deployFileWithDeps",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "group": "sfdeploy@5"
         }
       ]
     },
@@ -218,7 +236,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },

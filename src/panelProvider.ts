@@ -6,7 +6,9 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, parseManifestTypes, scanWorkspace } from './metadataScanner';
+import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
+import { DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -31,6 +33,19 @@ type Inbound =
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
   | { type: 'retryDeploy'; request?: RetryRequest }
+  // "Retry + changed vs branch" card button — the same untrusted RetryRequest
+  // round-trip as retryDeploy; the changed set itself is computed provider-side
+  // at click time (changedComponentKeys), never carried in the message.
+  | { type: 'retryDeployChanged'; request?: RetryRequest }
+  // Failure-card dependency suggestions. The webview only ever echoes the card's
+  // suggestion id plus a SELECTION of keys; the provider validates both against
+  // its own liveSuggestions map — the message can neither mint a key nor carry a
+  // retry request of its own.
+  | { type: 'suggestionOpened'; id?: string }
+  | { type: 'suggestionDeploy'; id?: string; keys?: string[] }
+  | { type: 'suggestionDeclined'; id?: string }
+  | { type: 'suggestionVerdict'; id?: string; bad?: boolean }
+  | { type: 'showSuggestionLog' }
   // Deploy-queue strip ✕ (Feature: deploy queue) — `id` is validated as a string
   // before use; an unknown id is simply a no-op removal.
   | { type: 'cancelQueued'; id?: string }
@@ -65,6 +80,8 @@ const LEARNED_RULES_KEY = 'learnedTypeRules';
 /** workspaceState key for the status-card history (newest first) — the Status
  *  pane doubles as a per-workspace deployment history across window reloads. */
 const CARD_HISTORY_KEY = 'statusCardHistory';
+/** globalState key for the dependency-suggestion feedback log. */
+const SUGGESTION_LOG_KEY = 'sfOrgDeployWrapper.suggestionLog';
 const CARD_HISTORY_MAX = 50;
 /** globalState key for folders whose type resolution failed — the negative cache
  *  (same TTL as learned rules). Without it every NEW session re-paid the serial
@@ -133,10 +150,6 @@ interface RetryRequest {
   validateOnly?: boolean;
   testLevel?: TestLevel;
   runTests?: string[];
-  /** Keep expanding the key set across dependency LAYERS: each failed round adds
-   *  the components the org named, up to MAX_AUTO_RESOLVE_ROUNDS. Only ever set
-   *  by the "Retry + N missing" button this extension itself renders. */
-  autoResolve?: boolean;
 }
 
 /** What a runDeploy call did. `aborted` covers every path that never reached the
@@ -150,10 +163,13 @@ interface DeployOutcome {
 
 const ABORTED: DeployOutcome = { status: 'aborted', missing: [], unresolved: [] };
 
-/** Dependency chains are layered — adding B can reveal that B needs C. Three
- *  rounds covers the realistic depth; beyond that the user is better served by a
- *  manifest than by more automatic org round-trips. */
-const MAX_AUTO_RESOLVE_ROUNDS = 3;
+/** Cap on how many changed components one "Retry + changed vs branch" click may
+ *  add. A branch that many components ahead of the failed deploy is a release
+ *  promotion, not a missing-dependency fix — that deploy belongs in a manifest
+ *  the user reviews, not behind a card button. Generous: the confirm modal only
+ *  names a COUNT, so past this size "deploy N components?" stops being an
+ *  informed yes. */
+const CHANGED_RETRY_MAX_ADDED = 100;
 
 /** Pre-retrieve backup limits. A retrieve that would overwrite more than
  *  BACKUP_MAX_FILES local files skips the backup (a copy that large is almost
@@ -366,6 +382,71 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   async diffFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'diff'); }
 
   /**
+   * "Deploy File + Dependencies" (context menu / palette): resolve the file's
+   * LOCAL dependency closure up front (depGraph — token-level, best-effort) and
+   * deploy entry + dependencies as ONE set, instead of reacting to org errors
+   * layer by layer the way the failure-card suggestions do. Every dependency key comes
+   * from a scanned MetadataItem, so this path upholds the same invariant as the
+   * error-driven one: file text can never mint a `--metadata` key that isn't a
+   * real workspace component. runDeploy's confirm modal names the full count
+   * before anything reaches the org.
+   */
+  async deployFileWithDeps(uri: vscode.Uri): Promise<void> {
+    if (!uri || !uri.fsPath) {
+      vscode.window.showInformationMessage('No file selected.');
+      return;
+    }
+    if (!(await this.ensureItemsForMenuAction())) return;
+    // Orgs load for the same reason as runByUri: the production guard must be
+    // able to classify the target even when the panel never opened.
+    if (this.orgs.length === 0) await this.loadOrgs();
+    const match = findItemForPath(this.items, uri.fsPath);
+    if (!match) {
+      // No infer/CLI fallback here, unlike runByUri: an inferred (out-of-package)
+      // item deploys via --source-dir, which beats --metadata in the CLI argv
+      // (sfCliService.deployMetadata) and would silently discard every dependency
+      // key — the one thing this command exists to add. Plain "Deploy to Org"
+      // still handles such files.
+      vscode.window.showInformationMessage(
+        'Not a scanned Salesforce metadata file — dependency resolution needs a file inside the project\'s package directories. Use "SF Deploy: Deploy to Org" for this one.'
+      );
+      return;
+    }
+    const key = `${match.type}:${match.name}`;
+    if (match.type !== 'ApexClass' && match.type !== 'ApexTrigger') {
+      // Still a useful deploy — just be honest that no scan happened, so the
+      // user doesn't assume referenced components were included.
+      vscode.window.showInformationMessage(`Dependency scanning only follows Apex source — deploying ${key} on its own.`);
+      await this.runDeploy([key]);
+      return;
+    }
+    const deps = await resolveLocalDependencies([match], this.items, async p => {
+      try { return await fs.readFile(p, 'utf8'); } catch { return undefined; }
+    });
+    const outcome = await this.runDeploy([key, ...deps.keys]);
+    // Post-hoc visibility: the result card lists every key but doesn't say which
+    // were auto-included — this card does, so a surprising extra component is
+    // traceable to this command rather than looking like panel state gone wrong.
+    // An aborted outcome posts nothing: either no deploy happened (dismissed
+    // modal, no org) or it was queued — and a queued run's confirm already named
+    // the full count, with the eventual result card listing every key.
+    if (deps.keys.length === 0 || outcome.status === 'aborted') return;
+    this.post({
+      type: 'status',
+      card: {
+        kind: outcome.status === 'ok' && !deps.truncated ? 'ok' : 'warn',
+        title: `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${key}`,
+        lines: [
+          ...(deps.truncated
+            ? [`Dependency scan stopped at its caps (depth ${DEFAULT_MAX_DEPTH}, ${DEFAULT_MAX_DEPS} components) — the included set may be incomplete.`]
+            : []),
+          ...deps.keys
+        ]
+      }
+    });
+  }
+
+  /**
    * Deploy a package.xml manifest to the target org (`sf project deploy start
    * --manifest`). Invoked from the explorer context menu (uri passed) or the
    * command palette (no uri → an XML open-dialog). The file is validated and
@@ -445,32 +526,39 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return this.runByUri(uri, 'diff', org);
   }
 
-  private async runByUri(uri: vscode.Uri, action: 'deploy' | 'retrieve' | 'diff', orgOverride?: string): Promise<void> {
-    if (!uri || !uri.fsPath) {
-      vscode.window.showInformationMessage('No file selected.');
-      return;
-    }
-    // Make sure the items list is fresh (the user may not have opened the panel
-    // yet) — but with a FAST scan (static + learned rules only). Resolving
-    // unknown folders via the CLI registry is the panel tree's concern; doing it
-    // here stalled context-menu ops for up to 30s per unknown folder before the
-    // confirm dialog could show. If the clicked file itself is in an unknown
-    // folder, resolveItemViaCli below resolves just that one file. When a full
-    // scan is already running (panel opening in parallel), share it instead.
+  /** Make sure the items list is fresh for a context-menu entry point (the user
+   *  may not have opened the panel yet) — but with a FAST scan (static + learned
+   *  rules only). Resolving unknown folders via the CLI registry is the panel
+   *  tree's concern; doing it here stalled context-menu ops for up to 30s per
+   *  unknown folder before the confirm dialog could show. When a full scan is
+   *  already running (panel opening in parallel), share it instead. Returns
+   *  false — after reporting the discovery failure — when no project root could
+   *  be established; callers must bail. */
+  private async ensureItemsForMenuAction(): Promise<boolean> {
     if (this.items.length === 0) {
       if (this.loadFilesInflight) await this.loadFilesInflight;
       else {
         const scan = await scanWorkspace(this.learnedRules());
         if (scan.projectError || !scan.root) {
           this.applyProjectDiscoveryFailure(scan.projectError ?? 'Could not determine the Salesforce DX project root.');
-          return;
+          return false;
         }
         this.clearProjectDiscoveryError();
         this.items = scan.items;
         this.workspaceRoot = scan.root;
       }
     }
-    if (!this.workspaceRoot) return;
+    return !!this.workspaceRoot;
+  }
+
+  private async runByUri(uri: vscode.Uri, action: 'deploy' | 'retrieve' | 'diff', orgOverride?: string): Promise<void> {
+    if (!uri || !uri.fsPath) {
+      vscode.window.showInformationMessage('No file selected.');
+      return;
+    }
+    // If the clicked file itself is in an unknown folder, resolveItemViaCli
+    // below resolves just that one file.
+    if (!(await this.ensureItemsForMenuAction())) return;
     // Load orgs too so the production guard can classify the target on deploys
     // initiated from the explorer/editor context menu (panel may never have opened).
     if (this.orgs.length === 0) await this.loadOrgs();
@@ -710,13 +798,150 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined,
           sourceDir
         };
-        if (r.autoResolve !== true) {
-          await this.runDeploy(keys, deployOpts);
-          return;
-        }
-        await this.runAutoResolvingDeploy(keys, deployOpts);
+        await this.runDeploy(keys, deployOpts);
         return;
       }
+      case 'retryDeployChanged': {
+        // Same round-trip trust model as retryDeploy: the request came back
+        // through the webview (and persisted history), so re-validate every
+        // field. The changed set is deliberately NOT part of the message — it's
+        // computed HERE, at click time, so it's fresh (the user usually edits
+        // between attempts) and costs nothing while the button sits unclicked.
+        const r = msg.request;
+        if (!r || typeof r !== 'object') return;
+        const retryKeys = Array.isArray(r.keys) ? r.keys.filter(k => typeof k === 'string' && k.includes(':')) : [];
+        if (retryKeys.length === 0) {
+          vscode.window.showInformationMessage('Nothing to retry — the original deploy request is no longer available.');
+          return;
+        }
+        // No sourceDir handling on purpose: the button is never offered for a
+        // sourceDir-pinned retry (`--source-dir` beats `--metadata` in the CLI
+        // argv, which would silently discard every key merged in below), so a
+        // request carrying one is forged or stale — ignore the field entirely.
+        // The deployable filter below reads this.items — make sure the scan has
+        // actually run (a context-menu retry after a window reload arrives with
+        // an empty item list, which would misread as "nothing deployable").
+        if (!(await this.ensureItemsForMenuAction())) return;
+        const changed = await this.changedComponentKeys();
+        if ('reason' in changed) {
+          vscode.window.showInformationMessage(changed.reason);
+          return;
+        }
+        // Only components with LOCAL SOURCE can join a --metadata deploy — the
+        // same split runDeploy applies as orgOnlySkipped, applied early so an
+        // org-only entry doesn't inflate the count or trip the cap.
+        const deployableKeys = new Set(this.items.filter(i => !!i.filePath).map(i => `${i.type}:${i.name}`));
+        const merged = mergeChangedKeys(retryKeys, changed.keys, deployableKeys, CHANGED_RETRY_MAX_ADDED);
+        if (merged.added.length === 0) {
+          vscode.window.showInformationMessage('No changed components beyond the ones already deployed.');
+          return;
+        }
+        if (merged.capped) {
+          vscode.window.showWarningMessage(
+            `Your branch has ${merged.added.length} changed components to add — too many for a one-click retry (cap: ${CHANGED_RETRY_MAX_ADDED}). Deploy the branch with a manifest instead.`
+          );
+          return;
+        }
+        // No extra confirmation here — runDeploy's own confirm modal names the
+        // full merged count against the target org. Deliberately independent of
+        // the dependency suggestions: expanding by git state and expanding by
+        // org error text are separate answers, and stacking them would deploy an
+        // ever-growing set nobody asked for.
+        await this.runDeploy(merged.keys, {
+          validateOnly: r.validateOnly === true,
+          testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
+          runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined
+        });
+        return;
+      }
+      case 'suggestionOpened': {
+        if (typeof msg.id !== 'string') return;
+        const live = this.liveSuggestions.get(msg.id);
+        if (!live) return; // expired/unknown — opening costs nothing, log nothing
+        await this.writeSuggestionEntry(msg.id, {
+          action: 'opened', candidates: live.candidates, org: live.orgLabel
+        });
+        return;
+      }
+      case 'suggestionDeploy': {
+        if (typeof msg.id !== 'string') return;
+        const live = this.liveSuggestions.get(msg.id);
+        if (!live) {
+          vscode.window.showInformationMessage('This suggestion has expired — use Retry deploy instead.');
+          return;
+        }
+        // Selection: intersect the webview's picks with the server-side candidate
+        // list. Anything else in the message is ignored — candidates were already
+        // validated against scanned items when the card was built.
+        const offered = new Set(live.candidates.map(c => c.key));
+        const picked = Array.isArray(msg.keys)
+          ? [...new Set(msg.keys.filter(k => typeof k === 'string' && offered.has(k)))]
+          : [];
+        if (picked.length === 0) {
+          vscode.window.showInformationMessage('No suggested components selected.');
+          return;
+        }
+        // A running operation would QUEUE this deploy, and the log would then
+        // record 'retry not run' for a retry that actually runs later. Refuse
+        // up front — nothing is consumed or logged, the card stays actionable.
+        if (this.busy) {
+          vscode.window.showInformationMessage('A deployment is already running — retry the suggestion when it finishes.');
+          this.post({ type: 'suggestionReset', id: msg.id });
+          return;
+        }
+        const baseKeys = (live.retry.keys ?? []).filter(k => typeof k === 'string' && k.includes(':'));
+        const declined = live.candidates.map(c => c.key).filter(k => !picked.includes(k));
+        // declined is ALWAYS set and verdict/outcome are explicitly cleared: an
+        // accept after an earlier decline must not inherit that decline's
+        // residue, or the log reads self-contradictory.
+        await this.writeSuggestionEntry(msg.id, {
+          action: 'accepted', candidates: live.candidates, org: live.orgLabel,
+          accepted: picked, declined: declined.length ? declined : undefined,
+          verdict: undefined, outcome: undefined
+        });
+        const outcome = await this.runDeploy([...new Set([...baseKeys, ...picked])], {
+          validateOnly: live.retry.validateOnly === true,
+          testLevel: isTestLevel(live.retry.testLevel) ? live.retry.testLevel : undefined,
+          runTests: Array.isArray(live.retry.runTests) ? live.retry.runTests.filter(t => typeof t === 'string') : undefined
+        });
+        if (outcome.status === 'aborted') {
+          // Dismissed confirm / no org / refused slot: nothing reached the org.
+          // Keep the suggestion alive and un-fold the card so the user can go
+          // again — consuming it here would strand the card on a false
+          // "Retrying…" line with nothing actually running.
+          await this.writeSuggestionEntry(msg.id, { outcome: 'aborted' });
+          this.post({ type: 'suggestionReset', id: msg.id });
+          return;
+        }
+        // Terminal result reached — the suggestion is spent now.
+        this.liveSuggestions.delete(msg.id);
+        await this.writeSuggestionEntry(msg.id, { outcome: outcome.status === 'ok' ? 'worked' : 'failed' });
+        return;
+      }
+      case 'suggestionDeclined': {
+        if (typeof msg.id !== 'string') return;
+        const live = this.liveSuggestions.get(msg.id);
+        if (!live) return;
+        await this.writeSuggestionEntry(msg.id, {
+          action: 'declined', candidates: live.candidates, org: live.orgLabel,
+          declined: live.candidates.map(c => c.key)
+        });
+        return;
+      }
+      case 'suggestionVerdict': {
+        if (typeof msg.id !== 'string' || typeof msg.bad !== 'boolean') return;
+        const live = this.liveSuggestions.get(msg.id);
+        // Verdict may arrive after decline; the map entry is still alive (only
+        // suggestionDeploy consumes it), so candidates resolve normally.
+        if (!live) return;
+        await this.writeSuggestionEntry(msg.id, {
+          action: 'declined', candidates: live.candidates, verdict: msg.bad ? 'bad' : 'fine'
+        });
+        return;
+      }
+      case 'showSuggestionLog':
+        await this.showSuggestionLog();
+        return;
       case 'cancelQueued':
         if (typeof msg.id !== 'string') return;
         this.deployQueue = this.deployQueue.filter(q => q.id !== msg.id);
@@ -1070,25 +1295,27 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.changedRefreshTimer = setTimeout(() => { void this.postChangedComponents(); }, 500);
   }
 
-  /** Compute which local components differ, for the "Changed" view, via the built-in
-   *  vscode.git extension, and post their keys. Default: uncommitted changes only
-   *  (working tree + index — includes untracked files, i.e. brand-new components).
-   *  When `sfOrgDeployWrapper.changedBaseRef` is set, ALSO include everything that
-   *  differs from that ref (committed changes too — the release-promotion question),
-   *  and tag the posted message with `base: <ref>`. Posts `keys: null` with a reason
-   *  when git can't answer (or the ref is bad/unknown), so the view says why instead
-   *  of showing a false "no changes". Never throws. */
-  private async postChangedComponents(): Promise<void> {
+  /** Compute which local components differ, via the built-in vscode.git
+   *  extension — shared by the "Changed" view (postChangedComponents) and the
+   *  "Retry + changed vs branch" card button (the retryDeployChanged handler).
+   *  Default: uncommitted changes only (working tree + index — includes
+   *  untracked files, i.e. brand-new components). When
+   *  `sfOrgDeployWrapper.changedBaseRef` is set, ALSO include everything that
+   *  differs from that ref (committed changes too — the release-promotion
+   *  question), reported as `base` alongside the keys. Returns `{ reason }` when
+   *  git can't answer (or the ref is bad/unknown), so the caller says why
+   *  instead of showing a false "no changes". Computed fresh per call and posts
+   *  nothing itself (output-channel logging aside) — callers own presentation.
+   *  Never throws. */
+  private async changedComponentKeys(): Promise<{ keys: string[]; base?: string } | { reason: string }> {
     try {
       const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
       if (!gitExt) {
-        this.post({ type: 'changed', keys: null, reason: 'Change detection unavailable — VS Code git extension is disabled.' });
-        return;
+        return { reason: 'Change detection unavailable — VS Code git extension is disabled.' };
       }
       const api = (gitExt.isActive ? gitExt.exports : await gitExt.activate()).getAPI(1);
       if (api.repositories.length === 0) {
-        this.post({ type: 'changed', keys: null, reason: 'Change detection unavailable — workspace is not a git repository.' });
-        return;
+        return { reason: 'Change detection unavailable — workspace is not a git repository.' };
       }
       // Optional base ref. Trim, and reject a value shaped like a git flag (leading
       // '-') before it reaches `git diff <ref>` argv — execFile blocks shell
@@ -1097,8 +1324,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       let baseRef: string | undefined;
       if (rawBase) {
         if (rawBase.startsWith('-')) {
-          this.post({ type: 'changed', keys: null, reason: `Invalid changedBaseRef "${rawBase}" — a git ref can't start with '-'.` });
-          return;
+          return { reason: `Invalid changedBaseRef "${rawBase}" — a git ref can't start with '-'.` };
         }
         baseRef = rawBase;
       }
@@ -1153,8 +1379,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             refChanges = await repo.diffWith(baseRef);
           } catch (err) {
             this.output.appendLine(`[changed] diffWith(${baseRef}) failed: ${err instanceof Error ? err.message : String(err)}`);
-            this.post({ type: 'changed', keys: null, reason: `Can't compare against "${baseRef}" — unknown git ref? (${stripAnsi(err instanceof Error ? err.message : String(err)).trim()})` });
-            return;
+            return { reason: `Can't compare against "${baseRef}" — unknown git ref? (${stripAnsi(err instanceof Error ? err.message : String(err)).trim()})` };
           }
           for (const change of refChanges) addPath(change.uri?.fsPath);
         }
@@ -1164,11 +1389,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           addPath(change.uri?.fsPath);
         }
       }
-      this.post({ type: 'changed', keys: [...keys], ...(baseRef ? { base: baseRef } : {}) });
+      return { keys: [...keys], ...(baseRef ? { base: baseRef } : {}) };
     } catch (err) {
       this.output.appendLine(`[changed] git change detection failed: ${err instanceof Error ? err.message : String(err)}`);
-      this.post({ type: 'changed', keys: null, reason: 'Change detection failed — see the output channel.' });
+      return { reason: 'Change detection failed — see the output channel.' };
     }
+  }
+
+  /** Post the Changed-view payload: the computed keys (tagged `base: <ref>` when
+   *  a base ref applies), or `keys: null` with the reason git couldn't answer. */
+  private async postChangedComponents(): Promise<void> {
+    const changed = await this.changedComponentKeys();
+    if ('reason' in changed) {
+      this.post({ type: 'changed', keys: null, reason: changed.reason });
+      return;
+    }
+    this.post({ type: 'changed', keys: changed.keys, ...(changed.base ? { base: changed.base } : {}) });
   }
 
   private sendActiveFile(notifyIfMissing = false, selectAndScroll = false): void {
@@ -1260,9 +1496,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  deploy the user already confirmed at enqueue time. Same invariant as
        *  orgOverride: only drainQueue sets it. */
       preConfirmed?: boolean;
-      /** Internal only — set by an auto-resolving retry round that intends to run
-       *  again, so one logical action doesn't fire a failure toast per round. */
-      quiet?: boolean;
     } = {}
   ): Promise<DeployOutcome> {
     // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
@@ -1392,8 +1625,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                   validateOnly: !!opts.validateOnly,
                   testLevel,
                   runTests: runTests.length ? runTests : undefined
-                },
-                quiet: opts.quiet
+                }
               });
               // Set AFTER the report call: a throw out of reportDeployResult must
               // not leave sawTerminal true with detection unset, which would make
@@ -1436,73 +1668,51 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return sawTerminal ? { status: 'ok', missing: [], unresolved: [] } : ABORTED;
   }
 
-  /**
-   * "Retry + N missing", but across dependency LAYERS: adding B can reveal that B
-   * itself needs C, and the org only names one layer per attempt. Each round
-   * redeploys the accumulated key set and folds in whatever the org named next,
-   * stopping as soon as a round succeeds, adds nothing new, or hits the round cap.
-   *
-   * Safe to iterate against a real org because a Salesforce deploy is atomic: a
-   * round that fails deploys NOTHING, so only the final successful round lands.
-   * Rounds are quiet (cards still post — they're the audit trail — but the
-   * per-round failure toast is suppressed) and this method emits the single
-   * user-facing verdict for the whole sequence.
-   */
-  private async runAutoResolvingDeploy(
-    initialKeys: string[],
-    opts: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string }
-  ): Promise<void> {
-    // Never carry sourceDir into an auto-resolve: `--source-dir` beats
-    // `--metadata` in the CLI argv, so it would silently discard every key the
-    // rounds add. Expanding a key set and pinning a single path are exclusive.
-    const deployOpts = { ...opts, sourceDir: undefined, quiet: true };
-    let keys = [...new Set(initialKeys)];
-    const added: string[] = [];
-    // What the last round said was still missing when the cap stopped us — named
-    // in the summary so the user can act on it, but never counted as attempted.
-    let notTried: string[] = [];
-    let unresolved: string[] = [];
+  // ---- Dependency suggestions (failure-card "Try with dependencies") ----
 
-    for (let round = 1; round <= MAX_AUTO_RESOLVE_ROUNDS; round++) {
-      const outcome = await this.runDeploy(keys, deployOpts);
-      unresolved = outcome.unresolved;
-      if (outcome.status === 'aborted') return; // queued, refused, cancelled — already reported
-      if (outcome.status === 'ok') {
-        const verb = opts.validateOnly ? 'Validated' : 'Deployed';
-        const detail = added.length ? ` after adding ${added.join(', ')}` : '';
-        this.notifySuccessIfPanelHidden(`${verb} ${keys.length} component${keys.length === 1 ? '' : 's'}${detail}`);
-        return;
-      }
-      // Failed. Anything genuinely new to add for the next round?
-      const fresh = outcome.missing.filter(k => !keys.includes(k));
-      if (fresh.length === 0) break;
-      if (round === MAX_AUTO_RESOLVE_ROUNDS) {
-        // Out of rounds. Record what we would have added next WITHOUT claiming we
-        // tried it — `added` is reported to the user as "already attempted".
-        notTried = fresh;
-        this.output.appendLine(`[auto-resolve] round ${round} failed; ${fresh.join(', ')} is still missing but the ${MAX_AUTO_RESOLVE_ROUNDS}-round cap is reached`);
-        break;
-      }
-      keys = [...keys, ...fresh];
-      added.push(...fresh);
-      this.output.appendLine(`[auto-resolve] round ${round} failed; adding ${fresh.join(', ')} and retrying (round ${round + 1}/${MAX_AUTO_RESOLVE_ROUNDS})`);
+  /** Server-side truth for suggestion cards currently alive in the webview.
+   *  The webview only ever echoes an id and a SELECTION; every key it picks is
+   *  validated against this map, so a forged message can neither mint a deploy
+   *  key nor resurrect an expired suggestion. Bounded: oldest evicted. */
+  private liveSuggestions = new Map<string, { candidates: SuggestionCandidateInfo[]; retry: RetryRequest; orgLabel: string }>();
+  private suggestionSeq = 0;
+
+  private rememberSuggestion(id: string, data: { candidates: SuggestionCandidateInfo[]; retry: RetryRequest; orgLabel: string }): void {
+    this.liveSuggestions.set(id, data);
+    // A handful of live cards is plenty — suggestions are meant to be acted on
+    // right after the failure, and stale ones render inert after a reload anyway.
+    while (this.liveSuggestions.size > 10) {
+      const oldest = this.liveSuggestions.keys().next().value;
+      if (oldest === undefined) break;
+      this.liveSuggestions.delete(oldest);
     }
+  }
 
-    // Exhausted: either nothing more resolved locally, or we hit the cap. The
-    // last round's failure card is already in the Status pane with the details;
-    // this is the one toast for the whole sequence.
-    const reason = added.length
-      ? `Added ${added.join(', ')} but it still fails.`
-      : 'Nothing further could be resolved from your workspace.';
-    // Naming what we ran out of rounds for is the actionable part — the user can
-    // add it by hand rather than clicking Retry + missing again.
-    const capped = notTried.length
-      ? ` Stopped at the ${MAX_AUTO_RESOLVE_ROUNDS}-round cap with ${notTried.join(', ')} still to add — retry to continue.`
-      : '';
-    const hint = unresolved.length
-      ? ` Referenced but not in your workspace: ${unresolved.join(', ')}.`
-      : '';
-    this.failureToast(`Auto-resolve stopped — ${reason}${capped}${hint}`, []);
+  private suggestionEntries(): SuggestionLogEntry[] {
+    return this.context.globalState.get<SuggestionLogEntry[]>(SUGGESTION_LOG_KEY, []);
+  }
+
+  /** Append or update the entry for `id` — the FULL id, because two cards can
+   *  share an at-stamp (same-millisecond failures) and must not merge. A patch
+   *  field set to undefined CLEARS it (see mergeSuggestionEntry). */
+  private async writeSuggestionEntry(id: string, patch: Partial<SuggestionLogEntry>): Promise<void> {
+    const next = mergeSuggestionEntry(this.suggestionEntries(), id, this.suggestionAt(id), patch);
+    // Persistence failure must never break the deploy flow — the log is a
+    // feedback notebook, not state.
+    await Promise.resolve(this.context.globalState.update(SUGGESTION_LOG_KEY, next)).catch(() => undefined);
+  }
+
+  /** The at-stamp doubles as the log correlation id; parse it back out of the
+   *  card's suggestion id ("sug-<at>-<seq>"). */
+  private suggestionAt(id: string): number {
+    const m = /^sug-(\d+)-\d+$/.exec(id);
+    return m ? Number(m[1]) : Date.now();
+  }
+
+  /** "Show Suggestion Log" command: open the copy-pasteable summary. */
+  async showSuggestionLog(): Promise<void> {
+    const doc = await vscode.workspace.openTextDocument({ content: formatSuggestionLog(this.suggestionEntries()), language: 'plaintext' });
+    await vscode.window.showTextDocument(doc, { preview: false });
   }
 
   /** Resolve the effective Apex test level + class list (and its confirm-modal
@@ -1706,8 +1916,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       start: number;
       validateOnly: boolean;
       retry?: RetryRequest;
-      /** Suppress the failure toast — an auto-resolve round that will retry. */
-      quiet?: boolean;
     }
   ): MissingDependencies | undefined {
     const { items, orgOnlySkipped, orgLabel, org, cmdId, start, validateOnly } = ctx;
@@ -1751,11 +1959,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             : {})
         }
       });
-      // A quiet round belongs to an auto-resolve sequence that emits its own
-      // single verdict — otherwise the last round toasts twice.
-      if (!ctx.quiet) {
-        this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
-      }
+      this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
     } else {
       // Structured lines: `key` (+ optional line/column) makes the row clickable
       // in the panel — it opens the source in a preview tab at the error position.
@@ -1799,38 +2003,53 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.items,
         new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
       );
-      const missing = retryKeys ? deps.keys : [];
       const buttons = ctx.retry
         ? [
             { label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } },
-            // Not offered when the original deploy was pinned to a sourceDir: that
-            // happens for a file OUTSIDE the package directories, which --metadata
-            // cannot address at all, and `--source-dir` beats `--metadata` in the
-            // CLI argv (sfCliService.deployMetadata) so the added keys would be
-            // silently discarded. The guidance line below still names what's
-            // missing — the user adds it by hand.
-            ...(missing.length && retryKeys && !ctx.retry.sourceDir
-              ? [{
-                  label: `Retry + ${missing.length} missing`,
-                  // autoResolve keeps expanding across dependency LAYERS: each
-                  // round adds what the org named next, so the user doesn't have
-                  // to find and click this button again per layer. Each round
-                  // still confirms — every round deploys a SUPERSET, and
-                  // auto-confirming a growing set against production is not ours
-                  // to decide.
-                  send: {
-                    type: 'retryDeploy',
-                    request: { ...ctx.retry, sourceDir: undefined, keys: [...retryKeys, ...missing], autoResolve: true }
-                  }
-                }]
+            // The missing dependency is very often something changed on this
+            // same branch (a new class and its new __mdt land together), and git
+            // already knows that set — no error-text parsing involved, so this
+            // is offered even when detection above found nothing. Not offered
+            // when the original deploy was pinned to a sourceDir: that happens
+            // for a file OUTSIDE the package directories, which --metadata
+            // cannot address at all, and `--source-dir` beats `--metadata` in
+            // the CLI argv (sfCliService.deployMetadata) so added keys would be
+            // silently discarded. Deliberately NO async work here: the changed
+            // set is computed at click time (retryDeployChanged handler), so
+            // it's fresh when used and free while unclicked.
+            ...(retryKeys && !ctx.retry.sourceDir
+              ? [{ label: 'Retry + changed vs branch', send: { type: 'retryDeployChanged', request: ctx.retry } }]
               : [])
           ]
         : undefined;
-      // Guidance goes FIRST: panel.js collapses a card past MAX_CARD_LINES (8),
-      // and on a real multi-class compile failure these are the two lines that
-      // say what to do about it.
-      const guidanceLines = [
-        ...(missing.length ? [`Missing but available locally: ${missing.join(', ')}`] : []),
+      // Per-row suggestion candidates for the card's "Try with dependencies"
+      // view. Same sourceDir exclusion as above (the retry couldn't carry the
+      // added keys), and only when there's a discrete key list to extend (a
+      // manifest retry has none). The card keeps the suggestion UI; the provider
+      // keeps the authority: liveSuggestions holds the server-side truth the
+      // webview's clicks are validated against.
+      const suggest = retryKeys && !ctx.retry?.sourceDir
+        ? buildSuggestionCandidates(
+            failures.map(f => ({ from: `${f.type}:${f.fullName}`, problem: fileProblem(f) ?? '' })),
+            this.items,
+            new Set(retryKeys)
+          )
+        : [];
+      let suggestPayload: { id: string; candidates: SuggestionCandidateInfo[]; unresolved: string[] } | undefined;
+      if (suggest.length && ctx.retry) {
+        const id = `sug-${Date.now()}-${this.suggestionSeq++}`;
+        this.rememberSuggestion(id, { candidates: suggest, retry: ctx.retry, orgLabel });
+        suggestPayload = { id, candidates: suggest, unresolved: deps.unresolved };
+      }
+      // The unresolved diagnosis still renders as a guidance line when there is
+      // no suggestion UI to carry it (nothing resolved locally, or manifest/
+      // sourceDir deploys) — it's the only feedback in that case. FIRST, because
+      // panel.js collapses a card past MAX_CARD_LINES.
+      const guidanceLines = suggestPayload ? [] : [
+        // A sourceDir-pinned retry can't be extended automatically (--source-dir
+        // beats --metadata) and a manifest retry has no key list — but the user
+        // still deserves to KNOW what's missing; that's the 0.14.0 behavior.
+        ...(retryKeys && deps.keys.length ? [`Missing but available locally: ${deps.keys.join(', ')} — add them to the deploy by hand.`] : []),
         ...(deps.unresolved.length
           ? [`Referenced but not found in your workspace: ${deps.unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
           : [])
@@ -1848,15 +2067,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             ...testLines,
             ...skipLines
           ],
-          ...(buttons ? { buttons } : {})
+          ...(buttons ? { buttons } : {}),
+          ...(suggestPayload ? { suggest: suggestPayload } : {})
         }
       });
       // An auto-resolving retry round that is about to run again suppresses its
       // own toast — otherwise one logical "resolve the dependencies" action
       // fires a failure toast per round. The final round always reports.
       const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
-      if (ctx.quiet) this.logResultLines(failureSummary, [...errLines, ...testLines]);
-      else this.failureToast(failureSummary, [...errLines, ...testLines]);
+      // Details also mirror into the output channel so "Show Output" opens a log
+      // that actually mentions the failure.
+      this.failureToast(failureSummary, [...errLines, ...testLines]);
       return deps;
     }
     return undefined;
@@ -2004,7 +2225,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  through the normal result renderer. */
   private reportPolledDeploy(
     result: DeployResult,
-    ctx: { items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number; validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest; quiet?: boolean }
+    ctx: { items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number; validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest }
   ): MissingDependencies | undefined {
     if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
       this.endCmd(ctx.cmdId, false, Date.now() - ctx.start);
@@ -3575,7 +3796,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // deployment history, surviving webview rebuilds AND window reloads (so a
       // failed context-menu deploy with the sidebar closed leaves a durable trace).
       m.card.at ??= Date.now();
-      this.pushCardHistory(m.card);
+      // The suggestion UI is live-only: a card restored after a reload renders
+      // without it (inert), so stale checkboxes can't deploy through an expired
+      // liveSuggestions entry. History gets a copy WITHOUT the payload.
+      this.pushCardHistory(m.card.suggest ? { ...m.card, suggest: undefined } : m.card);
     }
     this.view?.webview.postMessage(msg);
   }

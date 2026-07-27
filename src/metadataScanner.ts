@@ -477,8 +477,10 @@ export interface MissingDependencies {
 /** Custom-object suffixes: a bare type name ending in one of these is an sObject
  *  (custom object, custom metadata type, platform event, big object, external
  *  object), never an Apex class — so `Invalid type: Foo__mdt` resolves against
- *  CustomObject rather than guessing across every metadata type. */
-const SOBJECT_SUFFIX = /__(mdt|c|e|b|x)$/i;
+ *  CustomObject rather than guessing across every metadata type. Exported for
+ *  depGraph's source-token matching so the two features can't drift apart on
+ *  what counts as an sObject name. */
+export const SOBJECT_SUFFIX = /__(mdt|c|e|b|x)$/i;
 
 /** Cap on org-controlled text echoed back into the panel card. The webview sets
  *  it via textContent (no HTML risk) but the output channel and status history
@@ -495,8 +497,11 @@ const UNRESOLVED_MAX_LEN = 100;
  *  nonsense, and with only UNRESOLVED_MAX slots the noise would crowd out the one
  *  custom component the report exists to surface.
  *  This is a static list, not the full Apex type registry — extend it when a
- *  real message surfaces a type that shouldn't be reported. */
-const APEX_BUILTIN_TYPES = new Set([
+ *  real message surfaces a type that shouldn't be reported.
+ *  Exported (with PLATFORM_NAMESPACES / STANDARD_NAMES / isPlatformName) so
+ *  depGraph's local-source token matching reuses the SAME denylists instead of
+ *  maintaining a duplicate that would silently diverge. */
+export const APEX_BUILTIN_TYPES = new Set([
   'blob', 'boolean', 'date', 'datetime', 'decimal', 'double', 'id', 'integer', 'long',
   'object', 'string', 'time', 'list', 'set', 'map', 'iterator', 'iterable', 'sobject',
   'exception', 'type', 'trigger', 'test', 'system', 'database', 'schema', 'json',
@@ -507,7 +512,7 @@ const APEX_BUILTIN_TYPES = new Set([
 
 /** Namespaces whose members are platform-provided, so `System.JSONParser` or
  *  `Schema.SObjectType` is never something the user can deploy. */
-const PLATFORM_NAMESPACES = new Set([
+export const PLATFORM_NAMESPACES = new Set([
   'system', 'schema', 'database', 'messaging', 'connectapi', 'apex', 'auth', 'cache',
   'canvas', 'chatteranswers', 'datacloud', 'dom', 'eventbus', 'flow', 'functions',
   'kbmanagement', 'metadata', 'process', 'quickaction', 'reports', 'search', 'sfc',
@@ -518,7 +523,7 @@ const PLATFORM_NAMESPACES = new Set([
  *  that isn't in the workspace is not a missing dependency. Same noise argument as
  *  APEX_BUILTIN_TYPES; a resolvable LOCAL item of the same name still wins, because
  *  this list only ever suppresses the unresolved REPORT, never a lookup. */
-const STANDARD_NAMES = new Set([
+export const STANDARD_NAMES = new Set([
   'account', 'contact', 'lead', 'opportunity', 'case', 'user', 'task', 'event',
   'campaign', 'product2', 'pricebook2', 'pricebookentry', 'order', 'orderitem',
   'quote', 'contract', 'asset', 'attachment', 'note', 'document', 'folder', 'group',
@@ -530,8 +535,9 @@ const STANDARD_NAMES = new Set([
 /** True when a referent is platform-provided and so must never be reported as a
  *  missing workspace component. Applied ONLY to the unresolved report — never to
  *  key resolution, so a genuinely local component with a colliding name still
- *  resolves normally. */
-function isPlatformName(raw: string): boolean {
+ *  resolves normally. (depGraph applies it the other way round — to token
+ *  LOOKUPS — because there a platform name can only ever be a false positive.) */
+export function isPlatformName(raw: string): boolean {
   const lower = raw.toLowerCase();
   if (APEX_BUILTIN_TYPES.has(lower) || STANDARD_NAMES.has(lower)) return true;
   const dot = lower.indexOf('.');
@@ -604,7 +610,8 @@ function sanitizeUnresolved(text: string): string {
 
 /**
  * Parse deploy-failure problem strings for references to components that are
- * MISSING on the target org — feeding both the "Retry + N missing" button and
+ * MISSING on the target org — feeding both the failure card's dependency
+ * suggestions and
  * the card's "referenced but not in your workspace" diagnosis (panelProvider's
  * reportDeployResult), so a dependency the org couldn't find gets added to the
  * next attempt instead of making the user hunt it down.
@@ -752,6 +759,91 @@ export function detectMissingDependencies(
     keys.push(key);
   }
   return { keys, unresolved };
+}
+
+/** One suggestion candidate for the failure card: the missing component plus the
+ *  failing component whose error text named it. */
+export interface SuggestionCandidateInfo {
+  key: string;
+  from?: string;
+}
+
+/**
+ * Per-failure-row suggestion candidates for the card's "Try with dependencies"
+ * view — the row-level counterpart of detectMissingDependencies, so each
+ * suggestion can be shown NEXT TO the error that caused it. Same security
+ * invariant (a candidate key always names a real scanned item), same
+ * deployedKeys exclusion. Deduped by key, first-seen order; capped so a
+ * pathological failure can't render hundreds of checkboxes.
+ */
+export const SUGGESTION_CANDIDATES_MAX = 20;
+
+export function buildSuggestionCandidates(
+  failures: Array<{ from?: string; problem?: string }>,
+  items: MetadataItem[],
+  deployedKeys: Set<string>
+): SuggestionCandidateInfo[] {
+  const seen = new Set<string>();
+  const out: SuggestionCandidateInfo[] = [];
+  for (const f of failures) {
+    if (!f.problem) continue;
+    const deps = detectMissingDependencies([f.problem], items, deployedKeys);
+    for (const key of deps.keys) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // `from` carries the failing component's org-reported fullName — the one
+      // org-controlled field the suggestion path persists. Same bounds as the
+      // unresolved report: control characters flattened, length capped.
+      const from = f.from ? sanitizeUnresolved(f.from) : undefined;
+      out.push({ key, ...(from ? { from } : {}) });
+      if (out.length >= SUGGESTION_CANDIDATES_MAX) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * Union a failed deploy's own key set with the branch's changed components, for
+ * the "Retry + changed vs branch" card button (panelProvider's
+ * retryDeployChanged handler). Pure item-model logic, kept here so the contract
+ * is directly testable without the provider:
+ * - `retryKeys` lead and are never filtered — they already passed one deploy's
+ *   resolution, and dropping one here would silently shrink the retry.
+ * - a changed key is added only when it's in `deployableKeys` (components with
+ *   LOCAL SOURCE — items with a filePath, mirroring runDeploy's orgOnlySkipped
+ *   split): the Changed computation can name org-only components, and
+ *   `--metadata` can't deploy what has no local file. This also keeps the
+ *   security invariant — a key that never matched a scanned workspace item can't
+ *   enter the deploy set through this path.
+ * - both sides are deduped; first-seen order is preserved (retry keys first,
+ *   then the additions in `changedKeys` order) so the confirm modal and the
+ *   result card list the original set before the branch's extras.
+ * - `capped` reports that the ADDITION exceeds `cap`. The caller must refuse to
+ *   deploy a capped result (a set that size is a release promotion that belongs
+ *   in a reviewable manifest, not a one-click retry); `added` is still returned
+ *   in full so the refusal can state the real count.
+ */
+export function mergeChangedKeys(
+  retryKeys: string[],
+  changedKeys: string[],
+  deployableKeys: Set<string>,
+  cap: number
+): { keys: string[]; added: string[]; capped: boolean } {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  for (const k of retryKeys) {
+    if (seen.has(k)) continue;
+    seen.add(k);
+    keys.push(k);
+  }
+  const added: string[] = [];
+  for (const k of changedKeys) {
+    if (seen.has(k) || !deployableKeys.has(k)) continue;
+    seen.add(k);
+    added.push(k);
+    keys.push(k);
+  }
+  return { keys, added, capped: added.length > cap };
 }
 
 function matchExt(name: string, exts: string[]): string | undefined {

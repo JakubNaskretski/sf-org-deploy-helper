@@ -355,6 +355,20 @@
           renderTree();
         }
         return;
+      case 'suggestionReset': {
+        // The provider refused or the confirm modal was dismissed — nothing ran.
+        // Un-fold the card so the suggestion stays actionable instead of lying
+        // "Retrying…" forever.
+        if (typeof msg.id !== 'string') return;
+        for (const c of state.statusCards) {
+          if (c.suggest && c.suggest.id === msg.id) {
+            c.suggestDone = undefined;
+            c.suggestOpen = false;
+          }
+        }
+        renderStatus();
+        return;
+      }
       case 'busy':
         state.busy = !!msg.busy;
         state.busyAction = msg.action || null;
@@ -1155,6 +1169,14 @@
     for (const card of state.statusCards) {
       const el = document.createElement('div');
       el.className = `status-card ${card.kind || 'ok'}`;
+      // Suggestion view (state B): the card swaps its error list for the
+      // checkbox rows — everything else hides so a 40-failure card doesn't
+      // drown the choices. Plain local state, same pattern as card.expanded.
+      if (card.suggest && card.suggestOpen && !card.suggestDone) {
+        renderSuggestOpen(card, el);
+        st.appendChild(el);
+        continue;
+      }
       const t = document.createElement('div');
       t.className = 'title';
       const ic = document.createElement('span');
@@ -1280,10 +1302,11 @@
           const cb = document.createElement('button');
           cb.className = 'card-btn';
           cb.textContent = b.label || '';
-          // Retry rides the deploy pipeline, which QUEUES while busy — keeping it
-          // clickable matches the Deploy/Validate buttons. Resume monitoring and
-          // the restore/discard actions need the single operation slot themselves.
-          const queueable = b.send && b.send.type === 'retryDeploy';
+          // Retry (plain or +changed-vs-branch) rides the deploy pipeline, which
+          // QUEUES while busy — keeping it clickable matches the Deploy/Validate
+          // buttons. Resume monitoring and the restore/discard actions need the
+          // single operation slot themselves.
+          const queueable = b.send && (b.send.type === 'retryDeploy' || b.send.type === 'retryDeployChanged');
           cb.disabled = state.busy && !queueable;
           if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
           cb.addEventListener('click', () => {
@@ -1292,10 +1315,134 @@
           });
           bwrap.appendChild(cb);
         }
+        // State-A entry into the suggestion view, alongside the retry buttons.
+        // Opening is purely local (plus a log ping) — nothing deploys yet, so
+        // it stays enabled even while busy.
+        if (card.suggest && !card.suggestDone) {
+          const sb = document.createElement('button');
+          sb.className = 'card-btn suggest-open-btn';
+          sb.textContent = `Try with dependencies (${card.suggest.candidates.length})`;
+          sb.title = 'Review the missing components this failure references and retry with a selection of them.';
+          sb.addEventListener('click', () => {
+            card.suggestOpen = true;
+            // Reopening supersedes an earlier Back — the verdict question would
+            // otherwise linger under a live suggestion view.
+            card.suggestDeclined = false;
+            send('suggestionOpened', { id: card.suggest.id });
+            renderStatus();
+          });
+          bwrap.appendChild(sb);
+        }
         el.appendChild(bwrap);
+      }
+      if (card.suggestDone) {
+        const d = document.createElement('div');
+        d.className = 'suggest-summary';
+        d.textContent = card.suggestDone;
+        el.appendChild(d);
+      }
+      // Post-decline feedback, one shot: a small in-card question, no popups.
+      if (card.suggestDeclined && !card.suggestVerdictDone && !card.suggestDone) {
+        const fb = document.createElement('div');
+        fb.className = 'suggest-feedback';
+        fb.append('Was this suggestion off? ');
+        for (const [label, bad] of [['Yes — off', true], ['No, made sense', false]]) {
+          const b = document.createElement('button');
+          b.className = 'card-btn small';
+          b.textContent = label;
+          b.addEventListener('click', () => {
+            card.suggestVerdictDone = true;
+            send('suggestionVerdict', { id: card.suggest.id, bad });
+            renderStatus();
+          });
+          fb.appendChild(b);
+        }
+        el.appendChild(fb);
       }
       st.appendChild(el);
     }
+  }
+
+  /** State B of a failure card: checkbox rows for the suggested components,
+   *  everything else hidden. Selection state lives on the card object
+   *  (card.suggestSel), surviving re-renders exactly like card.expanded. */
+  function renderSuggestOpen(card, el) {
+    card.suggestSel = card.suggestSel || {};
+    for (const c of card.suggest.candidates) {
+      if (!(c.key in card.suggestSel)) card.suggestSel[c.key] = true; // pre-checked
+    }
+    const t = document.createElement('div');
+    t.className = 'title';
+    const ic = document.createElement('span');
+    ic.className = `card-icon ${card.kind || 'ok'}`;
+    ic.textContent = CARD_ICONS[card.kind] || CARD_ICONS.ok;
+    t.appendChild(ic);
+    const ttxt = document.createElement('span');
+    ttxt.textContent = 'Retry with missing dependencies?';
+    t.appendChild(ttxt);
+    el.appendChild(t);
+    const m = document.createElement('div');
+    m.className = 'meta';
+    m.textContent = 'Referenced by the failed components and present in your workspace — untick any you don\u2019t want.';
+    el.appendChild(m);
+
+    const ul = document.createElement('ul');
+    ul.className = 'suggest-rows';
+    for (const c of card.suggest.candidates) {
+      const li = document.createElement('li');
+      const lbl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!card.suggestSel[c.key];
+      cb.addEventListener('change', () => { card.suggestSel[c.key] = cb.checked; renderStatus(); });
+      lbl.appendChild(cb);
+      const txt = document.createElement('span');
+      // "OrderSvc -> add CustomObject:Billing__mdt": cause first, fix second.
+      txt.textContent = `${c.from ? c.from + '  \u2192  ' : ''}add ${c.key}`;
+      lbl.appendChild(txt);
+      li.appendChild(lbl);
+      ul.appendChild(li);
+    }
+    el.appendChild(ul);
+    // Referents that exist nowhere locally: context, not choices.
+    if (card.suggest.unresolved && card.suggest.unresolved.length) {
+      const u = document.createElement('div');
+      u.className = 'suggest-unresolved';
+      u.textContent = `Not in your workspace (retrieve or fix by hand): ${card.suggest.unresolved.join(', ')}`;
+      el.appendChild(u);
+    }
+
+    const n = card.suggest.candidates.filter(c => card.suggestSel[c.key]).length;
+    const bwrap = document.createElement('div');
+    bwrap.className = 'card-buttons';
+    const dep = document.createElement('button');
+    dep.className = 'card-btn primary';
+    dep.textContent = `Deploy with ${n} selected`;
+    // Deliberately NOT queue-tolerant: a queued suggestion retry would be logged
+    // "not run" while actually running later — the provider refuses while busy,
+    // so disable here too instead of promising a queue slot.
+    dep.disabled = n === 0 || state.busy;
+    if (state.busy && n > 0) dep.title = `Wait for ${state.busyAction || 'the running operation'} to finish`;
+    dep.addEventListener('click', () => {
+      if (n === 0) return;
+      const keys = card.suggest.candidates.map(c => c.key).filter(k => card.suggestSel[k]);
+      card.suggestDone = `Retrying with ${keys.length} added component${keys.length === 1 ? '' : 's'}\u2026 (result arrives as its own card)`;
+      card.suggestOpen = false;
+      send('suggestionDeploy', { id: card.suggest.id, keys });
+      renderStatus();
+    });
+    bwrap.appendChild(dep);
+    const back = document.createElement('button');
+    back.className = 'card-btn';
+    back.textContent = 'Back';
+    back.addEventListener('click', () => {
+      card.suggestOpen = false;
+      card.suggestDeclined = true;
+      send('suggestionDeclined', { id: card.suggest.id });
+      renderStatus();
+    });
+    bwrap.appendChild(back);
+    el.appendChild(bwrap);
   }
 
   function renderCmdLog() {

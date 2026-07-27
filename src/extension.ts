@@ -45,6 +45,8 @@ export function activate(context: vscode.ExtensionContext): void {
     registerSafe('sfOrgDeployWrapper.selectOrg', () => provider.pickOrg()),
     registerSafe('sfOrgDeployWrapper.refreshFiles', () => provider.refreshFiles()),
     registerSafe('sfOrgDeployWrapper.deployFile', (uri?: vscode.Uri) => provider.deployFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.deployFileWithDeps', (uri?: vscode.Uri) => provider.deployFileWithDeps(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.showSuggestionLog', () => provider.showSuggestionLog()),
     registerSafe('sfOrgDeployWrapper.retrieveFile', (uri?: vscode.Uri) => provider.retrieveFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
     registerSafe('sfOrgDeployWrapper.diffFile', (uri?: vscode.Uri) => provider.diffFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
     registerSafe('sfOrgDeployWrapper.diffFileWithOrg', (uri?: vscode.Uri) => provider.diffFileWithOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
