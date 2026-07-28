@@ -8,13 +8,27 @@
   // 'statusHistory' replay below.
   const STATUS_HISTORY_MAX = 50;
 
+  // Cap on the SELECTION copy written to webview state. One click on the Objects
+  // group checkbox ticks every field of every object, and this object is
+  // re-serialized on every subsequent toggle — an unbounded key list is the same
+  // state weight the provider refuses for card buttons (HISTORY_BUTTON_KEYS_MAX,
+  // panelProvider.ts). Past the cap the key list is OMITTED rather than trimmed:
+  // restoring a silently smaller selection than the user ticked is worse than
+  // restoring none, and the in-memory Set is untouched either way.
+  const PERSISTED_SELECTION_MAX = 2000;
+
   const persisted = vscode.getState() || {};
   const state = {
     orgs: [],
     selectedOrg: null,
     items: [], // {type, name, key (type:name), filePath, files[]}
     objectChildTypes: new Set(), // metadata types that nest under an object (CustomField, …)
-    selected: new Set(), // keys
+    // Checkbox selection, persisted like the filter/lens state: it is the most
+    // expensive thing in this panel to rebuild by hand, and a webview rebuild
+    // (sidebar collapsed, window reloaded) used to silently throw it away. Keys
+    // that no longer exist are pruned when the scan lands ('files' below), so a
+    // component deleted between sessions can't linger in the selection.
+    selected: new Set(Array.isArray(persisted.selected) ? persisted.selected : []), // keys
     expandedGroups: new Set(persisted.expandedGroups || []),
     filter: persisted.filter || '',
     typeFilter: new Set(persisted.typeFilter || []), // empty = all
@@ -76,8 +90,19 @@
       statusRatio: state.statusRatio,
       scanBannerDismissed: state.scanBannerDismissed,
       viewMode: state.viewMode,
-      testClasses: state.testClasses
+      testClasses: state.testClasses,
+      ...(state.selected.size <= PERSISTED_SELECTION_MAX ? { selected: Array.from(state.selected) } : {})
     });
+  }
+
+  // Every selection change goes through here: persist first, then repaint the tree
+  // (checkboxes, group tri-states) and the action bar (enabled-ness, count). Having
+  // one funnel is what keeps the persisted copy from drifting out of sync with the
+  // checkboxes on screen.
+  function selectionChanged() {
+    savePersisted();
+    renderTree();
+    renderActions();
   }
 
   const $ = (id) => document.getElementById(id);
@@ -155,8 +180,7 @@
   $('clearSel').addEventListener('click', () => {
     state.selected.clear();
     state.selectedLensKeys = null; // the Selected lens empties too, not just checkboxes
-    renderTree();
-    renderActions();
+    selectionChanged();
   });
   $('cmdlogHeader').addEventListener('click', () => {
     state.cmdLogCollapsed = !state.cmdLogCollapsed;
@@ -249,12 +273,25 @@
             .filter(k => !state.localKeys.has(k))
             .map(k => { const c = k.indexOf(':'); return { type: k.slice(0, c), name: k.slice(c + 1) }; });
         }
-        // Drop selections that no longer exist in either local or org
-        const valid = new Set([...state.localKeys, ...state.orgKeys]);
-        for (const k of Array.from(state.selected)) if (!valid.has(k)) state.selected.delete(k);
-        // Drop stale type-filter entries (allow org types too)
-        const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
-        for (const t of Array.from(state.typeFilter)) if (!allKnownTypes.has(t)) state.typeFilter.delete(t);
+        // Drop selections that no longer exist in either local or org. This is also
+        // what vets a selection RESTORED from webview state: it is written back
+        // pruned below, so a key deleted between sessions can't survive another reload.
+        // Only a scan that FOUND something may do that. The provider posts `files`
+        // with an empty item list when project discovery fails (multi-root
+        // workspace, sfdx-project.json not synced yet) and org membership is empty
+        // on a fresh webview, so pruning against nothing would delete every
+        // restored key AND persist the deletion — destroying the selection exactly
+        // when the workspace hiccups, with no way back. Keeping it costs nothing:
+        // Deploy/Validate stay disabled until a key is in localKeys, and every
+        // inbound key is re-resolved against the provider's own scan anyway.
+        if (state.items.length > 0 || state.orgKeys.size > 0) {
+          const valid = new Set([...state.localKeys, ...state.orgKeys]);
+          for (const k of Array.from(state.selected)) if (!valid.has(k)) state.selected.delete(k);
+          // Drop stale type-filter entries (allow org types too)
+          const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
+          for (const t of Array.from(state.typeFilter)) if (!allKnownTypes.has(t)) state.typeFilter.delete(t);
+          savePersisted(); // both prunes above are now the persisted truth too
+        }
         renderTypeFilter();
         renderTree();
         renderActions();
@@ -286,8 +323,17 @@
         state.orgMetaLabel = null;
         state.sourceFilter = 'all';
         if ($('sourceFilter')) $('sourceFilter').value = 'all';
-        // Drop any selected org-only keys that no longer exist locally.
-        for (const k of Array.from(state.selected)) if (!state.localKeys.has(k)) state.selected.delete(k);
+        // Drop any selected org-only keys that no longer exist locally — but only
+        // once a scan has established what "locally" means, for the same reason
+        // the `files` handler above refuses to prune against an empty scan. This
+        // is not hypothetical: a failed project discovery posts THIS message
+        // first and the empty `files` second, so on a fresh webview localKeys is
+        // still empty here and an unguarded prune would wipe the whole restored
+        // selection before the guarded handler ever ran.
+        if (state.items.length > 0) {
+          for (const k of Array.from(state.selected)) if (!state.localKeys.has(k)) state.selected.delete(k);
+          savePersisted();
+        }
         renderSourceFilter();
         renderTypeFilter();
         renderTree();
@@ -314,15 +360,18 @@
         // single-key activeFile select: visible lens, expanded paths, scroll to first.
         const keys = msg.keys || [];
         if (!keys.length) return;
+        // `replace` (a success card's "Select these N") means the selection BECOMES
+        // that run instead of growing by it — the button names a count, and diffing
+        // or retrieving "what just went up" is wrong against a union with whatever
+        // was ticked for unrelated work. Everything else here stays additive.
+        if (msg.replace) { state.selected.clear(); state.selectedLensKeys = null; }
         if (state.viewMode === 'changed') { state.viewMode = 'all'; savePersisted(); }
         for (const k of keys) {
           if (state.viewMode === 'selected' && state.selectedLensKeys) state.selectedLensKeys.add(k);
           expandPathForKey(k);
           state.selected.add(k);
         }
-        savePersisted();
-        renderTree();
-        renderActions();
+        selectionChanged();
         if (msg.scroll) scrollKeyIntoView(keys[0]);
         return;
       }
@@ -346,9 +395,7 @@
           if (state.viewMode === 'selected' && state.selectedLensKeys) state.selectedLensKeys.add(msg.key);
           expandPathForKey(msg.key);
           state.selected.add(msg.key);
-          savePersisted();
-          renderTree();
-          renderActions();
+          selectionChanged();
           if (msg.scroll) scrollKeyIntoView(msg.key);
         } else {
           // passive highlight from onDidChangeActiveTextEditor
@@ -710,8 +757,7 @@
     cb.addEventListener('change', () => {
       const all = sel === itemKeys.length;
       for (const k of itemKeys) { if (all) state.selected.delete(k); else state.selected.add(k); }
-      renderTree();
-      renderActions();
+      selectionChanged();
     });
     header.appendChild(cb);
 
@@ -759,8 +805,7 @@
     cb.checked = state.selected.has(key);
     cb.addEventListener('change', () => {
       if (cb.checked) state.selected.add(key); else state.selected.delete(key);
-      renderTree();
-      renderActions();
+      selectionChanged();
     });
     row.appendChild(cb);
     const name = document.createElement('span');
@@ -792,8 +837,7 @@
       if (e.target === cb) return;
       cb.checked = !cb.checked;
       if (cb.checked) state.selected.add(key); else state.selected.delete(key);
-      renderTree();
-      renderActions();
+      selectionChanged();
     });
     // Right-click a single component to deploy/retrieve/diff it directly.
     row.addEventListener('contextmenu', (e) => {
@@ -810,6 +854,25 @@
     const keys = [];
     if (o.obj) keys.push(`${o.obj.type}:${o.obj.name}`);
     for (const arr of o.children.values()) for (const it of arr) keys.push(`${it.type}:${it.name}`);
+    return keys;
+  }
+
+  // Every key the current lens + filters put in the tree, gated to components that
+  // exist locally — an org-only row has no source to deploy, so a bulk select must
+  // not tick it (same localKeys gate as the toolbar's Deploy button). Reads the
+  // GROUP data rather than the DOM, so the render's NODE_CAP doesn't silently
+  // shrink the set the button promises.
+  function localKeysInGroups(objectMap, flatGroups) {
+    const keys = [];
+    for (const o of objectMap.values()) {
+      for (const k of keysUnderObject(o)) if (state.localKeys.has(k)) keys.push(k);
+    }
+    for (const arr of flatGroups.values()) {
+      for (const it of arr) {
+        const k = `${it.type}:${it.name}`;
+        if (state.localKeys.has(k)) keys.push(k);
+      }
+    }
     return keys;
   }
 
@@ -881,18 +944,33 @@
       const clear = document.createElement('button');
       clear.textContent = 'Clear all';
       clear.title = 'Deselect everything';
-      clear.addEventListener('click', () => { state.selected.clear(); state.selectedLensKeys = null; renderTree(); renderActions(); });
+      clear.addEventListener('click', () => { state.selected.clear(); state.selectedLensKeys = null; selectionChanged(); });
       head.appendChild(clear);
       tree.appendChild(head);
     }
-    // Changed lens against a base ref: label what the lens is comparing to, above
-    // the rows (and above the empty state, which also names the ref).
-    if (state.viewMode === 'changed' && state.changedBase) {
+    // Changed lens header — rendered whenever the lens is active, not only when a
+    // base ref is configured: with the default (empty) changedBaseRef the lens used
+    // to show no header at all, so its one bulk action had nowhere to live. The
+    // label states which comparison is on screen, mirroring the empty-state text.
+    if (state.viewMode === 'changed') {
       const head = document.createElement('div');
       head.className = 'mode-head';
       const lbl = document.createElement('span');
-      lbl.textContent = `Changed vs ${state.changedBase}`;
+      lbl.textContent = state.changedBase ? `Changed vs ${state.changedBase}` : 'Uncommitted changes';
       head.appendChild(lbl);
+      // Select all, mirroring the Selected lens's Clear all. Additive: it ticks the
+      // rows this lens is showing (filters included) and touches nothing else.
+      const selectable = localKeysInGroups(objectMap, flatGroups);
+      if (selectable.length) {
+        const selectAll = document.createElement('button');
+        selectAll.textContent = `Select all (${selectable.length})`;
+        selectAll.title = 'Select every changed component listed here';
+        selectAll.addEventListener('click', () => {
+          for (const k of selectable) state.selected.add(k);
+          selectionChanged();
+        });
+        head.appendChild(selectAll);
+      }
       tree.appendChild(head);
     }
     if (objectMap.size === 0 && flatGroups.size === 0) {
@@ -1313,12 +1391,14 @@
           // Retry (plain or +changed-vs-branch) rides the deploy pipeline, which
           // QUEUES while busy — keeping it clickable matches the Deploy/Validate
           // buttons. Resume monitoring and the restore/discard actions need the
-          // single operation slot themselves.
+          // single operation slot themselves. "Select these N" only ticks tree
+          // rows — no org call, no operation slot — so busy never gates it.
           const queueable = b.send && (b.send.type === 'retryDeploy' || b.send.type === 'retryDeployChanged');
-          cb.disabled = state.busy && !queueable;
+          const selectionOnly = b.send && b.send.type === 'selectDeployed';
+          cb.disabled = state.busy && !queueable && !selectionOnly;
           if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
           cb.addEventListener('click', () => {
-            if (state.busy && !queueable) return;
+            if (state.busy && !queueable && !selectionOnly) return;
             send(b.send.type, b.send);
           });
           bwrap.appendChild(cb);

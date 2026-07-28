@@ -8,7 +8,7 @@ import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInf
 import { isLikelyProduction } from './kit/orgs';
 import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
-import { DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, resolveLocalDependencies } from './depGraph';
+import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -37,6 +37,11 @@ type Inbound =
   // round-trip as retryDeploy; the changed set itself is computed provider-side
   // at click time (changedComponentKeys), never carried in the message.
   | { type: 'retryDeployChanged'; request?: RetryRequest }
+  // "Select these N" on a successful result card — the keys ride back from the
+  // card, which outlives the window via the persisted history, so they are both
+  // untrusted and possibly stale: the handler intersects them with the current
+  // scan before anything reaches the tree (selectableScannedKeys).
+  | { type: 'selectDeployed'; keys?: string[] }
   // Failure-card dependency suggestions. The webview only ever echoes the card's
   // suggestion id plus a SELECTION of keys; the provider validates both against
   // its own liveSuggestions map — the message can neither mint a key nor carry a
@@ -83,6 +88,9 @@ const CARD_HISTORY_KEY = 'statusCardHistory';
 /** globalState key for the dependency-suggestion feedback log. */
 const SUGGESTION_LOG_KEY = 'sfOrgDeployWrapper.suggestionLog';
 const CARD_HISTORY_MAX = 50;
+/** Longest key list a card BUTTON may carry into the persisted history (see
+ *  pushCardHistory) — matches the 100-line cap applied to `lines` there. */
+const HISTORY_BUTTON_KEYS_MAX = 100;
 /** globalState key for folders whose type resolution failed — the negative cache
  *  (same TTL as learned rules). Without it every NEW session re-paid the serial
  *  30s-per-folder registry calls before a context-menu deploy could even confirm. */
@@ -117,7 +125,9 @@ const DEPLOY_POLL_INTERVAL_MS = 5000;
  *  means we've genuinely lost the job — stop, but KEEP it persisted for reattach. */
 const DEPLOY_POLL_MAX_FAILURES = 5;
 
-/** The three async-deploy flows, as shown on cards and persisted with the job. */
+/** The async-deploy flows, as shown on cards and persisted with the job. The verb
+ *  is a distinct value rather than a flag on 'Deploy' precisely so a reattached/
+ *  persisted job can never be reported as something it wasn't. */
 type DeployVerb = 'Deploy' | 'Validate' | 'Quick Deploy';
 
 /** A submitted async deploy we're polling, persisted so a reload can reattach. */
@@ -383,8 +393,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /**
    * "Deploy File + Dependencies" (context menu / palette): resolve the file's
-   * LOCAL dependency closure up front (depGraph — token-level, best-effort) and
-   * deploy entry + dependencies as ONE set, instead of reacting to org errors
+   * LOCAL dependency closure up front (depGraph — Apex tokens plus LWC/Aura
+   * declared references, best-effort) and deploy entry + dependencies as ONE
+   * set, instead of reacting to org errors
    * layer by layer the way the failure-card suggestions do. Every dependency key comes
    * from a scanned MetadataItem, so this path upholds the same invariant as the
    * error-driven one: file text can never mint a `--metadata` key that isn't a
@@ -413,10 +424,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     const key = `${match.type}:${match.name}`;
-    if (match.type !== 'ApexClass' && match.type !== 'ApexTrigger') {
+    if (!canScanDependencies(match.type)) {
       // Still a useful deploy — just be honest that no scan happened, so the
       // user doesn't assume referenced components were included.
-      vscode.window.showInformationMessage(`Dependency scanning only follows Apex source — deploying ${key} on its own.`);
+      vscode.window.showInformationMessage(
+        `Dependency scanning follows Apex, LWC and Aura source — deploying ${key} on its own.`
+      );
       await this.runDeploy([key]);
       return;
     }
@@ -438,7 +451,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         title: `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${key}`,
         lines: [
           ...(deps.truncated
-            ? [`Dependency scan stopped at its caps (depth ${DEFAULT_MAX_DEPTH}, ${DEFAULT_MAX_DEPS} components) — the included set may be incomplete.`]
+            ? [`Dependency scan stopped at its caps (depth ${DEFAULT_MAX_DEPTH}, ${DEFAULT_MAX_DEPS} components, ${DEFAULT_MAX_BUNDLE_FILES} files per bundle) — the included set may be incomplete.`]
             : []),
           ...deps.keys
         ]
@@ -792,13 +805,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           && isUnder(foldPathKey(path.resolve(this.workspaceRoot)), foldPathKey(path.resolve(r.sourceDir)))) {
           sourceDir = r.sourceDir;
         }
-        const deployOpts = {
-          validateOnly: r.validateOnly === true,
-          testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
-          runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined,
-          sourceDir
-        };
-        await this.runDeploy(keys, deployOpts);
+        await this.runDeploy(keys, { ...deployOptsFromRetry(r), sourceDir });
         return;
       }
       case 'retryDeployChanged': {
@@ -847,11 +854,33 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // the dependency suggestions: expanding by git state and expanding by
         // org error text are separate answers, and stacking them would deploy an
         // ever-growing set nobody asked for.
-        await this.runDeploy(merged.keys, {
-          validateOnly: r.validateOnly === true,
-          testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
-          runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined
-        });
+        await this.runDeploy(merged.keys, deployOptsFromRetry(r));
+        return;
+      }
+      case 'selectDeployed': {
+        // Re-selecting is not an org operation, so it is allowed while busy — but
+        // it still needs a scan to validate against (a card clicked right after a
+        // window reload can arrive before/without one).
+        if (!(await this.ensureItemsForMenuAction())) return;
+        const { keys, dropped } = this.selectableScannedKeys(msg.keys, this.items);
+        if (keys.length === 0) {
+          vscode.window.showInformationMessage(
+            'None of those components are in the current workspace scan — Refresh Files if they exist locally, or retrieve them from the org.'
+          );
+          return;
+        }
+        // `replace`: the selection BECOMES that run rather than growing by it.
+        // The label names a count and the follow-ups this button exists for (diff
+        // what just went up, retrieve it back) are wrong against a union with
+        // whatever was already ticked — a card is durable history, so "whatever
+        // was already ticked" can be an unrelated 40-row work in progress. The
+        // additive default stays for the suggestion flow and "Use open tabs",
+        // where adding to the current set is the whole point.
+        this.post({ type: 'selectKeys', keys, scroll: true, replace: true });
+        vscode.window.setStatusBarMessage(
+          `$(check) SF Deploy: selected ${keys.length} component${keys.length === 1 ? '' : 's'}${dropped > 0 ? ` (${dropped} no longer in the workspace)` : ''}`,
+          5000
+        );
         return;
       }
       case 'suggestionOpened': {
@@ -903,11 +932,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // deploy settles): the added components join the selection and scroll
         // into view, so the retry's contents are visible, not just implied.
         this.post({ type: 'selectKeys', keys: picked, scroll: true });
-        const outcome = await this.runDeploy([...new Set([...baseKeys, ...picked])], {
-          validateOnly: live.retry.validateOnly === true,
-          testLevel: isTestLevel(live.retry.testLevel) ? live.retry.testLevel : undefined,
-          runTests: Array.isArray(live.retry.runTests) ? live.retry.runTests.filter(t => typeof t === 'string') : undefined
-        });
+        // Server-side truth (liveSuggestions), so these are the ORIGINAL run's own
+        // modes: a suggestion accepted from a validation failure re-validates, it
+        // does not deploy.
+        const outcome = await this.runDeploy([...new Set([...baseKeys, ...picked])], deployOptsFromRetry(live.retry));
         if (outcome.status === 'aborted') {
           // Dismissed confirm / no org / refused slot: nothing reached the org.
           // Keep the suggestion alive and un-fold the card so the user can go
@@ -1508,6 +1536,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // see their own reserveBusy/notifyBusy calls, untouched). drainQueue re-enters
     // HERE with preConfirmed once the slot frees, so this check must not re-queue
     // a call that's already been dequeued.
+    const verb: DeployVerb = opts.validateOnly ? 'Validate' : 'Deploy';
     if (this.busy && !opts.preConfirmed) {
       await this.enqueueDeploy(keys, opts);
       return ABORTED;
@@ -1517,7 +1546,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // passes the entry check and two ops run at once, clobbering currentCancel and
     // re-enabling the UI mid-op (busy-flag TOCTOU). Release on any early
     // return with `releaseBusy()`.
-    if (!this.reserveBusy(opts.validateOnly ? 'Validate' : 'Deploy')) return ABORTED;
+    if (!this.reserveBusy(verb)) return ABORTED;
     let reserved = true;
     const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
     // Set by the terminal result callback; drives the auto-resolve loop in the
@@ -1549,7 +1578,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const isProd = isLikelyProduction(orgInfo);
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
-      const verb: DeployVerb = opts.validateOnly ? 'Validate' : 'Deploy';
 
       // RunSpecifiedTests needs an actual class list — resolved now (before the
       // confirm modal) so an empty list can refuse the deploy outright instead of
@@ -1560,20 +1588,29 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (!plan) return ABORTED; // resolveTestPlan already showed its own warning
       const { testLevel, runTests, testNote } = plan;
 
+      // Read the conflict override HERE, before the confirm, instead of at the
+      // deploy site below: the modal is the last gate before a live org change, so
+      // it has to name the value this very run will pass to the CLI. A VS Code
+      // modal is window-modal, so the setting can't be toggled from the panel or
+      // the Settings editor while it's up — what the user reads is what runs.
+      const ignoreConflicts = this.ignoreDeployConflicts();
+
       // A drained (pre-confirmed) deploy skips the modal entirely — the user
       // already confirmed it, against this same pinned org, at enqueue time.
       if (!opts.preConfirmed) {
         const modal = this.deployConfirmModal(
-          { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl },
+          { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl, ignoreConflicts },
           false
         );
         const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
         if (!confirm) return ABORTED;
       }
 
-      const ignoreConflicts = this.ignoreDeployConflicts();
       // Echo the --tests flags too (one per class, matching how the CLI itself
       // repeats the flag) so the command log names exactly what will run.
+      // NoTestRun is `deploy start`'s own default, so it stays off the command
+      // line; a validate can never arrive here as NoTestRun (resolveTestPlan
+      // resolves that to RunLocalTests, which `deploy validate` requires).
       const testArg = testLevel !== 'NoTestRun'
         ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
         : '';
@@ -1623,13 +1660,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             result => {
               detection = this.reportPolledDeploy(result, {
                 items, orgOnlySkipped, orgLabel, org, noun, cmdId, start, validateOnly: !!opts.validateOnly, verb,
-                retry: {
-                  keys: items.map(i => `${i.type}:${i.name}`),
-                  sourceDir: opts.sourceDir,
-                  validateOnly: !!opts.validateOnly,
-                  testLevel,
-                  runTests: runTests.length ? runTests : undefined
-                }
+                // Carries the run's own modes so Retry and an accepted dependency
+                // suggestion re-run as what this was — a validation must never turn
+                // into a deploy on its own.
+                retry: buildRetryRequest(opts, items, testLevel, runTests)
               });
               // Set AFTER the report call: a throw out of reportDeployResult must
               // not leave sawTerminal true with detection unset, which would make
@@ -1645,7 +1679,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
         // Org-labelled so exception cards stay attributable in the mixed-org history.
-        const labeledAction = `${verb} ${opts.validateOnly ? 'against' : 'to'} ${orgLabel}`;
+        const labeledAction = `${verb} ${orgPrep(verb)} ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
           // A cancel this far out means the ASYNC SUBMIT was killed before it
           // returned a job id — the org may still have enqueued it.
@@ -1721,23 +1755,31 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** Resolve the effective Apex test level + class list (and its confirm-modal
    *  note) for a deploy/validate request — shared by the immediate path
-   *  (runDeploy) and the enqueue path (enqueueDeploy) so a queued confirm's
-   *  test-level note is exactly the plan that will actually run. Returns
-   *  undefined (after showing its own warning) when RunSpecifiedTests has no
-   *  valid class name — the caller must bail without proceeding. */
+   *  (runDeploy), the enqueue path (enqueueDeploy) and the manifest path
+   *  (runManifestDeploy) so a confirm's test-level note is exactly the plan that
+   *  will actually run. Returns undefined (after showing its own warning) when
+   *  RunSpecifiedTests has no valid class name — the caller must bail without
+   *  proceeding. */
   private resolveTestPlan(
     opts: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] },
     isProd: boolean
   ): { testLevel: TestLevel; runTests: string[]; testNote: string } | undefined {
     // Production defaults to running local tests (the org requires them anyway);
-    // sandbox defaults to no tests. Validate-only always runs tests, so force at
-    // least RunLocalTests there. The configured default sits between the panel's
-    // own pick and that hardcoded smart fallback — it only kicks in when neither
-    // this call nor the panel/session has an opinion.
-    const testLevel: TestLevel = opts.testLevel
+    // sandbox defaults to no tests. The configured default sits between the
+    // panel's own pick and that hardcoded smart fallback — it only kicks in when
+    // neither this call nor the panel/session has an opinion.
+    const requested: TestLevel = opts.testLevel
       ?? this.testLevel
       ?? this.configuredTestLevel()
-      ?? (opts.validateOnly || isProd ? 'RunLocalTests' : 'NoTestRun');
+      ?? (isProd ? 'RunLocalTests' : 'NoTestRun');
+
+    // `sf project deploy validate` has no NoTestRun at all — its --test-level
+    // defaults to RunLocalTests. Resolving that here, rather than passing
+    // NoTestRun on and omitting the flag at the deploy site, is what keeps the
+    // confirm modal, the echoed command and the card's retry request describing
+    // the tests the org will really run.
+    const validateForcesTests = !!opts.validateOnly && requested === 'NoTestRun';
+    const testLevel: TestLevel = validateForcesTests ? 'RunLocalTests' : requested;
 
     let runTests: string[] = [];
     if (testLevel === 'RunSpecifiedTests') {
@@ -1755,7 +1797,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const testNote = testLevel === 'NoTestRun' ? ''
+    // The note names the level in EVERY case, NoTestRun included. An empty note
+    // stayed silent about the one outcome a user is least likely to expect — a
+    // deploy that runs no tests at all — which is exactly the case the modal
+    // exists to disclose.
+    //
+    // NoTestRun against production is additionally a level the ORG refuses when
+    // the payload contains Apex, so the note warns there. It cannot be reached by
+    // the smart default (production falls back to RunLocalTests) — only an
+    // explicit pick in the panel or defaultTestLevel gets here, i.e. the user
+    // meant it and the deploy is about to bounce. It warns rather than refuses
+    // because NoTestRun is legitimate for an Apex-free payload, and nothing here
+    // knows whether this one carries Apex.
+    const testNote = validateForcesTests
+      ? '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
+      : testLevel === 'NoTestRun'
+        ? (isProd
+          ? '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.'
+          : '\n\nTests: none (NoTestRun)')
       : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
       : `\n\nTests: ${testLevel}`;
     return { testLevel, runTests, testNote };
@@ -1764,26 +1823,35 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Build the deploy/validate confirm modal's message/options/label — shared by
    *  the immediate path (runDeploy) and the enqueue path (enqueueDeploy) so a
    *  queued confirm shows EXACTLY the same information an immediate one would.
-   *  `queued` is the only branching input: it adds a "Queue: " message prefix
-   *  and a detail line noting the deploy waits for the current operation to
-   *  finish; with `queued: false` this reproduces the pre-existing modal
-   *  byte-for-byte. */
+   *  `queued` adds a "Queue: " message prefix and a detail line noting the deploy
+   *  waits for the current operation to finish; `ignoreConflicts` adds the
+   *  overwrite-mode notice (see overwriteNotice). With `queued: false` and the
+   *  override off this reproduces the pre-existing modal byte-for-byte. */
   private deployConfirmModal(
-    args: { noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string; instanceUrl?: string },
+    args: {
+      noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
+      instanceUrl?: string; ignoreConflicts: boolean;
+    },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
+    const overwriteLine = overwriteNotice(ignoreConflicts, validateOnly, queued);
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
-        options: { modal: true, detail: [instanceUrl ?? '', queueNote].filter(Boolean).join('\n') },
+        options: { modal: true, detail: [instanceUrl ?? '', overwriteLine, queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
     }
-    const detail = isProd ? [instanceUrl ?? '', queueNote].filter(Boolean).join('\n') : queueNote;
+    // Below prod: keep the pre-existing shape — with no lines to show at all the
+    // `detail` key stays absent rather than becoming an empty string.
+    const rest = [overwriteLine, queueNote].filter(Boolean);
+    const detail = isProd
+      ? [instanceUrl ?? '', ...rest].filter(Boolean).join('\n')
+      : (rest.length > 0 ? rest.join('\n') : undefined);
     return {
       message: `${prefix}${validateOnly
         ? `Validate ${noun} against ${orgLabel}? (check-only — nothing is deployed)`
@@ -1828,8 +1896,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!plan) return;
     const { testLevel, runTests, testNote } = plan;
 
+    // The override is machine-scoped and re-read by runDeploy when the queue
+    // drains, so what's true NOW is only a snapshot — the queued variant of the
+    // notice says so rather than pinning the flag (pinning would change which
+    // flags a queued deploy actually runs with).
     const modal = this.deployConfirmModal(
-      { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl },
+      { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl, ignoreConflicts: this.ignoreDeployConflicts() },
       true
     );
     // Cap BEFORE the modal — confirming a deploy only to be told "queue full"
@@ -1958,6 +2030,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
           meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
           lines: [...lines, ...skipLines],
+          // Built from the ITEMS, not from the display lines: a manifest deploy
+          // synthesizes its items straight from <members> (wildcards and all) and
+          // a reattached job synthesizes them from the org's own report, so those
+          // "keys" name nothing the tree could ever tick. selectDeployedButtons
+          // keeps only the rows backed by local source — which for a normal run is
+          // the whole set, so re-selection reproduces the run exactly.
+          ...this.selectDeployedButtons(items),
           ...(validateOnly && result.id
             ? { quickDeploy: { jobId: result.id, label: `Quick Deploy ${items.length} validated component${items.length === 1 ? '' : 's'} to ${orgLabel}` } }
             : {})
@@ -1965,6 +2044,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       });
       this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
     } else {
+      // The org's request-level message. Read for EVERY failure, not just the
+      // no-rows one: it costs one extra problem string, a duplicate of a
+      // component problem simply dedupes inside the detector, and hard-coding
+      // "only when there are no rows" would be a second rule to keep in sync with
+      // the two result shapes above.
+      const envProblem = envelopeProblem(result);
       // Structured lines: `key` (+ optional line/column) makes the row clickable
       // in the panel — it opens the source in a preview tab at the error position.
       const errLines = failures.length
@@ -1976,7 +2061,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               ...(f.lineNumber ? { line: f.lineNumber, ...(f.columnNumber ? { column: f.columnNumber } : {}) } : {})
             };
           })
-        : (testFailures.length ? [] : ['Deploy reported failure with no per-component details.']);
+        : (testFailures.length ? [] : [envProblem
+          // Say WHAT the org rejected instead of only that it rejected something:
+          // with no component rows this is the only text there is, and it is the
+          // same string the detection below parses.
+          ? `Deploy reported failure with no per-component details: ${envProblem}`
+          : 'Deploy reported failure with no per-component details.']);
       const testLines = testFailures.map(t => {
         // Apex stack traces read "Class.Foo.testBar: line 12, column 1".
         const pos = /line (\d+)(?:, column (\d+))?/.exec(t.stackTrace ?? '');
@@ -2002,8 +2092,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // extend, but the "referenced but not in your workspace" diagnosis is
       // useful for every failed deploy, and it's the only feedback the user gets
       // when the missing dependency isn't in the workspace at all.
+      // Every failure text this result carries: the per-component rows PLUS the
+      // request-level message — which is all there is when the org rejected the
+      // deploy without naming components, the case that used to reach the
+      // detector as an empty list and produce silence. One list feeds both the
+      // diagnosis and the suggestion candidates, so the card can't offer a
+      // suggestion the diagnosis doesn't know about (or the reverse). The
+      // envelope row has no `from` (no component owns it); the card renders that
+      // as a plain "add Type:Name".
+      const problemRows: Array<{ from?: string; problem: string }> = failures.map(f => ({
+        from: `${fileType(f)}:${f.fullName}`,
+        problem: fileProblem(f) ?? ''
+      }));
+      if (envProblem) problemRows.push({ problem: envProblem });
       const deps = detectMissingDependencies(
-        failures.map(f => fileProblem(f) ?? ''),
+        problemRows.map(row => row.problem),
         this.items,
         new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
       );
@@ -2023,11 +2126,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // keeps the authority: liveSuggestions holds the server-side truth the
       // webview's clicks are validated against.
       const suggest = retryKeys && !ctx.retry?.sourceDir
-        ? buildSuggestionCandidates(
-            failures.map(f => ({ from: `${fileType(f)}:${f.fullName}`, problem: fileProblem(f) ?? '' })),
-            this.items,
-            new Set(retryKeys)
-          )
+        ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys))
         : [];
       let suggestPayload: { id: string; candidates: SuggestionCandidateInfo[]; unresolved: string[] } | undefined;
       if (suggest.length && ctx.retry) {
@@ -2099,7 +2198,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       report(msg);
       this.postProgress(`${progressTitle}: ${msg}`);
     });
-    const prep = verb === 'Validate' ? 'against' : 'to';
+    const prep = orgPrep(verb);
     if (outcome.kind === 'lost') {
       this.endCmd(cmdId, false, Date.now() - start);
       this.reportDeployLostContact(jobId, orgLabel, verb);
@@ -2223,7 +2322,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   ): MissingDependencies | undefined {
     if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
       this.endCmd(ctx.cmdId, false, Date.now() - ctx.start);
-      this.reportCancelled(`${ctx.verb} ${ctx.validateOnly ? 'against' : 'to'} ${ctx.orgLabel}`, 'The org cancelled the deploy.');
+      this.reportCancelled(`${ctx.verb} ${orgPrep(ctx.verb)} ${ctx.orgLabel}`, 'The org cancelled the deploy.');
       return undefined;
     }
     return this.reportDeployResult(result, ctx);
@@ -2345,7 +2444,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  synthesized from the report (itemsFromReport). */
   private async reattachDeployJob(job: ActiveDeployJob): Promise<void> {
     const root = this.workspaceRoot ?? process.cwd();
-    const prep = job.verb === 'Validate' ? 'against' : 'to';
+    const prep = orgPrep(job.verb);
     const cmdId = this.beginCmd(`sf project deploy report --job-id ${job.jobId} --target-org ${job.org}`);
     const start = Date.now();
     const progressTitle = `Reattaching to ${job.verb.toLowerCase()} of ${job.noun} ${prep} ${job.orgLabel}`;
@@ -2359,12 +2458,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           { jobId: job.jobId, org: job.org, orgLabel: job.orgLabel, root, verb: job.verb, noun: job.noun, cmdId, start, progressTitle }, report,
           result => {
             const items = this.itemsFromReport(result);
+            // The persisted verb is the ONLY record that this job was check-only
+            // (a validation) once the original run's opts are gone — read once, for
+            // both the card and its retry, so the two can never disagree.
+            const modes = verbModes(job.verb);
             this.reportPolledDeploy(result, {
               items, orgOnlySkipped: [], orgLabel: job.orgLabel, org: job.org,
-              noun: job.noun, cmdId, start, validateOnly: job.verb === 'Validate', verb: job.verb,
+              noun: job.noun, cmdId, start, ...modes, verb: job.verb,
               // Reattached cards synthesize their component list from the report —
               // retry re-deploys that set under the CURRENT panel defaults.
-              retry: { keys: items.map(i => `${i.type}:${i.name}`), validateOnly: job.verb === 'Validate' }
+              retry: { keys: items.map(i => `${i.type}:${i.name}`), ...modes }
             });
           }
         );
@@ -2660,45 +2763,33 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const items: MetadataItem[] = types.flatMap(t => t.members.map(m => ({ type: t.type, name: m, filePath: '', files: [] })));
       const noun = `manifest ${basename} — ${typeCount} type${typeCount === 1 ? '' : 's'}, ${memberCount} member${memberCount === 1 ? '' : 's'}`;
 
-      // Test-level chain, identical to runDeploy minus the validate-only branch (a
-      // manifest deploy is always the real thing): the panel's live pick, then the
-      // configured default, then the smart fallback (RunLocalTests on prod).
-      const testLevel: TestLevel = this.testLevel
-        ?? this.configuredTestLevel()
-        ?? (isProd ? 'RunLocalTests' : 'NoTestRun');
-      let runTests: string[] = [];
-      if (testLevel === 'RunSpecifiedTests') {
-        const candidates = this.runTests ?? [];
-        // Same CLI-argv safety filter as runDeploy: reject anything that isn't a
-        // bare Apex identifier before it becomes a `--tests` token.
-        runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
-        if (runTests.length < candidates.length) {
-          this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
-        }
-        if (runTests.length === 0) {
-          vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
-          return; // early return before the confirm modal — releaseBusy() in the outer finally covers this
-        }
-      }
+      // Same resolver as the selection deploy — a second copy of the chain is a
+      // second place for the confirm note to drift from what actually runs. A
+      // manifest deploy is always the real thing, so it passes no validateOnly and
+      // carries no per-call level: the panel's live pick, then the configured
+      // default, then the smart fallback (RunLocalTests on prod).
+      const plan = this.resolveTestPlan({}, isProd);
+      // resolveTestPlan already warned (RunSpecifiedTests with no valid class
+      // name) — early return before the confirm modal, releaseBusy() in the outer
+      // finally covers this.
+      if (!plan) return;
+      const { testLevel, runTests, testNote } = plan;
 
-      const testNote = testLevel === 'NoTestRun' ? ''
-        : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
-        : `\n\nTests: ${testLevel}`;
-
-      const confirm = isProd
-        ? await vscode.window.showWarningMessage(
-            `⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\nThis change will be live immediately.${testNote}`,
-            { modal: true, detail: orgInfo?.instanceUrl ?? '' },
-            'Deploy to PROD'
-          )
-        : await vscode.window.showWarningMessage(
-            `Deploy ${noun} — to ${orgLabel}?${testNote}`,
-            { modal: true },
-            'Deploy'
-          );
+      // Same rule as runDeploy: read the conflict override BEFORE the confirm (a
+      // manifest deploy passes it too) so the modal names the value this run uses.
+      const ignoreConflicts = this.ignoreDeployConflicts();
+      // Built by the SAME builder as the selection deploy rather than assembled
+      // inline here: a second copy of the detail assembly is a second place for
+      // the overwrite notice to go missing, and this one is only ever exercised
+      // by a manifest deploy. A manifest deploy is always the real thing and
+      // never queues, hence validateOnly off and queued false.
+      const modal = this.deployConfirmModal(
+        { noun, orgLabel, isProd, validateOnly: false, testNote, instanceUrl: orgInfo?.instanceUrl, ignoreConflicts },
+        false
+      );
+      const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
       if (!confirm) return;
 
-      const ignoreConflicts = this.ignoreDeployConflicts();
       const testArg = testLevel !== 'NoTestRun'
         ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
         : '';
@@ -3826,6 +3917,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (Array.isArray(persistable.lines) && persistable.lines.length > 100) {
       persistable.lines = [...persistable.lines.slice(0, 100), `… ${persistable.lines.length - 100} more (truncated in history)`];
     }
+    // Same bloat bound for a button that carries a key list ("Select these N"):
+    // 50 cards × an unbounded deploy set is state-DB weight nobody asked for.
+    // Truncating the list would leave a restored button promising N while
+    // selecting fewer, so the oversized BUTTON is dropped from the persisted copy
+    // instead — the live card, which is where the click normally happens, keeps it.
+    const buttons = persistable.buttons;
+    if (Array.isArray(buttons)) {
+      const kept = buttons.filter(b => {
+        const keys = (b as { send?: { keys?: unknown } } | null)?.send?.keys;
+        return !Array.isArray(keys) || keys.length <= HISTORY_BUTTON_KEYS_MAX;
+      });
+      if (kept.length !== buttons.length) persistable.buttons = kept;
+    }
     this.cardHistoryCache = [persistable, ...this.cardHistory()].slice(0, CARD_HISTORY_MAX);
     // A lost write costs one history entry — log, don't surface.
     void Promise.resolve(this.context.workspaceState.update(CARD_HISTORY_KEY, this.cardHistoryCache))
@@ -4341,6 +4445,48 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       ]
     };
   }
+
+  /** Card `buttons` for a SUCCESSFUL deploy/validate: one control that puts exactly
+   *  the components of that run back into the tree selection. Without it a
+   *  follow-up action (diff what just went up, retrieve it back, redeploy after one
+   *  more edit) means ticking the same rows again by hand — the panel otherwise
+   *  keeps no record of a finished run's contents. The keys ride WITH the card
+   *  because the card outlives both the selection and the window; they are
+   *  re-validated against the live scan on click (selectableScannedKeys), never
+   *  trusted back.
+   *  Only items with LOCAL SOURCE qualify, and the filter lives HERE rather than
+   *  at the call site so no caller can bypass it: a manifest deploy's items come
+   *  from <members> (`ApexClass:*` included) and a reattached job's from the org's
+   *  report, so a button built from those promises a selection the tree cannot
+   *  make and lands on "none of those are in your workspace" — while blaming a
+   *  workspace change that never happened. Spreads to nothing when the run
+   *  touched no local source at all. */
+  private selectDeployedButtons(items: MetadataItem[]): { buttons: Array<{ label: string; send: { type: string; keys: string[] } }> } | Record<string, never> {
+    const keys = items.filter(i => !!i.filePath).map(i => `${i.type}:${i.name}`);
+    if (keys.length === 0) return {};
+    return {
+      buttons: [{
+        label: keys.length === 1 ? 'Select this component' : `Select these ${keys.length}`,
+        send: { type: 'selectDeployed', keys }
+      }]
+    };
+  }
+
+  /** Keys echoed back from a result card, reduced to what can actually be selected
+   *  NOW: strings only, de-duplicated, and present in the current scan WITH local
+   *  source. Two reasons, not one: the message round-trips through the webview
+   *  (so only a real scanned MetadataItem may ever enter a selection that later
+   *  becomes a `--metadata` deploy), and a card is durable history (so it can name
+   *  a component since renamed, deleted, or moved out of the package directories).
+   *  `dropped` counts the losses so the caller can say so instead of quietly
+   *  selecting fewer components than the button promised. */
+  private selectableScannedKeys(raw: unknown, items: MetadataItem[]): { keys: string[]; dropped: number } {
+    const wanted = Array.isArray(raw) ? raw.filter((k): k is string => typeof k === 'string') : [];
+    const scanned = new Set(items.filter(i => !!i.filePath).map(i => `${i.type}:${i.name}`));
+    const unique = [...new Set(wanted)];
+    const keys = unique.filter(k => scanned.has(k));
+    return { keys, dropped: unique.length - keys.length };
+  }
 }
 
 // ---- module-local helpers ----
@@ -4471,6 +4617,94 @@ function isFatalFetchError(err: unknown): boolean {
  *  SfCliCancelledError and are matched before this. */
 function isTimeoutError(err: unknown): boolean {
   return err instanceof SfCliError && /timed out/i.test(err.message);
+}
+
+/** The confirm modal's one-line notice for the conflict override, or undefined when
+ *  the override is off (a silent modal then means the CLI's own conflict protection
+ *  is intact). Worth saying out loud because the setting is machine-scoped: it is
+ *  sticky across every workspace on this machine, so someone who switched it on
+ *  months ago in another project carries it into this one with nothing on screen to
+ *  say so — and the confirm is the last gate before a live org change. Wording
+ *  follows the panel's own "Overwrite org changes" label. A check-only validate gets
+ *  a different sentence: it replaces nothing, what it loses is the conflict check
+ *  that would have flagged newer org changes. `queued` states the run-time semantics
+ *  — the flag is re-read when the queue drains, so this line is a snapshot. */
+function overwriteNotice(ignoreConflicts: boolean, validateOnly: boolean, queued: boolean): string | undefined {
+  if (!ignoreConflicts) return undefined;
+  const body = validateOnly
+    ? 'Overwrite org changes is ON — the conflict check is skipped, so this validation will not flag newer changes in the org (--ignore-conflicts).'
+    : 'Overwrite org changes is ON — newer changes in the org will be replaced (--ignore-conflicts).';
+  return queued ? `${body} The setting is re-read when this queued run starts.` : body;
+}
+
+/** Preposition for a verb in card / progress / toast text: a check-only run
+ *  (validate) goes "against" an org, runs that actually write go "to" it. */
+function orgPrep(verb: DeployVerb): 'against' | 'to' {
+  return verb === 'Validate' ? 'against' : 'to';
+}
+
+/** The retry request a result card carries — built from the options the run
+ *  ACTUALLY used, in one place, because every field here is a promise about what
+ *  a later click re-runs. `validateOnly` is the load-bearing one: Retry and an
+ *  accepted dependency suggestion both re-enter runDeploy through it, so losing it
+ *  turns a check into a real deploy behind a button labelled "Retry validation". */
+export function buildRetryRequest(
+  opts: { validateOnly?: boolean; sourceDir?: string },
+  items: MetadataItem[],
+  testLevel: TestLevel,
+  runTests: string[]
+): RetryRequest {
+  return {
+    keys: items.map(i => `${i.type}:${i.name}`),
+    sourceDir: opts.sourceDir,
+    validateOnly: !!opts.validateOnly,
+    testLevel,
+    runTests: runTests.length ? runTests : undefined
+  };
+}
+
+/** The deploy options a retry-shaped request re-runs with. Shared by every path
+ *  that re-enters runDeploy from a card (Retry, Retry + changed, an accepted
+ *  dependency suggestion) so the check-only mode can't drift between them.
+ *  Strict `=== true`: the request round-trips through the webview and the
+ *  persisted history, so a missing field and a forged truthy value both read as
+ *  "not check-only" — safe only because runDeploy still confirms every run
+ *  against its own modal. `sourceDir` is deliberately NOT handled here: it needs
+ *  the workspace root to be validated against, which is the caller's job. */
+export function deployOptsFromRetry(r: RetryRequest): {
+  validateOnly: boolean; testLevel?: TestLevel; runTests?: string[];
+} {
+  return {
+    validateOnly: r.validateOnly === true,
+    testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
+    runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined
+  };
+}
+
+/** The check-only mode implied by a persisted job's verb. The verb is the ONLY
+ *  record that a reattached job was check-only once the original run's opts are
+ *  gone — without it a reattached validation reports as a deploy that landed, and
+ *  its Retry re-runs as one. */
+export function verbModes(verb: DeployVerb): { validateOnly: boolean } {
+  return { validateOnly: verb === 'Validate' };
+}
+
+/** Cap on the request-level failure text echoed into a card line and fed to the
+ *  dependency detector. Org-controlled, so bounded like every other such string;
+ *  400 leaves room for the sentence that names the type ("Invalid type: Foo__mdt")
+ *  without pasting a whole stack of platform prose into the card. */
+const ENVELOPE_PROBLEM_MAX = 400;
+
+/** The org's REQUEST-level failure text (`errorMessage` on the Metadata API deploy
+ *  status), flattened and length-bounded; '' when the org didn't send one.
+ *  It matters because a deploy CAN fail with no per-component rows at all — the
+ *  card then had nothing but "no per-component details" and dependency detection
+ *  never ran, even though this string routinely carries the same parseable
+ *  "Invalid type: X" wording the per-component problems do. */
+export function envelopeProblem(result: DeployResult): string {
+  const raw = typeof result.errorMessage === 'string' ? result.errorMessage : '';
+  const flat = stripAnsi(raw).replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return flat.length > ENVELOPE_PROBLEM_MAX ? `${flat.slice(0, ENVELOPE_PROBLEM_MAX - 1)}…` : flat;
 }
 
 /** Terminal Metadata API deploy statuses — the poll loop stops on any of these.

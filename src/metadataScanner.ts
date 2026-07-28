@@ -661,7 +661,23 @@ export function detectMissingDependencies(
     // "In field: action - no QuickAction named Account.Foo found"
     // Also matches the destructive-changes variant (org-verified, note the
     // capital and the colon): "No ApexClass named: Foo found".
-    for (const m of problem.matchAll(/[Nn]o ([A-Za-z0-9_]+) named:? ([\w.\-/]+) found/g)) {
+    // The NAME may contain spaces: a Layout fullName always does
+    // ("Account-Account Layout"), so a space-less capture never fired at all for
+    // a profile/permission set referencing a missing layout — no suggestion AND
+    // no unresolved line, just silence. Bounded so the widened capture can't run
+    // off into the surrounding prose: identifier characters only (excludes
+    // newlines, commas, quotes, parentheses), a handful of space-separated words,
+    // each word length-capped, and LAZY + anchored on the literal " found" so it
+    // stops at the first one rather than swallowing everything up to the last.
+    // The FIRST word gets the larger cap because a dotted fullName carries no
+    // space at all: `Object__c.Field__c` is legal at 40 + 1 + 43 characters (more
+    // with namespace prefixes), so a 60-char first word would match NOTHING for
+    // those — the same silence the widening exists to remove. Later words are
+    // prose-sized (a Layout's "Account-Account Layout"), so 60 covers them.
+    // A capture that does pick up a stray word is still safe by construction: it
+    // won't match a scanned item, so it can only ever become display-only
+    // `unresolved` text — never a --metadata key.
+    for (const m of problem.matchAll(/[Nn]o ([A-Za-z0-9_]+) named:? ([\w.\-/]{1,120}(?: [\w.\-/]{1,60}){0,5}?) found/g)) {
       candidates.push({ display: `${m[1]}:${m[2]}`, tries: [{ type: m[1], name: m[2] }] });
     }
     // An Apex class whose own dependency wasn't part of this same batch:

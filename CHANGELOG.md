@@ -3,6 +3,35 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.16.0
+
+- New: **LWC and Aura components get dependency scanning.** "Deploy File + Dependencies" now
+  follows `@salesforce/apex`, `@salesforce/schema`, message-channel and static-resource imports,
+  `c/childComponent` imports and Aura `<c:child>` / `controller=` references — previously it only
+  understood Apex and refused everything else.
+- New: **Select all in the Changed lens.** The Changed view now has its own header with a
+  select-all button (components without local source are skipped). Previously the header only
+  appeared when a base ref was configured.
+- New: **Your selection survives a reload.** Ticked components are remembered with the rest of the
+  panel state instead of having to be rebuilt by hand.
+- New: **Re-select what you just deployed** from the success card, for a quick follow-up action.
+- Changed: **The deploy confirmation always tells you what tests will run** — including
+  `Tests: none (NoTestRun)`, which used to be shown as nothing at all. The test-level picker also
+  spells out what its default resolves to (no tests on a sandbox, RunLocalTests on production).
+- Fixed: **Validate no longer silently runs tests you didn't ask for.** A validation can't skip
+  tests, so picking NoTestRun and clicking Validate now resolves to RunLocalTests and says so,
+  instead of omitting the flag and letting the CLI decide quietly.
+- New: **Production deploys warn when tests are switched off**, since Salesforce rejects that for a
+  production deploy containing Apex.
+- Changed: **The confirmation names the overwrite setting.** When "Overwrite org changes" is on,
+  the modal says so — it's a machine-wide setting that was invisible at the moment you confirmed.
+- Fixed: **Missing layouts now produce suggestions.** Component names containing spaces (every
+  layout, e.g. `Account-Account Layout`) were skipped by the dependency detector, so a permission
+  set or profile referencing a missing layout failed with no suggestion at all.
+- Fixed: **Failures without per-component detail are analysed too** — a deploy rejected with only
+  an overall message now feeds the suggestion flow instead of showing "no per-component details"
+  and stopping there.
+
 ## 0.15.1
 
 - Fixed: **Failure rows show the real component type** — a failing FlexiPage (or any

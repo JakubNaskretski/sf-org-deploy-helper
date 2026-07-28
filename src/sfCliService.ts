@@ -89,6 +89,12 @@ export interface DeployResult {
   numberTestsCompleted?: number;
   numberTestsTotal?: number;
   numberTestErrors?: number;
+  /** Request-level failure text from the Metadata API status. Set when the org
+   *  rejected the deploy as a whole rather than component by component — exactly
+   *  the case where `details.componentFailures`/`files` are empty, so this is the
+   *  ONLY text naming what went wrong (and it carries the same parseable wording,
+   *  e.g. "Invalid type: Foo__mdt"). */
+  errorMessage?: string;
   details?: {
     componentSuccesses?: DeployFileResult[];
     componentFailures?: DeployFileResult[];

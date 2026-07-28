@@ -17,7 +17,10 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
-const { stripApexNoise, extractTokens, resolveLocalDependencies } = require(path.join(__dirname, '..', 'out', 'depGraph.js'));
+const {
+  stripApexNoise, extractTokens, resolveLocalDependencies, canScanDependencies,
+  scanJsStrings, extractLwcModuleRefs, extractLwcTemplateRefs, extractAuraRefs, stripMarkupComments
+} = require(path.join(__dirname, '..', 'out', 'depGraph.js'));
 const p = (...s) => s.join(path.sep);
 
 let failed = 0;
@@ -73,8 +76,97 @@ const SOURCES = new Map([
     'DepFixHelper DepFixQueue Widget__c\n']
 ]);
 
+// ------------------------------------------------------------ bundle fixtures
+// LWC/Aura components are DIRECTORIES: the item carries `files`, and the reader
+// picks the source files out of that list instead of walking the disk. Names are
+// fictional, same corpus as above.
+const bfile = (dir, name) => p('ws', dir, name);
+const bundle = (type, name, dir, names) =>
+  ({ type, name, filePath: p('ws', dir), files: names.map(n => bfile(dir, n)) });
+const src = (dir, name, lines) => SOURCES.set(bfile(dir, name), lines.join('\n') + '\n');
+
+ITEMS.push(
+  bundle('LightningComponentBundle', 'depFixCard', 'lwc/depFixCard',
+    ['depFixCard.js', 'depFixCard.html', 'depFixCard.js-meta.xml', 'depFixCard.css', '__tests__/depFixCard.test.js']),
+  bundle('LightningComponentBundle', 'depFixChild', 'lwc/depFixChild', ['depFixChild.js', 'depFixChild.html']),
+  bundle('LightningComponentBundle', 'depFixTile', 'lwc/depFixTile', ['depFixTile.js']),
+  bundle('LightningComponentBundle', 'depFixHidden', 'lwc/depFixHidden', ['depFixHidden.js']),
+  bundle('LightningComponentBundle', 'depFixLoopA', 'lwc/depFixLoopA', ['depFixLoopA.js']),
+  bundle('LightningComponentBundle', 'depFixLoopB', 'lwc/depFixLoopB', ['depFixLoopB.js']),
+  bundle('AuraDefinitionBundle', 'DepFixPanel', 'aura/DepFixPanel',
+    ['DepFixPanel.cmp', 'DepFixPanelController.js', 'DepFixPanel.cmp-meta.xml', 'DepFixPanel.css']),
+  bundle('AuraDefinitionBundle', 'DepFixBase', 'aura/DepFixBase', ['DepFixBase.cmp']),
+  bundle('AuraDefinitionBundle', 'DepFixHidden', 'aura/DepFixHidden', ['DepFixHidden.cmp']),
+  item('LightningMessageChannel', 'DepFixChannel', 'messageChannels/DepFixChannel.messageChannel-meta.xml'),
+  item('StaticResource', 'DepFixAssets', 'staticresources/DepFixAssets.resource')
+);
+
+// Every import form in one module, each with a scanned target, plus the forms
+// that must resolve to NOTHING: a non-c namespace, a managed (namespaced) Apex
+// import, and specifiers hidden in a line comment, a block comment and a string.
+src('lwc/depFixCard', 'depFixCard.js', [
+  "import { LightningElement, wire } from 'lwc';",
+  "import getRows from '@salesforce/apex/DepFixHelper.getRows';",
+  "import DepFixQueue from '@salesforce/apex/DepFixQueue';",
+  "import SIZE_FIELD from '@salesforce/schema/Widget__c.Size__c';",
+  "import WIDGET_OBJECT from '@salesforce/schema/Widget__c';",
+  "import CHANNEL from '@salesforce/messageChannel/DepFixChannel__c';",
+  "import ASSETS from '@salesforce/resourceUrl/DepFixAssets';",
+  "import DepFixChild from 'c/depFixChild';",
+  "import { NavigationMixin } from 'lightning/navigation';",
+  "import ghost from 'acme/depFixChild';",
+  "import managed from '@salesforce/apex/acme.DepFixQueue.run';",
+  "// import hidden from '@salesforce/apex/AcmeGen1.run';",
+  "/* import blocked from '@salesforce/apex/AcmeGen2.run'; */",
+  'const doc = "import quoted from \'@salesforce/apex/AcmeLoopA.run\'";',
+  // Well-formed specifiers in DATA position: only the module-specifier slot counts.
+  "const note = '@salesforce/apex/AcmeGen2.run';",
+  "const slot = 'c/depFixHidden';"
+]);
+src('lwc/depFixCard', 'depFixCard.html', [
+  '<template>',
+  '  <!-- <c-dep-fix-hidden></c-dep-fix-hidden> -->',
+  '  <lightning-card title="DepFixService"></lightning-card>',
+  '  <c-dep-fix-tile></c-dep-fix-tile>',
+  '</template>'
+]);
+// Never-read bundle files, each holding a scanned name: an unread file must
+// contribute nothing, not merely happen to match nothing.
+src('lwc/depFixCard', 'depFixCard.js-meta.xml', ['<LightningComponentBundle><masterLabel>DepFixService</masterLabel></LightningComponentBundle>']);
+src('lwc/depFixCard', 'depFixCard.css', ['/* DepFixService */', '.card { color: red; }']);
+src('lwc/depFixCard', '__tests__/depFixCard.test.js', ["import spy from '@salesforce/apex/AcmeGen1.run';"]);
+
+src('lwc/depFixChild', 'depFixChild.js', ["import { LightningElement } from 'lwc';"]);
+src('lwc/depFixChild', 'depFixChild.html', ['<template></template>']);
+src('lwc/depFixTile', 'depFixTile.js', ["import ping from '@salesforce/apex/AcmeGen0.ping';"]);
+src('lwc/depFixHidden', 'depFixHidden.js', ["import { LightningElement } from 'lwc';"]);
+src('lwc/depFixLoopA', 'depFixLoopA.js', ["import B from 'c/depFixLoopB';"]);
+src('lwc/depFixLoopB', 'depFixLoopB.js', ["import A from 'c/depFixLoopA';"]);
+
+src('aura/DepFixPanel', 'DepFixPanel.cmp', [
+  '<aura:component controller="DepFixHelper" extends="c:DepFixBase" implements="force:appHostable">',
+  '  <!-- <c:DepFixHidden/> -->',
+  '  <c:depFixTile/>',
+  '  <aura:dependency resource="c:DepFixBase"/>',
+  '  <lightning:card title="DepFixService"/>',
+  '</aura:component>'
+]);
+// An Aura controller reaches Apex through component.get('c.method') — a method
+// on the component, not a class — so the bundle's .js is deliberately not read.
+// $A.createComponent is the one thing that costs (a dynamically created child);
+// it is left to the deploy to report, rather than reading JS with markup rules.
+src('aura/DepFixPanel', 'DepFixPanelController.js', [
+  '({ onInit: function (cmp) {',
+  '  cmp.get("c.load");',
+  '  $A.createComponent("c:DepFixHidden", {}, function (body) { cmp.set("v.body", body); });',
+  '} })'
+]);
+src('aura/DepFixBase', 'DepFixBase.cmp', ['<aura:component/>']);
+src('aura/DepFixHidden', 'DepFixHidden.cmp', ['<aura:component/>']);
+
 const readFile = async fp => SOURCES.get(fp);
 const resolve = (entry, opts, items = ITEMS) => resolveLocalDependencies(entry, items, readFile, opts);
+const byName = name => ITEMS.find(i => i.name === name);
 
 // ------------------------------------------------------------ stripApexNoise
 check('line comment content is blanked, code before/after survives', () => {
@@ -239,6 +331,240 @@ check('case-insensitive matches return the ITEM canonical casing, never the toke
 
 check('an unreadable entry file degrades to no deps, never a throw', async () => {
   const entry = item('ApexClass', 'AcmeMissing', 'classes/AcmeMissing.cls'); // no SOURCES entry
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out, { keys: [], truncated: false });
+});
+
+// ------------------------------------------------------- LWC module scanning
+check('scanJsStrings records specifiers but not ones inside comments', () => {
+  const scan = scanJsStrings("// import a from 'c/depFixChild'\nimport b from 'c/depFixTile';");
+  assert.deepStrictEqual(scan.strings.map(s => s.value), ['c/depFixTile']);
+});
+
+check('a specifier nested in another string is part of THAT literal, never its own', () => {
+  const scan = scanJsStrings('const s = "import a from \'c/depFixChild\'";');
+  assert.deepStrictEqual(scan.strings.map(s => s.value), ["import a from 'c/depFixChild'"]);
+  assert.deepStrictEqual(extractLwcModuleRefs('const s = "import a from \'c/depFixChild\'";'), []);
+});
+
+check('an unterminated literal is cut at the newline, so the next line still reads', () => {
+  const refs = extractLwcModuleRefs("const bad = 'oops\nimport Child from 'c/depFixChild';");
+  assert.deepStrictEqual(refs.map(r => r.tries[0].name), ['depFixChild']);
+});
+
+check('every @salesforce family maps to the component it addresses', () => {
+  const flat = source => extractLwcModuleRefs(source).map(r => r.tries.map(t => `${t.type}:${t.name}`).join('|'));
+  assert.deepStrictEqual(flat([
+    "import a from '@salesforce/apex/AcmeSvc.method';",
+    "import b from '@salesforce/apex/AcmeSvc';",
+    "import c from '@salesforce/schema/Widget__c.Size__c';",
+    "import d from '@salesforce/schema/Widget__c';",
+    "import e from '@salesforce/resourceUrl/AcmeAssets';",
+    "import f from 'c/acmeChild';"
+  ].join('\n')), [
+    'ApexClass:AcmeSvc',
+    'ApexClass:AcmeSvc',
+    'CustomField:Widget__c.Size__c',
+    'CustomObject:Widget__c',
+    'StaticResource:AcmeAssets',
+    'LightningComponentBundle:acmeChild'
+  ]);
+});
+
+check('a messageChannel specifier tries the verbatim name before the __c-stripped one', () => {
+  const refs = extractLwcModuleRefs("import c from '@salesforce/messageChannel/AcmeChannel__c';");
+  assert.deepStrictEqual(refs[0].tries, [
+    { type: 'LightningMessageChannel', name: 'AcmeChannel__c' },
+    { type: 'LightningMessageChannel', name: 'AcmeChannel' }
+  ]);
+});
+
+check('a well-formed specifier in data position is not an import', () => {
+  assert.deepStrictEqual(extractLwcModuleRefs([
+    "const note = '@salesforce/apex/AcmeSvc.run';",
+    "track({ module: 'c/acmeChild' });"
+  ].join('\n')), []);
+});
+
+check('platform, managed and non-c specifiers name nothing', () => {
+  assert.deepStrictEqual(extractLwcModuleRefs([
+    "import { LightningElement } from 'lwc';",
+    "import { NavigationMixin } from 'lightning/navigation';",
+    "import x from 'acme/acmeChild';",
+    "import y from '@salesforce/apex/acme.AcmeSvc.method';",
+    "import z from '@salesforce/label/c.AcmeLabel';",
+    "import u from '@salesforce/user/Id';"
+  ].join('\n')), []);
+});
+
+// ----------------------------------------------------- LWC template scanning
+check('a kebab-case child tag addresses the camelCase bundle; comments and non-c tags do not', () => {
+  const refs = extractLwcTemplateRefs([
+    '<template>',
+    '  <!-- <c-dep-fix-hidden></c-dep-fix-hidden> -->',
+    '  <lightning-card></lightning-card>',
+    '  <c-dep-fix-tile></c-dep-fix-tile>',
+    '</template>'
+  ].join('\n'));
+  assert.deepStrictEqual(refs.map(r => r.tries[0].name), ['depfixtile']);
+});
+
+check('stripMarkupComments blanks the span without fusing the markup around it', () => {
+  const out = stripMarkupComments('<a/><!-- <c:Hidden/> --><b/>');
+  assert.ok(!out.includes('Hidden'), out);
+  assert.ok(/<a\/>\s+<b\/>/.test(out), out);
+});
+
+// ------------------------------------------------------------ Aura scanning
+check('Aura markup: c: references in appearance order, then the Apex controller', () => {
+  const refs = extractAuraRefs([
+    '<aura:component controller="AcmeCtrl" extends="c:AcmeBase" implements="force:appHostable">',
+    '  <!-- <c:AcmeHidden/> -->',
+    '  <c:acmeTile/>',
+    '  <lightning:card title="AcmeSvc"/>',
+    '</aura:component>'
+  ].join('\n'));
+  assert.deepStrictEqual(refs.map(r => r.tries.map(t => `${t.type}:${t.name}`).join('|')), [
+    'AuraDefinitionBundle:AcmeBase|LightningComponentBundle:AcmeBase',
+    'AuraDefinitionBundle:acmeTile|LightningComponentBundle:acmeTile',
+    'ApexClass:AcmeCtrl'
+  ]);
+});
+
+check('a namespace-qualified controller resolves on its last segment', () => {
+  const refs = extractAuraRefs('<aura:component controller="acme.AcmeCtrl"/>');
+  assert.deepStrictEqual(refs, [{ tries: [{ type: 'ApexClass', name: 'AcmeCtrl' }] }]);
+});
+
+// ------------------------------------------------------- bundle resolution
+check('an LWC bundle resolves every declared reference and expands child bundles', async () => {
+  const out = await resolve([byName('depFixCard')]);
+  assert.deepStrictEqual(out, {
+    keys: [
+      // depFixCard.js, in specifier order …
+      'ApexClass:DepFixHelper',
+      'ApexClass:DepFixQueue',
+      'CustomField:Widget__c.Size__c',
+      'CustomObject:Widget__c',
+      'LightningMessageChannel:DepFixChannel',
+      'StaticResource:DepFixAssets',
+      'LightningComponentBundle:depFixChild',
+      // … then depFixCard.html (.js is read before .html) …
+      'LightningComponentBundle:depFixTile',
+      // … then the child bundle's own import.
+      'ApexClass:AcmeGen0'
+    ],
+    truncated: false
+  });
+  // The absent names are the decoys: AcmeGen1/AcmeGen2/AcmeLoopA sit in a
+  // comment or a string, DepFixService only in files that are never read, and
+  // depFixHidden only inside an HTML comment.
+  for (const gone of ['ApexClass:AcmeGen1', 'ApexClass:AcmeGen2', 'ApexClass:AcmeLoopA',
+    'ApexClass:DepFixService', 'LightningComponentBundle:depFixHidden']) {
+    assert.ok(!out.keys.includes(gone), `${gone} should not be included`);
+  }
+});
+
+check('jest files inside a bundle are never read (they are never deployed either)', async () => {
+  const entry = bundle('LightningComponentBundle', 'depFixSpec', 'lwc/depFixSpec',
+    ['depFixSpec.js', '__tests__/depFixSpec.test.js', '__mocks__/apexStub.js']);
+  src('lwc/depFixSpec', 'depFixSpec.js', ["import q from '@salesforce/apex/DepFixQueue.run';"]);
+  src('lwc/depFixSpec', '__tests__/depFixSpec.test.js', ["import a from '@salesforce/apex/AcmeGen1.run';"]);
+  src('lwc/depFixSpec', '__mocks__/apexStub.js', ["import b from '@salesforce/apex/AcmeGen2.run';"]);
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out, { keys: ['ApexClass:DepFixQueue'], truncated: false });
+});
+
+check('a child-component cycle terminates and never reports the entry', async () => {
+  const out = await resolve([byName('depFixLoopA')]);
+  assert.deepStrictEqual(out, { keys: ['LightningComponentBundle:depFixLoopB'], truncated: false });
+});
+
+check('an Aura bundle resolves c: tags (Aura or LWC) and its Apex controller', async () => {
+  const out = await resolve([byName('DepFixPanel')]);
+  assert.deepStrictEqual(out, {
+    keys: [
+      'AuraDefinitionBundle:DepFixBase',      // extends="c:DepFixBase"
+      'LightningComponentBundle:depFixTile',  // <c:depFixTile/> — an Aura tag can address an LWC
+      'ApexClass:DepFixHelper',               // controller="DepFixHelper"
+      'ApexClass:AcmeGen0',                   // via the tile's own import
+      'ApexClass:DepFixQueue'                 // via the controller class
+    ],
+    truncated: false
+  });
+  // DepFixService appears only in the bundle's controller .js and in a title
+  // attribute; DepFixHidden only inside a markup comment.
+  assert.ok(!out.keys.includes('ApexClass:DepFixService'), out.keys.join(','));
+  assert.ok(!out.keys.includes('AuraDefinitionBundle:DepFixHidden'), out.keys.join(','));
+});
+
+check('bundle references resolve case-insensitively and return the ITEM casing', async () => {
+  const entry = bundle('LightningComponentBundle', 'depFixCase', 'lwc/depFixCase', ['depFixCase.js']);
+  src('lwc/depFixCase', 'depFixCase.js', [
+    "import q from '@salesforce/apex/DEPFIXQUEUE.run';",
+    "import child from 'c/DEPFIXCHILD';",
+    "import f from '@salesforce/schema/WIDGET__C.SIZE__C';"
+  ]);
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, [
+    'ApexClass:DepFixQueue',
+    'LightningComponentBundle:depFixChild',
+    'CustomField:Widget__c.Size__c'
+  ]);
+});
+
+check('a declared reference to a platform name is still excluded', async () => {
+  // Decoys again: without a scanned Account/Account.Name, [] would also mean "absent".
+  const decoys = [
+    item('CustomObject', 'Account', 'objects/Account'),
+    item('CustomField', 'Account.Name', 'objects/Account/fields/Name.field-meta.xml')
+  ];
+  const entry = bundle('LightningComponentBundle', 'depFixPlat', 'lwc/depFixPlat', ['depFixPlat.js']);
+  src('lwc/depFixPlat', 'depFixPlat.js', [
+    "import n from '@salesforce/schema/Account.Name';",
+    "import a from '@salesforce/schema/Account';",
+    "import s from '@salesforce/schema/Widget__c.Size__c';"
+  ]);
+  const out = await resolve([entry], undefined, [...ITEMS, ...decoys]);
+  assert.deepStrictEqual(out.keys, ['CustomField:Widget__c.Size__c']);
+});
+
+// ------------------------------------------------------------- bundle caps
+check('maxBundleFiles trims the read list (in rank/path order) and flags truncated', async () => {
+  // `files` is deliberately unsorted: the reader orders it, the scan does not.
+  const entry = bundle('LightningComponentBundle', 'depFixWide', 'lwc/depFixWide',
+    ['extra.html', 'depFixWide.html', 'depFixWide.js']);
+  src('lwc/depFixWide', 'depFixWide.js', ["import g from '@salesforce/apex/AcmeGen0.ping';"]);
+  src('lwc/depFixWide', 'depFixWide.html', ['<template><c-dep-fix-child></c-dep-fix-child></template>']);
+  src('lwc/depFixWide', 'extra.html', ['<template><c-dep-fix-tile></c-dep-fix-tile></template>']);
+  const cut = await resolve([entry], { maxBundleFiles: 1 });
+  assert.deepStrictEqual(cut, { keys: ['ApexClass:AcmeGen0'], truncated: true });
+  const whole = await resolve([entry], { maxBundleFiles: 3 });
+  assert.deepStrictEqual(whole, {
+    keys: ['ApexClass:AcmeGen0', 'LightningComponentBundle:depFixChild', 'LightningComponentBundle:depFixTile'],
+    truncated: false
+  });
+});
+
+check('the depth cap applies to bundle expansion too', async () => {
+  const out = await resolve([byName('depFixCard')], { maxDepth: 1 });
+  assert.strictEqual(out.keys.length, 8); // everything depFixCard itself declares
+  assert.ok(!out.keys.includes('ApexClass:AcmeGen0'), out.keys.join(','));
+  assert.strictEqual(out.truncated, true); // the tile's own import is what got cut
+});
+
+// ------------------------------------------------------- scannable-type gate
+check('canScanDependencies accepts exactly the types with readable source', () => {
+  for (const t of ['ApexClass', 'ApexTrigger', 'LightningComponentBundle', 'AuraDefinitionBundle']) {
+    assert.strictEqual(canScanDependencies(t), true, t);
+  }
+  for (const t of ['CustomObject', 'CustomField', 'Layout', 'Flow', 'StaticResource', 'LightningMessageChannel']) {
+    assert.strictEqual(canScanDependencies(t), false, t);
+  }
+});
+
+check('a bundle entry with no readable file degrades to no deps, never a throw', async () => {
+  const entry = bundle('LightningComponentBundle', 'depFixBare', 'lwc/depFixBare', ['depFixBare.js-meta.xml']);
   const out = await resolve([entry]);
   assert.deepStrictEqual(out, { keys: [], truncated: false });
 });

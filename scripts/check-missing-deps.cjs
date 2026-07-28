@@ -525,5 +525,233 @@ check('ORG-VERIFIED: wrong method signature names the callee type', () => {
   assert.deepStrictEqual(out.keys, ['ApexClass:DepProbeBase']);
 });
 
+// ============================================== names that contain a SPACE
+// A Layout fullName is "<Object>-<Layout Name>" and ALWAYS carries a space, so
+// the space-less name capture could never fire: a profile or permission set
+// referencing a layout the org doesn't have produced no suggestion AND no
+// unresolved line — pure silence. The capture is widened, but it stays bounded
+// (no newlines, capped word length, few words, lazy up to the first " found")
+// so it cannot run off into the prose around the message.
+const LAYOUTS = [
+  item('Layout', 'Account-Account Layout', p('layouts', 'Account-Account Layout.layout-meta.xml')),
+  item('Layout', 'Widget__c-Widget Sales Layout', p('layouts', 'Widget__c-Widget Sales Layout.layout-meta.xml'))
+];
+
+check('THE LAYOUT BLIND SPOT: a space-bearing Layout name resolves', () => {
+  const out = detectMissingDependencies(
+    ['In field: layout - no Layout named Account-Account Layout found'],
+    LAYOUTS, new Set(['PermissionSet:Field_Ops']));
+  assert.deepStrictEqual(out.keys, ['Layout:Account-Account Layout']);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('a multi-word Layout name resolves too', () => {
+  const out = detectMissingDependencies(
+    ['no Layout named Widget__c-Widget Sales Layout found'], LAYOUTS, new Set());
+  assert.deepStrictEqual(out.keys, ['Layout:Widget__c-Widget Sales Layout']);
+});
+
+check('a space-bearing name with no local item is REPORTED, not swallowed', () => {
+  // The other half of the fix: silence was the bug, so an absent layout has to
+  // reach the user as text even though nothing can be added to the deploy.
+  const out = detectMissingDependencies(
+    ['no Layout named Ghost__c-Ghost Layout found'], LAYOUTS, new Set());
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['Layout:Ghost__c-Ghost Layout']);
+});
+
+// --- regressions for every wording the widened capture touches -------------
+check('REGRESSION: lowercase "no X named Y found" (FlexiPage/QuickAction) unchanged', () => {
+  const out = run('In field: action - no QuickAction named Account.Foo found');
+  assert.deepStrictEqual(out.keys, ['QuickAction:Account.Foo']);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('REGRESSION: capitalised colon variant "No X named: Y found" unchanged', () => {
+  assert.deepStrictEqual(run('No ApexClass named: MyHelper found').keys, ['ApexClass:MyHelper']);
+});
+
+check('REGRESSION: the wrong-type case still refuses to mint a key', () => {
+  const out = run('no Layout named MyHelper found');
+  assert.deepStrictEqual(out.keys, [], 'MyHelper is an ApexClass, not a Layout');
+  assert.deepStrictEqual(out.unresolved, ['Layout:MyHelper']);
+});
+
+check('REGRESSION: dotted and slashed names still capture whole', () => {
+  assert.deepStrictEqual(run('no QuickAction named account.foo found').keys, ['QuickAction:Account.Foo']);
+  assert.deepStrictEqual(run('no BogusType named Nothing.Here found').unresolved, ['BogusType:Nothing.Here']);
+});
+
+// --- the bounds that keep the widened capture honest -----------------------
+check('the capture stops at the FIRST " found", so two referents stay separate', () => {
+  const out = detectMissingDependencies(
+    ['no ApexClass named MyHelper found, no Layout named Account-Account Layout found'],
+    [...ITEMS, ...LAYOUTS], new Set());
+  assert.deepStrictEqual(out.keys, ['ApexClass:MyHelper', 'Layout:Account-Account Layout']);
+});
+
+check('a newline inside the name is never captured', () => {
+  const out = detectMissingDependencies(
+    ['no Layout named Account-Account\nLayout found'], LAYOUTS, new Set());
+  assert.deepStrictEqual(out.keys, [], 'a name may not span lines');
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('an absurdly long name is not captured at all', () => {
+  const out = run(`no Layout named ${'A'.repeat(300)} found`);
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, [], 'the per-word cap refuses it outright');
+});
+
+// The cap above must never sink below a LEGAL fullName, or the widening silently
+// re-creates the silence it removed. A dotted CustomField carries no space, so it
+// is one "word" as far as the pattern is concerned: 40 (object) + 1 + 43 (field)
+// is legal Salesforce, and namespace prefixes push it further. These two pin the
+// bound from below against real items, so a future tightening fails loudly.
+const LONG_NAMES = [
+  item('CustomField',
+    'Acme_Product_Allocation_Detail_Record__c.Estimated_Annual_Recurring_Revenue_Amt__c',
+    p('objects', 'Acme_Product_Allocation_Detail_Record__c', 'fields', 'Estimated_Annual_Recurring_Revenue_Amt__c.field-meta.xml')),
+  item('QuickAction',
+    'Acme_Product_Allocation_Detail_Record__c.Log_Estimated_Revenue_Adjustment',
+    p('quickActions', 'Acme_Product_Allocation_Detail_Record__c.Log_Estimated_Revenue_Adjustment.quickAction-meta.xml'))
+];
+
+check('an 82-char dotted CustomField fullName still resolves to its key', () => {
+  const name = LONG_NAMES[0].name;
+  assert.ok(name.length > 60, `fixture must exceed the per-word cap under test (len ${name.length})`);
+  const out = detectMissingDependencies(
+    [`In field: field - no CustomField named ${name} found`], LONG_NAMES, new Set());
+  assert.deepStrictEqual(out.keys, [`CustomField:${name}`]);
+});
+
+check('a long dotted name with no local item is REPORTED, not silently dropped', () => {
+  const out = detectMissingDependencies(
+    ['no QuickAction named Acme_Product_Allocation_Detail_Record__c.Log_Missing_Revenue_Adjustment found'],
+    LONG_NAMES, new Set());
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved,
+    ['QuickAction:Acme_Product_Allocation_Detail_Record__c.Log_Missing_Revenue_Adjustment']);
+});
+
+check('a space-bearing capture still cannot mint a key for a non-existent item', () => {
+  // The security invariant, re-pinned for the widened pattern: prose picked up
+  // by accident resolves against nothing and can only ever be display text.
+  const out = detectMissingDependencies(
+    ['no Layout named Totally Made Up Layout found', 'no ApexClass named Some Other Thing found'],
+    [...ITEMS, ...LAYOUTS], new Set());
+  assert.deepStrictEqual(out.keys, []);
+  const real = new Set([...ITEMS, ...LAYOUTS].map(i => `${i.type}:${i.name}`));
+  for (const k of out.keys) assert.ok(real.has(k), `minted a key with no local item: ${k}`);
+});
+
+// ================================ request-level ("envelope") failure text
+// A deploy can fail with NO per-component rows at all — the org rejected the
+// request as a whole. The provider used to feed the detector only the
+// per-failure problems, so detection never ran and the card said nothing but
+// "Deploy reported failure with no per-component details." The Metadata API's
+// own `errorMessage` carries the same parseable wording, so it now goes in as
+// one additional problem string; envelopeProblem (panelProvider) is what
+// flattens and bounds it first.
+const { envelopeProblem, DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+const ENVELOPE = { errorMessage: "Deploy failed.\n  MyThing: Invalid type: smth__mdt\r\n" };
+
+check('the envelope text parses exactly like a per-component problem', () => {
+  const out = run(envelopeProblem(ENVELOPE), ['ApexClass:MyThing']);
+  assert.deepStrictEqual(out.keys, ['CustomObject:smth__mdt']);
+});
+
+check('envelopeProblem flattens newlines/tabs/ANSI into one parseable line', () => {
+  assert.strictEqual(envelopeProblem(ENVELOPE), 'Deploy failed. MyThing: Invalid type: smth__mdt');
+  assert.strictEqual(envelopeProblem({ errorMessage: '[31mInvalid type: smth__mdt[0m' }), 'Invalid type: smth__mdt');
+});
+
+check('envelopeProblem is empty for a result that carries no message', () => {
+  for (const r of [{}, { errorMessage: '' }, { errorMessage: '   ' }, { errorMessage: 42 }, { errorMessage: null }]) {
+    assert.strictEqual(envelopeProblem(r), '', JSON.stringify(r));
+  }
+});
+
+check('envelopeProblem bounds org-controlled text', () => {
+  const out = envelopeProblem({ errorMessage: 'x'.repeat(5000) });
+  assert.ok(out.length <= 400, `len ${out.length}`);
+  assert.ok(out.endsWith('…'), out.slice(-5));
+});
+
+check('an envelope naming a missing layout also reaches the detector', () => {
+  // The two holes meet: a permission-set deploy rejected as a whole, naming a
+  // layout — space in the name AND no per-component row.
+  const out = detectMissingDependencies(
+    [envelopeProblem({ errorMessage: 'In field: layout - no Layout named Account-Account Layout found' })],
+    LAYOUTS, new Set(['PermissionSet:Field_Ops']));
+  assert.deepStrictEqual(out.keys, ['Layout:Account-Account Layout']);
+});
+
+// ------------------------------------------------ the WIRING, not the units
+// The two checks above compose envelopeProblem and the detector by hand, in this
+// file — which proves nothing about whether the PRODUCT composes them. The one
+// line that does (`if (envProblem) problemRows.push(...)` in reportDeployResult)
+// is what turns a request-level rejection into a suggestion, so it is pinned
+// here through the real card builder, driven with a stub `this`: the pure helpers
+// run for real, only the side effects (post/toasts/log) are captured.
+function failureCard(result, retryKeys) {
+  const posted = [];
+  const stub = Object.create(DeployPanelProvider.prototype);
+  stub.items = ITEMS;
+  stub.liveSuggestions = new Map();
+  stub.suggestionSeq = 0;
+  stub.post = (m) => posted.push(m);
+  stub.endCmd = () => undefined;
+  stub.failureToast = () => undefined;
+  stub.notifySuccessIfPanelHidden = () => undefined;
+  const deps = DeployPanelProvider.prototype.reportDeployResult.call(stub, result, {
+    items: retryKeys.map(k => item('ApexClass', k.split(':')[1], `classes/${k.split(':')[1]}.cls`)),
+    orgOnlySkipped: [], orgLabel: 'acme-dev', org: 'acme-dev-user',
+    noun: `${retryKeys.length} component`, cmdId: 'c1', start: Date.now(), validateOnly: false,
+    retry: { keys: retryKeys }
+  });
+  return { card: posted.find(m => m.type === 'status').card, deps };
+}
+
+check('WIRING: a rejection with NO component rows still produces a suggestion', () => {
+  // The whole point: before the envelope reached the detector this card said
+  // "no per-component details" and offered nothing at all.
+  const { card, deps } = failureCard(
+    { success: false, status: 'Failed', errorMessage: 'Deploy failed.\n  MyThing: Invalid type: smth__mdt' },
+    ['ApexClass:MyThing']
+  );
+  assert.deepStrictEqual(deps.keys, ['CustomObject:smth__mdt']);
+  assert.deepStrictEqual(card.suggest.candidates.map(c => c.key), ['CustomObject:smth__mdt']);
+  // …and the org's own words are on the card, not just the fact that it failed.
+  assert.ok(card.lines.some(l => typeof l === 'string' && l.includes('Invalid type: smth__mdt')), JSON.stringify(card.lines));
+});
+
+check('WIRING: the envelope is read even when component rows ARE present', () => {
+  // "Every failure, not just the no-rows one" is a decision, not an accident:
+  // restricting it to the empty-rows case loses the referent whenever the org
+  // sends both a row and a request-level message.
+  const { card } = failureCard(
+    {
+      success: false, status: 'Failed', numberComponentErrors: 1,
+      errorMessage: 'Invalid type: smth__mdt',
+      details: { componentFailures: [{ type: 'ApexClass', fullName: 'MyThing', state: 'Failed', problem: 'Dependent class is invalid and needs recompilation: Class MyHelper: bad' }] }
+    },
+    ['ApexClass:MyThing']
+  );
+  const keys = card.suggest.candidates.map(c => c.key);
+  assert.ok(keys.includes('CustomObject:smth__mdt'), `envelope referent lost: ${keys.join(', ')}`);
+  assert.ok(keys.includes('ApexClass:MyHelper'), `component-row referent lost: ${keys.join(', ')}`);
+});
+
+check('WIRING: an org message naming nothing local still leaves the card honest', () => {
+  const { card, deps } = failureCard(
+    { success: false, status: 'Failed', errorMessage: 'no Layout named Ghost__c-Ghost Layout found' },
+    ['ApexClass:MyThing']
+  );
+  assert.deepStrictEqual(deps.unresolved, ['Layout:Ghost__c-Ghost Layout']);
+  assert.strictEqual(card.suggest, undefined, 'nothing resolved locally — no checkbox list to offer');
+  assert.ok(card.lines.some(l => typeof l === 'string' && l.includes('Referenced but not found in your workspace')), JSON.stringify(card.lines));
+});
+
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }
 console.log(`detectMissingDependencies: all ${ran} checks passed`);

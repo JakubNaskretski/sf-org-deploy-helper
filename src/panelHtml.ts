@@ -490,8 +490,8 @@ body.resizing { cursor: row-resize; user-select: none; }
         <span class="spacer"></span>
         <span id="selCount" class="selected-count">0 selected</span>
         <button id="clearSel" class="subtle" style="display:none;" title="Clear selection">✕</button>
-        <select id="testLevel" class="org" title="Apex test level for deploy/validate">
-          <option value="">Tests: default</option>
+        <select id="testLevel" class="org" title="Apex test level for deploy/validate. 'Tests: default' is resolved from the target org — sandbox: no tests (NoTestRun), production: RunLocalTests — unless the Default Test Level setting names one. Validate always runs tests, so NoTestRun becomes RunLocalTests there. The confirm dialog names the level that will actually run.">
+          <option value="" title="Resolved from the target org: sandbox runs no tests (NoTestRun), production runs RunLocalTests. The Default Test Level setting, when set, takes precedence.">Tests: default (sandbox: none, prod: RunLocalTests)</option>
           <option value="NoTestRun">NoTestRun</option>
           <option value="RunSpecifiedTests">RunSpecifiedTests</option>
           <option value="RunLocalTests">RunLocalTests</option>
