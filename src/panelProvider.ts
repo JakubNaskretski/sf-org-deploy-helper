@@ -6,9 +6,10 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
-import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, resolveLocalDependencies } from './depGraph';
+import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 
 type Inbound =
@@ -91,6 +92,26 @@ const CARD_HISTORY_MAX = 50;
 /** Longest key list a card BUTTON may carry into the persisted history (see
  *  pushCardHistory) — matches the 100-line cap applied to `lines` there. */
 const HISTORY_BUTTON_KEYS_MAX = 100;
+/**
+ * Every `send.type` a card button may name today — i.e. the message types the
+ * card-building code above still EMITS, which is a narrower thing than the set
+ * handleMessage can route. `retryDeployChanged` is exactly that gap: the handler
+ * survives (0.15.0 cards persisted with the button, and it may return in some
+ * form), but "Retry + changed vs branch" was removed on user feedback, so a card
+ * restored from before then must not resurrect its button.
+ *
+ * A button naming anything outside this set is dead weight by definition — either
+ * the provider would ignore the message, or, as here, it advertises a feature that
+ * no longer exists. Pruning happens on BOTH read and write of the history, so
+ * cards persisted by an older version heal on their first restore.
+ *
+ * check-card-buttons.cjs re-derives this set from the button literals the code in
+ * this file builds, and fails on any drift — so removing the next feature's
+ * button-builder forces the entry out of here rather than leaving it to rot.
+ */
+export const SUPPORTED_CARD_BUTTON_SENDS: ReadonlySet<string> = new Set([
+  'retryDeploy', 'resumeDeploy', 'restoreBackup', 'discardBackup', 'selectDeployed'
+]);
 /** globalState key for folders whose type resolution failed — the negative cache
  *  (same TTL as learned rules). Without it every NEW session re-paid the serial
  *  30s-per-folder registry calls before a context-menu deploy could even confirm. */
@@ -191,6 +212,30 @@ const BACKUP_KEEP = 5;
  *  backup (see BackupManifest) and is skipped when restoring files. */
 const BACKUP_MANIFEST = 'backup.json';
 
+/** How a metadata scan was asked for. `silent` is the package-directory
+ *  watcher's background rescan: nobody clicked anything, so it may not spawn the
+ *  CLI, may not notify, and may not escalate a discovery failure. */
+interface LoadFilesOptions { silent?: boolean }
+
+/** Debounce window for the package-directory watcher (see RescanScheduler).
+ *  Long enough that a bulk write — `git checkout`, a branch switch, a package
+ *  install — collapses into ONE rescan: those deliver their events microseconds
+ *  to a few milliseconds apart, so any window in the hundreds of ms coalesces
+ *  the whole burst. Short enough that "I just saved a new class" feels
+ *  immediate. Deliberately in the same order as the 500ms Changed-lens debounce
+ *  the panel already uses for saves. */
+const WATCH_DEBOUNCE_MS = 600;
+
+/** How long a SUCCESS hidden-panel notice stays on screen before closing itself.
+ *  Long enough to be noticed by someone looking at the editor rather than the
+ *  corner of the screen; short enough that a run of context-menu deploys doesn't
+ *  leave a stack of verdicts to dismiss by hand — which is the behaviour being
+ *  fixed, since a notification carrying an action button never goes away on its
+ *  own. Only successes take this path: a success needs no follow-up, while a warn
+ *  or a failure the user missed must still be findable (VS Code drops a settled
+ *  progress notification from the Notification Center entirely). */
+const NOTICE_AUTO_DISMISS_MS = 20_000;
+
 interface BackupManifest { at: number; org: string; fileCount: number; workspaceRoot: string }
 /** One backup offered for restore: its on-disk dir plus the manifest fields. */
 interface BackupEntry { dir: string; at: number; org: string; fileCount: number }
@@ -256,6 +301,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     orgLabel: string;
     noun: string;
   }> = [];
+  /** Live watchers over the discovered project's package directories, plus their
+   *  event subscriptions — ALL of it, so re-pointing them at a new project root
+   *  can dispose the previous set whole (see syncFileWatchers). */
+  private fileWatchers: vscode.Disposable[] = [];
+  /** Identity of the currently-watched target set; an unchanged one is left
+   *  alone rather than re-created on every scan. */
+  private watchedTargetsKey?: string;
+  /** Collapses watcher notifications into one debounced, silent rescan. */
+  private readonly rescanScheduler: RescanScheduler;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -291,6 +345,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration('sfOrgDeployWrapper.changedBaseRef')) void this.postChangedComponents();
       if (e.affectsConfiguration('sfOrgDeployWrapper.ignoreDeployConflicts')) this.postIgnoreDeployConflicts();
     }));
+    // Files created or deleted OUTSIDE the panel's own operations (a new Apex
+    // class, a branch switch, a deleted component) used to be invisible until a
+    // manual Refresh Metadata Files: nothing but the four explicit paths ever
+    // rebuilt `this.items`, so the tree, the dependency suggestions and the
+    // Changed lens all disagreed with the disk. The watcher itself is created
+    // per project root by syncFileWatchers; this scheduler is what keeps its
+    // notifications from turning into a rescan storm.
+    this.rescanScheduler = new RescanScheduler({
+      delayMs: WATCH_DEBOUNCE_MS,
+      isBusy: () => this.busy,
+      run: () => this.rescanAfterFileChange(),
+      onError: err => this.output.appendLine(`[watch] rescan failed: ${err instanceof Error ? err.message : String(err)}`)
+    });
+    context.subscriptions.push(
+      this.rescanScheduler,
+      { dispose: () => this.disposeFileWatchers() },
+      { dispose: () => this.dismissTimedNotices() }
+    );
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -436,10 +508,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const deps = await resolveLocalDependencies([match], this.items, async p => {
       try { return await fs.readFile(p, 'utf8'); } catch { return undefined; }
     });
-    const outcome = await this.runDeploy([key, ...deps.keys]);
+    // The confirm modal is the LAST point where this set can be refused, and it
+    // otherwise names only a total — a number the user cannot check, because they
+    // picked one file and the rest was chosen for them. autoIncluded makes the
+    // split explicit there (see deployConfirmModal); the attribution card below
+    // then answers "which, and referenced by what".
+    const outcome = await this.runDeploy([key, ...deps.keys], {
+      autoIncluded: deps.keys.length ? { count: deps.keys.length, entryKey: key } : undefined
+    });
     // Post-hoc visibility: the result card lists every key but doesn't say which
-    // were auto-included — this card does, so a surprising extra component is
-    // traceable to this command rather than looking like panel state gone wrong.
+    // were auto-included or WHY — this card does, so a surprising extra component
+    // is traceable to the reference that pulled it in rather than looking like
+    // panel state gone wrong.
     // An aborted outcome posts nothing: either no deploy happened (dismissed
     // modal, no org) or it was queued — and a queued run's confirm already named
     // the full count, with the eventual result card listing every key.
@@ -449,11 +529,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       card: {
         kind: outcome.status === 'ok' && !deps.truncated ? 'ok' : 'warn',
         title: `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${key}`,
+        meta: 'Each line names the component whose source referenced it.',
         lines: [
           ...(deps.truncated
             ? [`Dependency scan stopped at its caps (depth ${DEFAULT_MAX_DEPTH}, ${DEFAULT_MAX_DEPS} components, ${DEFAULT_MAX_BUNDLE_FILES} files per bundle) — the included set may be incomplete.`]
             : []),
-          ...deps.keys
+          ...formatDependencyAttribution(deps.refs)
         ]
       }
     });
@@ -559,6 +640,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.clearProjectDiscoveryError();
         this.items = scan.items;
         this.workspaceRoot = scan.root;
+        // The panel may never open in this session (context-menu-only use), and
+        // this.items still drives every menu action — so the watcher starts here
+        // too rather than waiting for a panel scan that may never happen.
+        await this.syncFileWatchers(scan.root);
       }
     }
     return !!this.workspaceRoot;
@@ -769,11 +854,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           vscode.window.showInformationMessage('No matching local source file is available. Refresh Files if it exists locally, or retrieve it from the org.');
           return;
         }
+        // `filePath` is a FOLDER for the bundle types (LWC, Aura, CustomObject) —
+        // VS Code refuses to open one as a text document ("... is actually a
+        // directory"), which is what a click on any object row used to produce.
+        const target = await this.openTargetFor(it);
+        if (!target) {
+          vscode.window.showInformationMessage(`${it.type}:${it.name} is a folder with no source file to open — Refresh Files if its contents changed on disk.`);
+          return;
+        }
         // Error-card lines carry the CLI-reported position — land the cursor
         // there (VS Code clamps out-of-range positions to the document end).
         const line = typeof msg.line === 'number' && msg.line > 0 ? msg.line - 1 : undefined;
         const col = typeof msg.column === 'number' && msg.column > 0 ? msg.column - 1 : 0;
-        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(it.filePath), {
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(target), {
           preview: true,
           ...(line !== undefined ? { selection: new vscode.Range(line, col, line, col) } : {})
         });
@@ -999,6 +1092,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.cancelCurrent();
         return;
     }
+  }
+
+  /**
+   * The path an EDITOR may be pointed at for a scanned item. Normally that is
+   * `filePath`; for the directory-typed components (DIRECTORY_ITEM_TYPES) it is the
+   * folder's own definition file instead. The directory check is a stat rather than
+   * a type test so the rule stays true for whatever the scanner records next, and
+   * an unstattable path deliberately returns `filePath` unchanged — a missing file
+   * is not a directory, and openTextDocument's own error names it far better than a
+   * guess here would.
+   *
+   * `filePath` itself is NOT rewritten: deploy targeting, diff, retrieve backups and
+   * findItemForPath all address the folder on purpose.
+   */
+  private async openTargetFor(item: MetadataItem): Promise<string | undefined> {
+    let isDir: boolean;
+    try { isDir = (await fs.stat(item.filePath)).isDirectory(); } catch { return item.filePath; }
+    return isDir ? bundleDefinitionFile(item) : item.filePath;
   }
 
   /**
@@ -1236,24 +1347,69 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  spawned its own serial registry resolution (duplicate `sf` processes and
    *  stacked "Resolving metadata types" progress toasts). */
   private loadFilesInflight?: Promise<void>;
+  /** Whether the in-flight scan is the watcher's silent one. Only meaningful
+   *  while `loadFilesInflight` is set (it is assigned immediately before). */
+  private loadFilesInflightSilent = false;
 
-  private loadFiles(): Promise<void> {
-    return this.loadFilesInflight ??= this.doLoadFiles().finally(() => { this.loadFilesInflight = undefined; });
+  private async loadFiles(opts: LoadFilesOptions = {}): Promise<void> {
+    // A caller that wants the FULL scan must not be answered by the watcher's
+    // silent one, which skips CLI type resolution: let that finish, then run for
+    // real — the same chaining refreshFiles does for its deliberate retry.
+    if (this.loadFilesInflight && this.loadFilesInflightSilent && !opts.silent) {
+      await this.loadFilesInflight.catch(() => undefined);
+    }
+    if (this.loadFilesInflight) return this.loadFilesInflight;
+    this.loadFilesInflightSilent = !!opts.silent;
+    return this.loadFilesInflight = this.doLoadFiles(opts).finally(() => { this.loadFilesInflight = undefined; });
   }
 
-  private async doLoadFiles(): Promise<void> {
+  private async doLoadFiles(opts: LoadFilesOptions = {}): Promise<void> {
     let scan = await scanWorkspace(this.learnedRules());
     if (scan.projectError || !scan.root) {
+      // A background rescan must never ESCALATE a discovery failure. Emptying the
+      // tree, dropping org metadata and popping an error toast because a stray
+      // file event caught the workspace mid-hiccup would destroy panel state the
+      // user never touched — so the silent path keeps the last good list and just
+      // logs. An explicit refresh (or the next panel open) still reports it.
+      if (opts.silent) {
+        this.output.appendLine(`[watch] rescan skipped — ${scan.projectError ?? 'no Salesforce DX project root'}`);
+        return;
+      }
       this.applyProjectDiscoveryFailure(scan.projectError ?? 'Could not determine the Salesforce DX project root.');
       return;
     }
     this.clearProjectDiscoveryError();
+    // A SILENT rescan that came back with nothing, over a list that had components a
+    // moment ago, is far more likely to have caught the workspace mid-write — a
+    // checkout with the package directory momentarily absent, an editor swapping a
+    // tree — than to be the truth about the project. Publishing it empties the tree,
+    // and the webview prunes its persisted selection against what it is handed (auto
+    // Fetch Org keeps org membership non-empty, so that prune stays armed), which
+    // would delete a selection nobody can get back. Keep the last good list and log;
+    // the next watcher event, or an explicit Refresh Metadata Files, still reports a
+    // genuinely empty workspace.
+    if (opts.silent && scan.items.length === 0 && this.items.length > 0) {
+      this.output.appendLine(`[watch] rescan found no metadata under ${scan.root} — keeping the last known ${this.items.length} item(s); Refresh Metadata Files re-checks`);
+      await this.syncFileWatchers(scan.root);
+      return;
+    }
     // Folders no rule covers: resolve their types via the CLI registry, then
     // rescan so they land in the tree. Learned rules AND failures persist, so
     // this spawns `sf` only for genuinely new folders (or after cache expiry).
     const pending = scan.unknownFolders.filter(f => !this.unresolvable().has(foldPathKey(f)));
-    let resolveFailures: string[] = [];
-    if (pending.length && scan.root) {
+    // A silent rescan reports the folders ALREADY known-unresolvable instead of
+    // resolving anything: the banner an earlier real scan earned stays up, and
+    // one that no longer applies (folder deleted) disappears.
+    let resolveFailures: string[] = opts.silent
+      ? scan.unknownFolders.filter(f => this.unresolvable().has(foldPathKey(f))).map(f => path.basename(f))
+      : [];
+    // Resolving unknown folders spawns `sf` behind a progress notification — the
+    // exact interruption a background refresh must not cause — so the silent path
+    // stays on static + learned rules, the same fast-scan discipline
+    // ensureItemsForMenuAction uses. A genuinely new metadata FOLDER TYPE
+    // therefore waits for the next explicit Refresh Metadata Files; every folder
+    // an existing rule covers (the reported case: a new Apex class) lands now.
+    if (!opts.silent && pending.length && scan.root) {
       const scanRoot = scan.root;
       // Under window progress — this spawns `sf` (30s timeout per folder) and
       // would otherwise stall the tree with zero feedback on panel open/refresh.
@@ -1276,10 +1432,105 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const { items, root } = scan;
     this.items = items;
     this.workspaceRoot = root;
-    this.postFiles(items);
+    this.postFiles(items, { silent: !!opts.silent });
     // Keep the "Changed" view honest against the fresh item list. Fire-and-forget:
-    // the method never throws, and the tree must not wait on git.
+    // the method never throws, and the tree must not wait on git. This is also
+    // why the watcher needs no second trigger of its own: git state is separate
+    // from the item list, but every rescan already ends here.
     void this.postChangedComponents();
+    // Point the watcher at whatever project this scan settled on. Re-resolved per
+    // scan (package dirs can change with sfdx-project.json) and a no-op when the
+    // targets are identical.
+    await this.syncFileWatchers(root);
+  }
+
+  /** Keep a watcher over the discovered project's package directories, so files
+   *  created or deleted outside the extension's own operations reach the item
+   *  list. `root` undefined (project discovery failed) means NO watcher at all.
+   *
+   *  An unchanged target set is left running: every scan re-resolves the package
+   *  dirs, and tearing identical watchers down each time would churn live
+   *  registrations for nothing. A changed one disposes the previous watchers —
+   *  and their event subscriptions — BEFORE the new ones exist, which is what
+   *  keeps a re-created watcher from leaking the set it replaces.
+   *
+   *  Never throws: a workspace the watcher API refuses (an unreachable package
+   *  dir, a remote filesystem) must cost the tree nothing beyond staying manual. */
+  private async syncFileWatchers(root: string | undefined): Promise<void> {
+    let targets: WatchTarget[] = [];
+    // Declared outside the try so the failure path can dispose what THIS attempt
+    // built (see the catch).
+    const created: vscode.Disposable[] = [];
+    try {
+      targets = watchTargets(root, root ? await resolvePackageDirs(root) : []);
+      const key = watchTargetsKey(targets);
+      if (key === this.watchedTargetsKey) return;
+      this.disposeFileWatchers();
+      for (const target of targets) {
+        // Create and delete only — ignoreChangeEvents is the `true` in the middle.
+        // Editing a file's BODY cannot add or remove a component, so an onDidChange
+        // rescan would walk the whole package tree on every keystroke-save to
+        // rebuild the identical list. What a save DOES change — git state — is
+        // already covered by onDidSaveTextDocument → scheduleChangedRefresh.
+        const watcher = vscode.workspace.createFileSystemWatcher(
+          new vscode.RelativePattern(vscode.Uri.file(target.base), target.pattern),
+          false,
+          true,
+          false
+        );
+        created.push(
+          watcher,
+          watcher.onDidCreate(uri => this.onWatchedPathChanged(uri)),
+          watcher.onDidDelete(uri => this.onWatchedPathChanged(uri))
+        );
+      }
+      this.fileWatchers = created;
+      this.watchedTargetsKey = key;
+      this.output.appendLine(targets.length
+        ? `[watch] watching ${targets.map(t => t.base).join(', ')}`
+        : '[watch] no package directories to watch');
+    } catch (err) {
+      // Half-built state is worse than none: drop whatever was created and leave
+      // the key unset so the next scan retries from scratch. The watchers built HERE
+      // are disposed BY NAME, because `this.fileWatchers` was emptied by
+      // disposeFileWatchers above — disposing only that array would strand every
+      // watcher this attempt had already created: unreachable, but still delivering
+      // events, so each one keeps scheduling rescans that fail here again and strand
+      // another set on top. (Anything already handed to the field is skipped; the
+      // call below disposes those.)
+      for (const d of created) {
+        if (this.fileWatchers.includes(d)) continue;
+        try { d.dispose(); } catch { /* a watcher already torn down by VS Code */ }
+      }
+      this.disposeFileWatchers();
+      this.output.appendLine(`[watch] could not watch the package directories: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private disposeFileWatchers(): void {
+    for (const d of this.fileWatchers) {
+      try { d.dispose(); } catch { /* a watcher already torn down by VS Code */ }
+    }
+    this.fileWatchers = [];
+    this.watchedTargetsKey = undefined;
+  }
+
+  /** One create/delete notification from the package-directory watcher. */
+  private onWatchedPathChanged(uri: vscode.Uri): void {
+    if (!affectsItemList(uri?.fsPath)) return;
+    this.rescanScheduler.schedule();
+  }
+
+  /** The watcher's rescan: SILENT by design — no toast, no progress
+   *  notification, no focus change. The user created or deleted a file; they did
+   *  not ask the panel for anything, so the tree simply becomes correct
+   *  (selection survives untouched beyond the webview's existing stale-key
+   *  prune, which only ever drops keys that no longer exist). */
+  private async rescanAfterFileChange(): Promise<void> {
+    // Discovery failed since the event was queued — the watcher is disposed on
+    // that path, so this is belt-and-braces rather than a live case.
+    if (!this.workspaceRoot) return;
+    await this.loadFiles({ silent: true });
   }
 
   private changedRefreshTimer?: ReturnType<typeof setTimeout>;
@@ -1297,6 +1548,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.workspaceRoot = undefined;
     this.items = [];
     this.resetOrgMetadata();
+    // No valid root means nothing to watch: the package dirs this watcher was
+    // anchored at belong to a project the extension no longer accepts.
+    this.disposeFileWatchers();
     this.postFiles([]);
     // Root ambiguity is a hard blocker, not the dismissible scan notice used for
     // individual metadata folders the registry could not classify.
@@ -1309,9 +1563,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.projectDiscoveryError = undefined;
   }
 
-  private postFiles(items: MetadataItem[]): void {
+  /** Publish the item list to the webview. `silent` marks the watcher's background
+   *  rescan: the webview prunes (and persists) its selection against whatever list it
+   *  is given, and a scan nobody asked for is never authoritative enough to delete a
+   *  selection — a partially-written tree would take every key it happened to miss
+   *  with it. See the `files` handler in panel.js for the other half. */
+  private postFiles(items: MetadataItem[], opts: { silent?: boolean } = {}): void {
     this.post({
       type: 'files',
+      ...(opts.silent ? { silent: true } : {}),
       objectChildTypes: [...OBJECT_CHILD_TYPES],
       items: items.map(i => ({
         type: i.type,
@@ -1528,6 +1788,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  deploy the user already confirmed at enqueue time. Same invariant as
        *  orgOverride: only drainQueue sets it. */
       preConfirmed?: boolean;
+      /** Internal only — set by deployFileWithDeps so the confirm modal can say
+       *  how much of the count the user did NOT pick. Display only: it changes
+       *  one line of modal text and nothing about what deploys, so unlike
+       *  orgOverride/preConfirmed a forged value could not widen anything. */
+      autoIncluded?: { count: number; entryKey: string };
     } = {}
   ): Promise<DeployOutcome> {
     // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
@@ -1599,7 +1864,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // already confirmed it, against this same pinned org, at enqueue time.
       if (!opts.preConfirmed) {
         const modal = this.deployConfirmModal(
-          { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl, ignoreConflicts },
+          {
+            noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
+            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded
+          },
           false
         );
         const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
@@ -1830,25 +2098,26 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private deployConfirmModal(
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
-      instanceUrl?: string; ignoreConflicts: boolean;
+      instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: { count: number; entryKey: string };
     },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
     const overwriteLine = overwriteNotice(ignoreConflicts, validateOnly, queued);
+    const autoLine = autoIncludedNotice(autoIncluded);
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
-        options: { modal: true, detail: [instanceUrl ?? '', overwriteLine, queueNote].filter(Boolean).join('\n') },
+        options: { modal: true, detail: [instanceUrl ?? '', autoLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
     }
     // Below prod: keep the pre-existing shape — with no lines to show at all the
     // `detail` key stays absent rather than becoming an empty string.
-    const rest = [overwriteLine, queueNote].filter(Boolean);
+    const rest = [autoLine, overwriteLine, queueNote].filter(Boolean);
     const detail = isProd
       ? [instanceUrl ?? '', ...rest].filter(Boolean).join('\n')
       : (rest.length > 0 ? rest.join('\n') : undefined);
@@ -1874,7 +2143,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  can't retarget an already-queued deploy. */
   private async enqueueDeploy(
     keys: string[],
-    opts: { sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] }
+    opts: {
+      sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[];
+      /** Display only — see runDeploy. Carried so a "Deploy File + Dependencies"
+       *  that lands on a busy slot discloses the same split at confirm time; it is
+       *  deliberately NOT stored on the queue entry, because drainQueue re-enters
+       *  runDeploy preConfirmed and shows no second modal. */
+      autoIncluded?: { count: number; entryKey: string };
+    }
   ): Promise<void> {
     const root = this.requireRoot();
     if (!root) return;
@@ -1901,7 +2177,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // notice says so rather than pinning the flag (pinning would change which
     // flags a queued deploy actually runs with).
     const modal = this.deployConfirmModal(
-      { noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote, instanceUrl: orgInfo?.instanceUrl, ignoreConflicts: this.ignoreDeployConflicts() },
+      {
+        noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
+        instanceUrl: orgInfo?.instanceUrl, ignoreConflicts: this.ignoreDeployConflicts(),
+        autoIncluded: opts.autoIncluded
+      },
       true
     );
     // Cap BEFORE the modal — confirming a deploy only to be told "queue full"
@@ -2696,6 +2976,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               lines: [...missing.map(i => `${i.type}:${i.name} — not on org`), ...msgLines]
             }
           });
+          this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
         } else {
           const lines: string[] = [];
           for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
@@ -2713,6 +2994,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             }
           });
           if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
+          // Nothing FAILED, but components the user asked for weren't on the org —
+          // a warn card only, so with the panel hidden the skipped ones went unsaid.
+          else if (missing.length > 0) this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${ok.length} retrieved · ${missing.length} not on org`, 'warn');
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
@@ -2934,6 +3218,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 lines: msgLines.length ? msgLines : ['The org returned no components for this manifest.']
               }
             });
+            this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${basename} matched no components on the org`, 'warn');
           } else {
             const lines: string[] = [];
             for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
@@ -3193,6 +3478,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           type: 'status',
           card: { kind: 'warn', title: 'Login completed but returned no username', meta: 'Refreshed the org list — pick the new org from the dropdown.' }
         });
+        // Panel-triggered, but the browser round-trip is long enough for the user to
+        // collapse the sidebar meanwhile — and the success sibling below already
+        // notifies, so leaving this one silent is the asymmetry that reads as a hang.
+        this.notifyIfPanelHidden('Login completed but returned no username — pick the new org from the dropdown', 'warn');
         return;
       }
       await this.applyOrgSelection(username);
@@ -3277,6 +3566,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             lines: preLines
           }
         });
+        // Highly reachable from the context menu: its when-clause matches lwc/aura
+        // paths and both bundle types are DIFF_UNSUPPORTED, so this card was the
+        // ONLY feedback for right-clicking an LWC — invisible with the panel closed.
+        this.notifyIfPanelHidden(nothingDiffableNotice(unsupported.map(i => i.type), orgOnlySkipped.length), 'warn');
         return;
       }
 
@@ -3458,18 +3751,25 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         for (const e of errors) lines.push(`✗ ${e}`);
         for (const w of preLines) lines.push(w);
 
-        const kind = errors.length > 0 ? 'err' : ((missing.length > 0 || unsupported.length > 0) ? 'warn' : 'ok');
+        const outcome = classifyDiffOutcome({
+          opened: opened.length, missing: missing.length, errors: errors.length,
+          unsupported: unsupported.length, attempted: items.length
+        }, orgLabel);
         this.post({
           type: 'status',
-          card: {
-            kind,
-            title: opened.length > 0
-              ? `Diff opened for ${opened.length} component${opened.length === 1 ? '' : 's'} against ${orgLabel}`
-              : (missing.length === items.length ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues against ${orgLabel}`),
-            meta: `${opened.length} opened · ${missing.length} missing · ${errors.length} errors${unsupported.length ? ` · ${unsupported.length} unsupported` : ''}`,
-            lines
-          }
+          card: { kind: outcome.kind, title: outcome.title, meta: outcome.meta, lines }
         });
+        // The whole verdict lived in that card, so with the panel hidden a diff that
+        // opened nothing was a dead click. Opened editors need no toast — they are
+        // the feedback — which is why this is classified rather than unconditional.
+        if (outcome.notify === 'warn') this.notifyIfPanelHidden(outcome.title, 'warn');
+        // In-band retrieve errors get the failure treatment (details mirrored into
+        // the output channel), but gated on the panel being hidden: unlike the
+        // deploy/retrieve failure paths, this one never toasted, and a visible panel
+        // is already showing the same err card and lines.
+        else if (outcome.notify === 'err' && !this.view?.visible) {
+          this.failureToast(`Diff against ${orgLabel}: ${errors.length} error${errors.length === 1 ? '' : 's'}.`, lines);
+        }
       });
       } catch (err) {
         // Org-labelled so the exception card is attributable in the mixed-org history.
@@ -3833,18 +4133,84 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'progress', text });
   }
 
-  /** Visible success confirmation when the panel isn't open — e.g. a deploy/retrieve
-   *  fired from the Explorer or editor right-click menu, where the result card would
-   *  otherwise land in a hidden webview and read as "no feedback". Mirrors the error
-   *  path's notification + action button; offers to open the panel for the details. */
+  /** Success-kind entry point for notifyIfPanelHidden — the name deploy, quick deploy,
+   *  retrieve, manifest retrieve, delete, login and backup restore call, so a success
+   *  call site can never be misread as reporting a problem. */
   private notifySuccessIfPanelHidden(message: string): void {
+    this.notifyIfPanelHidden(message, 'ok');
+  }
+
+  /** Visible verdict when the panel isn't open — e.g. a deploy/retrieve/diff fired
+   *  from the Explorer or editor right-click menu, where the result card would
+   *  otherwise land in a hidden webview and read as "no feedback". `this.view` is
+   *  undefined until the panel is first revealed, so this covers both never-opened
+   *  and open-but-hidden.
+   *  `kind` picks the presentation, and the two are deliberately different
+   *  mechanisms:
+   *  - SUCCESS auto-dismisses (see showTimedNotice). The thing the user asked for
+   *    happened, so nothing has to be chased; a stack of verdicts to close by hand
+   *    is pure cost.
+   *  - WARN keeps the persistent toast and its 'Show Panel' button, exactly like a
+   *    failure. A warn verdict ("Nothing to diff — not on acme-dev") is the whole
+   *    reason this notification exists, and its detail lives on a card in the panel.
+   *    VS Code removes a SETTLED progress notification from the Notification Center
+   *    entirely, so an auto-dismissing warn the user wasn't watching would leave no
+   *    trace and no route back to the card — the reported bug again, one layer down.
+   *  A warn is never dressed as success either way: the status-bar line keeps its
+   *  $(warning) icon and the notification says so in words, so a "Nothing to diff"
+   *  verdict can't read as an accomplishment. */
+  private notifyIfPanelHidden(message: string, kind: 'ok' | 'warn' = 'ok'): void {
     if (this.view?.visible) return;
-    vscode.window.setStatusBarMessage(`$(check) ${message}`, 8000);
-    void vscode.window.showInformationMessage(`SF Deploy: ${message}`, 'Show Panel').then(choice => {
-      if (choice === 'Show Panel') {
-        void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-      }
-    }, () => undefined);
+    const warn = kind === 'warn';
+    vscode.window.setStatusBarMessage(`${warn ? '$(warning)' : '$(check)'} ${message}`, 8000);
+    if (warn) {
+      void vscode.window.showWarningMessage(`SF Deploy (warning): ${message}`, 'Show Panel').then(choice => {
+        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+      }, () => undefined);
+      return;
+    }
+    this.showTimedNotice(`SF Deploy: ${message}`);
+  }
+
+  /** Pending auto-dismiss callbacks for timed notices — invoked early on dispose so
+   *  a shutdown doesn't leave notifications spinning on a dead provider. Created on
+   *  first use; most sessions never show one. */
+  private noticeDismissers?: Set<() => void>;
+
+  /** Show a notification that closes itself after NOTICE_AUTO_DISMISS_MS.
+   *  VS Code has no timeout on showInformationMessage/showWarningMessage and no API
+   *  to dismiss a notification, and a notification carrying an action button stays
+   *  until the user closes it. A progress notification is the one that CAN end on
+   *  its own: it is torn down when its promise settles. The trade is that it can't
+   *  carry a 'Show Panel' button — hence no `cancellable`, and no buttons at all,
+   *  and hence only SUCCESS verdicts come through here (see notifyIfPanelHidden).
+   *  Fire-and-forget: the result paths that call this must return immediately, so
+   *  nothing here is awaited and the body does no work before its timer fires. */
+  private showTimedNotice(title: string): void {
+    void Promise.resolve(vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title },
+      () => new Promise<void>(resolve => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (): void => {
+          if (timer) clearTimeout(timer);
+          this.noticeDismissers?.delete(finish);
+          resolve();
+        };
+        timer = setTimeout(finish, NOTICE_AUTO_DISMISS_MS);
+        // A notice nobody is waiting on must never be the reason the extension host
+        // stays alive. (Absent outside Node, hence the optional call.)
+        timer.unref?.();
+        (this.noticeDismissers ??= new Set()).add(finish);
+      })
+    )).catch(() => undefined);
+  }
+
+  /** Close every outstanding timed notice — the dispose path for showTimedNotice's
+   *  timers. Resolving (rather than only clearing the timer) is what actually takes
+   *  the notification off screen; a cleared timer alone would strand it forever. */
+  private dismissTimedNotices(): void {
+    for (const finish of this.noticeDismissers ? [...this.noticeDismissers] : []) finish();
+    this.noticeDismissers?.clear();
   }
 
   private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn): Promise<void> {
@@ -3862,6 +4228,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       type: 'status',
       card: { kind: 'warn', title: `${action} cancelled`, ...(note ? { meta: note } : {}) }
     });
+    // A bare cancel needs no notification — the user pressed Cancel and the progress
+    // notification vanishing is the acknowledgment. A NOTE is different: it says
+    // something the click does NOT imply (the org-side operation may still be
+    // running), and with the panel hidden the card carrying it is invisible.
+    if (note) this.notifyIfPanelHidden(`${action} cancelled — ${note}`, 'warn');
   }
 
   private postOrgs(): void {
@@ -3898,7 +4269,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!this.cardHistoryCache) {
       const raw = this.context.workspaceState.get<unknown>(CARD_HISTORY_KEY, []);
       this.cardHistoryCache = Array.isArray(raw)
-        ? raw.filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+        ? raw
+          .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+          // Cards outlive the features that made them. A history entry written
+          // while "Retry + changed vs branch" existed still carries that button,
+          // so prune on the way OUT of storage too — pruning only on write would
+          // leave every already-persisted card advertising the removed feature
+          // until it aged off the 50-card cap.
+          .map(c => pruneCardButtons(c))
         : [];
     }
     return this.cardHistoryCache;
@@ -3908,7 +4286,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Strip the quickDeploy affordance from the persisted copy: its validation
     // anchor (`lastValidated`) is in-memory, so after a reload the button would
     // be dead. The LIVE card posted to the webview keeps it.
-    const { quickDeploy: _dropped, ...persistable } = card;
+    const { quickDeploy: _dropped, ...kept } = card;
+    // Then drop any button naming a message the provider no longer offers —
+    // before the size rule below, which only ever asks whether a button is too
+    // heavy, never whether it still means anything.
+    const persistable = pruneCardButtons(kept);
     // Bound the persisted copy: errText can carry full CLI stderr and a card can
     // list hundreds of components — 50 unbounded cards would bloat the state DB.
     if (typeof persistable.errText === 'string' && persistable.errText.length > 8_000) {
@@ -4582,8 +4964,12 @@ function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
 }
 
 /** Metadata types whose MDAPI-format retrieve differs structurally from source format,
- *  making `vscode.diff` against the local source-format file misleading. */
-const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
+ *  making `vscode.diff` against the local source-format file misleading. Exported
+ *  because it is load-bearing beyond diff quality: runDiff hands `item.filePath`
+ *  straight to `vscode.diff`, so every DIRECTORY_ITEM_TYPES member has to be in
+ *  here or that call would pass a folder to an editor — the same wall the openFile
+ *  handler hit. check-open-target.cjs pins the containment. */
+export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
  *  one REST query instead of a Metadata API retrieve round-trip. */
@@ -4598,6 +4984,64 @@ interface ToolingCodeRecord {
   Name?: string;
   NamespacePrefix?: string | null;
   [field: string]: unknown;
+}
+
+/**
+ * Card presentation for a finished diff run, plus whether the verdict needs a
+ * native notification when the panel is hidden. Pure, so the "which outcome may
+ * stay silent" rule is assertable: an opened diff editor IS the feedback, while a
+ * run that opened nothing, or one the org failed part of, would otherwise be a
+ * dead click from the context menu.
+ * `attempted` is the diffable set actually processed (after the >5 cap), which is
+ * what "everything was missing" has to be measured against.
+ */
+export function classifyDiffOutcome(
+  counts: { opened: number; missing: number; errors: number; unsupported: number; attempted: number },
+  orgLabel: string
+): { kind: 'ok' | 'warn' | 'err'; title: string; meta: string; notify: 'none' | 'warn' | 'err' } {
+  const { opened, missing, errors, unsupported, attempted } = counts;
+  const kind = errors > 0 ? 'err' : ((missing > 0 || unsupported > 0) ? 'warn' : 'ok');
+  const title = opened > 0
+    ? `Diff opened for ${opened} component${opened === 1 ? '' : 's'} against ${orgLabel}`
+    : (missing === attempted ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues against ${orgLabel}`);
+  const meta = `${opened} opened · ${missing} missing · ${errors} errors${unsupported ? ` · ${unsupported} unsupported` : ''}`;
+  const notify = errors > 0 ? 'err' : (opened === 0 && kind === 'warn' ? 'warn' : 'none');
+  return { kind, title, meta, notify };
+}
+
+/**
+ * Card with every button whose `send.type` is outside `supported` removed (see
+ * SUPPORTED_CARD_BUTTON_SENDS). A button with no usable `send.type` at all goes
+ * the same way — it could never have posted anything.
+ *
+ * Returns the card UNCHANGED (same reference) when nothing needed dropping, and
+ * omits the `buttons` key entirely rather than leaving an empty array behind, so a
+ * pruned card is indistinguishable from one that never had buttons.
+ */
+export function pruneCardButtons(
+  card: Record<string, unknown>,
+  supported: ReadonlySet<string> = SUPPORTED_CARD_BUTTON_SENDS
+): Record<string, unknown> {
+  const buttons = card.buttons;
+  if (!Array.isArray(buttons)) return card;
+  const kept = buttons.filter(b => {
+    const type = (b as { send?: { type?: unknown } } | null)?.send?.type;
+    return typeof type === 'string' && supported.has(type);
+  });
+  if (kept.length === buttons.length) return card;
+  const { buttons: _dropped, ...rest } = card;
+  return kept.length ? { ...rest, buttons: kept } : rest;
+}
+
+/** Condensed reason for a diff that had nothing to compare at all. The toast has no
+ *  room for the per-item lines — the card behind 'Show Panel' carries those — but a
+ *  single right-clicked file is the common case, so name its type outright. */
+export function nothingDiffableNotice(unsupportedTypes: string[], orgOnlyCount: number): string {
+  const parts: string[] = [];
+  if (unsupportedTypes.length === 1) parts.push(`diff isn't supported for ${unsupportedTypes[0]} yet`);
+  else if (unsupportedTypes.length > 1) parts.push(`${unsupportedTypes.length} unsupported metadata types`);
+  if (orgOnlyCount > 0) parts.push(`${orgOnlyCount} org-only component${orgOnlyCount === 1 ? '' : 's'} (retrieve first)`);
+  return `Nothing to diff — ${parts.join(' · ') || 'nothing comparable was selected'}`;
 }
 
 /** A fetch error that would affect every metadata type (expired auth, wrong/missing
@@ -4635,6 +5079,20 @@ function overwriteNotice(ignoreConflicts: boolean, validateOnly: boolean, queued
     ? 'Overwrite org changes is ON — the conflict check is skipped, so this validation will not flag newer changes in the org (--ignore-conflicts).'
     : 'Overwrite org changes is ON — newer changes in the org will be replaced (--ignore-conflicts).';
   return queued ? `${body} The setting is re-read when this queued run starts.` : body;
+}
+
+/**
+ * Modal detail line for "Deploy File + Dependencies": the one deploy path where
+ * the confirmed set is mostly NOT what the user selected. The count alone
+ * ("Deploy 26 components to …") reads as panel state gone wrong when the user
+ * right-clicked a single file, so name the split — the file they picked, plus how
+ * many the dependency scan added — while the deploy can still be refused.
+ * Undefined for every other path, which keeps their modals byte-for-byte as they
+ * were, and for a scan that added nothing (the count is then simply the truth).
+ */
+export function autoIncludedNotice(auto: { count: number; entryKey: string } | undefined): string | undefined {
+  if (!auto || auto.count <= 0) return undefined;
+  return `Includes ${auto.count} component${auto.count === 1 ? '' : 's'} auto-included as local dependencies of ${auto.entryKey} — the result card lists each one and what referenced it.`;
 }
 
 /** Preposition for a verb in card / progress / toast text: a check-only run

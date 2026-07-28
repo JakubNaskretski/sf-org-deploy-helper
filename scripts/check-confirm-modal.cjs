@@ -440,5 +440,69 @@ check('validate confirm states the tests it cannot skip', () => {
   assert.strictEqual(out.confirmLabel, 'Validate');
 });
 
+// ------------------------------------------------- auto-included dependencies
+// "Deploy File + Dependencies" is the one path where the confirmed set is mostly
+// NOT what the user selected: they right-click ONE file and the scan adds the
+// rest. The count alone can't be judged against that, so the modal names the
+// split — and only there, so every other modal keeps the text pinned above.
+const autoIncludedNotice = require(path.join(__dirname, '..', 'out', 'panelProvider.js')).autoIncludedNotice;
+
+check('the notice names the count and the file the user actually picked', () => {
+  assert.strictEqual(
+    autoIncludedNotice({ count: 25, entryKey: 'ApexClass:OrderSvc' }),
+    'Includes 25 components auto-included as local dependencies of ApexClass:OrderSvc — the result card lists each one and what referenced it.'
+  );
+});
+
+check('a single auto-included component reads singular', () => {
+  assert.ok(/Includes 1 component auto-included/.test(autoIncludedNotice({ count: 1, entryKey: 'ApexClass:A' })));
+});
+
+check('no notice when nothing was auto-included, or on any other deploy path', () => {
+  assert.strictEqual(autoIncludedNotice(undefined), undefined);
+  assert.strictEqual(autoIncludedNotice({ count: 0, entryKey: 'ApexClass:A' }), undefined);
+});
+
+check('the notice reaches the modal detail on the plain sandbox path', () => {
+  const out = modal({ autoIncluded: { count: 25, entryKey: 'ApexClass:OrderSvc' } });
+  assert.ok(/^Includes 25 components auto-included/.test(out.options.detail), out.options.detail);
+  // The message itself is untouched — the count there is still the honest total.
+  assert.strictEqual(out.message, 'Deploy 3 components to acme-dev?');
+});
+
+check('the notice leads the detail block, above the overwrite notice', () => {
+  // It answers "why are there 26 of these?", which has to be read before the
+  // consequences of deploying them.
+  const out = modal({ ignoreConflicts: true, autoIncluded: { count: 25, entryKey: 'ApexClass:OrderSvc' } });
+  const lines = out.options.detail.split('\n');
+  assert.ok(/^Includes 25 components auto-included/.test(lines[0]), out.options.detail);
+  assert.ok(/Overwrite org changes is ON/.test(lines[1]), out.options.detail);
+});
+
+check('on production the notice sits under the instance URL, above the rest', () => {
+  const out = modal({
+    isProd: true, instanceUrl: INSTANCE_URL, ignoreConflicts: true,
+    autoIncluded: { count: 4, entryKey: 'ApexClass:OrderSvc' }
+  });
+  const lines = out.options.detail.split('\n');
+  assert.strictEqual(lines[0], INSTANCE_URL);
+  assert.ok(/^Includes 4 components auto-included/.test(lines[1]), out.options.detail);
+  assert.ok(/Overwrite org changes is ON/.test(lines[2]), out.options.detail);
+});
+
+check('a queued dependency deploy discloses the same split', () => {
+  const out = modal({ autoIncluded: { count: 25, entryKey: 'ApexClass:OrderSvc' } }, true);
+  assert.ok(out.message.startsWith('Queue: Deploy'), out.message);
+  const lines = out.options.detail.split('\n');
+  assert.ok(/^Includes 25 components auto-included/.test(lines[0]), out.options.detail);
+  assert.strictEqual(lines[1], 'Runs after the current operation finishes.');
+});
+
+check('without the field the non-prod modal still omits `detail` entirely', () => {
+  // The pre-existing shape, re-pinned: adding an optional line must not turn the
+  // plainest modal into one carrying an empty detail block.
+  assert.deepStrictEqual(modal().options, { modal: true });
+});
+
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }
 console.log(`deployConfirmModal + resolveTestPlan: all ${ran} checks passed`);

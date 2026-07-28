@@ -115,6 +115,18 @@ export type LearnedRule = FolderRule & { learnedAt: number };
  *  MDAPI→source before a meaningful file-to-file diff. */
 export const OBJECT_CHILD_TYPES: ReadonlySet<string> = new Set(OBJECT_CHILD_RULES.map(r => r.type));
 
+/** Types whose scanned `filePath` is a DIRECTORY — the bundle folder (`lwc/<name>`,
+ *  `aura/<name>`) or the object folder (`objects/<Object>`) — rather than a file.
+ *  That is deliberate: deploy targeting, diff, retrieve backups and findItemForPath
+ *  all address the folder. Anything that hands `filePath` to an editor or to a
+ *  file-only CLI flag must resolve a real file first (bundleDefinitionFile).
+ *  Learned rules can never join this set — deriveRule only ever emits per-file
+ *  rules — so the membership here is complete and static. */
+export const DIRECTORY_ITEM_TYPES: ReadonlySet<string> = new Set([
+  ...RULES.filter(r => r.bundle).map(r => r.type),
+  'CustomObject'
+]);
+
 /** Resolve the package directories from sfdx-project.json or fall back to force-app. */
 export async function resolvePackageDirs(root: string): Promise<string[]> {
   try {
@@ -354,6 +366,46 @@ export function findItemForPath(items: MetadataItem[], absPath: string, platform
   // 3. The containing bundle/folder.
   match = items.find(i => key.startsWith(foldPathKey(i.filePath, platform) + path.sep));
   return match;
+}
+
+/** Extensions that spell a bundle's OWN definition file, best first. One list for
+ *  every directory-typed component, because the resolution rule is the same in
+ *  each case: the file named after the folder. `.object-meta.xml` is the whole of
+ *  CustomObject (there is no `<Object>.object` in source format); `.js` beats
+ *  `.html` for an LWC because the module is where the component is declared and
+ *  its imports are; the Aura entries are the four mutually-exclusive bundle roots
+ *  plus the two token/design bundles that have no `.cmp`. */
+const BUNDLE_DEFINITION_EXTS = ['.object-meta.xml', '.js', '.html', '.cmp', '.app', '.evt', '.intf', '.tokens', '.design'];
+
+/**
+ * The concrete FILE to open for a component whose `filePath` is a directory (see
+ * DIRECTORY_ITEM_TYPES). Resolution is explicit rather than "first file in the
+ * list", because the scan's `files` order is filesystem-dependent and, for a
+ * CustomObject, `files` also carries the decomposed children — opening
+ * `objects/Widget__c/fields/Size__c.field-meta.xml` for a click on `Widget__c`
+ * would show a DIFFERENT component's source and read as a bug of its own.
+ *
+ * Order: `<name><ext>` directly inside the folder for the ranked extensions above,
+ * then any other direct child named `<name>.*`, then the recorded `metaPath`, then
+ * the first listed file. Undefined only when the item lists no files at all — the
+ * caller must then say so instead of handing a directory to an editor.
+ *
+ * Name comparison is case-insensitive: `name` is the folder's own basename, so on
+ * a case-preserving filesystem the two always agree, and folding costs nothing.
+ */
+export function bundleDefinitionFile(
+  item: Pick<MetadataItem, 'name' | 'filePath' | 'metaPath' | 'files'>,
+  platform: NodeJS.Platform = process.platform
+): string | undefined {
+  const dirKey = foldPathKey(item.filePath, platform);
+  const direct = item.files.filter(f => foldPathKey(path.dirname(f), platform) === dirKey);
+  const named = direct.filter(f => path.basename(f).toLowerCase().startsWith(`${item.name.toLowerCase()}.`));
+  for (const ext of BUNDLE_DEFINITION_EXTS) {
+    const want = `${item.name}${ext}`.toLowerCase();
+    const hit = named.find(f => path.basename(f).toLowerCase() === want);
+    if (hit) return hit;
+  }
+  return named[0] ?? item.metaPath ?? direct[0] ?? item.files[0];
 }
 
 /**

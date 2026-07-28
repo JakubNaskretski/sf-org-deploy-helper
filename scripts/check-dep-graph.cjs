@@ -11,6 +11,12 @@
 // component), platform names and entry keys are excluded, BFS is transitive,
 // cycle-safe and deterministic, and both caps (depth / count) report
 // truncation only when they actually cut something.
+//
+// Two later additions are pinned here too, because both exist to make an
+// auto-included set JUDGEABLE rather than merely correct: per-key attribution
+// (which component's source pulled each one in, and at what depth), and the
+// member-position rule that keeps `Obj.Field__c` from also dragging in a
+// same-named CustomObject.
 const path = require('path');
 const assert = require('assert');
 const Module = require('module');
@@ -19,7 +25,8 @@ Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest)
 
 const {
   stripApexNoise, extractTokens, resolveLocalDependencies, canScanDependencies,
-  scanJsStrings, extractLwcModuleRefs, extractLwcTemplateRefs, extractAuraRefs, stripMarkupComments
+  scanJsStrings, extractLwcModuleRefs, extractLwcTemplateRefs, extractAuraRefs, stripMarkupComments,
+  formatDependencyAttribution, DEFAULT_MAX_DEPTH
 } = require(path.join(__dirname, '..', 'out', 'depGraph.js'));
 const p = (...s) => s.join(path.sep);
 
@@ -166,6 +173,11 @@ src('aura/DepFixHidden', 'DepFixHidden.cmp', ['<aura:component/>']);
 
 const readFile = async fp => SOURCES.get(fp);
 const resolve = (entry, opts, items = ITEMS) => resolveLocalDependencies(entry, items, readFile, opts);
+// The result also carries per-key attribution (refs) now. The checks below are
+// about the SET and the cap flag, so they compare exactly those two fields;
+// attribution has its own section at the end, where the `from`/`depth` of each
+// entry is the thing under test rather than incidental.
+const setOf = (out) => ({ keys: out.keys, truncated: out.truncated });
 const byName = name => ITEMS.find(i => i.name === name);
 
 // ------------------------------------------------------------ stripApexNoise
@@ -223,12 +235,12 @@ check('identifiers dedupe case-insensitively in first-appearance order', () => {
 // ------------------------------------------------- transitive chain & cycles
 check('chain A → B → C resolves transitively, entry key excluded', async () => {
   const out = await resolve([ITEMS[0]]); // DepFixService
-  assert.deepStrictEqual(out, { keys: ['ApexClass:DepFixHelper', 'ApexClass:DepFixQueue'], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:DepFixHelper', 'ApexClass:DepFixQueue'], truncated: false });
 });
 
 check('cycle A ⇄ B terminates without repeating either side', async () => {
   const out = await resolve([ITEMS.find(i => i.name === 'AcmeLoopA')]);
-  assert.deepStrictEqual(out, { keys: ['ApexClass:AcmeLoopB'], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:AcmeLoopB'], truncated: false });
 });
 
 check('multi-entry: entry keys are excluded even when they reference each other', async () => {
@@ -288,12 +300,12 @@ check('an identifier inside a string literal is NOT matched', async () => {
 // ------------------------------------------------------------------ depth cap
 check('depth cap stops expansion and reports truncation when it cut something', async () => {
   const out = await resolve([ITEMS[0]], { maxDepth: 1 }); // Service → Helper (→ Queue cut)
-  assert.deepStrictEqual(out, { keys: ['ApexClass:DepFixHelper'], truncated: true });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:DepFixHelper'], truncated: true });
 });
 
 check('depth cap that cuts nothing reports truncated false (boundary is probed, not guessed)', async () => {
   const out = await resolve([ITEMS[0]], { maxDepth: 2 }); // Queue at depth 2 references nothing
-  assert.deepStrictEqual(out, { keys: ['ApexClass:DepFixHelper', 'ApexClass:DepFixQueue'], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:DepFixHelper', 'ApexClass:DepFixQueue'], truncated: false });
 });
 
 // ----------------------------------------------------------------- deps cap
@@ -301,24 +313,24 @@ check('maxDeps cap trims in discovery order and flags truncated', async () => {
   const entry = item('ApexClass', 'AcmeGenRoot', 'classes/AcmeGenRoot.cls');
   SOURCES.set(entry.filePath, 'public class AcmeGenRoot { AcmeGen0 a; AcmeGen1 b; AcmeGen2 c; }\n');
   const out = await resolve([entry], { maxDeps: 2 });
-  assert.deepStrictEqual(out, { keys: ['ApexClass:AcmeGen0', 'ApexClass:AcmeGen1'], truncated: true });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:AcmeGen0', 'ApexClass:AcmeGen1'], truncated: true });
 });
 
 check('a set landing exactly on maxDeps is NOT truncated', async () => {
   const entry = item('ApexClass', 'AcmeGenRoot', 'classes/AcmeGenRoot.cls');
   const out = await resolve([entry], { maxDeps: 3 });
-  assert.deepStrictEqual(out, { keys: ['ApexClass:AcmeGen0', 'ApexClass:AcmeGen1', 'ApexClass:AcmeGen2'], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:AcmeGen0', 'ApexClass:AcmeGen1', 'ApexClass:AcmeGen2'], truncated: false });
 });
 
 // ---------------------------------------------------------- non-Apex entries
 check('a non-Apex entry is never read, even when its file content would match', async () => {
   const out = await resolve([ITEMS.find(i => i.type === 'Layout')]);
-  assert.deepStrictEqual(out, { keys: [], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: [], truncated: false });
 });
 
 check('a CustomObject entry is a leaf too', async () => {
   const out = await resolve([ITEMS.find(i => i.name === 'Widget__c')]);
-  assert.deepStrictEqual(out, { keys: [], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: [], truncated: false });
 });
 
 // --------------------------------------------------------- casing & resilience
@@ -332,7 +344,7 @@ check('case-insensitive matches return the ITEM canonical casing, never the toke
 check('an unreadable entry file degrades to no deps, never a throw', async () => {
   const entry = item('ApexClass', 'AcmeMissing', 'classes/AcmeMissing.cls'); // no SOURCES entry
   const out = await resolve([entry]);
-  assert.deepStrictEqual(out, { keys: [], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: [], truncated: false });
 });
 
 // ------------------------------------------------------- LWC module scanning
@@ -439,7 +451,7 @@ check('a namespace-qualified controller resolves on its last segment', () => {
 // ------------------------------------------------------- bundle resolution
 check('an LWC bundle resolves every declared reference and expands child bundles', async () => {
   const out = await resolve([byName('depFixCard')]);
-  assert.deepStrictEqual(out, {
+  assert.deepStrictEqual(setOf(out), {
     keys: [
       // depFixCard.js, in specifier order …
       'ApexClass:DepFixHelper',
@@ -472,17 +484,17 @@ check('jest files inside a bundle are never read (they are never deployed either
   src('lwc/depFixSpec', '__tests__/depFixSpec.test.js', ["import a from '@salesforce/apex/AcmeGen1.run';"]);
   src('lwc/depFixSpec', '__mocks__/apexStub.js', ["import b from '@salesforce/apex/AcmeGen2.run';"]);
   const out = await resolve([entry]);
-  assert.deepStrictEqual(out, { keys: ['ApexClass:DepFixQueue'], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:DepFixQueue'], truncated: false });
 });
 
 check('a child-component cycle terminates and never reports the entry', async () => {
   const out = await resolve([byName('depFixLoopA')]);
-  assert.deepStrictEqual(out, { keys: ['LightningComponentBundle:depFixLoopB'], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: ['LightningComponentBundle:depFixLoopB'], truncated: false });
 });
 
 check('an Aura bundle resolves c: tags (Aura or LWC) and its Apex controller', async () => {
   const out = await resolve([byName('DepFixPanel')]);
-  assert.deepStrictEqual(out, {
+  assert.deepStrictEqual(setOf(out), {
     keys: [
       'AuraDefinitionBundle:DepFixBase',      // extends="c:DepFixBase"
       'LightningComponentBundle:depFixTile',  // <c:depFixTile/> — an Aura tag can address an LWC
@@ -538,9 +550,9 @@ check('maxBundleFiles trims the read list (in rank/path order) and flags truncat
   src('lwc/depFixWide', 'depFixWide.html', ['<template><c-dep-fix-child></c-dep-fix-child></template>']);
   src('lwc/depFixWide', 'extra.html', ['<template><c-dep-fix-tile></c-dep-fix-tile></template>']);
   const cut = await resolve([entry], { maxBundleFiles: 1 });
-  assert.deepStrictEqual(cut, { keys: ['ApexClass:AcmeGen0'], truncated: true });
+  assert.deepStrictEqual(setOf(cut), { keys: ['ApexClass:AcmeGen0'], truncated: true });
   const whole = await resolve([entry], { maxBundleFiles: 3 });
-  assert.deepStrictEqual(whole, {
+  assert.deepStrictEqual(setOf(whole), {
     keys: ['ApexClass:AcmeGen0', 'LightningComponentBundle:depFixChild', 'LightningComponentBundle:depFixTile'],
     truncated: false
   });
@@ -566,7 +578,116 @@ check('canScanDependencies accepts exactly the types with readable source', () =
 check('a bundle entry with no readable file degrades to no deps, never a throw', async () => {
   const entry = bundle('LightningComponentBundle', 'depFixBare', 'lwc/depFixBare', ['depFixBare.js-meta.xml']);
   const out = await resolve([entry]);
-  assert.deepStrictEqual(out, { keys: [], truncated: false });
+  assert.deepStrictEqual(setOf(out), { keys: [], truncated: false });
+});
+
+// ------------------------------------------------------- member-position rule
+// A bare identifier that only ever appears after a dot is a member of whatever
+// precedes it — a method, a field, an inner or namespaced class — never a
+// separately deployable component here. The deployable thing on such a line is
+// the LEFT side, which is matched on its own.
+check('an identifier seen ONLY after a dot is not offered as a bare identifier', () => {
+  const toks = extractTokens('DepFixHelper.DepFixQueue();');
+  assert.deepStrictEqual(toks.identifiers, ['DepFixHelper']);
+  assert.deepStrictEqual(toks.dottedPairs, ['DepFixHelper.DepFixQueue']);
+});
+
+check('one non-member occurrence anywhere keeps the identifier', () => {
+  // Case-insensitive dedupe folds the type and the variable onto ONE key, so a
+  // per-occurrence rule would delete the real type reference in this shape.
+  const toks = extractTokens('DepFixQueue depFixQueue = svc.DepFixQueue;');
+  assert.ok(toks.identifiers.includes('DepFixQueue'), JSON.stringify(toks.identifiers));
+});
+
+check('member-only rule kills the object false positive on a lookup field', async () => {
+  const entry = item('ApexClass', 'AcmeLookup', 'classes/AcmeLookup.cls');
+  // Widget__c is a scanned CustomObject; here it appears ONLY as a field of
+  // DepFixRule__mdt, so the field is the reference and the object is not.
+  SOURCES.set(entry.filePath, 'public class AcmeLookup { Object v = DepFixRule__mdt.Widget__c; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['CustomObject:DepFixRule__mdt']);
+});
+
+check('a bare sObject token still matches when it is NOT in member position', async () => {
+  const entry = item('ApexClass', 'AcmeBareObj', 'classes/AcmeBareObj.cls');
+  SOURCES.set(entry.filePath, 'public class AcmeBareObj { Widget__c w = new Widget__c(); }\n');
+  assert.deepStrictEqual((await resolve([entry])).keys, ['CustomObject:Widget__c']);
+});
+
+// ------------------------------------------------------------- attribution
+// Every included key must name the component whose SOURCE pulled it in — the
+// whole point of the set being explainable rather than merely correct.
+check('refs name the referrer and the layer, and mirror keys exactly', async () => {
+  const out = await resolve([ITEMS[0]]); // DepFixService → DepFixHelper → DepFixQueue
+  assert.deepStrictEqual(out.refs, [
+    { key: 'ApexClass:DepFixHelper', from: 'ApexClass:DepFixService', depth: 1 },
+    { key: 'ApexClass:DepFixQueue', from: 'ApexClass:DepFixHelper', depth: 2 }
+  ]);
+  assert.deepStrictEqual(out.keys, out.refs.map(r => r.key));
+});
+
+check('a component reached from two places is attributed to the shallowest referrer', async () => {
+  // Both the entry and its helper name DepFixQueue; BFS reaches it from the
+  // entry first, and the dedupe must not later re-attribute it to the helper.
+  const entry = item('ApexClass', 'AcmeTwoWay', 'classes/AcmeTwoWay.cls');
+  SOURCES.set(entry.filePath, 'public class AcmeTwoWay { DepFixQueue q; DepFixHelper h; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.refs, [
+    { key: 'ApexClass:DepFixQueue', from: 'ApexClass:AcmeTwoWay', depth: 1 },
+    { key: 'ApexClass:DepFixHelper', from: 'ApexClass:AcmeTwoWay', depth: 1 }
+  ]);
+});
+
+check('bundle references are attributed to the bundle that declared them', async () => {
+  const out = await resolve([byName('depFixTile')]);
+  assert.deepStrictEqual(out.refs, [
+    { key: 'ApexClass:AcmeGen0', from: 'LightningComponentBundle:depFixTile', depth: 1 }
+  ]);
+});
+
+check('multiple entries attribute each find to the entry that referenced it', async () => {
+  const out = await resolve([ITEMS[1], byName('depFixTile')]); // DepFixHelper + depFixTile
+  assert.deepStrictEqual(out.refs, [
+    { key: 'ApexClass:DepFixQueue', from: 'ApexClass:DepFixHelper', depth: 1 },
+    { key: 'ApexClass:AcmeGen0', from: 'LightningComponentBundle:depFixTile', depth: 1 }
+  ]);
+});
+
+check('an empty result carries an empty refs list, never undefined', async () => {
+  const out = await resolve([ITEMS.find(i => i.type === 'Layout')]);
+  assert.deepStrictEqual(out.refs, []);
+});
+
+check('formatDependencyAttribution reads cause-first and hides depth 1', () => {
+  assert.deepStrictEqual(formatDependencyAttribution([
+    { key: 'ApexClass:DepFixHelper', from: 'ApexClass:DepFixService', depth: 1 },
+    { key: 'ApexClass:DepFixQueue', from: 'ApexClass:DepFixHelper', depth: 2 }
+  ]), [
+    'ApexClass:DepFixHelper — referenced by ApexClass:DepFixService',
+    'ApexClass:DepFixQueue — referenced by ApexClass:DepFixHelper (depth 2)'
+  ]);
+  assert.deepStrictEqual(formatDependencyAttribution([]), []);
+});
+
+check('every included key has exactly one attribution line', async () => {
+  const out = await resolve([byName('depFixCard')]);
+  assert.strictEqual(out.refs.length, out.keys.length);
+  assert.strictEqual(formatDependencyAttribution(out.refs).length, out.keys.length);
+  for (const r of out.refs) assert.ok(r.from && r.depth >= 1, JSON.stringify(r));
+});
+
+// ------------------------------------------------------------- depth default
+check('the default depth follows service → helper → utility and no further', async () => {
+  assert.strictEqual(DEFAULT_MAX_DEPTH, 2);
+  // AcmeD0 → AcmeD1 → AcmeD2 → AcmeD3: the fourth layer is what the default cuts.
+  const chain = ['AcmeD0', 'AcmeD1', 'AcmeD2', 'AcmeD3'].map(n => item('ApexClass', n, `classes/${n}.cls`));
+  for (let i = 0; i < chain.length; i++) {
+    SOURCES.set(chain[i].filePath, `public class ${chain[i].name} { ${chain[i + 1] ? chain[i + 1].name + ' next;' : ''} }\n`);
+  }
+  const out = await resolve([chain[0]], undefined, [...ITEMS, ...chain]);
+  assert.deepStrictEqual(out.keys, ['ApexClass:AcmeD1', 'ApexClass:AcmeD2']);
+  assert.strictEqual(out.truncated, true); // AcmeD3 is exactly what got cut
+  assert.deepStrictEqual(out.refs.map(r => r.depth), [1, 2]);
 });
 
 (async () => {

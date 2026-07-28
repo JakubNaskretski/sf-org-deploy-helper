@@ -27,10 +27,19 @@ import { MetadataItem, SOBJECT_SUFFIX, isPlatformName } from './metadataScanner'
  * MetadataItem; file text can only ever SELECT from the scan, never mint a key.
  */
 
-/** Dependency layers to follow (entry = depth 0). Three covers the realistic
- *  service → helper → utility shape; deeper graphs are better served by a
- *  manifest than by an ever-larger implicit deploy set. */
-export const DEFAULT_MAX_DEPTH = 3;
+/** Dependency layers to follow (entry = depth 0). TWO covers the realistic
+ *  service → helper → utility shape — the entry is the service, its own
+ *  references are depth 1, theirs depth 2 — and deeper graphs are better served
+ *  by a manifest than by an ever-larger implicit deploy set.
+ *
+ *  It was 3, which allowed a FOURTH layer the rationale never claimed. Each Apex
+ *  layer multiplies, and every entry here is a token GUESS, so that extra layer is
+ *  where a one-file deploy turned into the ~25-component set the user could not
+ *  account for. Reduced rather than papered over with heuristics: nothing short of
+ *  a real parser makes a fourth layer of guesses trustworthy, and a miss is the
+ *  cheap failure (the deploy fails and the failure card's suggestions pick it up).
+ */
+export const DEFAULT_MAX_DEPTH = 2;
 /** Cap on auto-included components. Past this size "deploy N components?" in
  *  the confirm modal stops being an informed yes — same reasoning as the
  *  changed-vs-branch retry cap, scaled down because every entry here is a
@@ -102,6 +111,8 @@ export function stripApexNoise(source: string): string {
  *  deduped case-insensitively in first-appearance order — the order is what
  *  makes resolveLocalDependencies' output deterministic. */
 export interface ApexTokens {
+  /** Identifiers eligible to name a TOP-LEVEL component (see extractTokens' member
+   *  rule) — not every identifier in the file. */
   identifiers: string[];
   dottedPairs: string[];
 }
@@ -114,6 +125,19 @@ export interface ApexTokens {
  * locally is CustomField `Object.Field`. Keywords and other non-references are
  * NOT filtered here — they simply match nothing in the scan, which is the
  * cheaper and safer filter.
+ *
+ * MEMBER RULE: an identifier whose every occurrence sits immediately after a `.`
+ * is dropped from `identifiers`. In `a.b`, `b` is a member of `a` — a method, a
+ * field, an inner class, a namespaced class — and none of those is a separately
+ * deployable component in this workspace; whatever IS deployable there is named
+ * by the left side, which is matched on its own. It costs nothing, needs no
+ * grammar (the same one-dot-between-tokens test the pairs already use), and it
+ * removes a false positive that shows up in ordinary code: `Order__c.Customer__c`
+ * used to pull in the CustomObject `Customer__c` on top of the CustomField it
+ * really names. One occurrence anywhere in the file outside member position is
+ * enough to keep the identifier — which matters because the dedupe is
+ * case-insensitive, so in `MyClass myClass = new MyClass();` the type and the
+ * variable are the SAME key and a per-key rule must not lose the type.
  */
 export function extractTokens(source: string): ApexTokens {
   const stripped = stripApexNoise(source);
@@ -121,22 +145,30 @@ export function extractTokens(source: string): ApexTokens {
   const hits: Array<{ text: string; start: number; end: number }> = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(stripped))) hits.push({ text: m[0], start: m.index, end: m.index + m[0].length });
+  // True when the only thing between hits i-1 and i is a single dot.
+  const dotJoined = (i: number): boolean =>
+    i > 0 && /^\s*\.\s*$/.test(stripped.slice(hits[i - 1].end, hits[i].start));
 
-  const identifiers: string[] = [];
+  // Keys in first-appearance order, with the spelling of the first occurrence;
+  // eligibility is decided across ALL occurrences, so the order stays independent
+  // of where the deciding occurrence was.
+  const order: string[] = [];
+  const spelling = new Map<string, string>();
+  const eligible = new Set<string>();
   const dottedPairs: string[] = [];
-  const seenIdent = new Set<string>();
   const seenPair = new Set<string>();
   for (let i = 0; i < hits.length; i++) {
     const ident = hits[i].text;
     const lower = ident.toLowerCase();
-    if (!seenIdent.has(lower)) { seenIdent.add(lower); identifiers.push(ident); }
-    if (i + 1 < hits.length && /^\s*\.\s*$/.test(stripped.slice(hits[i].end, hits[i + 1].start))) {
+    if (!spelling.has(lower)) { spelling.set(lower, ident); order.push(lower); }
+    if (!dotJoined(i)) eligible.add(lower);
+    if (i + 1 < hits.length && dotJoined(i + 1)) {
       const pair = `${ident}.${hits[i + 1].text}`;
       const pairLower = pair.toLowerCase();
       if (!seenPair.has(pairLower)) { seenPair.add(pairLower); dottedPairs.push(pair); }
     }
   }
-  return { identifiers, dottedPairs };
+  return { identifiers: order.filter(k => eligible.has(k)).map(k => spelling.get(k)!), dottedPairs };
 }
 
 /* ------------------------------------------------------------------ bundles
@@ -428,14 +460,42 @@ async function collectBundleRefs(
   return { found, trimmed: ranked.length > maxFiles };
 }
 
+/** One auto-included component, WITH the reason it is in the set. A bare key list
+ *  is unjudgeable: the user picked one file and got back a set they did not
+ *  choose, and "why is ApexClass:Helper here?" has no answer anywhere in the UI.
+ *  Attribution is that answer, and it doubles as the diagnosis when the token
+ *  matcher over-includes — an entry whose `from` makes no sense localises the bad
+ *  match to one file instead of indicting the whole set. */
+export interface LocalDependencyRef {
+  /** `Type:Name` of the included component. */
+  key: string;
+  /** `Type:Name` of the component whose SOURCE referenced it. The first discoverer
+   *  wins, matching the BFS order and the dedupe: a component reached from two
+   *  places is reported once, by the shallowest reference to it. */
+  from: string;
+  /** Layers below the entry — 1 for something the entry itself references. */
+  depth: number;
+}
+
 export interface LocalDependencyResult {
   /** `Type:Name` keys of scanned workspace items the entry's source (transitively)
-   *  references — entry keys excluded, BFS discovery order, deduped. */
+   *  references — entry keys excluded, BFS discovery order, deduped. Derived from
+   *  `refs` so the deploy payload and its explanation can never disagree. */
   keys: string[];
+  /** One entry per key, same order — see LocalDependencyRef. */
+  refs: LocalDependencyRef[];
   /** True when a cap cut something: maxDepth or maxDeps actually dropped a
    *  reference, or maxBundleFiles left part of a bundle unread. Either way the
    *  set may be incomplete. */
   truncated: boolean;
+}
+
+/** One display line per auto-included component, naming the component that
+ *  referenced it. The depth is spelled out only past the first layer: at depth 1
+ *  `from` IS the file the user right-clicked, so "(depth 1)" would only add noise.
+ *  Matches the failure-card suggestion rows' cause-then-effect reading order. */
+export function formatDependencyAttribution(refs: LocalDependencyRef[]): string[] {
+  return refs.map(r => `${r.key} — referenced by ${r.from}${r.depth > 1 ? ` (depth ${r.depth})` : ''}`);
 }
 
 /**
@@ -458,7 +518,8 @@ export interface LocalDependencyResult {
  * item unluckily named `Account`) and, for Apex tokens only, identifiers
  * shorter than 3 chars (one- and two-letter locals like `i`/`db` dominate Apex
  * source and a real component name that short is vanishingly rare — pure noise
- * control).
+ * control). extractTokens has already dropped member-position-only identifiers
+ * (see its MEMBER RULE) before any of this runs.
  *
  * Matched keys carry the ITEM's canonical casing, never the source token's.
  * Cycle-safe via the seen-set (entry keys pre-seeded, so an entry is never
@@ -484,7 +545,7 @@ export async function resolveLocalDependencies(
   const fieldByName = idx.get('CustomField')!;
 
   const seen = new Set<string>(entry.map(e => `${e.type}:${e.name}`));
-  const keys: string[] = [];
+  const refs: LocalDependencyRef[] = [];
   let truncated = false;
 
   // BFS queue of readable items. Depth is monotonically non-decreasing, so
@@ -537,16 +598,18 @@ export async function resolveLocalDependencies(
         truncated = true;
         break outer;
       }
-      if (keys.length >= maxDeps) {
+      if (refs.length >= maxDeps) {
         truncated = true;
         break outer;
       }
       seen.add(depKey);
-      keys.push(depKey);
+      // `current` is the component whose source was just read, so it IS the
+      // referrer — recorded here, at the only point where both sides are known.
+      refs.push({ key: depKey, from: `${current.type}:${current.name}`, depth: depth + 1 });
       // A class or a child bundle can reference further components; a field,
       // object, channel or resource is a leaf.
       if (dep.type === 'ApexClass' || BUNDLE_READ_EXTS.has(dep.type)) queue.push({ item: dep, depth: depth + 1 });
     }
   }
-  return { keys, truncated };
+  return { keys: refs.map(r => r.key), refs, truncated };
 }

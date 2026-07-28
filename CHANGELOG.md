@@ -3,6 +3,29 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.17.0
+
+- New: **The panel notices files you create or delete.** New Apex classes (and any other metadata
+  added outside the extension) now appear on their own instead of staying invisible until you hit
+  Refresh — which also means they can be offered as dependency suggestions. Watching is scoped to
+  your package directories, batched so a branch switch triggers one rescan, and completely silent.
+- Fixed: **Right-click "Diff with Org" no longer does nothing.** When the component isn't on the
+  org — or the file is an LWC/Aura bundle, where diff isn't supported — you now get told, instead
+  of the verdict disappearing because the panel happened to be closed. The same silence affected
+  retrieve, manifest retrieve, cancel and login; all now report.
+- Fixed: **Clicking an object row opens the object.** Custom objects and LWC/Aura bundles are
+  addressed by their folder, so clicking one asked the editor to open a directory and failed. It
+  now opens the component's definition file.
+- Fixed: **Buttons for removed features no longer haunt old cards.** A card saved while a feature
+  existed kept offering its button afterwards; stale buttons are now dropped, including from cards
+  already in your history.
+- Changed: **"Deploy File + Dependencies" explains itself and reaches less far.** Each auto-included
+  component now names what referenced it, the confirmation says how many were added on top of the
+  file you picked, and two sources of over-inclusion were removed: references that only ever appear
+  after a dot, and one dependency layer too many.
+- Changed: **Successful deploy notifications fade after 20 seconds.** Warnings and failures stay
+  until you dismiss them — those are the ones you need to act on.
+
 ## 0.16.0
 
 - New: **LWC and Aura components get dependency scanning.** "Deploy File + Dependencies" now

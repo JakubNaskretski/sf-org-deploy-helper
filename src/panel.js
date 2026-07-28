@@ -64,6 +64,14 @@
     changedKeys: null,       // Set of "Type:Name" with git changes; null = unknown/unavailable
     changedReason: '',       // why change detection is unavailable (when changedKeys is null)
     changedBase: '',         // git ref the Changed lens compares against ('' = uncommitted only)
+    // Signatures of the last APPLIED 'files' / 'changed' payloads (see
+    // filesSignature / changedSignature). Every render replaces the tree's
+    // innerHTML — scroll position and keyboard focus go with it — and the package
+    // directories are now watched, so a payload identical to the one already on
+    // screen arrives whenever anything at all is written under them. null = nothing
+    // rendered yet, so the first payload of each kind always renders.
+    filesSig: null,
+    changedSig: null,
     // Snapshot of the selection taken on ENTERING the Selected lens (IntelliJ
     // commit-window semantics): unchecking a row flips its checkbox but keeps the
     // row visible — instant removal would break double-click (the re-render shifts
@@ -255,6 +263,26 @@
   }
 
   // ---- Message handling ----
+
+  // Identity of an item list AS THE TREE RENDERS IT: the key, plus the two fields a
+  // row actually shows — the file path (row tooltip) and how many files back the
+  // component (the "N files" badge). Deliberately not a deep compare of whole
+  // objects: this runs on every scan, and being wrong in the "not equal" direction
+  // only costs the render that used to happen unconditionally anyway. JSON quoting
+  // is what keeps two different lists from spelling the same signature.
+  function filesSignature(items) {
+    return JSON.stringify(items.map(i => [i.type, i.name, i.filePath || '', (i.files || []).length]));
+  }
+
+  // Identity of a 'changed' payload. Sorted, because the Changed lens is a SET —
+  // two orderings of the same keys render the same rows, and git has no reason to
+  // report them in a stable order. `null` keys (change detection unavailable) is a
+  // state of its own, never an empty list.
+  function changedSignature(msg) {
+    const keys = msg.keys === null ? null : Array.from(msg.keys || []).sort();
+    return JSON.stringify([keys, msg.reason || '', msg.base || '']);
+  }
+
   function handleMessage(msg) {
     switch (msg.type) {
       case 'orgs':
@@ -263,7 +291,10 @@
         renderOrgs();
         renderActions();
         return;
-      case 'files':
+      case 'files': {
+        const sig = filesSignature(msg.items || []);
+        const sameList = state.filesSig !== null && sig === state.filesSig;
+        state.filesSig = sig;
         state.items = msg.items || [];
         state.objectChildTypes = new Set(msg.objectChildTypes || []);
         state.localKeys = new Set(state.items.map(i => `${i.type}:${i.name}`));
@@ -276,22 +307,38 @@
         // Drop selections that no longer exist in either local or org. This is also
         // what vets a selection RESTORED from webview state: it is written back
         // pruned below, so a key deleted between sessions can't survive another reload.
-        // Only a scan that FOUND something may do that. The provider posts `files`
-        // with an empty item list when project discovery fails (multi-root
-        // workspace, sfdx-project.json not synced yet) and org membership is empty
-        // on a fresh webview, so pruning against nothing would delete every
-        // restored key AND persist the deletion — destroying the selection exactly
-        // when the workspace hiccups, with no way back. Keeping it costs nothing:
-        // Deploy/Validate stay disabled until a key is in localKeys, and every
-        // inbound key is re-resolved against the provider's own scan anyway.
-        if (state.items.length > 0 || state.orgKeys.size > 0) {
+        // Two scans may NOT do that:
+        //   - one that found NOTHING. The provider posts `files` with an empty item
+        //     list when project discovery fails (multi-root workspace,
+        //     sfdx-project.json not synced yet) and org membership is empty on a
+        //     fresh webview, so pruning against nothing would delete every restored
+        //     key AND persist the deletion — destroying the selection exactly when
+        //     the workspace hiccups, with no way back.
+        //   - a SILENT one (`msg.silent`), i.e. the package-directory watcher's
+        //     background rescan. Nobody asked for it, and it can catch the tree
+        //     mid-write — a checkout, a branch switch, a bulk write — where a
+        //     PARTIAL list is indistinguishable from a real deletion. Deleting a
+        //     selection the user built by hand on that evidence, and persisting it,
+        //     is unrecoverable; the next explicit Refresh Metadata Files prunes.
+        // Keeping stale keys costs nothing: Deploy/Validate stay disabled until a
+        // key is in localKeys, and every inbound key is re-resolved against the
+        // provider's own scan anyway.
+        let pruned = false;
+        if (!msg.silent && (state.items.length > 0 || state.orgKeys.size > 0)) {
           const valid = new Set([...state.localKeys, ...state.orgKeys]);
-          for (const k of Array.from(state.selected)) if (!valid.has(k)) state.selected.delete(k);
+          for (const k of Array.from(state.selected)) if (!valid.has(k)) { state.selected.delete(k); pruned = true; }
           // Drop stale type-filter entries (allow org types too)
           const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
-          for (const t of Array.from(state.typeFilter)) if (!allKnownTypes.has(t)) state.typeFilter.delete(t);
+          for (const t of Array.from(state.typeFilter)) if (!allKnownTypes.has(t)) { state.typeFilter.delete(t); pruned = true; }
           savePersisted(); // both prunes above are now the persisted truth too
         }
+        // Nothing about the tree changed: the same components, the same rows, and no
+        // prune took anything out of the selection or the type filter. Rendering
+        // anyway would replace the tree's innerHTML — losing scroll position and
+        // moving focus out of the tree — for an identical result. That used to be
+        // rare (four explicit paths rebuilt the list); with the package directories
+        // watched it happens on any write under them, which is most of a working day.
+        if (sameList && !pruned) return;
         renderTypeFilter();
         renderTree();
         renderActions();
@@ -300,6 +347,7 @@
         // instead of leaving a stale clickable row until the panel is reopened.
         renderStatus();
         return;
+      }
       case 'orgMetadata':
         // Remember which org this membership came from — every message derived
         // from it (empty states, badge tooltips) names the org, so a delayed
@@ -347,14 +395,23 @@
         state.scanBanner = msg.message || '';
         renderBanner();
         return;
-      case 'changed':
+      case 'changed': {
+        const sig = changedSignature(msg);
+        const same = state.changedSig !== null && sig === state.changedSig;
+        state.changedSig = sig;
         state.changedKeys = msg.keys === null ? null : new Set(msg.keys || []);
         state.changedReason = msg.reason || '';
         // Base ref (Feature 2): when the provider compares against a git ref it tags
         // the message with `base`; empty/absent = the default uncommitted-only lens.
         state.changedBase = msg.base || '';
+        // Every scan ends by recomputing this lens, so a background rescan would
+        // rebuild the tree here even when the `files` handler above correctly
+        // declined to — same scroll and focus loss, one message later. An identical
+        // change set renders identical rows, so there is nothing to repaint.
+        if (same) return;
         renderTree();
         return;
+      }
       case 'selectKeys': {
         // Batch selection (e.g. "Use open tabs") — same reveal rules as the
         // single-key activeFile select: visible lens, expanded paths, scroll to first.

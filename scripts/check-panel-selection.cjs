@@ -12,7 +12,13 @@
 //      workspace hiccup destroys the selection permanently;
 //   3) bounds and semantics — an unbounded key list is not persisted at all, and
 //      a `selectKeys` message carrying `replace` sets the selection instead of
-//      growing it (a success card's "Select these N" means exactly those N).
+//      growing it (a success card's "Select these N" means exactly those N);
+//   4) what a BACKGROUND rescan may do. The package directories are watched now, so
+//      `files` arrives on any write under them — a scan nobody asked for, which can
+//      catch the tree mid-write. It may not prune (a partial list is
+//      indistinguishable from a deletion, and the prune is persisted), and an
+//      equivalent list may not re-render: every render replaces the tree's
+//      innerHTML, and scroll position and keyboard focus go with it.
 //
 // panel.js is a browser-only IIFE with no exports, so it is run inside a minimal
 // DOM/vscode-API shim and driven the way the provider drives it: by delivering
@@ -329,6 +335,184 @@ check('Select all selects exactly those, with no duplicates', () => {
     p.persisted().selected.slice().sort(),
     [KEY('AcmeInvoiceService'), KEY('AcmeOrderService')].sort()
   );
+});
+
+// ------------------------------------------- 4) what a background rescan may do
+// A watcher-driven rescan is marked `silent`. It is not authoritative: it may add
+// and remove rows, but it may not delete the user's selection, and it may not
+// repaint a tree that would come out identical.
+const SILENT = (names) => ({ ...FILES(names), silent: true });
+// Object identity of what the tree is built from: renderTree clears innerHTML, so a
+// surviving node is proof the tree was NOT rebuilt — which is what scroll position
+// and keyboard focus ride on.
+const rows = (p) => p.el('tree').children[0];
+// Component names rendered as rows (groups are expanded via `expandedGroups`).
+const labels = (p) => {
+  const out = [];
+  p.el('tree').find(e => { if (e.tagName === 'SPAN' && /^Acme/.test(e.textContent)) out.push(e.textContent); return false; });
+  return out;
+};
+const EXPANDED = { ...RESTORED, expandedGroups: ['ApexClass'] };
+
+check('a SILENT rescan may not prune the selection, in memory or on disk', () => {
+  // The transient case this exists for: a checkout, a branch switch, an editor
+  // writing a temp tree — the walk lands mid-write and reports a PARTIAL list,
+  // which is indistinguishable from a real deletion. Acting on it destroys a
+  // selection the user built by hand, and persists the loss.
+  const p = panel(RESTORED);
+  p.deliver(FILES(THREE));
+  p.deliver(SILENT(['AcmeOrderService']));
+  assert.strictEqual(p.liveCount(), 3, 'a background rescan threw the live selection away');
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), THREE.map(KEY).sort(), 'and persisted the loss');
+});
+
+check('…and the next EXPLICIT scan prunes exactly as it always did', () => {
+  const p = panel(RESTORED);
+  p.deliver(FILES(THREE));
+  p.deliver(SILENT(['AcmeOrderService']));
+  p.deliver(FILES(['AcmeOrderService']));
+  assert.strictEqual(p.liveCount(), 1);
+  assert.deepStrictEqual(p.persisted().selected, [KEY('AcmeOrderService')]);
+});
+
+check('a silent rescan still SHOWS what changed on disk', () => {
+  // Not pruning is not the same as not updating: the new class is the bug the
+  // watcher exists for.
+  const p = panel({ ...EXPANDED, selected: [] });
+  p.deliver(FILES(THREE));
+  p.deliver(SILENT([...THREE, 'AcmeShipmentService']));
+  assert.ok(labels(p).includes('AcmeShipmentService'), `new component missing from the tree: ${labels(p).join(', ')}`);
+});
+
+check('a silent rescan does not touch the type filter either', () => {
+  const p = panel({ ...RESTORED, typeFilter: ['ApexTrigger'] });
+  p.deliver(FILES(THREE));                 // explicit: ApexTrigger is stale, it goes
+  assert.deepStrictEqual(p.persisted().typeFilter, []);
+  const q = panel({ ...RESTORED, typeFilter: ['ApexTrigger'] });
+  q.deliver(SILENT(THREE));
+  assert.deepStrictEqual(q.persisted().typeFilter, ['ApexTrigger'], 'a background scan is not proof the type is gone');
+});
+
+check('an identical item list does not rebuild the tree', () => {
+  const p = panel(EXPANDED);
+  p.deliver(FILES(THREE));
+  const before = rows(p);
+  assert.ok(before, 'nothing was rendered to begin with');
+  p.deliver(SILENT(THREE));
+  assert.strictEqual(rows(p), before, 'the tree was rebuilt for an identical list — scroll position and focus are gone');
+  p.deliver(FILES(THREE));
+  assert.strictEqual(rows(p), before, '…and an explicit rescan finding the same thing is no different');
+});
+
+check('a real change renders immediately', () => {
+  const p = panel({ ...EXPANDED, selected: [] });
+  p.deliver(FILES(THREE));
+  const before = rows(p);
+  p.deliver(SILENT([...THREE, 'AcmeShipmentService']));
+  assert.notStrictEqual(rows(p), before, 'a new component must reach the tree at once');
+  p.deliver(SILENT(THREE));
+  assert.deepStrictEqual(labels(p).sort(), THREE.slice().sort(), 'a deleted component must leave it');
+});
+
+check('a change the tree RENDERS counts as a change, not just the key list', () => {
+  // Same components, moved on disk: the row tooltip is the file path, and the
+  // multi-file badge counts `files`.
+  const p = panel({ ...EXPANDED, selected: [] });
+  p.deliver(FILES(THREE));
+  const before = rows(p);
+  const moved = FILES(THREE);
+  moved.items[0] = { ...moved.items[0], filePath: '/ws/force-app/other/AcmeOrderService.cls' };
+  p.deliver(moved);
+  assert.notStrictEqual(rows(p), before);
+  const withMeta = FILES(THREE);
+  const after = rows(p);
+  withMeta.items[0] = { ...withMeta.items[0], filePath: '/ws/force-app/other/AcmeOrderService.cls', files: ['a', 'b'] };
+  p.deliver(withMeta);
+  assert.notStrictEqual(rows(p), after);
+});
+
+check('the render skip cannot mask the org-only / local merge', () => {
+  const p = panel({ ...EXPANDED, selected: [] });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnlyService' }] });
+  assert.ok(labels(p).includes('AcmeOrgOnlyService'), 'the org-only row never rendered');
+  p.deliver(SILENT(THREE));
+  assert.ok(labels(p).includes('AcmeOrgOnlyService'), 'a background rescan dropped the org-only row');
+  // Retrieved since: it exists locally now, and must be one row, not two.
+  p.deliver(SILENT([...THREE, 'AcmeOrgOnlyService']));
+  assert.deepStrictEqual(labels(p).filter(n => n === 'AcmeOrgOnlyService'), ['AcmeOrgOnlyService']);
+});
+
+check('a prune still repaints, even when the item list is identical', () => {
+  const p = panel({ ...EXPANDED, selected: [] });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeGhostService')] }); // no scan will vouch for it
+  const before = rows(p);
+  p.deliver(FILES(THREE));
+  assert.strictEqual(p.liveCount(), 0, 'the ghost key survived an explicit scan');
+  assert.notStrictEqual(rows(p), before, 'the checkboxes changed — the tree has to be repainted');
+});
+
+check('the FIRST payload always renders, empty list included', () => {
+  const p = panel(RESTORED);
+  p.deliver({ type: 'files', objectChildTypes: [], items: [] });
+  assert.ok(rows(p), 'the empty-workspace message never rendered');
+});
+
+// --------------------------------------------------- the Changed lens repaints
+// Every scan ends by recomputing this lens, so an unconditional render here would
+// undo the skip above one message later.
+check('an identical Changed payload does not rebuild the tree either', () => {
+  const p = panel({ ...EXPANDED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService')] });
+  const before = rows(p);
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService')] });
+  assert.strictEqual(rows(p), before);
+});
+
+check('key ORDER is not a change — git has no reason to be stable about it', () => {
+  const p = panel({ ...EXPANDED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService'), KEY('AcmeInvoiceService')] });
+  const before = rows(p);
+  p.deliver({ type: 'changed', keys: [KEY('AcmeInvoiceService'), KEY('AcmeOrderService')] });
+  assert.strictEqual(rows(p), before);
+});
+
+check('a component that just changed appears at once', () => {
+  const p = panel({ ...EXPANDED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService')] });
+  const before = rows(p);
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService'), KEY('AcmeInvoiceService')] });
+  assert.notStrictEqual(rows(p), before);
+  assert.deepStrictEqual(labels(p).sort(), ['AcmeInvoiceService', 'AcmeOrderService']);
+});
+
+check('change detection going UNAVAILABLE is a change, not an empty list', () => {
+  // `null` keys and `[]` keys render different empty states ("change detection
+  // unavailable" vs "nothing changed"), so they are different payloads even when
+  // nothing else in the message distinguishes them.
+  const p = panel({ ...EXPANDED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'changed', keys: [] });
+  const before = rows(p);
+  p.deliver({ type: 'changed', keys: null });
+  assert.notStrictEqual(rows(p), before, 'the tree still claims to know what changed');
+  const after = rows(p);
+  p.deliver({ type: 'changed', keys: null, reason: 'workspace is not a git repository' });
+  assert.notStrictEqual(rows(p), after, 'the reason has to reach the user');
+});
+
+check('a base-ref switch repaints even with the same key set', () => {
+  // The lens header names the ref it compares against — same keys, different story.
+  const p = panel({ ...EXPANDED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService')] });
+  const before = rows(p);
+  p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService')], base: 'origin/main' });
+  assert.notStrictEqual(rows(p), before);
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }
