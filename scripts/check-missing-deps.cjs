@@ -46,7 +46,30 @@ const ITEMS = [
   item('CustomField', 'Case.Shared__c', 'objects/Case/fields/Shared__c.field-meta.xml'),
   item('CustomField', 'Lead.Shared__c', 'objects/Lead/fields/Shared__c.field-meta.xml'),
   item('CustomField', 'Widget__c.Shared__c', 'objects/Widget__c/fields/Shared__c.field-meta.xml'),
-  item('CustomField', 'Contact.Shared__c', 'objects/Contact/fields/Shared__c.field-meta.xml')
+  item('CustomField', 'Contact.Shared__c', 'objects/Contact/fields/Shared__c.field-meta.xml'),
+  // Referent types for the component/page/label wordings. Several names exist
+  // under TWO types on purpose, because a message that tries an ordered pair of
+  // types only reveals its order when both are present, and only reveals that the
+  // SECOND try runs at all when just that one is present. Each collision below is
+  // pinned by a check further down:
+  //   dualCmp            LWC + Aura      — which bundle each wording prefers
+  //   timeline           LWC only        — the Aura-first wordings' LWC fallback
+  //   legacyPanel        Aura only       — the LWC-first wordings' Aura fallback
+  //   MyHelper           ApexClass + Flow — Flow action tries ApexClass first
+  //   Widget_Record_Page FlexiPage + ApexPage — override tries FlexiPage first
+  //   Log_Widget_Event   Flow only       — the Flow action's second try
+  //   WidgetView         ApexPage only   — the override's second try
+  item('LightningComponentBundle', 'dualCmp', 'lwc/dualCmp/dualCmp.js'),
+  item('AuraDefinitionBundle', 'dualCmp', 'aura/dualCmp/dualCmp.cmp'),
+  item('LightningComponentBundle', 'timeline', 'lwc/timeline/timeline.js'),
+  item('AuraDefinitionBundle', 'legacyPanel', 'aura/legacyPanel/legacyPanel.cmp'),
+  item('CustomLabel', 'Greeting_Label', 'labels/CustomLabels.labels-meta.xml'),
+  item('StaticResource', 'widgetAssets', 'staticresources/widgetAssets.resource-meta.xml'),
+  item('FlexiPage', 'Widget_Record_Page', 'flexipages/Widget_Record_Page.flexipage-meta.xml'),
+  item('ApexPage', 'Widget_Record_Page', 'pages/Widget_Record_Page.page'),
+  item('ApexPage', 'WidgetView', 'pages/WidgetView.page'),
+  item('Flow', 'Log_Widget_Event', 'flows/Log_Widget_Event.flow-meta.xml'),
+  item('Flow', 'MyHelper', 'flows/MyHelper.flow-meta.xml')
 ];
 
 const run = (problems, deployed = []) =>
@@ -643,6 +666,421 @@ check('a space-bearing capture still cannot mint a key for a non-existent item',
   assert.deepStrictEqual(out.keys, []);
   const real = new Set([...ITEMS, ...LAYOUTS].map(i => `${i.type}:${i.name}`));
   for (const k of out.keys) assert.ok(real.has(k), `minted a key with no local item: ${k}`);
+});
+
+// ====================== reference-style failures (components, labels, pages)
+// The wordings below name a referent the org couldn't resolve WITHOUT saying
+// "no <Type> named <X> found" — a QuickAction pointing at a deleted LWC, an LWC
+// importing a missing label, a Flow calling a missing action. Every string here
+// is quoted from the research catalog: ORG-VERIFIED = captured byte-exact from
+// `sf project deploy start --dry-run`; WILD-VERBATIM = raw CLI output pasted in a
+// public issue. The security invariant is unchanged — a type here is a GUESS, so
+// each candidate is a lookup and only a real local item can become a key.
+
+// --- QuickAction -> Lightning bundle (the reported bug) --------------------
+check('ORG-VERIFIED (the reported bug): a QuickAction naming a missing LWC resolves it', () => {
+  const out = run('Unable to retrieve lightning web component by namespace/developer name : timeline');
+  assert.deepStrictEqual(out.keys, ['LightningComponentBundle:timeline']);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('ORG-VERIFIED: "lightning web component" prefers the LWC when both types exist', () => {
+  assert.deepStrictEqual(
+    run('Unable to retrieve lightning web component by namespace/developer name : dualCmp').keys,
+    ['LightningComponentBundle:dualCmp']
+  );
+});
+
+check('ORG-VERIFIED: the same sentence WITHOUT "web" prefers the Aura bundle', () => {
+  assert.deepStrictEqual(
+    run('Unable to retrieve lightning component by namespace/developer name : dualCmp').keys,
+    ['AuraDefinitionBundle:dualCmp']
+  );
+});
+
+check('the second try is reachable: the "web" wording still finds an Aura-only bundle', () => {
+  // Both entries in the ordered pair matter — a QuickAction can carry either tag
+  // and the org's noun is not proof of what the workspace holds.
+  assert.deepStrictEqual(
+    run('Unable to retrieve lightning web component by namespace/developer name : legacyPanel').keys,
+    ['AuraDefinitionBundle:legacyPanel']
+  );
+});
+
+check('ORG-VERIFIED: the captured missing-component name with nothing local is unresolved', () => {
+  const out = run('Unable to retrieve lightning web component by namespace/developer name : missingCompZz123');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['missingCompZz123']);
+});
+
+check('an absurdly long component name is refused, not captured as a prefix', () => {
+  // Nothing anchors the right-hand side of these two names, so without the
+  // lookahead an over-long run would capture its first 80 characters — and a
+  // truncated prefix can collide with a real, shorter local item.
+  for (const s of [
+    `Unable to retrieve lightning web component by namespace/developer name : ${'t'.repeat(300)}`,
+    `We couldn't retrieve the design time component information for component c:${'t'.repeat(300)}`
+  ]) {
+    const out = run(s);
+    assert.deepStrictEqual(out.keys, [], s.slice(0, 40));
+    assert.deepStrictEqual(out.unresolved, [], s.slice(0, 40));
+  }
+});
+
+check('a name broken by punctuation is REFUSED, never resolved as its prefix', () => {
+  // The dangerous half of truncation: "timeline-v2" and "timeline.js" are not
+  // near misses of the local "timeline" — they are different components, and
+  // resolving the prefix would add the wrong bundle to the user's deploy under
+  // the org's authority. Both sentence-final captures must refuse outright.
+  for (const n of ['timeline-v2', 'timeline.js']) {
+    for (const s of [
+      `Unable to retrieve lightning web component by namespace/developer name : ${n}`,
+      `We couldn't retrieve the design time component information for component c:${n}`
+    ]) {
+      const out = run(s);
+      assert.deepStrictEqual(out.keys, [], `${n} :: ${s.slice(0, 30)}`);
+      assert.deepStrictEqual(out.unresolved, [], `${n} :: ${s.slice(0, 30)}`);
+    }
+  }
+  // …while the two shapes the guards must still ALLOW keep working: the real
+  // message's sentence-final period, and a name that ends the line.
+  assert.deepStrictEqual(
+    run("We couldn't retrieve the design time component information for component c:timeline.").keys,
+    ['LightningComponentBundle:timeline'], 'the closing period is part of the real message'
+  );
+  assert.deepStrictEqual(
+    run('Unable to retrieve lightning web component by namespace/developer name : timeline').keys,
+    ['LightningComponentBundle:timeline'], 'end-of-line must still match'
+  );
+});
+
+// --- LWC -> Apex ----------------------------------------------------------
+check('ORG-VERIFIED: "Unable to find Apex action class" resolves the class', () => {
+  assert.deepStrictEqual(run("Unable to find Apex action class referenced as 'MyHelper'.").keys, ['ApexClass:MyHelper']);
+});
+
+check('ORG-VERIFIED: the METHOD form deploys the class before the first dot', () => {
+  assert.deepStrictEqual(
+    run("Unable to find Apex action method referenced as 'MyHelper.getRows'.").keys,
+    ['ApexClass:MyHelper']
+  );
+});
+
+check('an Apex action naming no local class is unresolved, never minted', () => {
+  const out = run("Unable to find Apex action class referenced as 'GhostController'.");
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['ApexClass:GhostController']);
+});
+
+// --- LWC -> label / static resource ----------------------------------------
+check('ORG-VERIFIED: "of type label" resolves a CustomLabel with the c. prefix stripped', () => {
+  const out = run('Invalid reference c.Greeting_Label of type label in file errProbe.js');
+  assert.deepStrictEqual(out.keys, ['CustomLabel:Greeting_Label']);
+});
+
+check('ORG-VERIFIED: "of type resourceUrl" resolves a StaticResource', () => {
+  assert.deepStrictEqual(
+    run('Invalid reference widgetAssets of type resourceUrl in file errProbe.js').keys,
+    ['StaticResource:widgetAssets']
+  );
+});
+
+check('ORG-VERIFIED: the captured missing label is reported with its type', () => {
+  const out = run('Invalid reference c.Zz_Missing_Label_123 of type label in file errProbe.js');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['CustomLabel:Zz_Missing_Label_123']);
+});
+
+check('an unverified "of type" value is left alone rather than mapped to a guessed type', () => {
+  const out = run('Invalid reference somethingElse of type apexMethod in file errProbe.js');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+// --- markup:// references ---------------------------------------------------
+check('ORG-VERIFIED: "No MODULE named markup://c:X found : [" resolves the LWC', () => {
+  assert.deepStrictEqual(
+    run('No MODULE named markup://c:dualCmp found : [markup://c:parentCmp]').keys,
+    ['LightningComponentBundle:dualCmp']
+  );
+});
+
+check('the older "found: [" rendering (no space before the colon) matches too', () => {
+  assert.deepStrictEqual(
+    run('No MODULE named markup://c:timeline found: [markup://c:caseComp] LightningComponentBundle [1,1]').keys,
+    ['LightningComponentBundle:timeline']
+  );
+});
+
+check('ORG-VERIFIED: bare "No COMPONENT named markup://c:X found" prefers the Aura bundle', () => {
+  assert.deepStrictEqual(run('No COMPONENT named markup://c:dualCmp found').keys, ['AuraDefinitionBundle:dualCmp']);
+});
+
+check('PLATFORM NAMESPACES PRODUCE NOTHING AT ALL — not even unresolved text', () => {
+  // "Retrieve force:slds from your org" is nonsense, and with only 5 unresolved
+  // slots this noise would crowd out the one c: component that is actionable.
+  const out = run([
+    'No APPLICATION named markup://force:slds found :',
+    'No INTERFACE named markup://flexipage:availableForAllPageTypes found : [markup://stech:calendar]',
+    'No COMPONENT named markup://lightning:card found',
+    'No COMPONENT named markup://acme:managedThing found'
+  ]);
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, [], 'only the c: namespace can name a local component');
+});
+
+check('each markup:// noun falls back to the OTHER bundle type', () => {
+  // The noun says which kind the org was looking for, not which kind this
+  // workspace holds — an LWC and an Aura bundle can sit behind the same
+  // reference. Both fallbacks are pinned, so dropping either from the ordered
+  // pair fails here rather than going silently unsuggested.
+  assert.deepStrictEqual(
+    run('No MODULE named markup://c:legacyPanel found').keys,
+    ['AuraDefinitionBundle:legacyPanel'], "MODULE's Aura fallback"
+  );
+  assert.deepStrictEqual(
+    run('No COMPONENT named markup://c:timeline found').keys,
+    ['LightningComponentBundle:timeline'], "COMPONENT's LWC fallback"
+  );
+});
+
+check('a c: reference with no local bundle is reported', () => {
+  const out = run('No COMPONENT named markup://c:ghostCmp found');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['ghostCmp']);
+});
+
+// --- FlexiPage -> component -------------------------------------------------
+check('ORG-VERIFIED: the FlexiPage design-time wording resolves the component', () => {
+  assert.deepStrictEqual(
+    run("We couldn't retrieve the design time component information for component c:dualCmp.").keys,
+    ['LightningComponentBundle:dualCmp']
+  );
+});
+
+check('the CURLY apostrophe rendering of the same sentence matches', () => {
+  // The match starts at the stable tail, so "couldn’t" vs "couldn't" is irrelevant.
+  assert.deepStrictEqual(
+    run('We couldn’t retrieve the design time component information for component c:timeline.').keys,
+    ['LightningComponentBundle:timeline']
+  );
+});
+
+check('a design-time reference outside the c: namespace produces nothing', () => {
+  const out = run("We couldn't retrieve the design time component information for component lightning:card.");
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('a design-time reference to a missing component is reported', () => {
+  const out = run("We couldn't retrieve the design time component information for component c:ghostCmp.");
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['ghostCmp']);
+});
+
+// --- Flow -> action / screen extension --------------------------------------
+check('ORG-VERIFIED: a Flow naming a missing invocable action tries ApexClass first', () => {
+  // MyHelper exists locally as BOTH an ApexClass and a Flow, so this pins the
+  // order, not just that something resolved: an invocable action is Apex far more
+  // often than it is a subflow.
+  const real = "Get_Rows (Action) - We can't find the MyHelper action. Verify that it's available and that you have the permissions and licenses required to use it.";
+  assert.deepStrictEqual(run(real).keys, ['ApexClass:MyHelper']);
+});
+
+check('the Flow-action pattern stays linear on a whitespace flood', () => {
+  // Regression guard for a quadratic separator: two adjacent unbounded \s* around
+  // an optional "-" made the engine retry every split of a whitespace run when
+  // "We" never followed — 100KB of spaces blocked the extension host for ~4.5s.
+  const t0 = Date.now();
+  detectMissingDependencies([`(Action)${' '.repeat(100000)}`], [], new Set());
+  const ms = Date.now() - t0;
+  assert.ok(ms < 200, `took ${ms}ms — the (Action) separator regressed to a quadratic split`);
+});
+
+check('the Flow second try is reachable: an autolaunched Flow action resolves too', () => {
+  assert.deepStrictEqual(
+    run("Log_Event (Action) - We can't find the Log_Widget_Event action.").keys,
+    ['Flow:Log_Widget_Event']
+  );
+});
+
+check('the CURLY apostrophe rendering of the Flow action wording matches', () => {
+  assert.deepStrictEqual(
+    run('Get_Rows (Action) - We can’t find the MyHelper action.').keys,
+    ['ApexClass:MyHelper']
+  );
+});
+
+check('a Flow action naming nothing local is unresolved, never guessed into a key', () => {
+  const out = run("Get_Rows (Action) - We can't find the Ghost_Action action.");
+  assert.deepStrictEqual(out.keys, [], 'ApexClass and Flow are both LOOKUPS — a miss stays a miss');
+  assert.deepStrictEqual(out.unresolved, ['Ghost_Action']);
+});
+
+check('WILD-VERBATIM: a Flow screen extension resolves the LWC', () => {
+  const real = 'Screen_1 (Screen Component) - We can\'t find an extension called "c:timeline".';
+  assert.deepStrictEqual(run(real).keys, ['LightningComponentBundle:timeline']);
+});
+
+check('a screen extension prefers the LWC when both bundle types exist', () => {
+  // A screen component extension is an LWC in every documented case; Aura is only
+  // the fallback. Pinned against dualCmp, where both types are present.
+  assert.deepStrictEqual(
+    run('Screen_1 (Screen Component) - We can\'t find an extension called "c:dualCmp".').keys,
+    ['LightningComponentBundle:dualCmp']
+  );
+});
+
+check('a screen extension outside the c: namespace produces nothing', () => {
+  const out = run('Screen_1 (Screen Component) - We can\'t find an extension called "acme:timeline".');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, [], 'a managed package extension is not deployable from here');
+});
+
+check('a c: screen extension with no local bundle is reported', () => {
+  const out = run('Screen_1 (Screen Component) - We can\'t find an extension called "c:ghostCmp".');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['ghostCmp']);
+});
+
+// --- Visualforce -> controller ----------------------------------------------
+check("ORG-VERIFIED: \"Apex class 'X' does not exist\" resolves the controller", () => {
+  assert.deepStrictEqual(run("Apex class 'MyHelper' does not exist").keys, ['ApexClass:MyHelper']);
+});
+
+check('a Visualforce controller with no local class is unresolved', () => {
+  const out = run("Apex class 'GhostController' does not exist");
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['ApexClass:GhostController']);
+});
+
+// --- CustomObject action overrides -------------------------------------------
+check('WILD-VERBATIM: an action override tries the FlexiPage before the ApexPage', () => {
+  // Widget_Record_Page exists locally as BOTH, so this pins the order: a record
+  // page override is a FlexiPage far more often than a Visualforce page.
+  assert.deepStrictEqual(
+    run('Widget_Record_Page does not exist or is not a valid override for action View.').keys,
+    ['FlexiPage:Widget_Record_Page']
+  );
+});
+
+check('THE OVERRIDE LEFT BOUNDARY: a name may not start mid-token', () => {
+  // The name opens the message, so only a lookbehind stops matchAll from sliding
+  // right and capturing a SUFFIX of a longer token. "Legacy-Widget_Record_Page" is
+  // a different page from the local "Widget_Record_Page", and without the
+  // boundary the org's error would have added the local one to the deploy.
+  const out = run('Legacy-Widget_Record_Page does not exist or is not a valid override for action View.');
+  assert.deepStrictEqual(out.keys, [], 'a suffix of a longer name is not that name');
+  assert.deepStrictEqual(out.unresolved, [], 'a mid-token start is refused, not reported garbled');
+  // Same for a dotted qualifier.
+  assert.deepStrictEqual(run('Pkg.Widget_Record_Page does not exist or is not a valid override for action View.').keys, []);
+});
+
+check('THE OVERRIDE LEFT BOUNDARY: an over-long override name is refused outright', () => {
+  for (const len of [81, 100]) {
+    const out = run(`${'N'.repeat(len)} does not exist or is not a valid override for action View.`);
+    assert.deepStrictEqual(out.keys, [], `len ${len}`);
+    assert.deepStrictEqual(out.unresolved, [], `len ${len} — a trailing 80-char window is not the name`);
+  }
+});
+
+check('THE OVERRIDE LEFT BOUNDARY: a suffix attack cannot mint a real local key', () => {
+  // The sharp end of the same hole: a local page whose name is exactly the 80-char
+  // window the slide would land on. The boundary must refuse it.
+  const wide = 'P'.repeat(80);
+  const items2 = [item('FlexiPage', wide, 'flexipages/wide.flexipage-meta.xml')];
+  const out = detectMissingDependencies(
+    [`Legacy_${wide} does not exist or is not a valid override for action View.`], items2, new Set());
+  assert.deepStrictEqual(out.keys, [], 'the org named a longer page — this local one was never referenced');
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+check('the ApexPage second try is reachable for an override', () => {
+  assert.deepStrictEqual(
+    run('WidgetView does not exist or is not a valid override for action Edit.').keys,
+    ['ApexPage:WidgetView']
+  );
+});
+
+check('WILD-VERBATIM: the catalog override example names nothing local and is reported', () => {
+  const out = run('Timeline_Configuration_Record_Page does not exist or is not a valid override for action View.');
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, ['Timeline_Configuration_Record_Page']);
+});
+
+// --- the retrieve-side generic ------------------------------------------------
+check('"Entity of type X named Y cannot be found" resolves with the org-named type', () => {
+  assert.deepStrictEqual(
+    run("Entity of type 'LightningComponentBundle' named 'timeline' cannot be found").keys,
+    ['LightningComponentBundle:timeline']
+  );
+});
+
+check('an Entity name carrying spaces (a Layout fullName) still resolves', () => {
+  const out = detectMissingDependencies(
+    ["Entity of type 'Layout' named 'Account-Account Layout' cannot be found"], LAYOUTS, new Set());
+  assert.deepStrictEqual(out.keys, ['Layout:Account-Account Layout']);
+});
+
+check('an Entity of an unknown type lands in unresolved ONLY', () => {
+  const out = run("Entity of type 'BogusType' named 'X' cannot be found");
+  assert.deepStrictEqual(out.keys, [], 'the org naming a type is not evidence the workspace has it');
+  assert.deepStrictEqual(out.unresolved, ['BogusType:X']);
+});
+
+check('an Entity name may not span a newline', () => {
+  const out = run("Entity of type 'Layout' named 'Account-Account\nLayout' cannot be found");
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unresolved, []);
+});
+
+// --- the wild spacing of the dependent-class message ---------------------------
+check('WILD-VERBATIM: "Class Foo : Invalid type" (space before the colon) still parses', () => {
+  // The raw CLI log renders the class/cause separator as " : " on its own line,
+  // not "Foo:" as the earlier fixture assumed. The class capture stops at the
+  // space, so both spellings name the same class — pinned so a future tightening
+  // of that capture can't silently drop the wild form.
+  const out = run('Dependent class is invalid and needs recompilation:\nClass MyHelper : Invalid type: smth__mdt (12:5)');
+  assert.deepStrictEqual(out.keys, ['ApexClass:MyHelper', 'CustomObject:smth__mdt']);
+});
+
+// --- the security invariant, re-pinned for every new wording -------------------
+check('the new phrasings cannot mint a key for a component that is not in the scan', () => {
+  const out = run([
+    'Unable to retrieve lightning web component by namespace/developer name : imaginaryCmp',
+    'Unable to retrieve lightning component by namespace/developer name : imaginaryCmp',
+    "Unable to find Apex action class referenced as 'ImaginaryClass'.",
+    "Unable to find Apex action method referenced as 'ImaginaryClass.doIt'.",
+    'Invalid reference c.Imaginary_Label of type label in file x.js',
+    'Invalid reference imaginaryResource of type resourceUrl in file x.js',
+    'No MODULE named markup://c:imaginaryCmp found : [markup://c:x]',
+    'No COMPONENT named markup://c:../../etc/passwd found',
+    "We couldn't retrieve the design time component information for component c:imaginaryCmp.",
+    "Step_1 (Action) - We can't find the ImaginaryAction action.",
+    'Screen_1 (Screen Component) - We can\'t find an extension called "c:imaginaryCmp".',
+    "Apex class 'ImaginaryClass' does not exist",
+    'Imaginary_Page does not exist or is not a valid override for action View.',
+    "Entity of type 'ApexClass' named 'ImaginaryClass' cannot be found"
+  ]);
+  assert.deepStrictEqual(out.keys, [], 'nothing local matched, so nothing may be deployed');
+});
+
+check('every key produced by the new phrasings names a real local item', () => {
+  const real = new Set(ITEMS.map(i => `${i.type}:${i.name}`));
+  const out = run([
+    'Unable to retrieve lightning web component by namespace/developer name : timeline',
+    "Unable to find Apex action method referenced as 'MyHelper.getRows'.",
+    'Invalid reference c.Greeting_Label of type label in file x.js',
+    'Invalid reference widgetAssets of type resourceUrl in file x.js',
+    'No COMPONENT named markup://c:dualCmp found',
+    "We couldn't retrieve the design time component information for component c:legacyPanel.",
+    "Step_1 (Action) - We can't find the Log_Widget_Event action.",
+    "Apex class 'MyThing' does not exist",
+    'WidgetView does not exist or is not a valid override for action Edit.',
+    "Entity of type 'FlexiPage' named 'Widget_Record_Page' cannot be found"
+  ]);
+  for (const k of out.keys) assert.ok(real.has(k), `minted a key with no local item: ${k}`);
+  assert.strictEqual(out.keys.length, 10, JSON.stringify(out.keys));
 });
 
 // ================================ request-level ("envelope") failure text

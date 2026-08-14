@@ -355,10 +355,15 @@ check('"not on org" wording is reserved for a run where EVERYTHING was missing',
 });
 
 // --------------------------------------------- nothing diffable at all (early return)
-check('a single unsupported type is named outright — the LWC right-click case', () => {
+// WORDING CHANGED, deliberately. This case used to assert "diff isn't supported for
+// LightningComponentBundle yet" — and by pinning that sentence it quietly froze the
+// dead click it was written to make audible. A bundle IS diffable now, one file at a
+// time (runDiff's focusFile), so the panel path — which has no clicked file — has to
+// point at the way that works instead of denying the capability.
+check('a folder-typed component points at the way to diff it, not at a refusal', () => {
   assert.strictEqual(
     nothingDiffableNotice(['LightningComponentBundle'], 0),
-    "Nothing to diff — diff isn't supported for LightningComponentBundle yet"
+    'Nothing to diff — LightningComponentBundle has no whole-component diff — right-click a file inside it'
   );
 });
 
@@ -419,7 +424,10 @@ const drainTmpCleanup = () => { for (const fn of editorListeners.splice(0)) fn([
 
 const cards = (posted) => posted.filter(m => m.type === 'status').map(m => m.card);
 
-check('WIRING: right-clicking an LWC with the panel closed is no longer silent', async () => {
+// The PANEL path only — a bundle ticked in the tree, with no clicked file to focus on.
+// The right-click path this notice was named for now opens a real diff instead; that is
+// scripts/check-diff-focus.cjs's subject, and the two must not drift.
+check('WIRING: a bundle selected in the PANEL with the panel closed is not silent', async () => {
   resetUi();
   const { stub, posted } = diffStub([item('LightningComponentBundle', 'myCmp', '/w/lwc/myCmp/myCmp.js')]);
   await DeployPanelProvider.prototype.runDiff.call(stub, ['LightningComponentBundle:myCmp']);
@@ -427,7 +435,7 @@ check('WIRING: right-clicking an LWC with the panel closed is no longer silent',
   assert.strictEqual(cards(posted).length, 1, 'expected exactly the one verdict card');
   assert.strictEqual(cards(posted)[0].title, 'Nothing to diff');
   assert.deepStrictEqual(ui.warn.map(w => w.message), [
-    "SF Deploy (warning): Nothing to diff — diff isn't supported for LightningComponentBundle yet"
+    'SF Deploy (warning): Nothing to diff — LightningComponentBundle has no whole-component diff — right-click a file inside it'
   ]);
   assert.strictEqual(ui.notices.length, 0, 'a warn verdict must not expire on its own');
   assert.strictEqual(ui.error.length, 0, 'an unsupported type is not an error');

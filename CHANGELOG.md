@@ -3,6 +3,26 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.18.0
+
+- New: **Dependency suggestions understand many more org errors.** A failed deploy that says
+  "Unable to retrieve lightning web component…" on a quick action, "Unable to find Apex action
+  class…" from an LWC import, a missing custom label or static resource, a `markup://c:…`
+  reference, a Lightning-page component the org can't describe, a Flow action or screen component
+  it can't find, a missing Visualforce controller or a page named as an action override — all of
+  these now light up the "Retry + missing" suggestion when the missing piece exists in your
+  workspace. Previously only a handful of wordings were recognized. Every new wording was
+  verified against real deploy output, and suggestions still only ever offer components that
+  actually exist locally.
+- New: **Compare a single file inside an LWC, Aura bundle or object.** Right-click "Compare with
+  Org…" on a file inside a bundle now opens a real diff of that file against the org copy —
+  previously bundles refused with "diff isn't supported". The diff title names the exact file, and
+  a file that's missing on the org is reported as that file, not as the whole component. Selecting
+  a bundle in the panel (no single file to compare) now says what to do instead of refusing.
+- Fixed: **A hostile or garbled error message can't skew suggestions.** Suggestion parsing now
+  refuses truncated or overlong component names outright instead of matching a look-alike, and one
+  wording that could stall the extension for seconds on pathological input is bounded.
+
 ## 0.17.0
 
 - New: **The panel notices files you create or delete.** New Apex classes (and any other metadata

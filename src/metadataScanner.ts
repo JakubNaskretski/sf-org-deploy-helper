@@ -776,6 +776,135 @@ export function detectMissingDependencies(
     for (const m of problem.matchAll(/retrieve or load the information (?:on|of) (?:the )?field[:.]?\s*(?:Record\.)?([A-Za-z_]\w*)/gi)) {
       candidates.push({ display: m[1], bareName: m[1] });
     }
+    // A QuickAction whose <lightningWebComponent>/<lightningComponent> names a
+    // bundle the org doesn't have — the reported case. Org-verified wording:
+    // "Unable to retrieve lightning web component by namespace/developer name : myCmp"
+    // Lowercase, spaced colon, and the value is the BARE developer name — no `c:`
+    // prefix, no quotes, no brackets. The sentence without "web" is the Aura form,
+    // so one pattern covers both and "web" only decides which bundle type is tried
+    // FIRST; both are lookups, so the second-guess costs nothing and a wrong guess
+    // resolves to nothing rather than minting a key.
+    // The name ends the sentence, so nothing anchors its right-hand side and the
+    // capture must refuse anything it can't consume WHOLE rather than keep a
+    // prefix: a prefix names a DIFFERENT component that may well exist locally
+    // ("timeline-v2" truncating to a real "timeline"), which is a wrong-attribution
+    // key, not a near miss. Hence two guards — no identifier character or `-` may
+    // follow, and a `.` may only follow when nothing identifier-ish comes after it,
+    // so the sentence-final period and end-of-line still match while "timeline.js"
+    // does not. Same refuse-don't-truncate stance as the per-word cap above.
+    for (const m of problem.matchAll(/Unable to retrieve lightning (web )?component by namespace\/developer name\s*:\s*([A-Za-z0-9_]{1,80})(?![A-Za-z0-9_\-])(?!\.[A-Za-z0-9_])/gi)) {
+      const lwc = { type: 'LightningComponentBundle', name: m[2] };
+      const aura = { type: 'AuraDefinitionBundle', name: m[2] };
+      candidates.push({ display: m[2], tries: m[1] ? [lwc, aura] : [aura, lwc] });
+    }
+    // An LWC importing Apex the org can't resolve:
+    // "Unable to find Apex action class referenced as 'MyController'."
+    // "Unable to find Apex action method referenced as 'MyController.getRows'."
+    // The deployable unit is the CLASS either way, so the method form keeps only
+    // the segment before the first dot.
+    for (const m of problem.matchAll(/Unable to find Apex action (?:class|method) referenced as '([A-Za-z0-9_]{1,80})(?:\.[A-Za-z0-9_]{1,80})?'/g)) {
+      candidates.push({ display: `ApexClass:${m[1]}`, tries: [{ type: 'ApexClass', name: m[1] }] });
+    }
+    // An LWC's static @salesforce import the org can't satisfy:
+    // "Invalid reference c.My_Label of type label in file cmp.js"
+    // "Invalid reference myResource of type resourceUrl in file cmp.js"
+    // The `c.` belongs to the IMPORT syntax, not to the label's fullName, so it is
+    // stripped (the resourceUrl form carries no prefix at all). Only these two
+    // verified `of type` values are handled — other values are left alone rather
+    // than mapped to a guessed metadata type.
+    for (const m of problem.matchAll(/Invalid reference (?:c\.)?([A-Za-z0-9_]{1,80}) of type (label|resourceUrl)\b/gi)) {
+      const type = m[2].toLowerCase() === 'label' ? 'CustomLabel' : 'StaticResource';
+      candidates.push({ display: `${type}:${m[1]}`, tries: [{ type, name: m[1] }] });
+    }
+    // Aura/LWC markup naming a definition the org doesn't have. Three renderings
+    // are verified — "found : [" (v61), the older "found: [", and a bare "found" —
+    // so the pattern anchors on " found" and ignores whatever follows it:
+    //   "No MODULE named markup://c:childCmp found : [markup://c:parentCmp]"
+    //   "No COMPONENT named markup://c:someCmp found"
+    // ONLY the `c` namespace can name a local component. force:, flexipage:,
+    // lightning: and managed-package namespaces are platform-provided, so they are
+    // dropped outright — not even as unresolved text, on the same argument as
+    // isPlatformName: "retrieve force:slds from an org" is nonsense.
+    // MODULE is the LWC noun and the rest are Aura nouns; the other bundle type is
+    // still tried second because either kind can sit behind the same reference.
+    for (const m of problem.matchAll(/[Nn]o (MODULE|COMPONENT|APPLICATION|INTERFACE|EVENT) named markup:\/\/([A-Za-z0-9_]{1,40}):([A-Za-z0-9_]{1,80}) found/g)) {
+      if (m[2].toLowerCase() !== 'c') continue;
+      const lwc = { type: 'LightningComponentBundle', name: m[3] };
+      const aura = { type: 'AuraDefinitionBundle', name: m[3] };
+      candidates.push({ display: m[3], tries: m[1] === 'MODULE' ? [lwc, aura] : [aura, lwc] });
+    }
+    // A FlexiPage region holding a component the org can't describe:
+    // "We couldn't retrieve the design time component information for component c:myCmp."
+    // The apostrophe in "couldn't" arrives curly in some renderings, so the match
+    // starts at the stable tail of the sentence rather than at the contraction.
+    // Namespace rule as above: only `c` is local. The name is sentence-final here
+    // too, so it carries the same two guards as the QuickAction rule — refuse a
+    // truncated prefix, but keep matching the real message's closing period.
+    for (const m of problem.matchAll(/design[ -]?time component information for component ([A-Za-z0-9_]{1,40}):([A-Za-z0-9_]{1,80})(?![A-Za-z0-9_\-])(?!\.[A-Za-z0-9_])/gi)) {
+      if (m[1].toLowerCase() !== 'c') continue;
+      candidates.push({
+        display: m[2],
+        tries: [{ type: 'LightningComponentBundle', name: m[2] }, { type: 'AuraDefinitionBundle', name: m[2] }]
+      });
+    }
+    // A Flow calling an invocable action the org doesn't have:
+    // "Get_Rows (Action) - We can't find the MyInvocable action. Verify that it's ..."
+    // Flow builder text renders the apostrophe curly, hence the lax "can.?t". The
+    // action may be Apex or an autolaunched Flow and the text never says which, so
+    // both are tried — a lookup that misses can't mint a key.
+    // The separator is written `\s*(?:-\s*)?We` and NOT `\s*-?\s*We`: two adjacent
+    // unbounded `\s*` around an optional literal give the engine a fresh split of
+    // every whitespace run to try whenever "We" doesn't follow, which is quadratic
+    // — "(Action)" plus 100KB of spaces blocked the extension host for ~4.5s. This
+    // form leaves exactly one way to consume a run.
+    for (const m of problem.matchAll(/\(Action\)\s*(?:-\s*)?We can.?t find the ([A-Za-z0-9_]{1,80}) action/g)) {
+      candidates.push({ display: m[1], tries: [{ type: 'ApexClass', name: m[1] }, { type: 'Flow', name: m[1] }] });
+    }
+    // A Flow screen embedding a component extension the org doesn't have:
+    // Screen_1 (Screen Component) - We can't find an extension called "c:myCmp".
+    // Same namespace rule as the markup:// rule — only `c` is local; a managed
+    // package's extension is not something this workspace can deploy.
+    for (const m of problem.matchAll(/We can.?t find an extension called ["“]([A-Za-z0-9_]{1,40}):([A-Za-z0-9_]{1,80})["”]/g)) {
+      if (m[1].toLowerCase() !== 'c') continue;
+      candidates.push({
+        display: m[2],
+        tries: [{ type: 'LightningComponentBundle', name: m[2] }, { type: 'AuraDefinitionBundle', name: m[2] }]
+      });
+    }
+    // A Visualforce page whose controller isn't on the org (no trailing period in
+    // the real text): "Apex class 'MyController' does not exist".
+    for (const m of problem.matchAll(/Apex class '([A-Za-z0-9_]{1,80})' does not exist/gi)) {
+      candidates.push({ display: `ApexClass:${m[1]}`, tries: [{ type: 'ApexClass', name: m[1] }] });
+    }
+    // A CustomObject <actionOverrides> naming a page the org can't use:
+    // "Widget_Record_Page does not exist or is not a valid override for action View."
+    // The sentence is a DISJUNCTION and the org never says which half fired: the
+    // page may be absent, or present-but-invalid for that override (wrong page
+    // type, missing formFactor). Deploying the local copy is a plausible fix on
+    // BOTH branches — that is why the not-missing branch doesn't disqualify the
+    // rule — but it does mean a suggestion here can name a page the org already
+    // has. Suggestions are opt-in checkboxes, so that costs a glance, not a deploy.
+    // The text doesn't say which KIND of page either, so FlexiPage and ApexPage are
+    // both tried; the action name that follows is a standard action, not a
+    // component, so it is matched for anchoring only and never captured.
+    // The name opens the message, so nothing anchors its LEFT side — and envelope
+    // flattening can put prose in front of it. Without the lookbehind, matchAll
+    // simply slides right and captures a SUFFIX: an over-long name yields its last
+    // 80 characters instead of being refused, and "Legacy-Widget_Record_Page"
+    // yields "Widget_Record_Page" — a real local item the org never named. Starting
+    // mid-token must refuse, not slide.
+    for (const m of problem.matchAll(/(?<![A-Za-z0-9_.\-])([A-Za-z0-9_]{1,80}) does not exist or is not a valid override for action/g)) {
+      candidates.push({ display: m[1], tries: [{ type: 'FlexiPage', name: m[1] }, { type: 'ApexPage', name: m[1] }] });
+    }
+    // The retrieve-side generic, and the only message that names the type itself:
+    // "Entity of type 'LightningComponentBundle' named 'myCmp' cannot be found".
+    // The quotes bound both captures, so the type token goes straight into the
+    // lookup. The name may carry spaces and dots (a Layout fullName does), so it
+    // reuses the bounded word shape of the "no X named Y found" rule above — same
+    // per-word caps, same refusal to cross a newline.
+    for (const m of problem.matchAll(/Entity of type '([A-Za-z0-9_]{1,60})' named '([\w.\-/]{1,120}(?: [\w.\-/]{1,60}){0,5})' cannot be found/g)) {
+      candidates.push({ display: `${m[1]}:${m[2]}`, tries: [{ type: m[1], name: m[2] }] });
+    }
   }
 
   const seen = new Set<string>();

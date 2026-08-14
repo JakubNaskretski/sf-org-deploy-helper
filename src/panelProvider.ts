@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
@@ -701,7 +701,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const sourceDir = inferred ? match.filePath : undefined;
     if (action === 'deploy') { await this.runDeploy([key], { sourceDir }); return; }
     if (action === 'retrieve') return this.runRetrieve([key], { sourceDir });
-    return this.runDiff([key], orgOverride);
+    // The clicked path matters for folder-typed components (lwc/aura bundles,
+    // objects): the folder has no meaningful diff, the file the user pointed at does.
+    return this.runDiff([key], orgOverride, uri.fsPath);
   }
 
   // ---- Message routing ----
@@ -3527,7 +3529,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async runDiff(keys: string[], orgOverride?: string): Promise<void> {
+  /** `focusFile` — the exact file a context-menu diff was invoked on. Only used for
+   *  folder-typed components (DIRECTORY_ITEM_TYPES): the bundle/object folder itself
+   *  can't go to `vscode.diff`, but the clicked file inside it can. */
+  private async runDiff(keys: string[], orgOverride?: string, focusFile?: string): Promise<void> {
     // Reserve the busy slot synchronously before the >5-diff confirm modal and the
     // mkdtemp await (TOCTOU guard). Released via `releaseBusy()` on early return.
     if (!this.reserveBusy('Diff')) return;
@@ -3548,11 +3553,58 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const orgOnlySkipped = allItems.filter(i => !i.filePath);
       const withLocalFile = allItems.filter(i => !!i.filePath);
 
+      // A right-click on a file INSIDE a folder-typed component (lwc/aura bundle,
+      // object folder) diffs that one file: same retrieve, but the local side is the
+      // clicked file instead of the un-diffable folder. `focused` replaces its item
+      // by identity so the checks below can spot it without re-deriving the rule.
+      // The click only counts as a focus when it landed on a FILE. Right-clicking
+      // the bundle folder itself has no single file to compare, and a directory
+      // reaching `vscode.diff` is the exact wall DIFF_UNSUPPORTED exists to avoid.
+      const clicked = focusFile && await fs.stat(focusFile).then(s => s.isFile(), () => false)
+        ? focusFile
+        : undefined;
+      // `isUnder` also holds when the two paths are EQUAL, which is deliberate for one
+      // producer: inferItemForPath records a CustomObject as its `.object-meta.xml`
+      // rather than the folder. It is not deliberate for a bundle — that same function
+      // mints `LightningComponentBundle:jsconfig.json` for any file sitting directly
+      // under `lwc/`, and lifting the gate for one would spend a real org retrieve on a
+      // component that cannot exist.
+      const focusOwner = clicked
+        ? withLocalFile.find(i => DIRECTORY_ITEM_TYPES.has(i.type) && isUnder(i.filePath, clicked)
+            && (i.type === 'CustomObject' || foldPathKey(i.filePath) !== foldPathKey(clicked)))
+        : undefined;
+      // Folder-relative path of the clicked file (`myCmp.js`, `templates/inner.html`) —
+      // how it's found in the retrieve tree. EMPTY when the item already points AT that
+      // file (the CustomObject case above).
+      const focusRel = focusOwner && clicked ? path.relative(focusOwner.filePath, clicked) : undefined;
+      // …prefixed with the folder's own name, so the suffix search can't land on a
+      // same-named file in a different bundle if one ever shares the retrieve tree.
+      const focusSuffix = focusOwner && clicked
+        ? (focusRel ? path.join(path.basename(focusOwner.filePath), focusRel) : path.basename(clicked))
+        : undefined;
+      // What the user is TOLD was compared. Never empty while a focus is in play: an
+      // object diffed through its `.object-meta.xml` compares that file alone, and
+      // labelling it `CustomObject:Widget__c` would claim the fields, validation rules
+      // and record types were compared too — an empty diff editor then reads as "in
+      // sync". Separators normalised so a win32 `path.relative` can't render
+      // `myCmp/templates\alternate.html`.
+      const focusLabel = focusOwner && clicked
+        ? (focusRel || path.basename(clicked)).split(path.sep).join('/')
+        : undefined;
+      const focused = focusOwner && clicked ? { ...focusOwner, filePath: clicked } : undefined;
+      const localItems = focused ? withLocalFile.map(i => (i === focusOwner ? focused : i)) : withLocalFile;
+
       // Partition into diffable vs unsupported metadata types.
-      const diffable = withLocalFile.filter(i => !DIFF_UNSUPPORTED.has(i.type));
-      const unsupported = withLocalFile.filter(i => DIFF_UNSUPPORTED.has(i.type));
+      const diffable = localItems.filter(i => i === focused || !DIFF_UNSUPPORTED.has(i.type));
+      const unsupported = localItems.filter(i => i !== focused && DIFF_UNSUPPORTED.has(i.type));
       const preLines: string[] = [
-        ...unsupported.map(i => `— ${i.type}:${i.name} — diff not supported for this metadata type yet`),
+        // "not supported for this metadata type yet" became a lie the moment the focus
+        // rule shipped: three of the four DIFF_UNSUPPORTED members ARE diffable, one
+        // file at a time. The panel has no clicked file to work from, so the honest
+        // line says what the user can do instead of what the tool can't.
+        ...unsupported.map(i => DIRECTORY_ITEM_TYPES.has(i.type)
+          ? `— ${i.type}:${i.name} — no whole-component diff; right-click a file inside it → "Compare with Org…"`
+          : `— ${i.type}:${i.name} — diff not supported for this metadata type yet`),
         ...orgOnlySkipped.map(i => `— ${i.type}:${i.name} — org-only, no local file to diff (retrieve first)`)
       ];
 
@@ -3717,7 +3769,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           for (const item of slowItems) {
             const isChild = OBJECT_CHILD_TYPES.has(item.type);
             let remoteFile: string | undefined;
-            if (isChild) {
+            if (item === focused) {
+              // Retrieve landed the whole bundle/object folder. Match on the
+              // folder-relative path so a sibling (`myCmp.html` for a clicked
+              // `myCmp.js`) can never cross-match — the basename search below has a
+              // prefix fallback that would happily do exactly that.
+              remoteFile = await findFileBySuffix(proj, focusSuffix!);
+            } else if (isChild) {
               // Match by the `objects/<Object>/<folder>/<file>` suffix so same-named
               // fields on different objects in one batch don't cross-match.
               const childFolder = path.basename(path.dirname(item.filePath));
@@ -3731,16 +3789,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               // `<pkgDir>/main/default` nesting the CLI happens to use.
               const localBasename = path.basename(item.filePath);
               const leaf = item.name.split('/').pop() ?? item.name;
-              remoteFile = await findFileMatching(proj, localBasename, leaf);
+              remoteFile = await findFileMatching(proj, localBasename, leaf, path.basename(path.dirname(item.filePath)));
             }
             if (!remoteFile) {
-              missing.push(item);
+              // Name the FILE for a focused diff: "LightningComponentBundle:myCmp —
+              // not on org" would be a wrong verdict when the bundle is on the org
+              // and only this file (a new helper, say) isn't.
+              missing.push(item === focused && focusLabel ? { ...item, name: `${item.name}/${focusLabel}` } : item);
               continue;
             }
             const staged = await stageDiffCopy(remoteFile, item);
             tmpPaths.push(staged.dir);
-            await this.openDiff(item, staged.file, orgLabel, diffColumn());
-            opened.push(`${item.type}:${item.name}`);
+            await this.openDiff(item, staged.file, orgLabel, diffColumn(), item === focused ? focusLabel : undefined);
+            opened.push(`${item.type}:${item.name}${item === focused && focusLabel ? `/${focusLabel}` : ''}`);
             await floatFirstDiff();
           }
         }
@@ -4213,13 +4274,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.noticeDismissers?.clear();
   }
 
-  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn): Promise<void> {
+  /** `fileLabel` names the single file when the item is a folder-typed component
+   *  diffed through one of its files — `Type:Name` alone wouldn't say which. */
+  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn, fileLabel?: string): Promise<void> {
     // Org copy LEFT (read-only staged temp), local file RIGHT (the editable side) —
     // matches git / the official Salesforce extension, and makes the diff editor's
     // copy-block arrows pull org changes INTO the local file. The reverse order made
     // the arrows "copy" local blocks into a doomed temp file that never reaches the
     // org (deploy is the only upload path).
-    const title = `${item.type}:${item.name} — ${orgLabel} ↔ Local`;
+    const title = `${item.type}:${item.name}${fileLabel ? `/${fileLabel}` : ''} — ${orgLabel} ↔ Local`;
     await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(item.filePath), title, { preview: false, viewColumn });
   }
 
@@ -4968,7 +5031,9 @@ function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
  *  because it is load-bearing beyond diff quality: runDiff hands `item.filePath`
  *  straight to `vscode.diff`, so every DIRECTORY_ITEM_TYPES member has to be in
  *  here or that call would pass a folder to an editor — the same wall the openFile
- *  handler hit. check-open-target.cjs pins the containment. */
+ *  handler hit. check-open-target.cjs pins the containment. The one way past this
+ *  set is runDiff's `focusFile`, which first rewrites `filePath` to a real file
+ *  inside the folder. */
 export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
@@ -5038,8 +5103,13 @@ export function pruneCardButtons(
  *  single right-clicked file is the common case, so name its type outright. */
 export function nothingDiffableNotice(unsupportedTypes: string[], orgOnlyCount: number): string {
   const parts: string[] = [];
-  if (unsupportedTypes.length === 1) parts.push(`diff isn't supported for ${unsupportedTypes[0]} yet`);
-  else if (unsupportedTypes.length > 1) parts.push(`${unsupportedTypes.length} unsupported metadata types`);
+  if (unsupportedTypes.length === 1) {
+    // Same correction as the card line: a folder-typed component IS diffable through
+    // one of its files, so the toast must not tell the user the type isn't supported.
+    parts.push(DIRECTORY_ITEM_TYPES.has(unsupportedTypes[0])
+      ? `${unsupportedTypes[0]} has no whole-component diff — right-click a file inside it`
+      : `diff isn't supported for ${unsupportedTypes[0]} yet`);
+  } else if (unsupportedTypes.length > 1) parts.push(`${unsupportedTypes.length} unsupported metadata types`);
   if (orgOnlyCount > 0) parts.push(`${orgOnlyCount} org-only component${orgOnlyCount === 1 ? '' : 's'} (retrieve first)`);
   return `Nothing to diff — ${parts.join(' · ') || 'nothing comparable was selected'}`;
 }
@@ -5233,21 +5303,41 @@ function hintForError(err: unknown): string | undefined {
 
 /** Recursively find a file under `dir` whose name equals `exactBasename`, else the
  *  first whose name starts with `leafName + '.'`. Bounded by the retrieve output. */
-async function findFileMatching(dir: string, exactBasename: string, leafName: string): Promise<string | undefined> {
+/** First file under `dir`, depth-first, satisfying `pred`. */
+async function findFile(dir: string, pred: (name: string, full: string) => boolean): Promise<string | undefined> {
   let entries: import('fs').Dirent[];
   try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return undefined; }
-  let prefixHit: string | undefined;
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
-      const nested = await findFileMatching(full, exactBasename, leafName);
+      const nested = await findFile(full, pred);
       if (nested) return nested;
-    } else if (e.isFile()) {
-      if (e.name === exactBasename) return full;
-      if (!prefixHit && e.name.startsWith(leafName + '.')) prefixHit = full;
+    } else if (e.isFile() && pred(e.name, full)) {
+      return full;
     }
   }
-  return prefixHit;
+  return undefined;
+}
+
+/** Locate a retrieved component in the throwaway project: the SAME basename as the
+ *  local copy (source format's guarantee), and only if the whole tree has none, a
+ *  `<leaf>.*` near-miss inside a folder of the same name.
+ *
+ *  Three walks, most-specific first, because ONE walk showed a different component's
+ *  source with no hint anything was wrong:
+ *    1. exact basename in a folder of the same name — the only pairing that is certain.
+ *       Two EmailTemplates named `Welcome` in different folders (`Folder/Name` is the
+ *       fullName, so that is legal) otherwise both resolve to whichever the readdir
+ *       reached first.
+ *    2. exact basename anywhere — kept so a retrieve nesting we didn't predict still
+ *       pairs rather than reporting a present component absent.
+ *    3. a `<leaf>.*` near-miss, folder-guarded. Unguarded it let a QuickAction
+ *       `Widget__c.New_Widget` answer for a CustomTab `Widget__c`. */
+async function findFileMatching(dir: string, exactBasename: string, leafName: string, folderName: string): Promise<string | undefined> {
+  const inFolder = (full: string): boolean => path.basename(path.dirname(full)) === folderName;
+  return await findFile(dir, (n, full) => n === exactBasename && inFolder(full))
+    ?? await findFile(dir, n => n === exactBasename)
+    ?? await findFile(dir, (n, full) => n.startsWith(leafName + '.') && inFolder(full));
 }
 
 /** Recursively find a file under `dir` whose absolute path ends with `suffixPath`
@@ -5255,18 +5345,7 @@ async function findFileMatching(dir: string, exactBasename: string, leafName: st
  *  locate a decomposed child inside the converted source tree without assuming the
  *  tree's root nesting, while still keying on the object + child folder. */
 async function findFileBySuffix(dir: string, suffixPath: string): Promise<string | undefined> {
-  let entries: import('fs').Dirent[];
-  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return undefined; }
-  for (const e of entries) {
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      const nested = await findFileBySuffix(full, suffixPath);
-      if (nested) return nested;
-    } else if (e.isFile() && (full === suffixPath || full.endsWith(path.sep + suffixPath))) {
-      return full;
-    }
-  }
-  return undefined;
+  return findFile(dir, (_n, full) => full === suffixPath || full.endsWith(path.sep + suffixPath));
 }
 
 /** Scaffold a throwaway SFDX project so a source-format retrieve has somewhere to
