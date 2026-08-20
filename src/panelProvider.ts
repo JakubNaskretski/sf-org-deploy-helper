@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
-import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType } from './sfCliService';
+import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
 import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
@@ -2281,11 +2281,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // `files` on newer output — read both so failures are never silently dropped
     // (and the success gate accounts for both).
     const detailFailures = result.details?.componentFailures ?? [];
-    const detailSuccesses = result.details?.componentSuccesses ?? [];
     const fileFailures = (result.files ?? []).filter(f => f.state === 'Failed' || !!fileProblem(f));
-    const fileSuccesses = (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !fileProblem(f));
     const failures = detailFailures.length ? detailFailures : fileFailures;
-    const successes = detailSuccesses.length ? detailSuccesses : fileSuccesses;
+    const successes = deploySuccessRows(result);
     const testFailures: DeployTestFailure[] = result.details?.runTestResult?.failures ?? [];
     const success = result.success
       && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
@@ -2303,6 +2301,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // deploy it without re-validating / re-running tests.
         this.lastValidated = { jobId: result.id, org, label: orgLabel, count: items.length };
       }
+      // A real deploy landed these on the org — refresh their badges. Validate-only
+      // lands nothing. Failure path deliberately skipped: deploys are atomic
+      // (rollbackOnError is never disabled by this extension), so a failed run
+      // leaves org membership as it was.
+      if (!validateOnly) this.confirmDeployedOnOrg(successes, items, org, orgLabel);
       this.post({
         type: 'status',
         card: {
@@ -2816,7 +2819,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.persistActiveJob({ jobId: quickJobId, org, orgLabel, startedAt: Date.now(), verb: 'Quick Deploy', noun });
           const outcome = await this.drivePolledDeploy(
             { jobId: quickJobId, org, orgLabel, root, verb: 'Quick Deploy', noun, cmdId, start, progressTitle }, report,
-            result => this.reportQuickDeployResult(result, { orgLabel, count: validated.count, cmdId, start })
+            result => this.reportQuickDeployResult(result, { org, orgLabel, count: validated.count, cmdId, start })
           );
           keepPersisted = outcome.keepPersisted;
         });
@@ -2846,9 +2849,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  otherwise the quick-deploy-specific success/failure card. */
   private reportQuickDeployResult(
     result: DeployResult,
-    ctx: { orgLabel: string; count: number; cmdId: string; start: number }
+    ctx: { org: string; orgLabel: string; count: number; cmdId: string; start: number }
   ): void {
-    const { orgLabel, count, cmdId, start } = ctx;
+    const { org, orgLabel, count, cmdId, start } = ctx;
     const noun = `${count} component${count === 1 ? '' : 's'}`;
     if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
       this.endCmd(cmdId, false, Date.now() - start);
@@ -2862,6 +2865,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       && failures.length === 0;
     this.endCmd(cmdId, success, Date.now() - start);
     if (success) {
+      // No original item list survives to a quick deploy (only a count), so the
+      // row→item mapping leans on the scanner's current items alone.
+      this.confirmDeployedOnOrg(deploySuccessRows(result), [], org, orgLabel);
       this.post({
         type: 'status',
         card: {
@@ -2948,13 +2954,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const { result, cmd } = await handle.promise;
         this.updateCmd(cmdId, cmd);
         const files = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
-        const ok = files.filter(f => !f.problem && (f.state === undefined || f.state !== 'Failed'));
-        const failed = files.filter(f => f.problem || f.state === 'Failed');
+        const ok = files.filter(f => !retrieveProblem(f) && (f.state === undefined || f.state !== 'Failed'));
+        const failed = files.filter(f => retrieveProblem(f) || f.state === 'Failed');
         const missing = items.filter(i => !files.some(f => f.fullName === i.name && f.type === i.type));
         // Org-level messages (e.g. "entity of type X named Y cannot be found")
         // explain an empty result better than the bare missing list — surface them.
         const msgLines = (result.messages ?? []).filter(m => m.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
         this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
+        // Every ok row came FROM the org — proof of membership even when the last
+        // Fetch Org predates the component. The local side ('On org' → 'In both')
+        // is covered by the loadFiles() rescan below.
+        this.confirmOnOrg(ok, org, orgLabel);
 
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
           this.post({
@@ -2982,7 +2992,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         } else {
           const lines: string[] = [];
           for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
-          for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
+          for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`);
           for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
           lines.push(...msgLines);
           this.post({
@@ -3193,10 +3203,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const { result, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
           const files = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
-          const ok = files.filter(f => !f.problem && (f.state === undefined || f.state !== 'Failed'));
-          const failed = files.filter(f => f.problem || f.state === 'Failed');
+          const ok = files.filter(f => !retrieveProblem(f) && (f.state === undefined || f.state !== 'Failed'));
+          const failed = files.filter(f => retrieveProblem(f) || f.state === 'Failed');
           const msgLines = (result.messages ?? []).filter(m => m.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
           this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
+          // See runRetrieve: ok rows are org-confirmed membership.
+          this.confirmOnOrg(ok, org, orgLabel);
 
           if (failed.length === 0 && ok.length > 0) {
             this.post({
@@ -3224,7 +3236,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           } else {
             const lines: string[] = [];
             for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
-            for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${f.problem ?? 'failed'}`);
+            for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`);
             lines.push(...msgLines);
             this.post({
               type: 'status',
@@ -3426,12 +3438,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // to the org we just deleted from (a stale map for another org must be left alone).
     if (this.orgMembersOrg === org) {
       for (const k of deletedKeys) this.orgMembers.delete(k);
-      const orgItems = [...this.orgMembers.keys()].map(k => {
-        const colon = k.indexOf(':');
-        return { type: k.slice(0, colon), name: k.slice(colon + 1) };
-      });
       // Re-post so org-only rows / "on org" badges for the now-gone components vanish.
-      this.post({ type: 'orgMetadata', orgItems, orgLabel });
+      this.postOrgMembership(orgLabel);
     }
     // Rescan: the deleted source files are gone, so the tree drops them and — via the
     // webview's 'files' pruning against local+org keys — so does the selection. This
@@ -3439,6 +3447,81 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // (a delete removes files, i.e. changes the working tree). Neither throws.
     await this.loadFiles();
     await this.postChangedComponents();
+  }
+
+  /** Re-post the cached org membership to the webview (badges, org-only rows). */
+  private postOrgMembership(orgLabel: string): void {
+    const orgItems = [...this.orgMembers.keys()].map(k => {
+      const colon = k.indexOf(':');
+      return { type: k.slice(0, colon), name: k.slice(colon + 1) };
+    });
+    this.post({ type: 'orgMetadata', orgItems, orgLabel });
+  }
+
+  /** After a successful deploy or retrieve: the org itself just confirmed these
+   *  components exist on it, so fold them into cached membership and re-post —
+   *  flipping "Local only" badges to "In both" without waiting for the next Fetch
+   *  Org. Keys come ONLY from the org's per-component result rows, never from the
+   *  request (a manifest deploy's `ApexClass:*` must not mint a membership key).
+   *  Same guards as afterDelete: leave a membership belonging to another org
+   *  alone, and if no fetch ever populated it there are no badges to fix —
+   *  posting would falsely mark everything else "Local only".
+   *
+   *  DEPLOY rows must go through confirmDeployedOnOrg instead: MDAPI detail rows
+   *  report bundles per FILE (`myCmp/myCmp.js`), not per component — minting those
+   *  verbatim would create phantom org-only tree rows AND never flip the real
+   *  bundle badge (same shape problem localFailureKey exists for). Retrieve rows
+   *  are component-keyed (runRetrieve's `missing` check depends on exactly that),
+   *  so they are folded raw — after validation. */
+  private confirmOnOrg(
+    rows: Array<Pick<DeployFileResult, 'fullName' | 'type' | 'componentType'>>,
+    org: string,
+    orgLabel: string
+  ): void {
+    if (this.orgMembersOrg !== org) return;
+    this.addOrgMemberKeys(rows.map(r => {
+      const type = fileType(r);
+      // Both halves come from `sf --json`, and membership keys later become
+      // `--metadata <type>:<name>` argv tokens (resolveKeys) — apply the same
+      // defense-in-depth the scanner/learned-rule paths apply to type tokens:
+      // reject anything not shaped like a metadata type (flags, whitespace,
+      // colons — a colon-carrying type would also silently relabel the key,
+      // since every splitter cuts on the FIRST colon). Names keep their full
+      // legal charset (folders like `unfiled$public/Report`, dots, spaces) but
+      // never a wildcard, and the package.xml pseudo-row is junk, not metadata.
+      if (!/^[A-Za-z0-9_]+$/.test(type)) return undefined;
+      if (!r.fullName || r.fullName === 'package.xml' || r.fullName.includes('*')) return undefined;
+      return `${type}:${r.fullName}`;
+    }), orgLabel);
+  }
+
+  /** Deploy-flavoured confirmOnOrg: resolve each success row back to a scanned
+   *  local item first (exact key, else filePath — bundle sub-file rows land on
+   *  their bundle), and fold the ITEM's canonical key. A row no local item
+   *  accounts for is dropped — a deploy can only have deployed local source, so
+   *  an unmappable row is shape drift, not new membership. Item keys come from
+   *  the scanner, so they need no further vetting. */
+  private confirmDeployedOnOrg(
+    rows: Array<Pick<DeployFileResult, 'fullName' | 'type' | 'componentType' | 'filePath'>>,
+    deployedItems: MetadataItem[],
+    org: string,
+    orgLabel: string
+  ): void {
+    if (this.orgMembersOrg !== org) return; // skip the per-row item scans when membership can't change
+    this.addOrgMemberKeys(rows.map(r => this.localFailureKey(r, deployedItems)), orgLabel);
+  }
+
+  /** Shared sink for both confirm paths: fold vetted keys into the map, re-post
+   *  only when something actually changed — the common case (components already
+   *  on the org) must not re-render the webview tree. */
+  private addOrgMemberKeys(keys: Array<string | undefined>, orgLabel: string): void {
+    let added = false;
+    for (const key of keys) {
+      if (!key || this.orgMembers.has(key)) continue;
+      this.orgMembers.set(key, true);
+      added = true;
+    }
+    if (added) this.postOrgMembership(orgLabel);
   }
 
   /**
@@ -5244,6 +5327,19 @@ const TERMINAL_DEPLOY_STATUSES = new Set(['Succeeded', 'SucceededPartial', 'Fail
 function isTerminalDeploy(result: DeployResult): boolean {
   const status = typeof result.status === 'string' ? result.status : '';
   return TERMINAL_DEPLOY_STATUSES.has(status) || result.done === true;
+}
+
+/** Per-component success rows of a deploy result across both CLI shapes: prefer
+ *  `details.componentSuccesses` when it has rows, else the filtered `files` list.
+ *  `.length ?`, not `??` — an empty-but-present detail array must fall through to
+ *  `files`, or a shape carrying both silently reports zero successes. Note the
+ *  files filter admits any non-Failed state; if a destructive-changes flag is
+ *  ever added to deployMetadata, `state: 'Deleted'` rows would count as present
+ *  here and need excluding. */
+export function deploySuccessRows(result: DeployResult): DeployFileResult[] {
+  const detail = result.details?.componentSuccesses ?? [];
+  if (detail.length) return detail;
+  return (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !fileProblem(f));
 }
 
 /** The `Type:Name` components a delete (or its dry-run) reports as removed. The shape

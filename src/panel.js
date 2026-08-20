@@ -1028,6 +1028,16 @@
         });
         head.appendChild(selectAll);
       }
+      if (state.selected.size > 0) {
+        const clear = document.createElement('button');
+        // Global count in the label: this clears the WHOLE selection (matching the
+        // toolbar ✕ and the Selected lens's Clear all), while its neighbour
+        // "Select all (N)" is lens-scoped — the differing counts disclose that.
+        clear.textContent = `Clear selection (${state.selected.size})`;
+        clear.title = 'Deselect everything';
+        clear.addEventListener('click', () => { state.selected.clear(); state.selectedLensKeys = null; selectionChanged(); });
+        head.appendChild(clear);
+      }
       tree.appendChild(head);
     }
     if (objectMap.size === 0 && flatGroups.size === 0) {

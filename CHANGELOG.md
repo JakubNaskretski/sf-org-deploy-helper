@@ -3,6 +3,23 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.19.0
+
+- New: **Badges keep up with your deploys and retrieves.** Deploying a component that wasn't on
+  the org flips its badge from "Local only" to "In both" the moment the deploy succeeds — same
+  for quick deploys, and a retrieve marks what it actually brought back. Previously the tree only
+  caught up on the next Fetch Org. Only components the org itself confirmed are updated: a
+  validate-only run (which deploys nothing) changes nothing, a failed deploy changes nothing, and
+  a deploy to a different org than the one you fetched leaves your view alone. LWC and Aura
+  bundles update as one component, not as their individual files.
+- New: **Deselect everything from the Changed view.** Next to "Select all (N)" there is now
+  "Clear selection (M)" — N counts what this view can add, M counts your whole selection across
+  every view, so the differing numbers make the scope obvious. (The toolbar ✕ did this already;
+  now it's also where you'd look for it.)
+- Fixed: **Retrieve failures can't hide behind newer CLI wording.** Recent sf versions report a
+  failed file with different fields than older ones; those rows now count as failures in the
+  result card instead of being listed as retrieved.
+
 ## 0.18.0
 
 - New: **Dependency suggestions understand many more org errors.** A failed deploy that says

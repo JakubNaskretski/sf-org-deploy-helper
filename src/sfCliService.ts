@@ -132,6 +132,14 @@ export interface RetrieveFileResult {
   state?: string;
   filePath?: string;
   problem?: string;
+  /** Modern `sf` reports the failure text here and omits `problem` (same drift
+   *  as DeployFileResult.error) — read via retrieveProblem(), not `f.problem`. */
+  error?: string;
+}
+
+/** Failure text of a retrieve row across CLI shapes (see RetrieveFileResult.error). */
+export function retrieveProblem(f: Pick<RetrieveFileResult, 'problem' | 'error'>): string | undefined {
+  return f.problem ?? f.error;
 }
 
 export interface OrgMember {

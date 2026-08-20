@@ -128,9 +128,12 @@ body.resizing { cursor: row-resize; user-select: none; }
 .view-modes button.active { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
 /* Slim per-mode header inside the tree (e.g. "5 selected — Clear all"). */
 .mode-head {
-  display: flex; justify-content: space-between; align-items: center;
+  /* Label grows/ellipsizes on the left, buttons stay right — space-between would
+     centre the middle button once there are two (Select all + Clear selection). */
+  display: flex; align-items: center; gap: 8px; white-space: nowrap;
   padding: 2px 10px; font-size: 11px; color: var(--muted);
 }
+.mode-head span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .mode-head button {
   background: transparent; border: none; color: var(--muted); cursor: pointer;
   font-size: 11px; font-family: inherit; padding: 0;
