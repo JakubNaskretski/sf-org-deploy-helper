@@ -3,6 +3,14 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.19.2
+
+- Fixed: **The ⟳ button stays locked until its own refresh finishes.** Switching org while the
+  list was being re-read (from the dropdown or from another extension) unlocked it early, so the
+  spin stopped and a second refresh could start behind the first. It now waits for the reply to
+  its own request. Also, a listing failure at startup no longer shows "no authenticated orgs"
+  while leaving the deploy buttons enabled for the remembered org.
+
 ## 0.19.1
 
 - Fixed: **The ⟳ button shows it is refreshing the org list.** Clicking it looked dead: the list

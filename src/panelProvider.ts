@@ -775,7 +775,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       }
       case 'refreshOrgs':
-        await this.loadOrgs(true);
+        // The webview's ⟳ locks until THIS request is answered — not until any
+        // `orgs` broadcast (an org switch mid-listing would unlock it early).
+        try { await this.loadOrgs(true); } finally { this.post({ type: 'orgsRefreshed' }); }
         return;
       case 'refreshFiles':
         await this.refreshFiles();
@@ -1162,9 +1164,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // on the automatic load at startup.
       this.post({ type: 'banner', message: `Failed to list orgs: ${msg}${hint ? ` — ${hint}` : ''}` });
       this.reportError('List orgs', err);
-      // Still answer with the (unchanged) list: the webview's ⟳ stays locked
-      // until an `orgs` message arrives, whatever the outcome.
-      this.postOrgs();
       return;
     }
     try {

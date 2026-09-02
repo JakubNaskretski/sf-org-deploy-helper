@@ -20,7 +20,7 @@
   const persisted = vscode.getState() || {};
   const state = {
     orgs: [],
-    orgsLoading: false, // ⟳ request in flight; only the next `orgs` message clears it
+    orgsLoading: false, // ⟳ request in flight; only the provider's `orgsRefreshed` reply clears it
     selectedOrg: null,
     items: [], // {type, name, key (type:name), filePath, files[]}
     objectChildTypes: new Set(), // metadata types that nest under an object (CustomField, …)
@@ -120,9 +120,11 @@
 
   // ---- Init ----
   window.addEventListener('message', (ev) => handleMessage(ev.data));
-  // ⟳ locks itself until the provider answers with `orgs` (sent on success AND
-  // failure), so repeat clicks can't stack `sf org list` spawns, and the spin
-  // shows the click landed — a re-rendered identical dropdown doesn't.
+  // ⟳ locks itself until the provider's `orgsRefreshed` reply (sent when THIS
+  // request finishes, success or failure — not on any `orgs` broadcast, which an
+  // org switch mid-listing would trigger early), so repeat clicks can't stack
+  // `sf org list` spawns, and the spin shows the click landed — a re-rendered
+  // identical dropdown doesn't.
   $('refreshOrgs').addEventListener('click', () => {
     if (state.orgsLoading) return;
     state.orgsLoading = true;
@@ -295,10 +297,13 @@
   function handleMessage(msg) {
     switch (msg.type) {
       case 'orgs':
-        state.orgsLoading = false;
         state.orgs = msg.orgs || [];
         state.selectedOrg = msg.selected || null;
         renderOrgs();
+        renderActions();
+        return;
+      case 'orgsRefreshed':
+        state.orgsLoading = false;
         renderActions();
         return;
       case 'files': {
