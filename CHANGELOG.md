@@ -3,6 +3,15 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.19.1
+
+- Fixed: **The ⟳ button shows it is refreshing the org list.** Clicking it looked dead: the list
+  was re-read, but an unchanged list re-rendered identically, and nothing stopped further clicks
+  from starting more `sf org list` runs behind the first. The button now locks and spins until
+  the list comes back, a status-bar message confirms the refresh and the org count, and a
+  listing failure unlocks it as well as reporting the error. Its tooltip is back too — it went
+  missing after the first refresh.
+
 ## 0.19.0
 
 - New: **Badges keep up with your deploys and retrieves.** Deploying a component that wasn't on

@@ -18,7 +18,9 @@
 //      catch the tree mid-write. It may not prune (a partial list is
 //      indistinguishable from a deletion, and the prune is persisted), and an
 //      equivalent list may not re-render: every render replaces the tree's
-//      innerHTML, and scroll position and keyboard focus go with it.
+//      innerHTML, and scroll position and keyboard focus go with it;
+//   5) the ⟳ Refresh-orgs button: locked while its request is in flight, freed
+//      only by the provider's `orgs` answer — which must come on failure too.
 //
 // panel.js is a browser-only IIFE with no exports, so it is run inside a minimal
 // DOM/vscode-API shim and driven the way the provider drives it: by delivering
@@ -513,6 +515,37 @@ check('a base-ref switch repaints even with the same key set', () => {
   const before = rows(p);
   p.deliver({ type: 'changed', keys: [KEY('AcmeOrderService')], base: 'origin/main' });
   assert.notStrictEqual(rows(p), before);
+});
+
+// ------------------------------------------ 5) the ⟳ Refresh-orgs button
+// A successful refresh re-renders the same dropdown, so the button itself is
+// the feedback: it locks (and spins) on click, stacks no second request, and
+// unlocks only when the provider answers with `orgs`.
+check('⟳ locks on click, ignores repeats, unlocks on the orgs answer', () => {
+  const p = panel(undefined);
+  const btn = p.el('refreshOrgs');
+  const sent = () => p.outbound.filter(m => m.type === 'refreshOrgs').length;
+  btn.fire('click');
+  assert.strictEqual(sent(), 1);
+  assert.strictEqual(btn.disabled, true);
+  assert.ok(btn.classList.contains('loading'));
+  btn.fire('click'); // repeat while in flight — must not spawn another `sf org list`
+  assert.strictEqual(sent(), 1);
+  p.deliver({ type: 'orgs', orgs: [], selected: null });
+  assert.strictEqual(btn.disabled, false);
+  assert.ok(!btn.classList.contains('loading'));
+  assert.strictEqual(btn.title, 'Refresh org list');
+  btn.fire('click'); // and it works again afterwards
+  assert.strictEqual(sent(), 2);
+});
+
+check('the provider answers ⟳ with orgs even when listing fails', () => {
+  // Otherwise the button spins forever: the unlock has exactly one trigger.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
+  const body = /private async loadOrgs\([^)]*\)[^{]*\{([\s\S]*?)\n  \}\n/.exec(src)?.[1] ?? '';
+  const failPath = /catch \(err\) \{([\s\S]*?)return;/.exec(body)?.[1] ?? '';
+  assert.ok(failPath, 'loadOrgs failure path not found');
+  assert.ok(/this\.postOrgs\(\);/.test(failPath), 'loadOrgs failure path must postOrgs() before returning');
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

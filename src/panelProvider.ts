@@ -1162,6 +1162,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // on the automatic load at startup.
       this.post({ type: 'banner', message: `Failed to list orgs: ${msg}${hint ? ` — ${hint}` : ''}` });
       this.reportError('List orgs', err);
+      // Still answer with the (unchanged) list: the webview's ⟳ stays locked
+      // until an `orgs` message arrives, whatever the outcome.
+      this.postOrgs();
       return;
     }
     try {
@@ -1182,6 +1185,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.postOrgs();
     if (notify && this.orgs.length === 0) {
       vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
+    } else if (notify) {
+      // An unchanged list re-renders identically — say it finished.
+      vscode.window.setStatusBarMessage(`$(check) SF Deploy: org list refreshed — ${this.orgs.length} org${this.orgs.length === 1 ? '' : 's'}`, 4000);
     }
     this.post({ type: 'banner', message: this.orgs.length === 0 ? 'No authenticated Salesforce orgs found. Run `sf org login web`.' : '' });
   }

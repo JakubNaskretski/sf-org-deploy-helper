@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.19.0",
+  "version": "0.19.1",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -209,7 +209,12 @@
         },
         "sfOrgDeployWrapper.defaultTestLevel": {
           "type": "string",
-          "enum": ["", "NoTestRun", "RunLocalTests", "RunAllTestsInOrg"],
+          "enum": [
+            "",
+            "NoTestRun",
+            "RunLocalTests",
+            "RunAllTestsInOrg"
+          ],
           "enumDescriptions": [
             "Smart default — RunLocalTests against a production org, NoTestRun against a sandbox or scratch org.",
             "Run no Apex tests. Salesforce rejects this test level for a production deploy.",

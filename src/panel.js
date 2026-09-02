@@ -20,6 +20,7 @@
   const persisted = vscode.getState() || {};
   const state = {
     orgs: [],
+    orgsLoading: false, // ⟳ request in flight; only the next `orgs` message clears it
     selectedOrg: null,
     items: [], // {type, name, key (type:name), filePath, files[]}
     objectChildTypes: new Set(), // metadata types that nest under an object (CustomField, …)
@@ -119,7 +120,15 @@
 
   // ---- Init ----
   window.addEventListener('message', (ev) => handleMessage(ev.data));
-  $('refreshOrgs').addEventListener('click', () => send('refreshOrgs'));
+  // ⟳ locks itself until the provider answers with `orgs` (sent on success AND
+  // failure), so repeat clicks can't stack `sf org list` spawns, and the spin
+  // shows the click landed — a re-rendered identical dropdown doesn't.
+  $('refreshOrgs').addEventListener('click', () => {
+    if (state.orgsLoading) return;
+    state.orgsLoading = true;
+    renderActions();
+    send('refreshOrgs');
+  });
   // Authenticate a new org (sf org login web) — busy-guarded like the other toolbar
   // buttons so it can't be fired into a running operation.
   $('addOrg').addEventListener('click', () => { if (!state.busy) send('loginOrg'); });
@@ -286,6 +295,7 @@
   function handleMessage(msg) {
     switch (msg.type) {
       case 'orgs':
+        state.orgsLoading = false;
         state.orgs = msg.orgs || [];
         state.selectedOrg = msg.selected || null;
         renderOrgs();
@@ -1205,8 +1215,10 @@
     if (orgSelect) { orgSelect.disabled = state.busy || state.orgs.length === 0; orgSelect.title = lockTip; }
     $('fetchOrgBtn').disabled = state.busy;
     $('fetchOrgBtn').title = lockTip;
-    $('refreshOrgs').disabled = state.busy;
-    $('refreshOrgs').title = lockTip;
+    const refreshOrgs = $('refreshOrgs');
+    refreshOrgs.disabled = state.busy || state.orgsLoading;
+    refreshOrgs.title = lockTip || (state.orgsLoading ? 'Refreshing org list…' : 'Refresh org list');
+    refreshOrgs.classList.toggle('loading', state.orgsLoading);
     $('addOrg').disabled = state.busy;
     $('addOrg').title = lockTip || 'Authenticate a new org (sf org login web)';
     $('refreshFiles').disabled = state.busy;

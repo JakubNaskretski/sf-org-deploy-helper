@@ -398,6 +398,9 @@ body.resizing { cursor: row-resize; user-select: none; }
   vertical-align: middle; margin-right: 6px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* ⟳ spins while the provider re-lists orgs — an unchanged dropdown re-renders
+   identically, so this is the only sign the click landed. */
+#refreshOrgs.loading span { display: inline-block; animation: spin 0.8s linear infinite; }
 
 .banner {
   /* statusBarItem.warning* is a matched fg/bg pair with core defaults in every
@@ -454,7 +457,7 @@ body.resizing { cursor: row-resize; user-select: none; }
   <div class="toolbar">
     <span title="Salesforce org">Org:</span>
     <select id="orgSelect" class="org" title="Authenticated orgs"></select>
-    <button id="refreshOrgs" class="secondary" title="Refresh org list">⟳</button>
+    <button id="refreshOrgs" class="secondary" title="Refresh org list"><span>⟳</span></button>
     <button id="addOrg" class="secondary" title="Authenticate a new org (sf org login web)">＋</button>
     <button id="refreshFiles" class="secondary" title="Rescan workspace metadata">Rescan</button>
     <button id="fetchOrgBtn" class="secondary" title="Fetch all metadata from the connected org and merge with local workspace">Fetch Org</button>
