@@ -3,6 +3,17 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.20.1
+
+- Fixed: **Retrieve no longer fails with "Source Conflict Error".** On a source-tracked org
+  (scratch or sandbox) the CLI refused to retrieve any component you had also edited locally,
+  and the panel offered no way past it — even though you had just confirmed a modal saying your
+  local files will be overwritten, and a backup had been taken. Retrieve now tells the CLI to
+  overwrite (`--ignore-conflicts`) whenever that backup is on disk, which is what a retrieve is
+  for; if you have turned pre-retrieve backups off (or the backup was skipped as too large), the
+  CLI's conflict check stays on as your last safety net. Deploys are unchanged: the org side is
+  still protected unless you turn on the overwrite toggle.
+
 ## 0.20.0
 
 - Added: **Your target org is now your own.** Switching the org in another Skrety Salesforce

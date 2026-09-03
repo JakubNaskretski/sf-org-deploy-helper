@@ -370,7 +370,7 @@ export class SfCliService extends KitSfCliService {
     metadata: string[],
     targetOrg: string,
     cwd: string,
-    opts: { outputDir?: string; timeoutMs?: number; sourceDirs?: string[]; manifest?: string } = {}
+    opts: { outputDir?: string; timeoutMs?: number; sourceDirs?: string[]; manifest?: string; ignoreConflicts?: boolean } = {}
   ): Cancellable<{ result: RetrieveResult; cmd: string }> {
     const args = ['project', 'retrieve', 'start'];
     // A manifest wins over the source-dir / per-component targets (mutually
@@ -381,6 +381,9 @@ export class SfCliService extends KitSfCliService {
     else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
     if (opts.outputDir) args.push('--target-metadata-dir', opts.outputDir, '--unzip');
+    // `--ignore-conflicts` skips the CLI's source-tracking conflict check. Only
+    // meaningful on tracked orgs (scratch/sandbox); a no-op elsewhere.
+    if (opts.ignoreConflicts) args.push('--ignore-conflicts');
     args.push('--json');
     const cmd = this.formatCmd(args);
     const inner = this.runJsonCancellable<SfJsonEnvelope<RetrieveResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
