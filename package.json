@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.19.2",
+  "version": "0.20.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -229,11 +229,17 @@
           "default": true,
           "markdownDescription": "Before a retrieve overwrites your local files, save the current copies first so the overwrite is undoable via **SF Deploy: Restore Retrieve Backup**. Backups are kept for the last 5 retrieves per workspace (older ones are pruned). A retrieve is aborted if its backup can't be written — the safety net is the whole point, so proceeding without it silently would be worse."
         },
+        "sfOrgDeployWrapper.syncOrgWithFamily": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Follow and publish the Salesforce org shared across the Skrety SF plugins (`skrety.salesforce.targetOrg`). Off: this plugin keeps its own org and ignores switches made in sibling plugins."
+        },
         "skrety.salesforce.targetOrg": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Shared target Salesforce org (username or alias) for the Skrety SF plugin family. Set from the org picker in any of the plugins; machine-scoped so it isn't synced to other machines. Leave empty to fall back to the CLI default org."
+          "markdownDescription": "Shared target Salesforce org (username or alias) for the Skrety SF plugin family. Only used by plugins that have their own `syncOrgWithFamily` setting enabled — those follow it and publish their org picks to it; every other plugin keeps its own target org and ignores this value. Machine-scoped so it isn't synced to other machines."
         }
       }
     }
@@ -241,7 +247,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },

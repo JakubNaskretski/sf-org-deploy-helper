@@ -323,16 +323,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // corrupted write or a hand-edited state DB.
     this.testLevel = this.readStoredTestLevel();
     this.runTests = this.readStoredRunTests();
-    // Follow EXTERNAL changes to the shared target-org setting (a sibling Skrety SF
-    // plugin, or a hand edit of settings.json): drop org metadata fetched for a
-    // different org so stale badges can't describe the new target, then resync the
-    // webview dropdown/state. NEVER write orgStore from here — the write is what
-    // fired this event, so setting it again would loop. Our own applyOrgSelection /
-    // pickOrg writes also land here; they've already reset metadata (making the guard
-    // a no-op) and a second postOrgs is harmless. This also closes the cross-plugin
-    // clobber: with the dropdown kept current, Fetch Org sends the ACTUAL selected
-    // org, so its applyOrgSelection no longer writes a stale org back over the
-    // sibling's switch.
+    // Follow every applied target-org change — our own picks, and (only while
+    // `sfOrgDeployWrapper.syncOrgWithFamily` is on) a switch adopted from a sibling
+    // Skrety SF plugin: drop org metadata fetched for a different org so stale
+    // badges can't describe the new target, then resync the webview dropdown/state.
+    // NEVER write orgStore from here — the write is what fired this event, so
+    // setting it again would loop. Our own applyOrgSelection / pickOrg writes also
+    // land here; they've already reset metadata (making the guard a no-op) and a
+    // second postOrgs is harmless. This also closes the cross-plugin clobber: with
+    // the dropdown kept current, Fetch Org sends the ACTUAL selected org, so its
+    // applyOrgSelection no longer writes a stale org back over an adopted switch.
     context.subscriptions.push(orgStore.onDidChange(username => {
       if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
       this.postOrgs();
@@ -399,7 +399,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (this.busy) { this.notifyBusy(); return; }
     const username = await this.promptForOrg('Select Salesforce org');
     if (username) {
-      await this.orgStore.set(username);
+      // A deliberate pick — the one path that may publish to the family setting
+      // (and only while syncOrgWithFamily is on; the store decides).
+      await this.orgStore.setFromUserPick(username);
       if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
       this.postOrgs();
     }
@@ -790,7 +792,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await this.loadOrgMetadata();
         return;
       case 'selectOrg':
-        await this.applyOrgSelection(msg.username || undefined);
+        await this.applyOrgSelection(msg.username || undefined, true);
         return;
       case 'useActiveFile':
         this.sendActiveFile(true, true);
@@ -1167,6 +1169,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
+      // Reconcile the remembered org against the list, and fall back to the CLI
+      // default on a first run. Both are housekeeping, not a pick: `set` keeps them
+      // private to this plugin so they can never retarget a sibling's org.
       const current = this.orgStore.get();
       if (current && !this.orgs.some(o => o.username === current)) {
         await this.orgStore.set(undefined);
@@ -3952,10 +3957,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** Apply a target-org selection from the webview: persist it, drop org metadata
    *  fetched for a different org, and re-broadcast. No-op when unchanged, so it's safe
-   *  to call defensively right before an operation that must hit the selected org. */
-  private async applyOrgSelection(username: string | undefined): Promise<void> {
+   *  to call defensively right before an operation that must hit the selected org.
+   *  `userInitiated` marks the panel's org dropdown — the only caller here that is an
+   *  actual pick, and so the only one that may publish to the family setting. Echoing
+   *  back the dropdown's existing value (Fetch Org) and auto-selecting a freshly
+   *  authenticated org are housekeeping: they stay private to this plugin. */
+  private async applyOrgSelection(username: string | undefined, userInitiated = false): Promise<void> {
     if (username === this.orgStore.get()) return;
-    await this.orgStore.set(username);
+    if (userInitiated) await this.orgStore.setFromUserPick(username);
+    else await this.orgStore.set(username);
     if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
     this.postOrgs();
   }

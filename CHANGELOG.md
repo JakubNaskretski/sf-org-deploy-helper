@@ -3,6 +3,14 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.20.0
+
+- Added: **Your target org is now your own.** Switching the org in another Skrety Salesforce
+  extension no longer retargets your deploys, and picking an org here no longer moves theirs.
+  Prefer the old shared behavior? Turn on `sfOrgDeployWrapper.syncOrgWithFamily` (off by
+  default) — it takes effect immediately, follows the shared org and publishes your picks to
+  it. On the first start after updating you keep the org you were already using.
+
 ## 0.19.2
 
 - Fixed: **The ⟳ button stays locked until its own refresh finishes.** Switching org while the
