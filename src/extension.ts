@@ -6,13 +6,7 @@ import { DeployPanelProvider } from './panelProvider';
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Org Deploy Wrapper');
   const sf = new SfCliService();
-  const orgStore = new OrgStore(context.globalState);
-  // Seed the shared setting from the legacy globalState key so the remembered org
-  // survives the move to `skrety.salesforce.targetOrg`. Fire-and-forget: the
-  // status bar refreshes off the store's change event once the seed lands. A failed
-  // seed only costs the remembered org — log it rather than leave a floating rejection.
-  void orgStore.migrate().catch(err =>
-    output.appendLine(`[migrate] ${err instanceof Error ? err.message : String(err)}`));
+  const orgStore = new OrgStore(context.globalState, msg => output.appendLine(msg));
   const provider = new DeployPanelProvider(context, orgStore, sf, output);
 
   // Status bar org indicator (T13)
@@ -61,8 +55,17 @@ export function activate(context: vscode.ExtensionContext): void {
     registerSafe('sfOrgDeployWrapper.restoreRetrieveBackup', () => provider.restoreRetrieveBackup())
   );
 
-  // A rejected command handler (e.g. the status-bar org pick failing to save the
-  // shared setting) is otherwise an unhandled rejection the user never sees.
+  // Settle the remembered org (one-time adoption of the family setting, then a
+  // family switch missed while we were shut down). Runs AFTER the listeners above
+  // are wired so the resulting change event reaches the status bar and the panel.
+  // Fire-and-forget: a failure only costs the remembered org — log it rather than
+  // leave a floating rejection.
+  void orgStore.migrate().catch(err =>
+    output.appendLine(`[migrate] ${err instanceof Error ? err.message : String(err)}`));
+
+  // A rejected command handler (e.g. the status-bar org pick failing to save this
+  // plugin's remembered org — or, with syncOrgWithFamily on, to publish it to the
+  // family) is otherwise an unhandled rejection the user never sees.
   function registerSafe(id: string, fn: (...args: [vscode.Uri?]) => Promise<void> | void): vscode.Disposable {
     return vscode.commands.registerCommand(id, (...args: [vscode.Uri?]) => {
       void Promise.resolve(fn(...args)).catch(err => {
