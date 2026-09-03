@@ -2953,13 +2953,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return; // releaseBusy() in the outer finally frees the slot
       }
 
-      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}`);
+      // A confirmed retrieve IS an overwrite: the modal said so, and when a backup
+      // was actually written above it is undoable. Then the CLI's source-tracking
+      // conflict check guards the same local edits a second time and only ever
+      // BLOCKED the retrieve ("Source Conflict Error") on tracked orgs, so skip it.
+      // No backup on disk (setting off, or skipped as over the file cap) → the CLI
+      // check stays as the last safety net. Deploy keeps its opt-in toggle — there
+      // the overwrite hits the org, not a backed-up file.
+      const ignoreConflicts = backupDir !== undefined;
+      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
       reserved = false;
       const start = Date.now();
       try {
         await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
         this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
-        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined });
+        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, ignoreConflicts });
         this.currentCancel = handle.cancel;
         const { result, cmd } = await handle.promise;
         this.updateCmd(cmdId, cmd);
@@ -3202,13 +3210,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return; // releaseBusy() in the outer finally frees the slot
       }
 
-      const cmdId = this.beginCmd(`sf project retrieve start --manifest ${/\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath} --target-org ${org}`);
+      // Same rule as runRetrieve: a confirmed retrieve with a backup on disk skips
+      // the CLI's conflict check; without one the CLI check stays. One more guard
+      // here: the backup set came from the SCAN, and a manifest can name a type
+      // whose folder the scanner could not resolve (no items → nothing backed up,
+      // yet local files exist). While any such folder is on record the backup
+      // cannot vouch for the whole manifest, so the CLI check stays too.
+      const ignoreConflicts = backupDir !== undefined && this.unresolvable().size === 0;
+      const cmdId = this.beginCmd(`sf project retrieve start --manifest ${/\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
       reserved = false;
       const start = Date.now();
       try {
         await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
           this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
-          const handle = this.sf.retrieveMetadata([], org, root, { manifest: manifestPath, timeoutMs: this.timeoutMs() });
+          const handle = this.sf.retrieveMetadata([], org, root, { manifest: manifestPath, timeoutMs: this.timeoutMs(), ignoreConflicts });
           this.currentCancel = handle.cancel;
           const { result, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
