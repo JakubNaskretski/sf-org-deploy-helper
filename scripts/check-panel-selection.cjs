@@ -142,7 +142,7 @@ const IDS = [
   'selCount', 'sourceFilter', 'sourceFilterRow', 'splitter', 'status', 'statusHeader', 'testClasses',
   'testLevel', 'tree', 'typeFilterDetails', 'typeFilterLabel', 'typeFilterList', 'typeFilterRow',
   'useActive', 'useOpenTabs', 'validateBtn', 'viewModes',
-  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll'
+  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll', 'orgAsOf'
 ];
 
 /** Boot one panel instance over the given persisted webview state. */
@@ -578,6 +578,38 @@ check('the provider replies orgsRefreshed however the listing ends', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
   const shape = /case 'refreshOrgs':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.loadOrgs\(true\); \} finally \{ this\.post\(\{ type: 'orgsRefreshed' \}\); \}\n\s*return;/;
   assert.ok(shape.test(src), "refreshOrgs handler must be exactly: try { await this.loadOrgs(true); } finally { this.post({ type: 'orgsRefreshed' }); }");
+});
+
+// ------------------------------------------- 5b) the org snapshot's age
+// Membership can arrive from a persisted snapshot (Feature: org cache): the note
+// beside the source filter and the Fetch Org tooltip must say how old it is, a
+// fresh fetch (no `asOf`) reads as now, and an org switch clears it.
+const asOfText = (at) => {
+  const d = new Date(at);
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? time : `yesterday ${time}`;
+};
+check('"org as of" shows the snapshot time, reads as now without asOf, clears on reset', () => {
+  const p = panel(undefined);
+  p.deliver(FILES(THREE));
+  const note = p.el('orgAsOf');
+  const fetchBtn = p.el('fetchOrgBtn');
+  // Noon yesterday — a fixed calendar day, whatever the clock (or DST) says now.
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1); yesterday.setHours(12, 0, 0, 0);
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [], asOf: yesterday.getTime() });
+  assert.strictEqual(note.textContent, `org as of ${asOfText(yesterday)}`);
+  assert.ok(note.textContent.startsWith('org as of yesterday '), note.textContent);
+  assert.strictEqual(p.el('sourceFilterRow').style.display, 'flex');
+  assert.strictEqual(fetchBtn.title, `Re-list acme-dev — badges are as of ${asOfText(yesterday)}`);
+  // A fresh fetch posts no asOf: the note is "now" (either side of a minute tick).
+  const before = asOfText(Date.now());
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [] });
+  const after = asOfText(Date.now());
+  assert.ok([before, after].some(t => note.textContent === `org as of ${t}`), note.textContent);
+  p.deliver({ type: 'orgMetadataReset' });
+  assert.strictEqual(note.textContent, '');
+  assert.strictEqual(p.el('sourceFilterRow').style.display, 'none');
+  assert.strictEqual(fetchBtn.title, 'Fetch all metadata from the connected org and merge with local workspace');
 });
 
 // ---------------------------------------------------------- 6) the type filter

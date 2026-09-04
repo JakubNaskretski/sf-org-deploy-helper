@@ -140,6 +140,17 @@ const ACTIVE_JOB_KEY = 'activeDeployJob';
 /** Don't reattach to a persisted job older than this — a day-old id almost
  *  certainly finished long ago, and reattaching would just report stale state. */
 const ACTIVE_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** workspaceState key for the per-org membership snapshots (Feature: org cache):
+ *  `Record<username, OrgSnapshot>`, newest write last, at most ORG_CACHE_MAX_ORGS
+ *  entries — the panel opens on the last listing instead of ~90 `sf` spawns. */
+const ORG_CACHE_KEY = 'orgMembershipCache';
+const ORG_CACHE_MAX_ORGS = 5;
+/** Largest key list persisted — a bigger org is listed fresh each session rather
+ *  than ballooning the state DB. */
+const ORG_CACHE_MAX_KEYS = 50_000;
+/** One org's persisted membership: vetted "Type:Name" keys, when the org was
+ *  listed, and what the managed-package filter hid (per type). */
+interface OrgSnapshot { org: string; keys: string[]; at: number; managedHidden?: Record<string, number> }
 /** How long to wait between `deploy report` polls of a running job. */
 const DEPLOY_POLL_INTERVAL_MS = 5000;
 /** Consecutive poll failures tolerated before we declare contact lost. A single
@@ -278,6 +289,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The org username `orgMembers` was fetched from — guards against using a stale
    *  membership map after the user switches the target org. */
   private orgMembersOrg?: string;
+  /** When `orgMembers` was listed from the org — the snapshot's `at` and the
+   *  webview's "as of". Carried through hydration and later confirm/delete
+   *  mutations (a deploy vouches for one component, not the whole listing).
+   *  Undefined after an interrupted listing: never persisted, never "as of". */
+  private orgMembersAt?: number;
   /** Folders whose type resolution via the CLI registry failed — skipped on
    *  rescans so a refresh doesn't respawn `sf` for a lost cause. Backed by
    *  globalState with the learned-rules TTL; lazily loaded via `unresolvable()`.
@@ -344,6 +360,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     context.subscriptions.push(orgStore.onDidChange(username => {
       if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
       this.postOrgs();
+      // The new org's snapshot (if any) replaces the badges just dropped; only a
+      // STALE one fetches — with none, a switch stays manual as before.
+      if (username) this.maybeAutoFetchOrg(true);
     }));
     // Recompute the Changed lens when its base ref changes — the setting flips the
     // view between "uncommitted only" and "differs from <ref>" without a rescan.
@@ -1155,16 +1174,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** One automatic Fetch Org per session (`fetchOrgOnOpen`, default on), fired
    *  after the panel's first ready — badges appear without a manual click.
-   *  Skipped silently when disabled, no org/root yet, or an operation is running
-   *  (no "already running" toast for an action the user didn't take; the next
-   *  panel open retries in that case). A webview rebuild does NOT re-trigger it,
-   *  and later org switches stay manual — Fetch Org remains the refresh. */
+   *  The persisted snapshot comes first (Feature: org cache): a fresh one IS the
+   *  session's listing — badges show instantly and no `sf` spawns; a stale one
+   *  shows meanwhile and the fetch refreshes it in the background. Skipped
+   *  silently when disabled, no org/root yet, or an operation is running (no
+   *  "already running" toast for an action the user didn't take; the next panel
+   *  open retries in that case). A webview rebuild re-posts the membership but
+   *  does NOT re-fetch. `onSwitch` (org changed mid-session): the new org's
+   *  snapshot shows, and only a STALE one fetches — with none, the switch stays
+   *  manual as before; Fetch Org remains the refresh. */
   private autoFetchDone = false;
 
-  private maybeAutoFetchOrg(): void {
-    if (this.autoFetchDone) return;
+  private maybeAutoFetchOrg(onSwitch = false): void {
+    if (!this.workspaceRoot || !this.orgStore.get()) return;
+    const snapshot = this.hydrateOrgSnapshot();
+    if (onSwitch ? snapshot !== 'stale' : this.autoFetchDone || snapshot === 'fresh') return;
     if (!vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('fetchOrgOnOpen', true)) return;
-    if (this.busy || !this.workspaceRoot || !this.orgStore.get()) return;
+    if (this.busy) return;
     this.autoFetchDone = true;
     void this.loadOrgMetadata().catch(err =>
       this.output.appendLine(`[Fetch Org] auto-fetch failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -3572,6 +3598,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       for (const k of deletedKeys) this.orgMembers.delete(k);
       // Re-post so org-only rows / "on org" badges for the now-gone components vanish.
       this.postOrgMembership(orgLabel);
+      this.persistOrgSnapshot();
     }
     // Rescan: the deleted source files are gone, so the tree drops them and — via the
     // webview's 'files' pruning against local+org keys — so does the selection. This
@@ -3587,7 +3614,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const colon = k.indexOf(':');
       return { type: k.slice(0, colon), name: k.slice(colon + 1) };
     });
-    this.post({ type: 'orgMetadata', orgItems, orgLabel });
+    this.post({ type: 'orgMetadata', orgItems, orgLabel, asOf: this.orgMembersAt });
   }
 
   /** After a successful deploy or retrieve: the org itself just confirmed these
@@ -3653,7 +3680,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.orgMembers.set(key, true);
       added = true;
     }
-    if (added) this.postOrgMembership(orgLabel);
+    if (added) {
+      this.postOrgMembership(orgLabel);
+      this.persistOrgSnapshot();
+    }
   }
 
   /**
@@ -4074,7 +4104,67 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private resetOrgMetadata(): void {
     this.orgMembers = new Map();
     this.orgMembersOrg = undefined;
+    this.orgMembersAt = undefined;
     this.post({ type: 'orgMetadataReset' });
+  }
+
+  /** Show the selected org's persisted snapshot (Feature: org cache) — or, on a
+   *  webview rebuild, the membership already in memory — stamped with its age.
+   *  'none' when there is nothing to show; an interrupted listing reads as stale. */
+  private hydrateOrgSnapshot(): 'fresh' | 'stale' | 'none' {
+    const org = this.orgStore.get();
+    if (!org) return 'none';
+    if (this.orgMembersOrg !== org) {
+      const snap = this.readOrgCache()[org];
+      if (!snap) return 'none';
+      this.orgMembers = new Map(snap.keys.map(k => [k, true as const]));
+      this.orgMembersOrg = org;
+      this.orgMembersAt = snap.at;
+      const hidden = Object.values(snap.managedHidden ?? {}).reduce((a, b) => a + b, 0);
+      this.output.appendLine(`[org cache] ${org}: ${snap.keys.length} components as of ${new Date(snap.at).toLocaleString()}${hidden ? ` (${hidden} managed hidden)` : ''}`);
+    }
+    this.postOrgMembership(this.orgs.find(o => o.username === org)?.alias ?? org);
+    const hours = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('orgCacheMaxAgeHours', 24);
+    const maxAgeMs = Math.max(0, Math.min(720, Number.isFinite(hours) ? hours : 24)) * 3_600_000;
+    return Date.now() - (this.orgMembersAt ?? 0) >= maxAgeMs ? 'stale' : 'fresh';
+  }
+
+  /** The persisted snapshots, shape- and charset-guarded per entry (the state DB
+   *  can hand back anything after corruption or a hand edit). */
+  private readOrgCache(): Record<string, OrgSnapshot> {
+    const raw = this.context.workspaceState.get<unknown>(ORG_CACHE_KEY);
+    const out: Record<string, OrgSnapshot> = {};
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+    for (const [org, entry] of Object.entries(raw as Record<string, unknown>)) {
+      const snap = vetOrgSnapshot(org, entry);
+      if (snap) out[org] = snap;
+    }
+    return out;
+  }
+
+  /** Write the in-memory membership as the selected org's snapshot. Fire-and-forget
+   *  like the other workspaceState writes. `managedHidden` comes from a fetch; a
+   *  confirm/delete mutation keeps the previous snapshot's. The oldest org drops
+   *  past ORG_CACHE_MAX_ORGS; an over-cap listing is dropped instead of persisted
+   *  (and the org's older snapshot with it — a smaller stale one must not resurrect). */
+  private persistOrgSnapshot(managedHidden?: ReadonlyMap<string, number>): void {
+    const org = this.orgMembersOrg;
+    const at = this.orgMembersAt;
+    if (!org || at === undefined) return;
+    const cache = this.readOrgCache();
+    const prev = cache[org];
+    delete cache[org];
+    if (this.orgMembers.size > ORG_CACHE_MAX_KEYS) {
+      this.output.appendLine(`[org cache] ${org}: ${this.orgMembers.size} components exceed the ${ORG_CACHE_MAX_KEYS} cap — snapshot not persisted.`);
+    } else {
+      const snap: OrgSnapshot = { org, keys: [...this.orgMembers.keys()], at };
+      const hidden = managedHidden ? Object.fromEntries([...managedHidden].filter(([, n]) => n > 0)) : prev?.managedHidden;
+      if (hidden && Object.keys(hidden).length > 0) snap.managedHidden = hidden;
+      cache[org] = snap;
+    }
+    const next = Object.fromEntries(Object.entries(cache).slice(-ORG_CACHE_MAX_ORGS));
+    void Promise.resolve(this.context.workspaceState.update(ORG_CACHE_KEY, next))
+      .catch(err => this.output.appendLine(`[org cache] persist failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   /** Apply a target-org selection from the webview: persist it, drop org metadata
@@ -4252,6 +4342,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // we got (better than nothing), but flag the listing as incomplete so the badges
       // aren't trusted as exhaustive.
       const incomplete = fatal.length > 0;
+      // Only a complete listing earns a session-spanning snapshot — an interrupted
+      // one would open the next session on badges already known to be wrong.
+      this.orgMembersAt = incomplete ? undefined : Date.now();
+      this.persistOrgSnapshot(managedSkipped);
       const managedTotal = [...managedSkipped.values()].reduce((a, b) => a + b, 0);
       const metaParts = [`${orgItems.length} components`];
       if (managedTotal > 0) metaParts.push(`${managedTotal} managed skipped`);
@@ -5418,6 +5512,30 @@ export function managedHiddenLine(byType: ReadonlyMap<string, number>): string {
   const shown = sorted.slice(0, MANAGED_LINE_TYPES).map(([t, n]) => `${t} ${n}`);
   const rest = sorted.length - shown.length;
   return `— Hidden managed-package components: ${shown.join(', ')}${rest > 0 ? ` and ${rest} more type${rest === 1 ? '' : 's'}` : ''} (enable sfOrgDeployWrapper.fetchIncludeManaged to show)`;
+}
+
+/** Shape- and charset-guard one persisted snapshot. Keys are vetted exactly as
+ *  confirmOnOrg vets org rows — they become `--metadata` argv via resolveKeys —
+ *  so a tampered entry can lose keys but never smuggle one in. A future stamp
+ *  reads as now. Exported for the harness. */
+export function vetOrgSnapshot(org: string, raw: unknown): OrgSnapshot | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const s = raw as Partial<OrgSnapshot>;
+  if (s.org !== org || typeof s.at !== 'number' || !Number.isFinite(s.at) || !Array.isArray(s.keys)) return undefined;
+  if (s.keys.length > ORG_CACHE_MAX_KEYS) return undefined;
+  const keys = s.keys.filter((k): k is string => {
+    if (typeof k !== 'string') return false;
+    const colon = k.indexOf(':');
+    if (colon < 1 || !/^[A-Za-z0-9_]+$/.test(k.slice(0, colon))) return false;
+    const name = k.slice(colon + 1);
+    return name !== '' && name !== 'package.xml' && !name.includes('*');
+  });
+  const snap: OrgSnapshot = { org, keys, at: Math.min(s.at, Date.now()) };
+  if (s.managedHidden && typeof s.managedHidden === 'object' && !Array.isArray(s.managedHidden)) {
+    const hidden = Object.fromEntries(Object.entries(s.managedHidden).filter(([, n]) => typeof n === 'number' && n > 0));
+    if (Object.keys(hidden).length > 0) snap.managedHidden = hidden;
+  }
+  return snap;
 }
 
 /** The local process-kill timeout (SfCliError whose message says it "timed out",

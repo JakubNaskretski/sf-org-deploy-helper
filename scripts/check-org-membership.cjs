@@ -48,6 +48,8 @@ function fake(members, org, items = []) {
     addOrgMemberKeys: proto.addOrgMemberKeys,
     postOrgMembership: proto.postOrgMembership,
     localFailureKey: proto.localFailureKey,
+    // The snapshot write that follows a repost is check-org-cache.cjs's contract.
+    persistOrgSnapshot: () => {},
     post: (m) => posts.push(m),
     posts
   };
