@@ -100,6 +100,13 @@ const FIX = [
   { rel: 'messageChannels/Widget_Channel.messageChannel-meta.xml', type: 'LightningMessageChannel', name: 'Widget_Channel' },
   { rel: 'testSuites/Widget_Suite.testSuite-meta.xml', type: 'ApexTestSuite', name: 'Widget_Suite' },
   { rel: 'platformEventSubscriberConfigs/Widget_Cfg.platformEventSubscriberConfig-meta.xml', type: 'PlatformEventSubscriberConfig', name: 'Widget_Cfg' },
+  // OmniStudio (standard runtime): one `<fullName>.<suffix>-meta.xml` per component,
+  // no sidecar, no bundle. Names carry the version (and, for OmniScripts, the
+  // language) segments the platform bakes into the fullName.
+  { rel: 'omniScripts/Widget_Intake_English_1.os-meta.xml', type: 'OmniScript', name: 'Widget_Intake_English_1' },
+  { rel: 'omniIntegrationProcedures/Widget_Fetch_1.oip-meta.xml', type: 'OmniIntegrationProcedure', name: 'Widget_Fetch_1' },
+  { rel: 'omniDataTransforms/WidgetTransform.rpt-meta.xml', type: 'OmniDataTransform', name: 'WidgetTransform' },
+  { rel: 'omniUiCard/WidgetCard_1.ouc-meta.xml', type: 'OmniUiCard', name: 'WidgetCard_1' },
   // Two templates with the SAME leaf name in different folders — legal, because
   // EmailTemplate's fullName is `Folder/Name`, and one retrieve lands both. The only
   // shape in the whole table where two components share a basename outside objects/.

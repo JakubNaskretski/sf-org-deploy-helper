@@ -81,6 +81,14 @@ const RULES: FolderRule[] = [
   { folder: 'testSuites', type: 'ApexTestSuite', primaryExt: ['.testSuite-meta.xml'] },
   { folder: 'platformEventSubscriberConfigs', type: 'PlatformEventSubscriberConfig', primaryExt: ['.platformEventSubscriberConfig-meta.xml'] },
   { folder: 'email', type: 'EmailTemplate', primaryExt: ['.email'], metaSuffix: '.email-meta.xml', nested: true },
+  // OmniStudio, standard runtime — directoryName/suffix straight from the sf
+  // registry. One default-adapter `<fullName>.<suffix>-meta.xml` per component:
+  // no content/meta pair, no bundle, no decomposition. Static so the tree never
+  // hangs on a learned rule that expires or is absent while the cache is off.
+  { folder: 'omniScripts', type: 'OmniScript', primaryExt: ['.os-meta.xml'] },
+  { folder: 'omniIntegrationProcedures', type: 'OmniIntegrationProcedure', primaryExt: ['.oip-meta.xml'] },
+  { folder: 'omniDataTransforms', type: 'OmniDataTransform', primaryExt: ['.rpt-meta.xml'] },
+  { folder: 'omniUiCard', type: 'OmniUiCard', primaryExt: ['.ouc-meta.xml'] },
 ];
 
 /** Decomposed children of a CustomObject in SFDX source format. Each is a single
@@ -308,7 +316,28 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
     return true;
   });
   deduped.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type.localeCompare(b.type)));
-  return { items: deduped, root, unknownFolders };
+  const warning = await detectDataPackExports(root, pkgDirs);
+  return { items: deduped, root, unknownFolders, ...(warning ? { warning } : {}) };
+}
+
+/** Banner text for a project carrying OmniStudio DataPack exports (Vlocity Build
+ *  Tool / IDX layout). Those are DATA exports, not Metadata API source: the scan
+ *  cannot list them, and without this line a DataPack-based project reads as
+ *  "the extension ignores OmniStudio". Names the four standard-runtime types
+ *  that ARE handled so the reader knows which layout to retrieve instead. */
+export const DATAPACK_WARNING = 'OmniStudio DataPack exports (vlocity/, *_DataPack.json) are data records, not Metadata API source, so they are not listed here. This extension handles the standard-runtime types OmniScript, OmniIntegrationProcedure, OmniDataTransform and OmniUiCard as retrieved by sf (omniScripts/, omniIntegrationProcedures/, omniDataTransforms/, omniUiCard/).';
+
+/** DATAPACK_WARNING when a top-level `vlocity/` folder (project root or package
+ *  dir) exists or any `*_DataPack.json` sits under a package dir; else undefined.
+ *  Pure (root + package dirs in) so the harness can drive it on a temp tree. */
+export async function detectDataPackExports(root: string, pkgDirs: string[]): Promise<string | undefined> {
+  if (await isDirectory(path.join(root, 'vlocity'))) return DATAPACK_WARNING;
+  for (const pkg of pkgDirs) {
+    const pkgRoot = path.join(root, pkg);
+    if (await isDirectory(path.join(pkgRoot, 'vlocity'))) return DATAPACK_WARNING;
+    if (await hasFileMatching(pkgRoot, ['_DataPack.json'])) return DATAPACK_WARNING;
+  }
+  return undefined;
 }
 
 /** Walk `objectsDir` and emit one item per decomposed object child. A directory whose
@@ -513,6 +542,14 @@ export function deriveRule(folderName: string, type: string, members: string[], 
     }
   }
   return undefined;
+}
+
+/** Basenames of every `-meta.xml` under `dir`, at any depth. deriveRule keys on
+ *  `<member><suffix>` names, and a folder whose files sit in an org-hint
+ *  subfolder (a layout the CLI itself accepts) has none at the top level — a
+ *  flat readdir there derived nothing and the folder was negative-cached. */
+export async function listMetaFileNames(dir: string): Promise<string[]> {
+  return (await walkForFilesMatching(dir, ['-meta.xml'])).map(f => path.basename(f));
 }
 
 /** What detectMissingDependencies found in a batch of org failure messages.
@@ -1067,6 +1104,26 @@ function shouldSkipDir(name: string): boolean {
 
 async function pathExists(p: string): Promise<boolean> {
   try { await fs.access(p); return true; } catch { return false; }
+}
+
+async function isDirectory(p: string): Promise<boolean> {
+  try { return (await fs.stat(p)).isDirectory(); } catch { return false; }
+}
+
+/** Whether any file under `dir` matches `exts` — returns at the first hit, so a
+ *  positive answer costs far less than a full walk. Same skip/depth bounds. */
+async function hasFileMatching(dir: string, exts: string[]): Promise<boolean> {
+  const walk = async (d: string, depth: number): Promise<boolean> => {
+    if (depth > MAX_SCAN_DEPTH) return false;
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return false; }
+    for (const e of entries) {
+      if (e.isFile()) { if (matchExt(e.name, exts)) return true; }
+      else if (e.isDirectory() && !shouldSkipDir(e.name) && (await walk(path.join(d, e.name), depth + 1))) return true;
+    }
+    return false;
+  };
+  return walk(dir, 0);
 }
 
 async function listAllFiles(dir: string): Promise<string[]> {

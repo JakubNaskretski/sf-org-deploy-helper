@@ -139,6 +139,9 @@ body.resizing { cursor: row-resize; user-select: none; }
   font-size: 11px; font-family: inherit; padding: 0;
 }
 .mode-head button:hover { color: var(--fg); text-decoration: underline; }
+.mode-head button:disabled { opacity: 0.5; cursor: not-allowed; text-decoration: none; }
+/* Expand all / Collapse all row above the tree (panel.js renderTreeTools). */
+.tree-tools { border-bottom: 1px solid var(--border); padding: 3px 10px; }
 /* Deploy-queue strip (Feature: deploy queue): one row per deploy/validate
    deferred behind the single busy slot, between the action bar and the Status
    pane. Rows reuse .mode-head itself (see panel.js renderQueue) rather than a
@@ -167,12 +170,22 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .type-filter-list label { display: flex; gap: 6px; align-items: center; cursor: pointer; padding: 1px 2px; }
 .type-filter-list input[type="checkbox"] { margin: 0; flex: none; width: 13px; height: 13px; }
+/* One row per type: the checkbox label plus an "only" shortcut that shows on hover. */
+.type-filter-list .type-row { display: flex; align-items: center; gap: 4px; }
+.type-filter-list .type-row label { flex: 1; min-width: 0; }
+.type-filter-list .type-only {
+  visibility: hidden; flex: none; background: transparent; border: none;
+  color: var(--muted); font-size: 10px; font-family: inherit; cursor: pointer; padding: 0 2px;
+}
+.type-filter-list .type-row:hover .type-only, .type-filter-list .type-only:focus { visibility: visible; }
+.type-filter-list .type-only:hover { color: var(--fg); text-decoration: underline; }
 .type-filter-actions { display: flex; gap: 6px; margin-top: 4px; }
 .type-filter-actions button {
   background: transparent; color: var(--fg); border: 1px solid var(--border);
   border-radius: 2px; padding: 2px 6px; font-size: 11px; cursor: pointer;
   font-family: inherit;
 }
+.type-filter-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 .tree .group-header input[type="checkbox"] { margin: 0; }
 .tree .row.active-editor { background: var(--row-active); }
 .org-badge {
@@ -485,9 +498,18 @@ body.resizing { cursor: row-resize; user-select: none; }
         <div id="typeFilterRow" class="type-filter-row" style="display:none;">
           <details id="typeFilterDetails">
             <summary><span id="typeFilterLabel">All types</span></summary>
+            <div id="typeFilterActions" class="type-filter-actions">
+              <button id="typeFilterAll" type="button" title="Show every type">All</button>
+              <button id="typeFilterNone" type="button" title="Hide every type">None</button>
+            </div>
             <div id="typeFilterList" class="type-filter-list"></div>
           </details>
         </div>
+      </div>
+      <div id="treeTools" class="mode-head tree-tools" style="display:none;">
+        <span></span>
+        <button id="expandAll" type="button" title="Expand every group">Expand all</button>
+        <button id="collapseAll" type="button" title="Collapse every group">Collapse all</button>
       </div>
       <div id="tree" class="tree"></div>
       <div class="actions" id="actionsBar">

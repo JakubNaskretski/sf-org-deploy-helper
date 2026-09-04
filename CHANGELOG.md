@@ -3,6 +3,48 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.21.0
+
+- New: **All / None sit above the type list, and every type has an "only" shortcut.** With many
+  metadata types the two buttons were at the bottom of a scrolling list, out of sight, so
+  narrowing to one type meant unticking everything else by hand. They are now always visible,
+  each row has an *only* button that shows just that type, and choosing None survives a reload
+  instead of quietly reverting to All. Ticking types after None counts correctly and no longer
+  re-enables every type by accident.
+- New: **Expand all / Collapse all for the component tree.** Two buttons above the tree open or
+  close every group at once, objects and their field/rule groups included. They are disabled,
+  with the reason in the tooltip, while a search or the Selected/Changed view keeps groups open
+  anyway.
+- New: **OmniStudio components are recognized outright.** OmniScripts, Integration Procedures,
+  DataRaptors and FlexCards in their standard-runtime folders (`omniScripts`,
+  `omniIntegrationProcedures`, `omniDataTransforms`, `omniUiCard`) no longer depend on the CLI
+  registry lookup and its cache, so they stop vanishing from the tree after a background rescan;
+  a nested subfolder layout is found too. The search box knows them by their everyday names:
+  "flexcard", "dataraptor", "integration procedure".
+- Changed: **Fetch Org says what it could not list, and why.** Types the org does not support
+  are one "Not available on this org" line instead of a wall of red failures, and the card stays
+  green. When those are OmniStudio types, the card explains that FlexCards and friends can only
+  be listed on the standard runtime with "Use OmniStudio Metadata API" turned on in Setup — on
+  the managed-package runtime they are data records no Metadata API tool can see. Components
+  hidden by the managed-package filter are now named per type every time, not only when something
+  else failed. A project holding OmniStudio DataPack exports gets a banner explaining those are
+  not Metadata API source.
+- Fixed: **A type that shows up later is no longer hidden by an old filter.** If you had narrowed
+  the type list months ago, a type that first appears now (say OmniUiCard after enabling
+  OmniStudio) was unticked by default and never announced. New types now default to visible.
+  The first session after this update only records what you already have; the behavior kicks in
+  from the next session on.
+- Fixed: **Learned folder types survive a background rescan** after their cache entry expires.
+  Re-verification now happens on the next explicit Refresh Metadata Files, not on every file
+  event in between.
+- Fixed: **A double-click no longer runs, queues or asks twice.** A second click on Deploy or
+  Validate that landed before the first confirmation opened used to slip into the deploy queue
+  as a twin, and cancelling the first dialog while confirming the second deployed with no
+  further prompt. While a confirmation is open, further clicks are ignored; an identical deploy
+  already waiting in the queue is not added again. Retrieve, Diff, Fetch Org, Login and the card
+  buttons now lock the moment you click them instead of answering a second click with
+  "already running".
+
 ## 0.20.1
 
 - Fixed: **Retrieve no longer fails with "Source Conflict Error".** On a source-tracked org

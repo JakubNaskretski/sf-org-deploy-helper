@@ -20,7 +20,23 @@
 //      equivalent list may not re-render: every render replaces the tree's
 //      innerHTML, and scroll position and keyboard focus go with it;
 //   5) the ⟳ Refresh-orgs button: locked while its request is in flight, freed
-//      only by the provider's `orgsRefreshed` reply — not by an `orgs` broadcast.
+//      only by the provider's `orgsRefreshed` reply — not by an `orgs` broadcast;
+//   6) the type filter: All / None are a static row ABOVE the scrolling list (they
+//      used to be its last child, out of view past ~8 types), each row has an
+//      "only" shortcut, every write lands in one funnel that keeps the persisted
+//      contract ([] = all, ['__none__'] = none, plain names otherwise) — the
+//      sentinel never mixes with names, never reads two-of-three as All, and
+//      survives the explicit scan a webview rebuild starts with. A type seen for
+//      the FIRST time joins a plain-names filter so it shows, and OmniStudio's
+//      user-facing names (FlexCard, DataRaptor, …) are searchable aliases;
+//   7) Expand all / Collapse all above the tree: every group the CURRENT lens and
+//      filters draw, at every depth, in the same key grammar renderTree reads;
+//      disabled (with the reason) while the render force-expands anyway;
+//   8) double-click guards: a slot-taking click locks its control (and the other
+//      slot-taking ones) synchronously until the provider's `busy` reply —
+//      Deploy/Validate/Retry queue while busy but never send while pending —
+//      Rescan locks until `filesRefreshed`, and a repeated `busy` post is a
+//      no-op for the progress card and the Status pane.
 //
 // panel.js is a browser-only IIFE with no exports, so it is run inside a minimal
 // DOM/vscode-API shim and driven the way the provider drives it: by delivering
@@ -82,6 +98,8 @@ class El {
   }
   removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; }
   remove() { if (this._parent) this._parent.removeChild(this); }
+  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? Object.assign(new El('#text'), { textContent: n }) : n); }
+  prepend(...nodes) { for (const n of nodes.reverse()) this.insertBefore(n, this.firstChild); }
   addEventListener(t, fn) { (this.listeners[t] ||= []).push(fn); }
   removeEventListener(t, fn) { this.listeners[t] = (this.listeners[t] || []).filter(f => f !== fn); }
   fire(t) {
@@ -123,7 +141,8 @@ const IDS = [
   'orgSelect', 'queueStrip', 'refreshFiles', 'refreshOrgs', 'retrieveBtn', 'scanBanner', 'search',
   'selCount', 'sourceFilter', 'sourceFilterRow', 'splitter', 'status', 'statusHeader', 'testClasses',
   'testLevel', 'tree', 'typeFilterDetails', 'typeFilterLabel', 'typeFilterList', 'typeFilterRow',
-  'useActive', 'useOpenTabs', 'validateBtn', 'viewModes'
+  'useActive', 'useOpenTabs', 'validateBtn', 'viewModes',
+  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll'
 ];
 
 /** Boot one panel instance over the given persisted webview state. */
@@ -136,7 +155,10 @@ function panel(persisted) {
 
   const sandbox = {
     console,
-    setTimeout, clearTimeout, setInterval, clearInterval,
+    setTimeout, clearTimeout, clearInterval,
+    // The progress card's elapsed clock is a real setInterval; a panel left busy
+    // at the end of a check must not keep this process alive.
+    setInterval: (fn, ms) => { const t = setInterval(fn, ms); t.unref(); return t; },
     requestAnimationFrame: (fn) => setTimeout(fn, 0),
     acquireVsCodeApi: () => ({
       postMessage: (m) => outbound.push(m),
@@ -551,6 +573,477 @@ check('the provider replies orgsRefreshed however the listing ends', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
   const shape = /case 'refreshOrgs':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.loadOrgs\(true\); \} finally \{ this\.post\(\{ type: 'orgsRefreshed' \}\); \}\n\s*return;/;
   assert.ok(shape.test(src), "refreshOrgs handler must be exactly: try { await this.loadOrgs(true); } finally { this.post({ type: 'orgsRefreshed' }); }");
+});
+
+// ---------------------------------------------------------- 6) the type filter
+// Driven the way the user drives it: the static All / None buttons, a row's
+// "only" button, and its checkbox (set `checked`, fire 'change' — the shim has
+// no click-to-toggle). Read back through the persisted filter, the summary
+// label, and the group headers the tree actually built.
+const item = (type, name) => ({ type, name, filePath: `/ws/force-app/${type}/${name}`, files: [] });
+const TFILES = (items, objectChildTypes = []) => ({ type: 'files', objectChildTypes, items });
+const THREE_TYPES = [item('ApexClass', 'AcmeA'), item('ApexTrigger', 'AcmeT'), item('Flow', 'AcmeF')];
+const NESTED = [item('CustomObject', 'Acme__c'), item('CustomField', 'Acme__c.Foo__c'), item('ApexClass', 'AcmeA')];
+const BASE = { selected: [], expandedGroups: [], filter: '', typeFilter: [], viewMode: 'all', testClasses: '' };
+const HTML_TS = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelHtml.ts'), 'utf8');
+
+const label = (p) => p.el('typeFilterLabel').textContent;
+const groups = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'group-header') o.push(e.children[2].textContent); return false; }); return o; };
+const names = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'name') o.push(e.textContent); return false; }); return o; };
+const onlyBtn = (p, type) => p.el('typeFilterList').find(e => e.tagName === 'BUTTON' && e.textContent === 'only' && e.title === `Show only ${type}`);
+const rowLabel = (p, type) => { const b = onlyBtn(p, type); return b && b.parentNode.children[0]; };
+const tick = (p, type, on) => { const lbl = rowLabel(p, type); assert.ok(lbl, `no row for ${type}`); const cb = lbl.children[0]; cb.checked = on; cb.fire('change'); };
+const treeText = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'status-empty') o.push(e.textContent); return false; }); return o; };
+
+check('All / None are not inside the scrolling list', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(THREE_TYPES));
+  assert.ok(!p.el('typeFilterList').find(e => e.classList.contains('type-filter-actions')), 'the action row is still appended to the list');
+  for (const c of p.el('typeFilterList').children) assert.strictEqual(c.className, 'type-row', `unexpected list child ${c.tagName}.${c.className}`);
+  assert.strictEqual(p.el('typeFilterList').children.length, 3);
+});
+
+check('the markup puts #typeFilterActions above #typeFilterList, inside the same <details>', () => {
+  const shape = /<details id="typeFilterDetails">\s*<summary>[\s\S]*?<\/summary>\s*<div id="typeFilterActions" class="type-filter-actions">\s*<button id="typeFilterAll"[^>]*>All<\/button>\s*<button id="typeFilterNone"[^>]*>None<\/button>\s*<\/div>\s*<div id="typeFilterList" class="type-filter-list"><\/div>\s*<\/details>/;
+  assert.ok(shape.test(HTML_TS), 'panelHtml.ts: All/None must be a static row between <summary> and #typeFilterList');
+});
+
+check('the "only" button sits outside the <label>, so its click is not a checkbox toggle', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(THREE_TYPES));
+  const b = onlyBtn(p, 'ApexClass');
+  assert.ok(b, 'no only button');
+  assert.strictEqual(b.parentNode.className, 'type-row');
+  assert.strictEqual(b.parentNode.children[0].tagName, 'LABEL');
+  assert.ok(!b.parentNode.children[0].find(e => e === b), 'the button is a child of the label');
+});
+
+check('None empties the tree and persists the sentinel; All restores and persists empty', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(THREE_TYPES));
+  assert.strictEqual(p.el('typeFilterAll').disabled, true, 'All has nothing to do while every type shows');
+  assert.strictEqual(p.el('typeFilterNone').disabled, false);
+  p.el('typeFilterNone').fire('click');
+  assert.deepStrictEqual(p.persisted().typeFilter, ['__none__']);
+  assert.strictEqual(label(p), '0 of 3 types');
+  assert.deepStrictEqual(groups(p), []);
+  assert.strictEqual(p.el('typeFilterNone').disabled, true);
+  assert.strictEqual(p.el('typeFilterAll').disabled, false);
+  p.el('typeFilterAll').fire('click');
+  assert.deepStrictEqual(p.persisted().typeFilter, []);
+  assert.strictEqual(label(p), 'All types (3)');
+  assert.deepStrictEqual(groups(p), ['ApexClass', 'ApexTrigger', 'Flow']);
+});
+
+check('"only" narrows to one type in one click, and replaces rather than adds', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(THREE_TYPES));
+  const b = onlyBtn(p, 'ApexTrigger');
+  assert.ok(b, 'no only button on the ApexTrigger row');
+  b.fire('click');
+  assert.deepStrictEqual(p.persisted().typeFilter, ['ApexTrigger']);
+  assert.strictEqual(label(p), '1 of 3 types');
+  assert.deepStrictEqual(groups(p), ['ApexTrigger']);
+  onlyBtn(p, 'Flow').fire('click');
+  assert.deepStrictEqual(p.persisted().typeFilter, ['Flow']);
+  assert.deepStrictEqual(groups(p), ['Flow']);
+});
+
+check('"only" on the single type in the workspace reads as All', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES([item('ApexClass', 'AcmeA')]));
+  onlyBtn(p, 'ApexClass').fire('click');
+  assert.deepStrictEqual(p.persisted().typeFilter, []);
+  assert.strictEqual(label(p), 'All types (1)');
+});
+
+check('None then ticking one type never mixes the sentinel in, and two of three is not All', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(THREE_TYPES));
+  p.el('typeFilterNone').fire('click');
+  tick(p, 'ApexClass', true);
+  assert.deepStrictEqual(p.persisted().typeFilter, ['ApexClass']);
+  assert.strictEqual(label(p), '1 of 3 types');
+  assert.deepStrictEqual(groups(p), ['ApexClass']);
+  tick(p, 'ApexTrigger', true);
+  assert.deepStrictEqual(p.persisted().typeFilter.slice().sort(), ['ApexClass', 'ApexTrigger']);
+  assert.strictEqual(label(p), '2 of 3 types', 'two of three ticked must not read as All');
+  assert.deepStrictEqual(groups(p), ['ApexClass', 'ApexTrigger']);
+});
+
+check('unticking from All seeds the rest; re-ticking the last collapses back to All; unticking all is None', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(THREE_TYPES));
+  tick(p, 'Flow', false);
+  assert.deepStrictEqual(p.persisted().typeFilter.slice().sort(), ['ApexClass', 'ApexTrigger']);
+  assert.strictEqual(label(p), '2 of 3 types');
+  tick(p, 'Flow', true);
+  assert.deepStrictEqual(p.persisted().typeFilter, []);
+  assert.strictEqual(label(p), 'All types (3)');
+  tick(p, 'ApexClass', false); tick(p, 'ApexTrigger', false); tick(p, 'Flow', false);
+  assert.deepStrictEqual(p.persisted().typeFilter, ['__none__'], 'unticking the last type is None, not All');
+});
+
+check('None survives the explicit scan every webview rebuild starts with', () => {
+  const p = panel({ ...BASE, typeFilter: ['__none__'] });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['__none__']);
+  assert.strictEqual(label(p), '0 of 3 types');
+  assert.deepStrictEqual(treeText(p), ['No metadata matches the current filter.']);
+});
+
+check('a mixed sentinel persisted by 0.20.x is repaired by the first scan', () => {
+  const p = panel({ ...BASE, typeFilter: ['__none__', 'ApexClass'] });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['ApexClass']);
+  assert.strictEqual(label(p), '1 of 3 types');
+  assert.deepStrictEqual(groups(p), ['ApexClass']);
+});
+
+check('a prune that leaves every known type ticked reads as All', () => {
+  const p = panel({ ...BASE, typeFilter: ['ApexClass', 'ApexTrigger', 'Flow'] });
+  p.deliver(TFILES(THREE_TYPES.slice(0, 2)));
+  assert.deepStrictEqual(p.persisted().typeFilter, []);
+  assert.strictEqual(label(p), 'All types (2)');
+});
+
+check('the type filter gates org-only rows too, and counts org-only types', () => {
+  const p = panel({ ...BASE, typeFilter: ['ApexClass'] });
+  p.deliver(TFILES(THREE_TYPES));
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'Layout', name: 'AcmeLayout' }] });
+  assert.deepStrictEqual(groups(p), ['ApexClass']);
+  assert.strictEqual(label(p), '1 of 4 types');
+  onlyBtn(p, 'Layout').fire('click');
+  assert.deepStrictEqual(groups(p), ['Layout']);
+});
+
+check('the Changed lens owns up to the type / source filter hiding its rows', () => {
+  const p = panel({ ...BASE, typeFilter: ['Flow'], viewMode: 'changed' });
+  p.deliver(TFILES(THREE_TYPES));
+  p.deliver({ type: 'changed', keys: ['ApexClass:AcmeA'] });
+  assert.deepStrictEqual(treeText(p), ['No changed component matches the current filter.']);
+  const q = panel({ ...BASE, viewMode: 'changed' });
+  q.deliver(TFILES(THREE_TYPES));
+  q.deliver({ type: 'changed', keys: [] });
+  assert.deepStrictEqual(treeText(q), ['No uncommitted git changes in workspace metadata.'], 'no filter, nothing changed: the old text stays');
+  const r = panel({ ...BASE, viewMode: 'changed' });
+  r.deliver(TFILES(THREE_TYPES));
+  r.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeA' }] });
+  r.el('sourceFilter').value = 'org-only'; r.el('sourceFilter').fire('change');
+  r.deliver({ type: 'changed', keys: ['ApexClass:AcmeA'] });
+  assert.deepStrictEqual(treeText(r), ['No changed component matches the current filter.'], 'the source filter hid the row');
+});
+
+// ------------------------------------------ 6b) a type that appears LATER
+// A persisted plain-names filter used to hide any type that first showed up
+// after it was written (OmniUiCard after the org gains OmniStudio): the row was
+// simply unticked in a list nobody reopens. New types default to visible — told
+// apart from RESTORED ones by the persisted `seenTypes` baseline.
+const SEEN = ['ApexClass', 'ApexTrigger', 'Flow'];
+
+check('a type first seen on an org fetch joins a plain-names filter and shows', () => {
+  const p = panel({ ...BASE, typeFilter: ['ApexClass'], seenTypes: SEEN });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['ApexClass'], 'restored types are not new');
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'OmniUiCard', name: 'AcmeCard_Acme_1' }] });
+  assert.deepStrictEqual(p.persisted().typeFilter.slice().sort(), ['ApexClass', 'OmniUiCard']);
+  assert.strictEqual(label(p), '2 of 4 types');
+  assert.deepStrictEqual(groups(p), ['ApexClass', 'OmniUiCard (FlexCard)']);
+  assert.ok(p.persisted().seenTypes.includes('OmniUiCard'), 'the newcomer must be recorded, or it is "new" again next time');
+});
+
+check('…and one first seen on a scan, explicit or silent', () => {
+  const p = panel({ ...BASE, typeFilter: ['ApexClass'], seenTypes: SEEN });
+  p.deliver(TFILES([...THREE_TYPES, item('Layout', 'AcmeLayout')]));
+  assert.deepStrictEqual(p.persisted().typeFilter.slice().sort(), ['ApexClass', 'Layout']);
+  assert.deepStrictEqual(groups(p), ['ApexClass', 'Layout']);
+  const q = panel({ ...BASE, typeFilter: ['ApexClass'], seenTypes: SEEN });
+  q.deliver(TFILES(THREE_TYPES));
+  q.deliver({ ...TFILES([...THREE_TYPES, item('Layout', 'AcmeLayout')]), silent: true });
+  assert.deepStrictEqual(q.persisted().typeFilter.slice().sort(), ['ApexClass', 'Layout'], 'showing a new type is additive — a silent scan may do it');
+});
+
+check('None is an explicit choice: a new type stays hidden', () => {
+  const p = panel({ ...BASE, typeFilter: ['__none__'], seenTypes: SEEN });
+  p.deliver(TFILES([...THREE_TYPES, item('Layout', 'AcmeLayout')]));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['__none__']);
+  assert.deepStrictEqual(groups(p), []);
+});
+
+check('a filter with no recorded baseline is left alone — the first session only seeds', () => {
+  // State written by 0.20.x has a filter but no seenTypes: every type would look
+  // new, and the user's narrowing would silently widen to All on upgrade — on
+  // the ready scan, or one message later on the org fetch.
+  const p = panel({ ...BASE, typeFilter: ['ApexClass'] });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['ApexClass']);
+  assert.deepStrictEqual(p.persisted().seenTypes.slice().sort(), SEEN);
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'Layout', name: 'AcmeLayout' }] });
+  assert.deepStrictEqual(p.persisted().typeFilter, ['ApexClass'], 'the org fetch of the same session must not widen it either');
+  assert.ok(p.persisted().seenTypes.includes('Layout'));
+  // An empty persisted baseline is no baseline (a discovery-failure session
+  // persists seenTypes: [] on any click).
+  const q = panel({ ...BASE, typeFilter: ['ApexClass'], seenTypes: [] });
+  q.deliver(TFILES(THREE_TYPES));
+  assert.deepStrictEqual(q.persisted().typeFilter, ['ApexClass']);
+});
+
+check('a newcomer that completes the set reads as All', () => {
+  const p = panel({ ...BASE, typeFilter: ['ApexClass'], seenTypes: ['ApexClass', 'Flow'] });
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('Layout', 'AcmeLayout')]));
+  assert.deepStrictEqual(p.persisted().typeFilter, []);
+  assert.strictEqual(label(p), 'All types (2)');
+});
+
+// --------------------------------------------- 6c) OmniStudio search aliases
+check('the search box knows OmniStudio by its user-facing names', () => {
+  const OMNI = [item('OmniUiCard', 'AcmeCard_Acme_1'), item('OmniDataTransform', 'AcmeExtract'), item('OmniIntegrationProcedure', 'Acme_Fetch'), item('OmniScript', 'Acme_Intake_English_1'), item('ApexClass', 'AcmeA')];
+  const seen = (filter) => { const p = panel({ ...BASE, filter }); p.deliver(TFILES(OMNI)); return names(p); };
+  assert.deepStrictEqual(seen('flexcard'), ['AcmeCard_Acme_1']);
+  assert.deepStrictEqual(seen('type:dataraptor'), ['AcmeExtract']);
+  assert.deepStrictEqual(seen('t:flexcard'), ['AcmeCard_Acme_1']);
+  assert.deepStrictEqual(seen('integration procedure'), ['Acme_Fetch']);
+  assert.deepStrictEqual(seen('omniscript'), ['Acme_Intake_English_1']);
+  assert.deepStrictEqual(seen('type:apex'), ['AcmeA'], 'a plain type still matches its own name only');
+});
+
+check('aliased types are labelled "Type (Alias)" on group headers and filter rows; plain types stay plain', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES([item('OmniUiCard', 'AcmeCard_Acme_1'), item('OmniScript', 'Acme_Intake_English_1'), item('ApexClass', 'AcmeA')]));
+  assert.deepStrictEqual(groups(p), ['ApexClass', 'OmniScript', 'OmniUiCard (FlexCard)']);
+  assert.strictEqual(rowLabel(p, 'OmniUiCard').children[1].textContent, 'OmniUiCard (FlexCard)');
+  assert.strictEqual(rowLabel(p, 'OmniScript').children[1].textContent, 'OmniScript', 'an alias equal to the type adds nothing');
+  assert.strictEqual(rowLabel(p, 'ApexClass').children[1].textContent, 'ApexClass');
+  onlyBtn(p, 'OmniUiCard').fire('click'); // the filter still speaks API names
+  assert.deepStrictEqual(p.persisted().typeFilter, ['OmniUiCard']);
+});
+
+// ------------------------------------------------ 7) Expand all / Collapse all
+check('the tools row sits above #tree in the markup', () => {
+  assert.ok(/<div id="treeTools" class="mode-head tree-tools"[^>]*>[\s\S]*?<button id="expandAll"[\s\S]*?<button id="collapseAll"[\s\S]*?<\/div>\s*<div id="tree" class="tree">/.test(HTML_TS));
+});
+
+check('Expand all opens every group at every depth, and persists', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  assert.deepStrictEqual(groups(p), ['Objects', 'ApexClass']);
+  p.el('expandAll').fire('click');
+  assert.deepStrictEqual(p.persisted().expandedGroups.slice().sort(), ['ApexClass', '__OBJECTS__', 'obj/Acme__c', 'objc/Acme__c/CustomField']);
+  assert.deepStrictEqual(groups(p), ['Objects', 'Acme__c', 'Fields', 'ApexClass']);
+  assert.deepStrictEqual(names(p), ['⊙ object definition', 'Foo__c', 'AcmeA']);
+  // and a rebuild restores it — the keys are the ones renderTree reads
+  const q = panel({ ...BASE, expandedGroups: p.persisted().expandedGroups });
+  q.deliver(TFILES(NESTED, ['CustomField']));
+  assert.deepStrictEqual(names(q), ['⊙ object definition', 'Foo__c', 'AcmeA']);
+});
+
+check('Collapse all closes everything and persists an empty set', () => {
+  const p = panel({ ...BASE, expandedGroups: ['ApexClass', '__OBJECTS__', 'obj/Acme__c', 'objc/Acme__c/CustomField'] });
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  assert.deepStrictEqual(names(p), ['⊙ object definition', 'Foo__c', 'AcmeA']);
+  p.el('collapseAll').fire('click');
+  assert.deepStrictEqual(p.persisted().expandedGroups, []);
+  assert.deepStrictEqual(groups(p), ['Objects', 'ApexClass']);
+  assert.deepStrictEqual(names(p), []);
+});
+
+check('Expand all is scoped to what the filters show; Collapse all clears hidden keys too', () => {
+  const p = panel({ ...BASE, typeFilter: ['ApexClass'] });
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  p.el('expandAll').fire('click');
+  assert.deepStrictEqual(p.persisted().expandedGroups, ['ApexClass'], 'hidden Objects groups must not be touched');
+  const q = panel({ ...BASE, typeFilter: ['ApexClass'], expandedGroups: ['Flow', 'ApexClass'] });
+  q.deliver(TFILES(NESTED, ['CustomField']));
+  q.el('collapseAll').fire('click');
+  assert.deepStrictEqual(q.persisted().expandedGroups, [], 'a key for a hidden group would reopen it later by itself');
+});
+
+check('the controls are disabled, with the reason, while the tree is force-expanded', () => {
+  const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeA'] });
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  assert.strictEqual(p.el('expandAll').disabled, true);
+  assert.strictEqual(p.el('collapseAll').disabled, true);
+  assert.strictEqual(p.el('expandAll').title, 'Groups auto-expand in the Selected and Changed views');
+  const q = panel({ ...BASE, filter: 'acme' });
+  q.deliver(TFILES(NESTED, ['CustomField']));
+  assert.strictEqual(q.el('expandAll').disabled, true);
+  assert.strictEqual(q.el('collapseAll').title, 'Groups auto-expand while a filter is typed');
+  const r = panel(BASE);
+  r.deliver(TFILES(NESTED, ['CustomField']));
+  assert.strictEqual(r.el('expandAll').disabled, false);
+  assert.strictEqual(r.el('collapseAll').disabled, false);
+  assert.strictEqual(r.el('expandAll').title, 'Expand every group');
+  assert.strictEqual(r.el('collapseAll').title, 'Collapse every group');
+  assert.strictEqual(r.el('treeTools').style.display, 'flex');
+});
+
+check('the tools row hides when there is nothing to expand', () => {
+  const p = panel(BASE);
+  p.deliver({ type: 'files', objectChildTypes: [], items: [] });
+  assert.strictEqual(p.el('treeTools').style.display, 'none');
+  const q = panel({ ...BASE, typeFilter: ['__none__'] });
+  q.deliver(TFILES(THREE_TYPES));
+  assert.strictEqual(q.el('treeTools').style.display, 'none', 'an empty filtered tree has no groups either');
+  q.el('typeFilterAll').fire('click');
+  assert.strictEqual(q.el('treeTools').style.display, 'flex', 'and it comes back with the groups');
+});
+
+check('Expand / Collapse all never touch the selection', () => {
+  const p = panel({ ...BASE, selected: ['ApexClass:AcmeA'] });
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  p.el('expandAll').fire('click');
+  p.el('collapseAll').fire('click');
+  assert.deepStrictEqual(p.persisted().selected, ['ApexClass:AcmeA']);
+  assert.strictEqual(p.liveCount(), 1);
+});
+
+// ------------------------------------------------ 8) double-click guards
+// The provider disables nothing; a button is only ever locked by the `busy`
+// reply, and that round trip is wide enough for the second click of a
+// double-click to send a twin (a second modal, a duplicate queue entry, a
+// misleading "already running" toast). sendAction locks the clicked control —
+// and every other slot-taking one — synchronously until ANY `busy` post answers.
+const DC = { selected: ['ApexClass:AcmeA', 'ApexClass:AcmeB'], expandedGroups: [], filter: '', typeFilter: [], viewMode: 'all', testClasses: '' };
+function armed(opts = {}) {
+  const p = panel(DC);
+  p.deliver({ type: 'orgs', orgs: [{ username: 'acme-dev-user', alias: 'acme-dev', label: 'acme-dev (acme-dev-user)', kind: 'sandbox' }], selected: 'acme-dev-user' });
+  p.deliver(FILES(['AcmeA', 'AcmeB']));
+  if (opts.busy) p.deliver({ type: 'busy', busy: true, action: opts.busy });
+  return p;
+}
+// A browser never delivers a click to a disabled or hidden button; the shim's
+// fire() would, so gate the way the browser does.
+function click(btn) {
+  if (!btn || btn.disabled || (btn.style && btn.style.display === 'none')) return false;
+  btn.fire('click');
+  return true;
+}
+const sent = (p, type) => p.outbound.filter(m => m.type === type).length;
+const findBtn = (p, label) => p.el('status').find(e => e.tagName === 'BUTTON' && e.textContent === label);
+const GUARDED = [['deployBtn', 'deploy'], ['validateBtn', 'deploy'], ['retrieveBtn', 'retrieve'], ['diffBtn', 'diff'], ['fetchOrgBtn', 'fetchOrgMetadata'], ['addOrg', 'loginOrg']];
+
+for (const [id, type] of GUARDED) {
+  check(`${id}: two clicks send one ${type}; locked ("Sending…") with the other guarded buttons until the busy reply`, () => {
+    const p = armed();
+    const b = p.el(id);
+    assert.ok(click(b));
+    assert.strictEqual(sent(p, type), 1);
+    assert.strictEqual(b.disabled, true);
+    assert.strictEqual(b.title, 'Sending…');
+    assert.ok(!click(b));
+    b.fire('click'); // even a click forced past the disabled gate is dropped
+    assert.strictEqual(sent(p, type), 1);
+    for (const [other] of GUARDED) assert.strictEqual(p.el(other).disabled, true, `${other} stayed enabled`);
+    p.deliver({ type: 'busy', busy: false });
+    assert.strictEqual(b.disabled, false, 'the busy reply must clear the pending lock');
+    assert.notStrictEqual(b.title, 'Sending…');
+    assert.ok(click(b));
+    assert.strictEqual(sent(p, type), 2);
+  });
+}
+
+check('Deploy queues while busy but never sends while its previous click is unanswered', () => {
+  const p = armed({ busy: 'Retrieve' });
+  const b = p.el('deployBtn');
+  assert.ok(click(b));
+  assert.strictEqual(sent(p, 'deploy'), 1);
+  assert.strictEqual(b.disabled, true);
+  assert.ok(!click(b));
+  p.deliver({ type: 'busy', busy: true, action: 'Retrieve' }); // the provider's re-sync: same state
+  assert.strictEqual(b.disabled, false);
+  assert.strictEqual(b.title, 'Will queue behind Retrieve');
+  assert.ok(click(b));
+  assert.strictEqual(sent(p, 'deploy'), 2);
+  assert.strictEqual(p.el('retrieveBtn').style.display, 'none', 'Retrieve stays hidden while busy');
+});
+
+const CARD = (buttons) => ({ type: 'status', card: { kind: 'ok', title: 'Retrieved 2 components', buttons } });
+const CARD_BTNS = [
+  ['Retry deploy', { type: 'retryDeploy', request: { keys: DC.selected } }, 1],
+  ['Resume monitoring', { type: 'resumeDeploy', jobId: '0Af000000000001AAA' }, 1],
+  ['Restore backup…', { type: 'restoreBackup', dir: '/backups/x' }, 1],
+  ['Discard backup', { type: 'discardBackup', dir: '/backups/x' }, 1],
+  ['Select these 2', { type: 'selectDeployed', keys: DC.selected }, 2] // selection-only: never gated
+];
+for (const [label, send, expect] of CARD_BTNS) {
+  check(`card "${label}": two clicks send ${expect} ${send.type}`, () => {
+    const p = armed();
+    p.deliver(CARD([{ label, send }]));
+    click(findBtn(p, label));
+    click(findBtn(p, label)); // re-found: a render replaces the element under the cursor
+    assert.strictEqual(sent(p, send.type), expect);
+    if (expect === 1) {
+      assert.strictEqual(findBtn(p, label).disabled, true);
+      assert.strictEqual(findBtn(p, label).title, 'Sending…');
+      assert.strictEqual(p.el('deployBtn').disabled, true, 'the toolbar locks with the card');
+      p.deliver({ type: 'busy', busy: false });
+      assert.strictEqual(findBtn(p, label).disabled, false);
+      assert.strictEqual(p.el('deployBtn').disabled, false);
+    }
+  });
+}
+
+check('card Retry queues while busy, not while pending', () => {
+  const p = armed({ busy: 'Deploy' });
+  p.deliver(CARD([{ label: 'Retry deploy', send: { type: 'retryDeploy', request: { keys: DC.selected } } }]));
+  assert.ok(click(findBtn(p, 'Retry deploy')));
+  assert.strictEqual(sent(p, 'retryDeploy'), 1);
+  assert.ok(!click(findBtn(p, 'Retry deploy')));
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy' });
+  assert.strictEqual(findBtn(p, 'Retry deploy').title, 'Will queue behind Deploy');
+  assert.ok(click(findBtn(p, 'Retry deploy')));
+  assert.strictEqual(sent(p, 'retryDeploy'), 2);
+});
+
+check('Quick Deploy stays one-shot', () => {
+  const p = armed();
+  p.deliver({ type: 'status', card: { kind: 'ok', title: 'Validation succeeded', quickDeploy: { jobId: '0Af000000000001AAA', label: 'Quick Deploy 2' } } });
+  assert.ok(click(findBtn(p, 'Quick Deploy 2')));
+  assert.strictEqual(findBtn(p, 'Quick Deploy 2'), null, 'the button must vanish on its one click');
+  assert.strictEqual(sent(p, 'quickDeploy'), 1);
+});
+
+check('Rescan locks on click until filesRefreshed — a busy broadcast does not free it', () => {
+  const p = armed();
+  const b = p.el('refreshFiles');
+  assert.ok(click(b));
+  assert.strictEqual(sent(p, 'refreshFiles'), 1);
+  assert.strictEqual(b.disabled, true);
+  assert.strictEqual(b.title, 'Rescanning…');
+  b.fire('click');
+  assert.strictEqual(sent(p, 'refreshFiles'), 1);
+  p.deliver({ type: 'busy', busy: false });
+  assert.strictEqual(b.disabled, true, 'a busy post is not this request\'s answer');
+  p.deliver({ type: 'filesRefreshed' });
+  assert.strictEqual(b.disabled, false);
+  assert.ok(click(b));
+  assert.strictEqual(sent(p, 'refreshFiles'), 2);
+});
+
+check('a repeated busy post neither wipes the progress text nor rebuilds the Status pane', () => {
+  const p = armed({ busy: 'Deploy' });
+  p.deliver({ type: 'progress', text: 'Deploying 2 components to acme-dev…' });
+  const progressText = () => {
+    const t = p.el('status').find(e => e.classList.contains('title') && e.parentNode && e.parentNode.classList.contains('progress'));
+    return t ? t.children[1].textContent : null;
+  };
+  assert.strictEqual(progressText(), 'Deploying 2 components to acme-dev…');
+  const pane = p.el('status').children;
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy' });
+  assert.strictEqual(p.el('status').children, pane, 'the re-sync rebuilt the Status pane');
+  // A reset that was not repainted is invisible until the next render — force one.
+  p.deliver({ type: 'status', card: { kind: 'ok', title: 'Unrelated card' } });
+  assert.strictEqual(progressText(), 'Deploying 2 components to acme-dev…', 'the re-sync reset the progress text');
+  p.deliver({ type: 'busy', busy: false });
+  assert.strictEqual(progressText(), null, 'a real transition must still repaint');
+});
+
+check('the context-menu paths and the provider\'s Rescan reply share the same guards', () => {
+  assert.ok(/function runKeys\([\s\S]*?state\.pendingAction[\s\S]*?sendAction\('deploy'[\s\S]*?sendAction\(kind, \{ keys \}\)/.test(PANEL_JS), 'runKeys must gate on pendingAction and send through sendAction');
+  assert.ok(/function runDelete\([\s\S]*?state\.pendingAction[\s\S]*?sendAction\('deleteFromOrg'/.test(PANEL_JS), 'runDelete must gate on pendingAction and send through sendAction');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
+  const shape = /case 'refreshFiles':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.refreshFiles\(\); \} finally \{ this\.post\(\{ type: 'filesRefreshed' \}\); \}\n\s*return;/;
+  assert.ok(shape.test(src), "refreshFiles handler must be exactly: try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }");
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

@@ -5,9 +5,22 @@ const path = require('path');
 const assert = require('assert');
 const Module = require('module');
 const origLoad = Module._load;
-Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
+// scanWorkspace (the OmniStudio end-to-end case at the bottom) needs project
+// discovery — workspaceFolders + findFiles pointed at a temp project. Everything
+// else here is pure path logic and never touches the stub.
+const ws = { folders: [], projectFiles: [] };
+const vscodeStub = {
+  workspace: {
+    get workspaceFolders() { return ws.folders; },
+    findFiles: async () => ws.projectFiles.map(f => ({ fsPath: f })),
+    asRelativePath: uri => uri.fsPath
+  },
+  RelativePattern: class { constructor(base, pattern) { Object.assign(this, { base, pattern }); } },
+  Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) }
+};
+Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { inferItemForPath, parseManifestTypes, deriveRule, findItemForPath, foldPathKey, detectMissingDependencies, selectProjectRoot } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { inferItemForPath, parseManifestTypes, deriveRule, findItemForPath, foldPathKey, detectMissingDependencies, selectProjectRoot, listMetaFileNames, detectDataPackExports, scanWorkspace, DATAPACK_WARNING } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep); // build OS-native paths
 let failed = 0;
 
@@ -42,6 +55,14 @@ const cases = [
   [p('x', 'permissionsets', 'Admin.permissionset-meta.xml'), 'PermissionSet', 'Admin'],
   [p('x', 'flexipages', 'Home.flexipage-meta.xml'), 'FlexiPage', 'Home'],
   [p('x', 'platformEventSubscriberConfigs', 'nameSmth.platformEventSubscriberConfig-meta.xml'), 'PlatformEventSubscriberConfig', 'nameSmth'],
+  // OmniStudio standard-runtime types: static RULES, so NO learned rule is passed
+  // here — a tree that only knew them through the registry cache lost every row
+  // on the first silent rescan after the cache expired.
+  [p('x', 'omniScripts', 'Widget_Intake_English_1.os-meta.xml'), 'OmniScript', 'Widget_Intake_English_1'],
+  [p('x', 'omniIntegrationProcedures', 'Widget_Fetch_1.oip-meta.xml'), 'OmniIntegrationProcedure', 'Widget_Fetch_1'],
+  [p('x', 'omniDataTransforms', 'WidgetTransform.rpt-meta.xml'), 'OmniDataTransform', 'WidgetTransform'],
+  [p('x', 'omniUiCard', 'WidgetCard_1.ouc-meta.xml'), 'OmniUiCard', 'WidgetCard_1'],
+  [p('x', 'omniScripts', 'orgHint', 'Widget_Intake_English_2.os-meta.xml'), 'OmniScript', 'Widget_Intake_English_2'], // org-hint subfolder
   // bundles: component is the bundle dir, regardless of which inner file was clicked
   [p('a', 'lwc', 'myCmp', 'myCmp.js'), 'LightningComponentBundle', 'myCmp', p('a', 'lwc', 'myCmp')],
   [p('a', 'lwc', 'myCmp', 'sub', 'helper.js'), 'LightningComponentBundle', 'myCmp', p('a', 'lwc', 'myCmp')],
@@ -134,6 +155,39 @@ try {
   assert.strictEqual(deriveRule('somemadeup', 'Whatever', ['A'], ['B.x-meta.xml']), undefined);
 } catch (e) { failed++; console.error('FAIL deriveRule:', e.message); }
 
+// deriveRule for OmniStudio: the registry answers with the file stem as the member
+// and a `<stem>.<suffix>-meta.xml` file. One rule per suffix must derive, so the
+// learned path keeps working for a registry newer than the static table.
+try {
+  for (const [folder, type, member, suffix] of [
+    ['omniScripts', 'OmniScript', 'Widget_Intake_English_1', '.os-meta.xml'],
+    ['omniIntegrationProcedures', 'OmniIntegrationProcedure', 'Widget_Fetch_1', '.oip-meta.xml'],
+    ['omniDataTransforms', 'OmniDataTransform', 'WidgetTransform', '.rpt-meta.xml'],
+    ['omniUiCard', 'OmniUiCard', 'WidgetCard_1', '.ouc-meta.xml']
+  ]) {
+    assert.deepStrictEqual(deriveRule(folder, type, [member], [member + suffix]), { folder, type, primaryExt: [suffix] }, folder);
+  }
+  // Real `sf project generate manifest --source-dir omniScripts` output (sf 2.137.7)
+  // → the members feed deriveRule exactly as learnRulesForFolders does.
+  const omniXml = `<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>Widget_Intake_English_1</members>
+        <name>OmniScript</name>
+    </types>
+    <version>61.0</version>
+</Package>`;
+  const [t] = parseManifestTypes(omniXml);
+  assert.deepStrictEqual(deriveRule('omniScripts', t.type, t.members, ['Widget_Intake_English_1.os-meta.xml']),
+    { folder: 'omniScripts', type: 'OmniScript', primaryExt: ['.os-meta.xml'] });
+  // Org-hint layout: a flat readdir of the folder sees only the subfolder NAME and
+  // derives nothing (the 7-day negative-cache trap); the recursive basenames
+  // listMetaFileNames hands over do derive.
+  assert.strictEqual(deriveRule('omniIntegrationProcedures', 'OmniIntegrationProcedure', ['Widget_Fetch_1'], ['orgHint']), undefined,
+    'a subfolder name must not derive a rule');
+  assert.deepStrictEqual(deriveRule('omniIntegrationProcedures', 'OmniIntegrationProcedure', ['Widget_Fetch_1'], ['Widget_Fetch_1.oip-meta.xml']).primaryExt, ['.oip-meta.xml']);
+} catch (e) { failed++; console.error('FAIL deriveRule (OmniStudio):', e.message); }
+
 // foldPathKey + findItemForPath case-folding. Windows filesystems are
 // case-insensitive and VS Code's URI sources disagree about drive-letter casing;
 // the platform param lets us exercise win32 folding on this non-Windows host.
@@ -175,5 +229,85 @@ try {
   assert.deepStrictEqual(out, { keys: ['QuickAction:Account.Foo'], unresolved: [] }, 'returns {keys, unresolved}');
 } catch (e) { failed++; console.error('FAIL detectMissingDependencies:', e.message); }
 
-if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
-console.log(`inferItemForPath/parseManifestTypes/deriveRule/foldPathKey/detectMissingDependencies: all checks passed (${cases.length + noMatch.length} infer cases + learned-rule + parser + derive + fold + dependency-detector)`);
+// The filesystem-backed contracts — listMetaFileNames, detectDataPackExports and
+// the whole scan over an OmniStudio project — run on a temp tree.
+(async () => {
+  const fsp = require('fs/promises');
+  const os = require('os');
+  const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'sf-check-infer-'));
+  const w = async (rel, body = '<x/>') => {
+    const abs = path.join(tmp, rel);
+    await fsp.mkdir(path.dirname(abs), { recursive: true });
+    await fsp.writeFile(abs, body, 'utf8');
+  };
+
+  // listMetaFileNames: recursive, basenames only, -meta.xml only, skip dirs honoured.
+  try {
+    const dir = path.join(tmp, 'omniIntegrationProcedures');
+    await w('omniIntegrationProcedures/Widget_Fetch_1.oip-meta.xml');
+    await w('omniIntegrationProcedures/orgHint/Widget_Fetch_2.oip-meta.xml');
+    await w('omniIntegrationProcedures/orgHint/notes.txt');
+    await w('omniIntegrationProcedures/node_modules/Junk.oip-meta.xml');
+    await w('omniIntegrationProcedures/.hidden/Junk2.oip-meta.xml');
+    assert.deepStrictEqual((await listMetaFileNames(dir)).sort(), ['Widget_Fetch_1.oip-meta.xml', 'Widget_Fetch_2.oip-meta.xml']);
+    // End to end: a folder whose ONLY file is nested derives through the helper.
+    await fsp.rm(path.join(dir, 'Widget_Fetch_1.oip-meta.xml'));
+    assert.deepStrictEqual(
+      deriveRule('omniIntegrationProcedures', 'OmniIntegrationProcedure', ['Widget_Fetch_2'], await listMetaFileNames(dir)),
+      { folder: 'omniIntegrationProcedures', type: 'OmniIntegrationProcedure', primaryExt: ['.oip-meta.xml'] });
+    assert.deepStrictEqual(await listMetaFileNames(path.join(tmp, 'missing')), [], 'an unreadable dir lists nothing, never throws');
+  } catch (e) { failed++; console.error('FAIL listMetaFileNames:', e.message); }
+
+  // detectDataPackExports: vlocity/ at the project root or package dir, or any
+  // *_DataPack.json below a package dir; only the DECLARED package dirs are walked.
+  try {
+    const proj = path.join(tmp, 'proj');
+    await w('proj/force-app/main/default/classes/A.cls', 'public class A {}');
+    assert.strictEqual(await detectDataPackExports(proj, ['force-app']), undefined, 'a plain project has no DataPack warning');
+    await w('proj/force-app/main/default/vlocity/OmniScript/Widget/Widget_DataPack.json', '{}');
+    assert.strictEqual(await detectDataPackExports(proj, ['force-app']), DATAPACK_WARNING, '*_DataPack.json under a package dir');
+    assert.strictEqual(await detectDataPackExports(proj, ['other-app']), undefined, 'only declared package dirs are searched');
+    await w('proj/vlocity/README.md', 'exports');
+    assert.strictEqual(await detectDataPackExports(proj, ['other-app']), DATAPACK_WARNING, 'a top-level vlocity/ folder');
+    assert.match(DATAPACK_WARNING, /OmniScript, OmniIntegrationProcedure, OmniDataTransform and OmniUiCard/, 'the warning names the handled types');
+    assert.match(DATAPACK_WARNING, /not Metadata API source/);
+  } catch (e) { failed++; console.error('FAIL detectDataPackExports:', e.message); }
+
+  // scanWorkspace over an OmniStudio project WITHOUT learned rules: the four
+  // folders are recognised (never reported unknown), the nested file lands too,
+  // and the DataPack warning rides on the scan result once exports appear.
+  try {
+    const proj = path.join(tmp, 'omni');
+    const pkg = 'omni/force-app/main/default/';
+    await w('omni/sfdx-project.json', JSON.stringify({ packageDirectories: [{ path: 'force-app' }] }));
+    await w(pkg + 'omniScripts/Widget_Intake_English_1.os-meta.xml');
+    await w(pkg + 'omniScripts/orgHint/Widget_Intake_English_2.os-meta.xml');
+    await w(pkg + 'omniIntegrationProcedures/Widget_Fetch_1.oip-meta.xml');
+    await w(pkg + 'omniDataTransforms/WidgetTransform.rpt-meta.xml');
+    await w(pkg + 'omniUiCard/WidgetCard_1.ouc-meta.xml');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'omni', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const scan = await scanWorkspace();
+    assert.strictEqual(scan.root, proj);
+    assert.deepStrictEqual(scan.unknownFolders, [], 'an Omni folder must never be an unknown folder');
+    assert.deepStrictEqual(scan.items.map(i => `${i.type}:${i.name}`), [
+      'OmniDataTransform:WidgetTransform',
+      'OmniIntegrationProcedure:Widget_Fetch_1',
+      'OmniScript:Widget_Intake_English_1',
+      'OmniScript:Widget_Intake_English_2',
+      'OmniUiCard:WidgetCard_1'
+    ]);
+    const os1 = scan.items.find(i => i.name === 'Widget_Intake_English_1');
+    assert.strictEqual(os1.filePath, path.join(proj, 'force-app', 'main', 'default', 'omniScripts', 'Widget_Intake_English_1.os-meta.xml'));
+    assert.deepStrictEqual(os1.files, [os1.filePath], 'single-file type: no sidecar');
+    assert.ok(!('warning' in scan), 'no DataPack exports → no warning key');
+    await w('omni/vlocity/OmniScript/Widget/Widget_DataPack.json', '{}');
+    const again = await scanWorkspace();
+    assert.strictEqual(again.warning, DATAPACK_WARNING, 'the scan carries the DataPack warning');
+    assert.strictEqual(again.items.length, 5, 'DataPack exports never become items');
+  } catch (e) { failed++; console.error('FAIL scanWorkspace (OmniStudio):', e.message); }
+
+  await fsp.rm(tmp, { recursive: true, force: true });
+  if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
+  console.log(`inferItemForPath/parseManifestTypes/deriveRule/foldPathKey/detectMissingDependencies: all checks passed (${cases.length + noMatch.length} infer cases + learned-rule + parser + derive + fold + dependency-detector + OmniStudio scan/DataPack)`);
+})();

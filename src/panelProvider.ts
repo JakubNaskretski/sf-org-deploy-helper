@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
@@ -254,6 +254,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentCancel?: () => void;
   private currentAction?: string;
   private currentProgressText?: string;
+  /** A deploy-family confirm modal is up (runDeploy's, enqueueDeploy's "Queue:"
+   *  variant, or the manifest deploy's). A deploy/validate/retry arriving
+   *  meanwhile is the twin of the request being confirmed — a double-click, or a
+   *  click that landed after the slot was taken but before the modal opened —
+   *  not a request to queue a second run; runDeploy refuses it instead of
+   *  enqueueing (double-click audit). Held only across awaitConfirm's await. */
+  private confirmOpen = false;
   /** Async job id of the deploy/validate/quick-deploy currently being polled. Now
    *  that deploys submit with `--async` and return an id in seconds, this is set
    *  IMMEDIATELY after submit and held for the whole poll — so a mid-deploy Cancel
@@ -376,7 +383,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // in an unhandled promise looks to the user like the panel simply ignoring
     // clicks, with no trace anywhere.
     view.webview.onDidReceiveMessage((m: Inbound) => {
-      void this.handleMessage(m).catch(err => this.reportError(m?.type ?? 'panel action', err));
+      void this.handleMessage(m)
+        .catch(err => this.reportError(m?.type ?? 'panel action', err))
+        // The webview locks the clicked button the moment it sends
+        // (pendingAction) and only a `busy` post unlocks it, so EVERY message is
+        // answered with the slot's true state once its handler is done — thrown
+        // or not. Slot-taking ops answered long before this (the webview treats
+        // a repeat as a no-op); the paths that never touch the slot (refused,
+        // invalid, a cancelled queue modal) have nothing else.
+        .finally(() => this.postBusy());
     });
     const editorChangeSub = vscode.window.onDidChangeActiveTextEditor(() => this.sendActiveFile());
     // Keep the "Changed" lens and its tab badge live through the edit→deploy loop:
@@ -634,7 +649,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (this.items.length === 0) {
       if (this.loadFilesInflight) await this.loadFilesInflight;
       else {
-        const scan = await scanWorkspace(this.learnedRules());
+        // Expired rules included: this scan never re-resolves, so dropping
+        // them could only lose the clicked file's own row.
+        const scan = await scanWorkspace(this.learnedRules(true));
         if (scan.projectError || !scan.root) {
           this.applyProjectDiscoveryFailure(scan.projectError ?? 'Could not determine the Salesforce DX project root.');
           return false;
@@ -721,7 +738,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.sendActiveFile();
         // Re-sync busy state so a webview recreated mid-operation (e.g. after the
         // sidebar was collapsed) doesn't show enabled buttons during a running op.
-        this.post({ type: 'busy', busy: this.busy, action: this.currentAction });
+        this.postBusy();
         if (this.busy && this.currentProgressText) this.post({ type: 'progress', text: this.currentProgressText });
         // Restore the test-level select after a webview rebuild — the provider is
         // the source of truth so a collapsed/reopened panel can't silently diverge.
@@ -782,7 +799,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         try { await this.loadOrgs(true); } finally { this.post({ type: 'orgsRefreshed' }); }
         return;
       case 'refreshFiles':
-        await this.refreshFiles();
+        // Rescan locks itself like ⟳ — until THIS request's reply, whether the
+        // scan ran, was refused mid-op, or threw.
+        try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }
         return;
       case 'fetchOrgMetadata':
         // Trust the org the webview has selected, applied before we read it back —
@@ -1207,8 +1226,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('typeCacheDays', 7);
   }
 
-  /** Cached learned rules, expired entries dropped. Cache off (0 days) → none. */
-  private learnedRules(): FolderRule[] {
+  /** Cached learned rules. Expired entries are dropped — unless `includeExpired`,
+   *  which the scans that never re-resolve types (the watcher's silent rescan,
+   *  the context-menu fast scan) pass: for them expiry cannot mean "forget the
+   *  folder", or every row of that type vanished from the tree on the first
+   *  file event after the TTL. An expired rule stays in force until the next
+   *  explicit scan re-verifies the folder against the registry and re-stamps
+   *  it. Cache off (0 days) → none. */
+  private learnedRules(includeExpired = false): FolderRule[] {
     const days = this.typeCacheDays();
     if (days <= 0) return [];
     const cutoff = Date.now() - days * 86_400_000;
@@ -1216,7 +1241,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // tampered state DB entry must degrade to "rule ignored", never flow onward.
     return this.context.globalState.get<LearnedRule[]>(LEARNED_RULES_KEY, [])
       .filter(r => !!r && typeof r.folder === 'string' && typeof r.type === 'string'
-        && /^[A-Za-z0-9_]+$/.test(r.type) && r.learnedAt >= cutoff);
+        && /^[A-Za-z0-9_]+$/.test(r.type) && typeof r.learnedAt === 'number'
+        && (includeExpired || r.learnedAt >= cutoff));
   }
 
   private async rememberRule(rule: FolderRule): Promise<void> {
@@ -1287,7 +1313,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       try {
         const xml = await this.sf.generateManifest([folder], root);
         const types = parseManifestTypes(xml);
-        const fileNames = await fs.readdir(folder);
+        // Recursive -meta.xml basenames: an org-hint subfolder layout has no
+        // member-named file at the top level and used to derive nothing.
+        const fileNames = await listMetaFileNames(folder);
         let ruleFound = false;
         // Derive only from a clean single-type folder — when two types share a
         // folder, a same-named member could bind the other type's file suffix
@@ -1376,7 +1404,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async doLoadFiles(opts: LoadFilesOptions = {}): Promise<void> {
-    let scan = await scanWorkspace(this.learnedRules());
+    // The silent path keeps expired learned rules (see learnedRules): it never
+    // re-resolves, so expiry there could only empty the tree of those types.
+    let scan = await scanWorkspace(this.learnedRules(!!opts.silent));
     if (scan.projectError || !scan.root) {
       // A background rescan must never ESCALATE a discovery failure. Emptying the
       // tree, dropping org metadata and popping an error toast because a stray
@@ -1815,6 +1845,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // a call that's already been dequeued.
     const verb: DeployVerb = opts.validateOnly ? 'Validate' : 'Deploy';
     if (this.busy && !opts.preConfirmed) {
+      // Slot taken but its confirm modal still unanswered: this is the twin of
+      // THAT request (double-click), not a deploy to run behind it. Enqueueing
+      // stacked a second "Queue:" modal — and cancelling #1 then confirming #2
+      // deployed with no prompt the user recognised.
+      if (this.confirmOpen) {
+        vscode.window.setStatusBarMessage('$(warning) SF Deploy: answer the open confirmation first', 4000);
+        return ABORTED;
+      }
       await this.enqueueDeploy(keys, opts);
       return ABORTED;
     }
@@ -1882,7 +1920,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           },
           false
         );
-        const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
+        const confirm = await this.awaitConfirm(modal);
         if (!confirm) return ABORTED;
       }
 
@@ -2183,6 +2221,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const plan = this.resolveTestPlan(opts, isProd);
     if (!plan) return;
     const { testLevel, runTests, testNote } = plan;
+    const entryKeys = items.map(i => `${i.type}:${i.name}`);
+    const validateOnly = !!opts.validateOnly;
+    // A twin of an entry already waiting — same pinned org, same key SET, same
+    // mode — is a repeat click, not a second run: say so instead of queueing it
+    // twice (a different set still queues). Before the modal so the user isn't
+    // asked to confirm a request that can't be honoured; again at the push
+    // because the modal await is a TOCTOU window (same shape as the cap).
+    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
 
     // The override is machine-scoped and re-read by runDeploy when the queue
     // drains, so what's true NOW is only a snapshot — the queued variant of the
@@ -2202,7 +2248,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       vscode.window.showInformationMessage(`SF Deploy: queue full (${DEPLOY_QUEUE_MAX} max) — wait for a queued operation to run before adding another.`);
       return;
     }
-    const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
+    const confirm = await this.awaitConfirm(modal);
     if (!confirm) return;
     // Re-check at the push: the early check avoids showing a doomed modal, but
     // the await above is a TOCTOU window — concurrent enqueues could all pass
@@ -2211,9 +2257,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       vscode.window.showInformationMessage(`SF Deploy: the queue filled up while the confirmation was open (${DEPLOY_QUEUE_MAX} max) — this deploy was NOT queued.`);
       return;
     }
+    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
     this.deployQueue.push({
       id: crypto.randomBytes(8).toString('hex'),
-      keys: items.map(i => `${i.type}:${i.name}`),
+      keys: entryKeys,
       opts: { validateOnly: opts.validateOnly, testLevel, runTests: runTests.length ? runTests : undefined, sourceDir: opts.sourceDir },
       org,
       orgLabel,
@@ -2226,6 +2273,26 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // ever run this item (post-release review, MED). If the slot is already
     // free, kick the drain ourselves.
     if (!this.busy) queueMicrotask(() => this.drainQueue());
+  }
+
+  /** Is an identical entry — same pinned org, same key set, same mode — already
+   *  waiting? Order-insensitive: the queue holds a set, whatever order the keys
+   *  were resolved in. */
+  private twinQueued(org: string, keys: string[], validateOnly: boolean): boolean {
+    return this.deployQueue.some(q => q.org === org && !!q.opts.validateOnly === validateOnly && sameKeySet(q.keys, keys));
+  }
+
+  private notifyAlreadyQueued(noun: string, orgLabel: string, validateOnly: boolean): void {
+    vscode.window.showInformationMessage(`SF Deploy: already queued — ${validateOnly ? 'validate' : 'deploy'} ${noun} → ${orgLabel} is waiting behind the current operation.`);
+  }
+
+  /** Show a deploy-family confirm modal with `confirmOpen` held for exactly the
+   *  await: a modal that throws (window closed) must not leave it stuck, or
+   *  every later deploy would be refused as a twin. */
+  private async awaitConfirm(modal: { message: string; options: vscode.MessageOptions; confirmLabel: string }): Promise<string | undefined> {
+    this.confirmOpen = true;
+    try { return await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel); }
+    finally { this.confirmOpen = false; }
   }
 
   /** Run the next queued deploy/validate now that the busy slot is free (see
@@ -3101,7 +3168,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         { noun, orgLabel, isProd, validateOnly: false, testNote, instanceUrl: orgInfo?.instanceUrl, ignoreConflicts },
         false
       );
-      const confirm = await vscode.window.showWarningMessage(modal.message, modal.options, modal.confirmLabel);
+      const confirm = await this.awaitConfirm(modal);
       if (!confirm) return;
 
       const testArg = testLevel !== 'NoTestRun'
@@ -4002,8 +4069,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const timeoutMs = this.timeoutMs();
 
     const orgItems: Array<{ type: string; name: string }> = [];
-    let managedSkipped = 0;
+    // Per TYPE, so the card can say WHICH components the default managed-package
+    // filter hid — "30 managed skipped" told a user missing their FlexCards nothing.
+    const managedSkipped = new Map<string, number>();
     const failures: Array<{ label: string; err: unknown }> = [];
+    // Types this org cannot list at all (feature off, other runtime). Not
+    // failures: every other type listed fine, so the badges stay trustworthy and
+    // the card stays green — they are named once, as a group.
+    const unsupported: string[] = [];
+    const recordFailure = (label: string, err: unknown): void => {
+      if (isUnsupportedTypeError(err)) unsupported.push(label);
+      else failures.push({ label, err });
+      this.output.appendLine(`[Fetch Org] ${label}: ${err instanceof Error ? err.message : String(err)}`);
+    };
     let fetchCancelled = false;
     const activeCancels = new Set<() => void>();
 
@@ -4022,13 +4100,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const { members } = await h.promise;
         for (const m of members) {
           if (!m.fullName) continue;
-          if (!includeManaged && m.manageableState === 'installed') { managedSkipped++; continue; }
+          if (!includeManaged && m.manageableState === 'installed') { managedSkipped.set(type, (managedSkipped.get(type) ?? 0) + 1); continue; }
           orgItems.push({ type, name: m.fullName });
         }
       } catch (err) {
         if (fetchCancelled || err instanceof SfCliCancelledError) throw err;
-        failures.push({ label, err });
-        this.output.appendLine(`[Fetch Org] ${label}: ${err instanceof Error ? err.message : String(err)}`);
+        recordFailure(label, err);
       } finally {
         activeCancels.delete(h.cancel);
       }
@@ -4061,8 +4138,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             }
           } catch (err) {
             if (fetchCancelled || err instanceof SfCliCancelledError) throw err;
-            failures.push({ label: folderType, err });
-            this.output.appendLine(`[Fetch Org] ${folderType}: ${err instanceof Error ? err.message : String(err)}`);
+            recordFailure(folderType, err);
           }
         }
 
@@ -4136,21 +4212,29 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // we got (better than nothing), but flag the listing as incomplete so the badges
       // aren't trusted as exhaustive.
       const incomplete = fatal.length > 0;
+      const managedTotal = [...managedSkipped.values()].reduce((a, b) => a + b, 0);
       const metaParts = [`${orgItems.length} components`];
-      if (managedSkipped > 0) metaParts.push(`${managedSkipped} managed skipped`);
+      if (managedTotal > 0) metaParts.push(`${managedTotal} managed skipped`);
+      if (unsupported.length > 0) metaParts.push(`${unsupported.length} type${unsupported.length === 1 ? '' : 's'} not available`);
       if (failures.length > 0) metaParts.push(`${failures.length} type${failures.length === 1 ? '' : 's'} failed`);
       const card: Record<string, unknown> = {
         kind: incomplete ? 'err' : (failures.length > 0 ? 'warn' : 'ok'),
         title: incomplete ? `Org metadata incomplete for ${orgLabel}` : `Org metadata loaded from ${orgLabel}`,
         meta: metaParts.join(' · ')
       };
-      if (failures.length > 0) {
-        const lines = failures.slice(0, 8).map(f => `✗ ${f.label} — ${f.err instanceof Error ? f.err.message : String(f.err)}`);
-        if (failures.length > 8) lines.push(`…and ${failures.length - 8} more (see output channel)`);
-        if (incomplete) lines.unshift('⚠ A connection/auth error interrupted the listing — some "local only" badges may be incomplete. Re-run Fetch Org.');
-        if (managedSkipped > 0) lines.unshift(`— ${managedSkipped} managed-package component${managedSkipped === 1 ? '' : 's'} hidden (enable sfOrgDeployWrapper.fetchIncludeManaged to show)`);
-        card.lines = lines;
+      // Built unconditionally: the managed-package line used to render only when
+      // some OTHER type had failed, so a clean fetch hid the one explanation of
+      // why a user's (managed) FlexCards were not in the tree.
+      const lines: string[] = [];
+      if (managedTotal > 0) lines.push(managedHiddenLine(managedSkipped));
+      if (incomplete) lines.push('⚠ A connection/auth error interrupted the listing — some "local only" badges may be incomplete. Re-run Fetch Org.');
+      if (unsupported.length > 0) {
+        lines.push(`— Not available on this org: ${[...unsupported].sort().join(', ')}`);
+        if (unsupported.some(t => t.startsWith('Omni'))) lines.push(OMNI_UNSUPPORTED_HINT);
       }
+      lines.push(...failures.slice(0, 8).map(f => `✗ ${f.label} — ${f.err instanceof Error ? f.err.message : String(f.err)}`));
+      if (failures.length > 8) lines.push(`…and ${failures.length - 8} more (see output channel)`);
+      if (lines.length > 0) card.lines = lines;
       this.post({ type: 'status', card });
       // An incomplete listing means some "local only" badges can be wrong — with
       // auto-fetch the card may be hidden, so toast that the org view is partial.
@@ -4248,6 +4332,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // instantly (the deploy never gets off the ground). A too-low value is a
     // footgun; a too-high one is the user's call.
     return Math.max(10_000, vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('commandTimeoutMs', 180_000));
+  }
+
+  /** The slot's current state, as the webview's `busy` message. */
+  private postBusy(): void {
+    this.post({ type: 'busy', busy: this.busy, action: this.currentAction });
   }
 
   private setBusy(b: boolean, action?: string): void {
@@ -4815,15 +4904,28 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * backup…" button (`dir` already names the exact backup that retrieve made, so the
    * picker is skipped and we go straight to picking which files to restore).
    *
-   * Busy-refuses WITHOUT taking the slot (like refreshFiles/pickOrg) so the pickers
-   * can't block a running op; reserves the 'Restore' slot only around the copy
-   * phase. Before overwriting, the CURRENT copies of the chosen files are backed up
-   * (so a restore is itself undoable), then the backup is copied back. Every
-   * destination is confined to the workspace root — a tampered backup dir can't
-   * write outside it.
+   * Holds the 'Restore' slot for the WHOLE flow, pickers and confirm included —
+   * reserving only around the copy phase let a double-clicked card button open
+   * a second file picker on top of the first (double-click audit). The panel's
+   * Cancel is a no-op meanwhile (nothing installs currentCancel); Esc dismisses
+   * the pickers as before. Before overwriting, the CURRENT copies of the chosen
+   * files are backed up (so a restore is itself undoable), then the backup is
+   * copied back. Every destination is confined to the workspace root — a
+   * tampered backup dir can't write outside it.
    */
   async restoreRetrieveBackup(dir?: string): Promise<void> {
-    if (this.busy) { this.notifyBusy(); return; }
+    if (!this.reserveBusy('Restore')) return;
+    try {
+      await this.restoreBackupHeld(dir);
+    } catch (err) {
+      this.reportError('Restore Retrieve Backup', err);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  /** Body of restoreRetrieveBackup, run with the slot already held. */
+  private async restoreBackupHeld(dir: string | undefined): Promise<void> {
     const root = this.requireRoot();
     if (!root) return;
 
@@ -4871,7 +4973,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         { placeHolder: `${new Date(picked.backup.at).toLocaleString()} — ${picked.backup.org} · ${picked.backup.fileCount} file${picked.backup.fileCount === 1 ? '' : 's'}` }
       );
       if (!next) return;
-      if (next.action === 'discard') { await this.discardBackup(picked.backup.dir); return; }
+      if (next.action === 'discard') { await this.discardBackupHeld(picked.backup.dir); return; }
       backup = picked.backup;
     }
 
@@ -4898,10 +5000,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     );
     if (confirm !== 'Restore') return;
 
-    // Reserve the slot only for the copy phase (finally-release), matching the
-    // discipline the deploy/retrieve paths use.
-    if (!this.reserveBusy('Restore')) return;
-    try {
+    {
       const rootResolved = path.resolve(root);
       // Undo-of-the-undo: back up the CURRENT state of the chosen files first.
       // Protect the source dir from that backup's prune so we can't delete what
@@ -4936,10 +5035,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
       });
       this.notifySuccessIfPanelHidden(`Restored ${restored.length} file${restored.length === 1 ? '' : 's'} from backup`);
-    } catch (err) {
-      this.reportError('Restore Retrieve Backup', err);
-    } finally {
-      this.setBusy(false);
     }
   }
 
@@ -4949,12 +5044,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * from the palette restore flow's "Discard this backup" alternative. `dir` is
    * validated exactly like restoreRetrieveBackup's, before any fs use.
    *
-   * Busy-refuses WITHOUT taking the slot: discarding is a single fast, local
-   * fs.rm — there's no multi-step phase worth a progress slot for, unlike restore's
-   * copy phase.
+   * Holds the 'Discard' slot across its confirm modal: refusing without the slot
+   * let a double-clicked card button stack two modals and two "Backup discarded"
+   * cards (double-click audit).
    */
   private async discardBackup(dir: string | undefined): Promise<void> {
-    if (this.busy) { this.notifyBusy(); return; }
+    if (!this.reserveBusy('Discard')) return;
+    try {
+      await this.discardBackupHeld(dir);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  /** Body of discardBackup, run with the slot already held — also the palette
+   *  restore flow's "Discard this backup" branch, which holds 'Restore'. */
+  private async discardBackupHeld(dir: string | undefined): Promise<void> {
     const root = this.requireRoot();
     if (!root) return;
     const resolved = this.resolveBackupDir(root, dir);
@@ -5066,6 +5171,13 @@ function sanitizeSegment(s: string): string {
  *  absolute paths. Compares via foldPathKey so a drive-letter/casing drift between
  *  a dialog- or infer-sourced path and the workspace root can't drop an in-tree
  *  file on Windows; callers keep using their ORIGINAL paths for the fs operations. */
+/** Same keys, any order (keys are unique "Type:Name" from resolveKeys). */
+function sameKeySet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every(k => set.has(k));
+}
+
 function isUnder(root: string, abs: string): boolean {
   const r = foldPathKey(root);
   const a = foldPathKey(abs);
@@ -5235,6 +5347,37 @@ function isFatalFetchError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   const txt = `${name} ${message}`.toLowerCase();
   return /nodefaultenv|namedorgnotfound|noauthinfofound|invalid_grant|expired|refreshtokenauth|enotfound|getaddrinfo|econnrefused|econnreset|etimedout|socket hang up|timed out/.test(txt);
+}
+
+/** `sf org list metadata` refusing the TYPE itself (`sf:INVALID_TYPE: Cannot use:
+ *  OmniUiCard in this organization`): the feature is off or the org runs a
+ *  different runtime. Every other type in the same fetch listed normally, so
+ *  this is reported as "not available", never as a failure. The message
+ *  pattern is bounded — it runs over org-controlled text. Exported for the
+ *  harness. */
+export function isUnsupportedTypeError(err: unknown): boolean {
+  const name = err instanceof SfCliError ? err.errorName ?? '' : '';
+  const message = err instanceof Error ? err.message : String(err);
+  return /^(sf:)?INVALID_TYPE$/i.test(name) || /cannot use: [^\n]{1,200} in this organization/i.test(message);
+}
+
+/** Why an OmniStudio type is unlistable: the Metadata API only sees OmniStudio
+ *  on the standard runtime with the org setting on; on the managed-package
+ *  runtime FlexCards/OmniScripts are data records no `sf org list metadata`
+ *  can reach — the most common reading of "not all my FlexCards show up". */
+export const OMNI_UNSUPPORTED_HINT = '— OmniStudio types (FlexCards, OmniScripts, Integration Procedures, DataRaptors) can only be listed on the standard runtime with Setup → OmniStudio Settings → "Use OmniStudio Metadata API" enabled; on the managed-package runtime they are data records the Metadata API cannot list.';
+
+/** Cap on types named in the hidden-managed line; the rest are counted. */
+const MANAGED_LINE_TYPES = 12;
+
+/** "Hidden managed-package components: OmniUiCard 30, ApexClass 210 …" —
+ *  biggest counts first so the type the user is looking for is likeliest in
+ *  view. Exported for the harness. */
+export function managedHiddenLine(byType: ReadonlyMap<string, number>): string {
+  const sorted = [...byType].filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const shown = sorted.slice(0, MANAGED_LINE_TYPES).map(([t, n]) => `${t} ${n}`);
+  const rest = sorted.length - shown.length;
+  return `— Hidden managed-package components: ${shown.join(', ')}${rest > 0 ? ` and ${rest} more type${rest === 1 ? '' : 's'}` : ''} (enable sfOrgDeployWrapper.fetchIncludeManaged to show)`;
 }
 
 /** The local process-kill timeout (SfCliError whose message says it "timed out",
@@ -5408,6 +5551,9 @@ function hintForError(err: unknown): string | undefined {
   const txt = `${name} ${message}`.toLowerCase();
   if (txt.includes('conflict')) {
     return 'The org has changes that conflict with your local files — retrieve them first, or enable Overwrite org changes in the panel.';
+  }
+  if (/invalid_type|cannot use: /.test(txt)) {
+    return 'This metadata type is not available on this org (feature not enabled or wrong runtime).';
   }
   if (/namedorgnotfound|noauthinfofound|invalid_grant|expired|refreshtokenauth/.test(txt)) {
     return 'Org authentication looks expired or missing — run `sf org login web` and retry.';
