@@ -17,10 +17,21 @@
   // restoring none, and the in-memory Set is untouched either way.
   const PERSISTED_SELECTION_MAX = 2000;
 
+  // Type-filter sentinel. The persisted typeFilter is one of: empty (= every
+  // type), this token ALONE (= no type), or plain type names — never the token
+  // mixed with names (normalizeTypeFilter enforces that).
+  const TYPE_NONE = '__none__';
+
   const persisted = vscode.getState() || {};
   const state = {
     orgs: [],
     orgsLoading: false, // ⟳ request in flight; only the provider's `orgsRefreshed` reply clears it
+    filesLoading: false, // Rescan in flight; only the provider's `filesRefreshed` reply clears it
+    // A slot-taking click has been sent and the provider's `busy` reply isn't
+    // back yet (see sendAction). Every guarded button locks meanwhile — that
+    // round trip is the only window in which a double-click's second click
+    // could send a twin.
+    pendingAction: null,
     selectedOrg: null,
     items: [], // {type, name, key (type:name), filePath, files[]}
     objectChildTypes: new Set(), // metadata types that nest under an object (CustomField, …)
@@ -33,6 +44,15 @@
     expandedGroups: new Set(persisted.expandedGroups || []),
     filter: persisted.filter || '',
     typeFilter: new Set(persisted.typeFilter || []), // empty = all
+    // Every type this webview has ever seen, local or org, persisted so a type
+    // that first APPEARS later can be told from one merely restored (see
+    // noteNewTypes). Append-only: a type missing from the ready scan but back
+    // with the org fetch must not masquerade as new on every reload.
+    seenTypes: new Set(persisted.seenTypes || []),
+    // Whether the previous session recorded a baseline at all. Without one
+    // (state written before seenTypes existed, or a fresh install) "new" is
+    // undecidable, so this whole session only seeds — it never widens the filter.
+    seenTypesBaseline: Array.isArray(persisted.seenTypes) && persisted.seenTypes.length > 0,
     busy: false,
     busyAction: null,
     progress: null, // { text, startedAt } while an operation runs
@@ -95,6 +115,7 @@
       expandedGroups: Array.from(state.expandedGroups),
       filter: state.filter,
       typeFilter: Array.from(state.typeFilter),
+      seenTypes: Array.from(state.seenTypes),
       cmdLogCollapsed: state.cmdLogCollapsed,
       statusRatio: state.statusRatio,
       scanBannerDismissed: state.scanBannerDismissed,
@@ -118,6 +139,23 @@
 
   function send(type, payload) { vscode.postMessage({ type, ...(payload || {}) }); }
 
+  // The funnel for every click that takes (or asks for) the operation slot —
+  // toolbar, context menu and card buttons alike. The provider answers EVERY
+  // message with a `busy` post once its handler is done (reserved, refused,
+  // invalid, or thrown), and until that lands the clicked control stays locked:
+  // without it the second click of a double-click sent a twin — a second modal,
+  // a duplicate queue entry, or a misleading "already running" toast.
+  // Deploy/Validate/Retry stay clickable while BUSY (they queue), never while
+  // PENDING. Returns false when the previous click is still unanswered.
+  function sendAction(type, payload) {
+    if (state.pendingAction) return false;
+    state.pendingAction = type;
+    send(type, payload);
+    renderActions();
+    renderStatus(); // card buttons lock too
+    return true;
+  }
+
   // ---- Init ----
   window.addEventListener('message', (ev) => handleMessage(ev.data));
   // ⟳ locks itself until the provider's `orgsRefreshed` reply (sent when THIS
@@ -133,10 +171,24 @@
   });
   // Authenticate a new org (sf org login web) — busy-guarded like the other toolbar
   // buttons so it can't be fired into a running operation.
-  $('addOrg').addEventListener('click', () => { if (!state.busy) send('loginOrg'); });
-  $('refreshFiles').addEventListener('click', () => send('refreshFiles'));
-  $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) send('fetchOrgMetadata', { username: state.selectedOrg }); });
+  $('addOrg').addEventListener('click', () => { if (!state.busy) sendAction('loginOrg'); });
+  // Rescan locks like ⟳: freed only by the provider's `filesRefreshed` reply to
+  // this request, so a double-click can't pay for two full scans.
+  $('refreshFiles').addEventListener('click', () => {
+    if (state.filesLoading) return;
+    state.filesLoading = true;
+    renderActions();
+    send('refreshFiles');
+  });
+  $('fetchOrgBtn').addEventListener('click', () => { if (!state.busy) sendAction('fetchOrgMetadata', { username: state.selectedOrg }); });
   $('sourceFilter').addEventListener('change', (e) => { state.sourceFilter = e.target.value; renderTree(); });
+  // Type filter All / None: a static row above the scrolling list (panelHtml.ts),
+  // bound once like every other toolbar control.
+  $('typeFilterAll').addEventListener('click', () => applyTypeFilter(new Set(knownTypes())));
+  $('typeFilterNone').addEventListener('click', () => applyTypeFilter(new Set()));
+  // Tree Expand all / Collapse all (static row above the tree, panelHtml.ts).
+  $('expandAll').addEventListener('click', () => setAllGroups(true));
+  $('collapseAll').addEventListener('click', () => setAllGroups(false));
   document.querySelectorAll('#viewModes button').forEach((btn) => {
     btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
   });
@@ -256,12 +308,12 @@
     // renderActions above and the provider's runDeploy). Retrieve/Diff still
     // need the slot free.
     const queueableWhileBusy = kind === 'deploy' || kind === 'validate';
-    if (state.busy && !queueableWhileBusy) return;
+    if (state.pendingAction || (state.busy && !queueableWhileBusy)) return;
     const keys = Array.from(state.selected);
     if (keys.length === 0) return;
     if (!state.selectedOrg) return;
-    if (kind === 'retrieve') return send('retrieve', { keys });
-    if (kind === 'diff') return send('diff', { keys });
+    if (kind === 'retrieve') return sendAction('retrieve', { keys });
+    if (kind === 'diff') return sendAction('diff', { keys });
     // deploy / validate: the chosen test level applies (empty → provider's default).
     const testLevel = ($('testLevel') && $('testLevel').value) || undefined;
     let runTests;
@@ -269,8 +321,8 @@
       runTests = parseTestClasses();
       if (runTests.length === 0) { flagTestClassesError(); return; }
     }
-    if (kind === 'deploy') return send('deploy', { keys, testLevel, runTests });
-    return send('deploy', { keys, validateOnly: true, testLevel, runTests });
+    if (kind === 'deploy') return sendAction('deploy', { keys, testLevel, runTests });
+    return sendAction('deploy', { keys, validateOnly: true, testLevel, runTests });
   }
 
   // ---- Message handling ----
@@ -304,6 +356,10 @@
         return;
       case 'orgsRefreshed':
         state.orgsLoading = false;
+        renderActions();
+        return;
+      case 'filesRefreshed':
+        state.filesLoading = false;
         renderActions();
         return;
       case 'files': {
@@ -344,9 +400,16 @@
           for (const k of Array.from(state.selected)) if (!valid.has(k)) { state.selected.delete(k); pruned = true; }
           // Drop stale type-filter entries (allow org types too)
           const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
-          for (const t of Array.from(state.typeFilter)) if (!allKnownTypes.has(t)) { state.typeFilter.delete(t); pruned = true; }
+          // The None sentinel is not a type name: pruning it as one turned a
+          // deliberate "no types" into "all types" on every webview rebuild.
+          for (const t of Array.from(state.typeFilter)) if (t !== TYPE_NONE && !allKnownTypes.has(t)) { state.typeFilter.delete(t); pruned = true; }
+          if (normalizeTypeFilter(Array.from(allKnownTypes))) pruned = true;
           savePersisted(); // both prunes above are now the persisted truth too
         }
+        // A type seen for the first time joins a plain-names filter so it shows
+        // (noteNewTypes). It can't change an item list identical to the last one,
+        // so the render skip below stays honest.
+        noteNewTypes(knownTypes());
         // Nothing about the tree changed: the same components, the same rows, and no
         // prune took anything out of the selection or the type filter. Rendering
         // anyway would replace the tree's innerHTML — losing scroll position and
@@ -372,6 +435,7 @@
         state.orgKeys = new Set((msg.orgItems || []).map(i => `${i.type}:${i.name}`));
         state.orgOnlyItems = (msg.orgItems || []).filter(i => !state.localKeys.has(`${i.type}:${i.name}`));
         state.orgLoaded = true;
+        noteNewTypes(knownTypes());
         renderSourceFilter();
         renderTypeFilter();
         renderTree();
@@ -488,19 +552,34 @@
         renderStatus();
         return;
       }
-      case 'busy':
-        state.busy = !!msg.busy;
-        state.busyAction = msg.action || null;
-        if (state.busy) {
-          state.progress = { text: state.busyAction ? `${state.busyAction} running…` : 'Working…', startedAt: Date.now() };
-          startProgressTimer();
-        } else {
-          state.progress = null;
-          stopProgressTimer();
+      case 'busy': {
+        // Every `busy` post answers an outstanding click (sendAction): the
+        // provider re-syncs after each handled message, so this is where the
+        // pending lock clears. Only a real transition touches the progress card
+        // and repaints — a mid-op re-sync must not wipe the live progress text,
+        // restart the elapsed clock, or rebuild the Status pane under the user.
+        const hadPending = !!state.pendingAction;
+        state.pendingAction = null;
+        const busy = !!msg.busy;
+        const busyAction = msg.action || null;
+        const changed = busy !== state.busy || busyAction !== state.busyAction;
+        state.busy = busy;
+        state.busyAction = busyAction;
+        if (changed) {
+          if (busy) {
+            state.progress = { text: busyAction ? `${busyAction} running…` : 'Working…', startedAt: Date.now() };
+            startProgressTimer();
+          } else {
+            state.progress = null;
+            stopProgressTimer();
+          }
         }
-        renderActions();
-        renderStatus();
+        if (changed || hadPending) {
+          renderActions();
+          renderStatus();
+        }
         return;
+      }
       case 'progress':
         if (state.progress && msg.text) {
           state.progress.text = msg.text;
@@ -602,61 +681,104 @@
     const row = $('typeFilterRow');
     const list = $('typeFilterList');
     const label = $('typeFilterLabel');
-    const types = Array.from(new Set([
-      ...state.items.map(i => i.type),
-      ...state.orgOnlyItems.map(i => i.type)
-    ])).sort();
+    const types = knownTypes();
     if (types.length === 0) { row.style.display = 'none'; return; }
     row.style.display = 'block';
     list.innerHTML = '';
     for (const t of types) {
+      const tr = document.createElement('div');
+      tr.className = 'type-row';
       const lbl = document.createElement('label');
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       // empty typeFilter = all selected
       cb.checked = state.typeFilter.size === 0 || state.typeFilter.has(t);
       cb.addEventListener('change', () => {
-        if (state.typeFilter.size === 0) {
-          // seed with all then remove this one
-          for (const x of types) state.typeFilter.add(x);
-        }
-        if (cb.checked) state.typeFilter.add(t); else state.typeFilter.delete(t);
-        // if user re-selects everything, collapse to empty (= "all")
-        if (state.typeFilter.size === types.length) state.typeFilter.clear();
-        savePersisted();
-        renderTypeFilter();
-        renderTree();
+        const next = allowedTypes(types);
+        if (cb.checked) next.add(t); else next.delete(t);
+        applyTypeFilter(next);
       });
       lbl.appendChild(cb);
       const span = document.createElement('span');
-      span.textContent = t;
+      span.textContent = typeLabel(t);
       lbl.appendChild(span);
-      list.appendChild(lbl);
+      tr.appendChild(lbl);
+      // "only": one click narrows the tree to this type — with ~95 types the
+      // alternative was unticking the other 94 by hand. Outside the <label> so
+      // the click can't double as a checkbox toggle.
+      const only = document.createElement('button');
+      only.type = 'button';
+      only.className = 'type-only';
+      only.textContent = 'only';
+      only.title = `Show only ${t}`;
+      only.addEventListener('click', () => applyTypeFilter(new Set([t])));
+      tr.appendChild(only);
+      list.appendChild(tr);
     }
-    // action row (All / None)
-    const actions = document.createElement('div');
-    actions.className = 'type-filter-actions';
-    const all = document.createElement('button');
-    all.textContent = 'All';
-    all.addEventListener('click', () => { state.typeFilter.clear(); savePersisted(); renderTypeFilter(); renderTree(); });
-    const none = document.createElement('button');
-    none.textContent = 'None';
-    none.addEventListener('click', () => {
-      state.typeFilter.clear();
-      // placeholder sentinel: add a token nothing matches
-      state.typeFilter.add('__none__');
-      savePersisted();
-      renderTypeFilter();
-      renderTree();
-    });
-    actions.appendChild(all);
-    actions.appendChild(none);
-    list.appendChild(actions);
+    // All / None live in the static row ABOVE the list (panelHtml.ts) so they
+    // stay in view however long the list scrolls; here they only learn whether
+    // they have anything left to do.
+    $('typeFilterAll').disabled = state.typeFilter.size === 0;
+    $('typeFilterNone').disabled = state.typeFilter.has(TYPE_NONE);
     label.textContent = state.typeFilter.size === 0
       ? `All types (${types.length})`
-      : state.typeFilter.has('__none__')
+      : state.typeFilter.has(TYPE_NONE)
         ? `0 of ${types.length} types`
         : `${state.typeFilter.size} of ${types.length} types`;
+  }
+
+  // The types on screen right now (local ∪ org-only), sorted — what the filter
+  // list shows and what the persisted contract is normalized against.
+  function knownTypes() {
+    return Array.from(new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)])).sort();
+  }
+  // The types currently VISIBLE, expanded from the persisted contract (empty =
+  // every known type) so a caller can add/remove one and hand it back.
+  function allowedTypes(types) {
+    return state.typeFilter.size === 0 ? new Set(types) : new Set(Array.from(state.typeFilter).filter(t => t !== TYPE_NONE));
+  }
+  // Rewrites state.typeFilter to the persisted contract for the given known
+  // types: empty stays empty (all); every known type present → empty; no names →
+  // the sentinel alone; otherwise plain names with the sentinel dropped. Returns
+  // true when anything changed.
+  function normalizeTypeFilter(types) {
+    if (state.typeFilter.size === 0) return false;
+    const names = Array.from(state.typeFilter).filter(t => t !== TYPE_NONE);
+    let next;
+    if (names.length === 0) next = new Set([TYPE_NONE]);
+    else if (types.length > 0 && types.every(t => names.includes(t))) next = new Set();
+    else next = new Set(names);
+    const changed = next.size !== state.typeFilter.size || Array.from(next).some(t => !state.typeFilter.has(t));
+    state.typeFilter = next;
+    return changed;
+  }
+  // Single write funnel: `visible` is the set of types that should show; empty
+  // means none. All / None / only / every checkbox land here, so the persisted
+  // contract can't drift (the old per-button writes mixed the sentinel with
+  // names and read two of three ticked types as "all").
+  function applyTypeFilter(visible) {
+    state.typeFilter = visible.size === 0 ? new Set([TYPE_NONE]) : new Set(visible);
+    normalizeTypeFilter(knownTypes());
+    savePersisted();
+    renderTypeFilter();
+    renderTree();
+  }
+  // New-type visibility. A persisted plain-names filter would otherwise hide any
+  // type that first appears later — OmniUiCard once the org gains OmniStudio, a
+  // new folder after a retrieve — with nothing to say so (its checkbox is simply
+  // unticked in a list nobody reopens). A type never seen before joins the
+  // filter, so it shows; None is an explicit choice and is kept. Without a
+  // baseline from the previous session (seenTypesBaseline) new and restored are
+  // indistinguishable, so this session only records what it sees.
+  function noteNewTypes(types) {
+    const fresh = Array.from(new Set(types)).filter(t => !state.seenTypes.has(t));
+    if (fresh.length === 0) return;
+    for (const t of fresh) state.seenTypes.add(t);
+    if (state.seenTypesBaseline && state.typeFilter.size > 0 && !state.typeFilter.has(TYPE_NONE)) {
+      for (const t of fresh) state.typeFilter.add(t);
+      normalizeTypeFilter(knownTypes()); // the newcomer may complete the set (= All)
+    }
+    savePersisted();
   }
 
   function isTypeAllowed(type) {
@@ -718,6 +840,22 @@
   };
   function childLabel(type) { return CHILD_LABELS[type] || type; }
 
+  // User-facing names for API types nobody searches by: OmniStudio calls an
+  // OmniUiCard a FlexCard and an OmniDataTransform a DataRaptor. Matched by the
+  // search box and shown in parentheses on group headers and filter rows.
+  const TYPE_ALIASES = {
+    OmniUiCard: 'FlexCard',
+    OmniScript: 'OmniScript',
+    OmniIntegrationProcedure: 'Integration Procedure',
+    OmniDataTransform: 'DataRaptor'
+  };
+  function typeAlias(type) { return TYPE_ALIASES[type] || ''; }
+  // 'OmniUiCard (FlexCard)' — only where the alias adds a name the type lacks.
+  function typeLabel(type) {
+    const alias = typeAlias(type);
+    return alias && alias !== type ? `${type} (${alias})` : type;
+  }
+
   // Expand the group path that reveals `key` (so "Use active file" can scroll to it).
   function expandPathForKey(key) {
     const [type, name] = splitKey(key);
@@ -732,6 +870,35 @@
     } else {
       state.expandedGroups.add(type);
     }
+  }
+
+  // Every group key the current lens + filters would draw — the same partition
+  // renderTree paints, same key grammar (type | '__OBJECTS__' | 'obj/<o>' |
+  // 'objc/<o>/<childType>') — so "Expand all" opens exactly what is on screen
+  // and leaves hidden groups' state alone.
+  function groupKeysInGroups(objectMap, flatGroups) {
+    const keys = [];
+    if (objectMap.size > 0) {
+      keys.push('__OBJECTS__');
+      for (const [name, o] of objectMap) {
+        keys.push('obj/' + name);
+        for (const ct of o.children.keys()) keys.push('objc/' + name + '/' + ct);
+      }
+    }
+    for (const type of flatGroups.keys()) keys.push(type);
+    return keys;
+  }
+  // Expand all = every visible group; Collapse all = EVERY key, visible or not
+  // (a group hidden by today's lens would otherwise reopen by itself later).
+  function setAllGroups(expand) {
+    if (expand) {
+      const { objectMap, flatGroups } = buildGroups();
+      for (const k of groupKeysInGroups(objectMap, flatGroups)) state.expandedGroups.add(k);
+    } else {
+      state.expandedGroups.clear();
+    }
+    savePersisted();
+    renderTree();
   }
 
   // ---- Search matching ----
@@ -760,11 +927,11 @@
       if (!raw) continue;
       const typeTok = raw.startsWith('type:') ? raw.slice(5) : (raw.startsWith('t:') ? raw.slice(2) : null);
       if (typeTok !== null) {
-        if (typeTok && !item.type.toLowerCase().includes(typeTok)) return false;
+        if (typeTok && !`${item.type} ${typeAlias(item.type)}`.toLowerCase().includes(typeTok)) return false;
         continue; // bare "type:" while still typing matches everything
       }
       if (hay === null) {
-        hay = `${item.type} ${item.name}`.toLowerCase();
+        hay = `${item.type} ${typeAlias(item.type)} ${item.name}`.toLowerCase();
         initials = nameInitials(item.name);
       }
       if (!hay.includes(raw) && !initials.includes(raw)) return false;
@@ -972,7 +1139,9 @@
       // null + no reason = the provider simply hasn't answered yet (e.g. webview
       // restored straight into this lens) — don't flash a false "unavailable".
       if (state.changedKeys === null) return state.changedReason || 'Detecting changes…';
-      if (filter && state.changedKeys.size > 0) return 'No changed component matches the current filter.';
+      // Any active filter — text, type or source — may be what hid the rows;
+      // blaming git for that sends the user to the wrong place.
+      if (state.changedKeys.size > 0 && (filter || state.typeFilter.size > 0 || state.sourceFilter !== 'all')) return 'No changed component matches the current filter.';
       // With a base ref the lens answers "what differs from <ref>"; without it, the
       // uncommitted-only default.
       return state.changedBase
@@ -980,6 +1149,24 @@
         : 'No uncommitted git changes in workspace metadata.';
     }
     return 'No metadata matches the current filter.';
+  }
+
+  // Expand all / Collapse all row above the tree (static markup, panelHtml.ts).
+  // Hidden when there is nothing to expand; disabled — not hidden — while the
+  // tree is force-expanded (Selected/Changed lens, or a search filter), with
+  // the reason in the tooltip.
+  function renderTreeTools(objectMap, flatGroups) {
+    const tools = $('treeTools');
+    if (!tools) return;
+    tools.style.display = (objectMap.size > 0 || flatGroups.size > 0) ? 'flex' : 'none';
+    const auto = state.viewMode !== 'all' ? 'Groups auto-expand in the Selected and Changed views'
+      : (state.filter ? 'Groups auto-expand while a filter is typed' : '');
+    const ex = $('expandAll');
+    const co = $('collapseAll');
+    ex.disabled = !!auto;
+    co.disabled = !!auto;
+    ex.title = auto || 'Expand every group';
+    co.title = auto || 'Collapse every group';
   }
 
   function renderTree() {
@@ -990,6 +1177,7 @@
     const hasLocal = state.items.length > 0;
     const hasOrg = state.orgLoaded && state.orgOnlyItems.length > 0;
     if (!hasLocal && !hasOrg) {
+      renderTreeTools(new Map(), new Map());
       const d = document.createElement('div');
       d.className = 'status-empty';
       d.textContent = state.orgLoaded
@@ -1003,6 +1191,7 @@
     // groups like an active text filter does (NODE_CAP still bounds the render).
     const forceExpand = state.viewMode !== 'all';
     const { objectMap, flatGroups } = buildGroups();
+    renderTreeTools(objectMap, flatGroups);
     // Slim header for the Selected lens: the count and the one action the old
     // chip tray provided that checkboxes don't cover in one click.
     if (state.viewMode === 'selected' && (state.selected.size > 0 || (state.selectedLensKeys && state.selectedLensKeys.size > 0))) {
@@ -1118,7 +1307,7 @@
       const arr = flatGroups.get(type).slice().sort((a, b) => a.name.localeCompare(b.name));
       const keys = arr.map(it => `${it.type}:${it.name}`);
       const expanded = state.expandedGroups.has(type) || !!filter || forceExpand;
-      const node = makeGroupNode({ key: type, label: type, count: arr.length, itemKeys: keys, expanded, depth: 0 });
+      const node = makeGroupNode({ key: type, label: typeLabel(type), count: arr.length, itemKeys: keys, expanded, depth: 0 });
       tree.appendChild(node.group); nodes++;
       if (expanded) for (const it of arr) {
         if (!budgetLeft()) { truncated = true; break; }
@@ -1155,6 +1344,10 @@
     const hasLocalSelectedNow = anySelectedNow && Array.from(state.selected).some(k => state.localKeys.has(k));
     const hasLocalSelectedIdle = anySelectedIdle && Array.from(state.selected).some(k => state.localKeys.has(k));
     const allOrgOnly = anySelectedNow && Array.from(state.selected).every(k => !state.localKeys.has(k));
+    // A click is out and unanswered (sendAction): every slot-taking control
+    // locks, Deploy/Validate included — queueable while busy, never while pending.
+    const pending = !!state.pendingAction;
+    const pendingTip = pending ? 'Sending…' : '';
     const deployBtn = $('deployBtn');
     const validateBtn = $('validateBtn');
     const retrieveBtn = $('retrieveBtn');
@@ -1175,13 +1368,13 @@
     // being refused.
     deployBtn.style.display = '';
     if (validateBtn) validateBtn.style.display = '';
-    deployBtn.disabled = !hasLocalSelectedNow;
-    if (validateBtn) validateBtn.disabled = !hasLocalSelectedNow;
+    deployBtn.disabled = !hasLocalSelectedNow || pending;
+    if (validateBtn) validateBtn.disabled = !hasLocalSelectedNow || pending;
     const orgOnlyTip = allOrgOnly ? 'Org-only items have no local source — retrieve them first.' : '';
     const queueTip = state.busy && hasLocalSelectedNow ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
-    deployBtn.title = queueTip || orgOnlyTip;
+    deployBtn.title = pendingTip || queueTip || orgOnlyTip;
     if (validateBtn) {
-      validateBtn.title = queueTip || orgOnlyTip || 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
+      validateBtn.title = pendingTip || queueTip || orgOnlyTip || 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
     }
 
     // Selection helpers stay VISIBLE while busy, just disabled — a control that
@@ -1208,9 +1401,10 @@
       if (testLevel) { testLevel.style.display = ''; testLevel.disabled = !hasLocalSelectedIdle; }
       clearSel.style.display = state.selected.size > 0 ? '' : 'none';
       cancelBtn.style.display = 'none';
-      retrieveBtn.disabled = !anySelectedIdle;
-      diffBtn.disabled = !hasLocalSelectedIdle;
-      diffBtn.title = allOrgOnly ? 'Org-only items have no local file to diff against — retrieve them first.' : '';
+      retrieveBtn.disabled = !anySelectedIdle || pending;
+      retrieveBtn.title = pendingTip;
+      diffBtn.disabled = !hasLocalSelectedIdle || pending;
+      diffBtn.title = pendingTip || (allOrgOnly ? 'Org-only items have no local file to diff against — retrieve them first.' : '');
     }
     // Lock org switching and fetch/refresh while an operation runs, so an in-flight
     // Fetch Org can't be raced by an org change or a second fetch. Tooltip says WHY
@@ -1218,16 +1412,16 @@
     const lockTip = state.busy ? `Locked while ${state.busyAction || 'an operation'} is running — cancel it or wait` : '';
     const orgSelect = $('orgSelect');
     if (orgSelect) { orgSelect.disabled = state.busy || state.orgs.length === 0; orgSelect.title = lockTip; }
-    $('fetchOrgBtn').disabled = state.busy;
-    $('fetchOrgBtn').title = lockTip;
+    $('fetchOrgBtn').disabled = state.busy || pending;
+    $('fetchOrgBtn').title = pendingTip || lockTip;
     const refreshOrgs = $('refreshOrgs');
     refreshOrgs.disabled = state.busy || state.orgsLoading;
     refreshOrgs.title = lockTip || (state.orgsLoading ? 'Refreshing org list…' : 'Refresh org list');
     refreshOrgs.classList.toggle('loading', state.orgsLoading);
-    $('addOrg').disabled = state.busy;
-    $('addOrg').title = lockTip || 'Authenticate a new org (sf org login web)';
-    $('refreshFiles').disabled = state.busy;
-    $('refreshFiles').title = lockTip || 'Rescan workspace files (also retries folders whose type resolution failed)';
+    $('addOrg').disabled = state.busy || pending;
+    $('addOrg').title = pendingTip || lockTip || 'Authenticate a new org (sf org login web)';
+    $('refreshFiles').disabled = state.busy || pending || state.filesLoading;
+    $('refreshFiles').title = pendingTip || lockTip || (state.filesLoading ? 'Rescanning…' : 'Rescan workspace files (also retries folders whose type resolution failed)');
   }
 
   function renderIgnoreDeployConflicts() {
@@ -1451,10 +1645,10 @@
         const qd = document.createElement('button');
         qd.className = 'primary quick-deploy';
         qd.textContent = card.quickDeploy.label || 'Quick Deploy validated components';
-        qd.disabled = state.busy;
+        qd.disabled = state.busy || !!state.pendingAction;
         qd.title = 'Deploy the validated components — skips validation and the test run.';
         qd.addEventListener('click', () => {
-          if (state.busy) return;
+          if (state.busy || state.pendingAction) return;
           card.quickDeployDone = true;   // one-shot: a validation can be quick-deployed once
           renderStatus();
           send('quickDeploy', { jobId: card.quickDeploy.jobId });
@@ -1479,11 +1673,16 @@
           // rows — no org call, no operation slot — so busy never gates it.
           const queueable = b.send && (b.send.type === 'retryDeploy' || b.send.type === 'retryDeployChanged');
           const selectionOnly = b.send && b.send.type === 'selectDeployed';
-          cb.disabled = state.busy && !queueable && !selectionOnly;
-          if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
+          // Everything but the selection-only button also waits for the
+          // provider's answer to the previous click (sendAction).
+          const pending = !!state.pendingAction && !selectionOnly;
+          cb.disabled = (state.busy && !queueable && !selectionOnly) || pending;
+          if (pending) cb.title = 'Sending…';
+          else if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
           cb.addEventListener('click', () => {
             if (state.busy && !queueable && !selectionOnly) return;
-            send(b.send.type, b.send);
+            if (selectionOnly) send(b.send.type, b.send);
+            else sendAction(b.send.type, b.send);
           });
           bwrap.appendChild(cb);
         }
@@ -1757,17 +1956,17 @@
     // Deploy/Validate queue behind a running op instead of refusing (mirrors
     // action() above); Retrieve/Diff/Delete/Open-in-Org still need the slot free.
     const queueableWhileBusy = kind === 'deploy' || kind === 'validate';
-    if ((state.busy && !queueableWhileBusy) || !state.selectedOrg || !keys || !keys.length) return;
-    if (kind === 'validate') return send('deploy', { keys, validateOnly: true });
-    send(kind, { keys });
+    if (state.pendingAction || (state.busy && !queueableWhileBusy) || !state.selectedOrg || !keys || !keys.length) return;
+    if (kind === 'validate') return sendAction('deploy', { keys, validateOnly: true });
+    sendAction(kind, { keys });
   }
 
   // Delete from Org: the provider previews (dry-run) and shows a destructive confirm
   // before anything is removed. Org-only rows ARE valid targets (unlike deploy/diff),
   // so there's no local-file gate here — only busy / no-org.
   function runDelete(keys) {
-    if (state.busy || !state.selectedOrg || !keys || !keys.length) return;
-    send('deleteFromOrg', { keys });
+    if (state.pendingAction || state.busy || !state.selectedOrg || !keys || !keys.length) return;
+    sendAction('deleteFromOrg', { keys });
   }
 
   // Deploy/Retrieve/Diff menu items for a set of component keys. Deploy and Diff need a
