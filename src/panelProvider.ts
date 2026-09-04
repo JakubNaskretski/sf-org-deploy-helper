@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryRulesSource } from './registryRules';
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
@@ -1353,14 +1353,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // member-named file at the top level and used to derive nothing.
         const fileNames = await listMetaFileNames(folder);
         let ruleFound = false;
-        // Derive only from a clean single-type folder — when two types share a
-        // folder, a same-named member could bind the other type's file suffix
-        // and the wrong cached rule would mislabel the whole folder on every
-        // scan until TTL expiry. Multi-type folders stay click-deployable.
-        if (types.length === 1) {
-          const rule = deriveRule(label, types[0].type, types[0].members, fileNames);
-          if (rule) { await this.rememberRule(rule); learned.push(rule); ruleFound = true; }
-        }
+        // Single-type folder: the plain derivation. Several types sharing a
+        // folder (wave/): one rule per type, but only when every type binds a
+        // distinct suffix — deriveRulesForTypes refuses anything ambiguous, so
+        // a wrong cached rule can't mislabel the folder until TTL expiry.
+        // A refused folder stays click-deployable.
+        const rules = types.length === 1
+          ? [deriveRule(label, types[0].type, types[0].members, fileNames)].filter((r): r is FolderRule => !!r)
+          : (deriveRulesForTypes(label, types, fileNames) ?? []);
+        for (const rule of rules) { await this.rememberRule(rule); learned.push(rule); ruleFound = true; }
         if (ruleFound) {
           this.output.appendLine(`[typeResolve] learned ${label} → ${types.map(t => t.type).join(', ')} (sf registry, cached ${this.typeCacheDays()}d)`);
         } else {

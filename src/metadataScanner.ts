@@ -556,6 +556,32 @@ export function deriveRule(folderName: string, type: string, members: string[], 
   return undefined;
 }
 
+/** Multi-type folder (wave/: WaveDataset .wds next to WaveDashboard .wdash):
+ *  one rule per type, but only when the binding is unambiguous — every member
+ *  of a type maps to exactly one `-meta.xml` suffix, and no two types claim the
+ *  same suffix. A same-named member across two types would bind both suffixes
+ *  and is refused wholesale (undefined), as is a type with no derivable file:
+ *  a wrong cached rule would mislabel the folder on every scan until expiry. */
+export function deriveRulesForTypes(folderName: string, types: Array<{ type: string; members: string[] }>, fileNames: string[]): FolderRule[] | undefined {
+  const rules: FolderRule[] = [];
+  const claimed = new Set<string>();
+  for (const t of types) {
+    const suffixes = new Set<string>();
+    for (const m of t.members) {
+      if (m.includes('/')) continue;
+      for (const f of fileNames) {
+        if (f.startsWith(m + '.') && f.endsWith('-meta.xml')) suffixes.add(f.slice(m.length));
+      }
+    }
+    if (suffixes.size !== 1) return undefined;
+    const [suffix] = suffixes;
+    if (claimed.has(suffix)) return undefined;
+    claimed.add(suffix);
+    rules.push({ folder: folderName, type: t.type, primaryExt: [suffix] });
+  }
+  return rules.length ? rules : undefined;
+}
+
 /** Basenames of every `-meta.xml` under `dir`, at any depth. deriveRule keys on
  *  `<member><suffix>` names, and a folder whose files sit in an org-hint
  *  subfolder (a layout the CLI itself accepts) has none at the top level — a

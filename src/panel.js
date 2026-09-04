@@ -1116,13 +1116,22 @@
   }
 
   // View-mode tabs: highlight the active lens and show live counts on the other two.
+  function visibleKeyCount(keys) {
+    let n = 0;
+    for (const k of keys) if (isTypeAllowed(k.slice(0, k.indexOf(':')))) n++;
+    return n;
+  }
+
   function renderViewModes() {
     const labels = { all: 'All', selected: 'Selected', changed: 'Changed' };
     document.querySelectorAll('#viewModes button').forEach((btn) => {
       const m = btn.dataset.mode;
       btn.classList.toggle('active', state.viewMode === m);
-      const count = m === 'selected' ? state.selected.size
-        : (m === 'changed' && state.changedKeys ? state.changedKeys.size : null);
+      // Counts honour the type filter, like the rows do: a key is `Type:Name`
+      // (split on the FIRST colon), so no item lookup is needed. Otherwise
+      // "Changed (3)" sat above a tree showing one row.
+      const count = m === 'selected' ? visibleKeyCount(state.selected)
+        : (m === 'changed' && state.changedKeys ? visibleKeyCount(state.changedKeys) : null);
       btn.textContent = count === null || count === 0 ? labels[m] : `${labels[m]} (${count})`;
     });
   }

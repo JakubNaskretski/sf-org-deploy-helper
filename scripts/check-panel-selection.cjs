@@ -149,6 +149,11 @@ const IDS = [
 function panel(persisted) {
   const els = new Map();
   for (const id of IDS) { const e = new El('div'); e.id = id; els.set(id, e); }
+  // The three lens tabs are static markup in panelHtml.ts; renderViewModes finds
+  // them via querySelectorAll('#viewModes button') and rewrites their text.
+  for (const mode of ['all', 'selected', 'changed']) {
+    const b = new El('button'); b.dataset.mode = mode; els.get('viewModes').appendChild(b);
+  }
   const listeners = {};
   let stored = persisted ? JSON.parse(JSON.stringify(persisted)) : undefined;
   const outbound = [];
@@ -170,7 +175,7 @@ function panel(persisted) {
       getElementById: (id) => els.get(id) || null,
       createElement: (tag) => new El(tag),
       querySelector: () => null,
-      querySelectorAll: () => [],
+      querySelectorAll: (sel) => (sel === '#viewModes button' ? els.get('viewModes').children.slice() : []),
       addEventListener: () => {},
       removeEventListener: () => {}
     },
@@ -592,6 +597,26 @@ const groups = (p) => { const o = []; p.el('tree').find(e => { if (e.className =
 const names = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'name') o.push(e.textContent); return false; }); return o; };
 const onlyBtn = (p, type) => p.el('typeFilterList').find(e => e.tagName === 'BUTTON' && e.textContent === 'only' && e.title === `Show only ${type}`);
 const rowLabel = (p, type) => { const b = onlyBtn(p, type); return b && b.parentNode.children[0]; };
+const tab = (p, mode) => p.el('viewModes').children.find(b => b.dataset.mode === mode).textContent;
+
+// ---- 9. lens tab counts honour the type filter (0.22.0) ----
+check('Selected / Changed tab counts follow the type filter, like the rows do', () => {
+  const p = panel();
+  p.deliver({ type: 'files', objectChildTypes: [], items: [item('ApexClass', 'A1'), item('ApexClass', 'A2'), item('Flow', 'F1')] });
+  p.deliver({ type: 'selectKeys', keys: ['ApexClass:A1', 'ApexClass:A2', 'Flow:F1'], replace: true });
+  p.deliver({ type: 'changed', keys: ['ApexClass:A1', 'Flow:F1'] });
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
+  assert.strictEqual(tab(p, 'changed'), 'Changed (2)');
+  onlyBtn(p, 'Flow').fire('click');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (1)', 'only Flow → one selected row visible');
+  assert.strictEqual(tab(p, 'changed'), 'Changed (1)');
+  assert.strictEqual(p.liveCount(), 3, 'the live selection itself is untouched by the filter');
+  p.el('typeFilterNone').fire('click');
+  assert.strictEqual(tab(p, 'selected'), 'Selected', 'nothing visible → bare label');
+  p.el('typeFilterAll').fire('click');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
+  assert.strictEqual(tab(p, 'all'), 'All');
+});
 const tick = (p, type, on) => { const lbl = rowLabel(p, type); assert.ok(lbl, `no row for ${type}`); const cb = lbl.children[0]; cb.checked = on; cb.fire('change'); };
 const treeText = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'status-empty') o.push(e.textContent); return false; }); return o; };
 
