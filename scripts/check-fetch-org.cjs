@@ -341,14 +341,16 @@ check('cache off (typeCacheDays 0): no learned rules either way', () => {
 });
 
 // ------------------------------------------------------------------ source pins
+// 0.21.1: call sites go through ruleSet() (registry → learned); the silent flag
+// still reaches learnedRules through it — check-registry-rules.cjs pins ruleSet's body.
 check('source: the silent scan keeps expired learned rules; the post-resolution rescan stays on fresh ones', () => {
-  assert.ok(src.includes('let scan = await scanWorkspace(this.learnedRules(!!opts.silent));'),
-    'doLoadFiles must pass the silent flag through to learnedRules');
-  assert.ok(src.includes('scan = await scanWorkspace([...this.learnedRules(), ...fresh]);'));
+  assert.ok(src.includes('let scan = await scanWorkspace(this.ruleSet(!!opts.silent));'),
+    'doLoadFiles must pass the silent flag through to the rule set');
+  assert.ok(src.includes('scan = await scanWorkspace([...this.ruleSet(), ...fresh]);'));
 });
 
 check('source: the context-menu fast scan keeps expired rules too', () => {
-  assert.ok(src.includes('const scan = await scanWorkspace(this.learnedRules(true));'));
+  assert.ok(src.includes('const scan = await scanWorkspace(this.ruleSet(true));'));
 });
 
 check('source: learnRulesForFolders derives from recursive -meta.xml basenames, not a flat readdir', () => {

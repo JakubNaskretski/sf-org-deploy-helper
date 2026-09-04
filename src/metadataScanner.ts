@@ -97,6 +97,10 @@ const RULES: FolderRule[] = [
  *  (e.g. `CustomField:Account.MyField__c`). These exist on standard objects too —
  *  even ones with no deployable `*.object-meta.xml` — so they're scanned
  *  independently of the CustomObject bundle. */
+/** Folders the static rules own. Registry-derived rules skip these: the static
+ *  entry knows shapes the registry's default adapter doesn't (bundles, objects). */
+export const STATIC_RULE_FOLDERS: ReadonlySet<string> = new Set([...RULES.map(r => r.folder), 'objects']);
+
 const OBJECT_CHILD_RULES: Array<{ folder: string; type: string; suffix: string }> = [
   { folder: 'fields', type: 'CustomField', suffix: '.field-meta.xml' },
   { folder: 'businessProcesses', type: 'BusinessProcess', suffix: '.businessProcess-meta.xml' },
