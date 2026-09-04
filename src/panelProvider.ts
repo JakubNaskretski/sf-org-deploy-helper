@@ -193,6 +193,14 @@ interface RetryRequest {
   validateOnly?: boolean;
   testLevel?: TestLevel;
   runTests?: string[];
+  /** Set ONLY on the request a "Retry + overwrite" card button builds (the
+   *  normal retry request plus this one field) — never by buildRetryRequest, so
+   *  a plain Retry re-read from the same card never carries it. A one-off per
+   *  click, not a mode: deployOptsFromRetry maps `true` to runDeploy's
+   *  ignoreConflictsOverride; anything else (missing, false, forged) maps to
+   *  undefined, which lets the machine-scoped setting decide, exactly as a
+   *  plain Retry always has. */
+  ignoreConflicts?: boolean;
 }
 
 /** What a runDeploy call did. `aborted` covers every path that never reached the
@@ -320,7 +328,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private deployQueue: Array<{
     id: string;
     keys: string[];
-    opts: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string };
+    opts: {
+      validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string;
+      /** See enqueueDeploy/runDeploy — pinned at enqueue time, unlike the
+       *  machine-scoped setting itself. */
+      ignoreConflictsOverride?: boolean;
+    };
     org: string;
     orgLabel: string;
     noun: string;
@@ -1901,6 +1914,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  one line of modal text and nothing about what deploys, so unlike
        *  orgOverride/preConfirmed a forged value could not widen anything. */
       autoIncluded?: { count: number; entryKey: string };
+      /** One-off override of the machine-scoped ignoreDeployConflicts setting,
+       *  for exactly this run. Set only via a "Retry + overwrite" card button
+       *  (deployOptsFromRetry reading RetryRequest.ignoreConflicts) — every other
+       *  caller leaves it undefined so the live setting decides, as before this
+       *  existed. Never sticky: buildRetryRequest does not carry it forward into
+       *  the NEXT card's plain Retry request. */
+      ignoreConflictsOverride?: boolean;
     } = {}
   ): Promise<DeployOutcome> {
     // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
@@ -1974,7 +1994,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // it has to name the value this very run will pass to the CLI. A VS Code
       // modal is window-modal, so the setting can't be toggled from the panel or
       // the Settings editor while it's up — what the user reads is what runs.
-      const ignoreConflicts = this.ignoreDeployConflicts();
+      // `ignoreConflictsOverride` is the "Retry + overwrite" card button's one-off
+      // per-click flag (see deployFailureButtons) — set ONLY by that button's own
+      // request, never by the machine-scoped setting itself. It wins when present;
+      // every other caller leaves it undefined and falls through to the setting.
+      const ignoreConflicts = opts.ignoreConflictsOverride ?? this.ignoreDeployConflicts();
 
       // A drained (pre-confirmed) deploy skips the modal entirely — the user
       // already confirmed it, against this same pinned org, at enqueue time.
@@ -1998,6 +2022,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const testArg = testLevel !== 'NoTestRun'
         ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
         : '';
+
+      // Snapshot the retry request once, up front: the client-side conflict
+      // check throws from the submit call BELOW, before any job id exists, so
+      // the exception handler needs the exact same request the success path
+      // (buildRetryRequest inlined at the report call, below) would build.
+      const retry = buildRetryRequest(opts, items, testLevel, runTests);
 
       const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
@@ -2047,7 +2077,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 // Carries the run's own modes so Retry and an accepted dependency
                 // suggestion re-run as what this was — a validation must never turn
                 // into a deploy on its own.
-                retry: buildRetryRequest(opts, items, testLevel, runTests)
+                retry
               });
               // Set AFTER the report call: a throw out of reportDeployResult must
               // not leave sawTerminal true with detection unset, which would make
@@ -2072,7 +2102,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // Only the short submit call can time out now (polls are handled inside
           // drivePolledDeploy); killing it does NOT stop an already-enqueued deploy.
           this.reportDeployTimeout(labeledAction, err);
-        } else this.reportError(labeledAction, err);
+        } else this.reportError(labeledAction, err, retry);
       } finally {
         if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
@@ -2266,6 +2296,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  deliberately NOT stored on the queue entry, because drainQueue re-enters
        *  runDeploy preConfirmed and shows no second modal. */
       autoIncluded?: { count: number; entryKey: string };
+      /** See runDeploy — unlike the machine-scoped setting (re-read fresh when the
+       *  queue drains, below), this one-off flag IS stored on the queue entry and
+       *  carried through unchanged: it names a single click, not something that
+       *  could legitimately change while the deploy waits its turn. */
+      ignoreConflictsOverride?: boolean;
     }
   ): Promise<void> {
     const root = this.requireRoot();
@@ -2296,14 +2331,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // because the modal await is a TOCTOU window (same shape as the cap).
     if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
 
-    // The override is machine-scoped and re-read by runDeploy when the queue
+    // The SETTING is machine-scoped and re-read by runDeploy when the queue
     // drains, so what's true NOW is only a snapshot — the queued variant of the
     // notice says so rather than pinning the flag (pinning would change which
-    // flags a queued deploy actually runs with).
+    // flags a queued deploy actually runs with). A "Retry + overwrite" click's
+    // own override is different: it's pinned below (on the queue entry itself),
+    // so name what will actually run — same `??` as runDeploy.
+    const ignoreConflicts = opts.ignoreConflictsOverride ?? this.ignoreDeployConflicts();
     const modal = this.deployConfirmModal(
       {
         noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
-        instanceUrl: orgInfo?.instanceUrl, ignoreConflicts: this.ignoreDeployConflicts(),
+        instanceUrl: orgInfo?.instanceUrl, ignoreConflicts,
         autoIncluded: opts.autoIncluded
       },
       true
@@ -2327,7 +2365,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.deployQueue.push({
       id: crypto.randomBytes(8).toString('hex'),
       keys: entryKeys,
-      opts: { validateOnly: opts.validateOnly, testLevel, runTests: runTests.length ? runTests : undefined, sourceDir: opts.sourceDir },
+      opts: {
+        validateOnly: opts.validateOnly, testLevel, runTests: runTests.length ? runTests : undefined,
+        sourceDir: opts.sourceDir, ignoreConflictsOverride: opts.ignoreConflictsOverride
+      },
       org,
       orgLabel,
       noun: `${opts.validateOnly ? 'Validate' : 'Deploy'} ${noun}`
@@ -2538,15 +2579,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.items,
         new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
       );
-      const buttons = ctx.retry
-        ? [
-            { label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } }
-            // "Retry + changed vs branch" was offered here in 0.15.0 and removed
-            // on user feedback — the Changed lens already owns that workflow. The
-            // retryDeployChanged handler stays: persisted 0.15.0 cards still
-            // carry the button, and it may return in some future form.
-          ]
-        : undefined;
+      // "Retry + changed vs branch" was offered here in 0.15.0 and removed on user
+      // feedback — the Changed lens already owns that workflow. The
+      // retryDeployChanged handler stays: persisted 0.15.0 cards still carry the
+      // button, and it may return in some future form. deployFailureButtons adds
+      // "Retry + overwrite" beside the plain Retry when this failure is itself a
+      // client-side conflict (see isConflictFailure) and the run wrote — in
+      // practice a completed DeployResult never carries one (the check throws at
+      // submit, before a job — and a conflict-blocked run reports through
+      // reportError instead, never reaching this function at all), but the same
+      // rule covers a CLI version that ever reports it this way instead.
+      const buttons = deployFailureButtons(ctx.retry, isConflictFailure(result));
       // Per-row suggestion candidates for the card's "Try with dependencies"
       // view. Same sourceDir exclusion as above (the retry couldn't carry the
       // added keys), and only when there's a discrete key list to extend (a
@@ -4790,7 +4833,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private reportError(action: string, err: unknown): void {
+  /**
+   * `retry` is passed ONLY by callers that can name the exact deploy request
+   * that just failed (today: runDeploy's own catch — the client-side conflict
+   * check throws HERE, from the submit call, before any job id exists, so a
+   * conflict-blocked deploy never reaches reportDeployResult's card at all).
+   * Every other caller (org list, backup, diff, login, …) leaves it undefined
+   * and gets exactly the card this function has always built.
+   */
+  private reportError(action: string, err: unknown, retry?: RetryRequest): void {
     // Belt: reportError is the last line of defense, so a synchronous throw from
     // post()/history persistence here must not cascade into the caller's catch and
     // mask the real error. Fall back to the output channel, never rethrow.
@@ -4806,7 +4857,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           meta: 'See command log / output channel for details',
           errText: stripAnsi([message, stderr].filter(Boolean).join('\n')).trim(),
           actions: err instanceof SfCliError ? err.actions : undefined,
-          hint: hintForError(err)
+          hint: hintForError(err),
+          buttons: deployFailureButtons(retry, isConflictFailure(err))
         }
       });
       void vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
@@ -5614,13 +5666,70 @@ export function buildRetryRequest(
  *  against its own modal. `sourceDir` is deliberately NOT handled here: it needs
  *  the workspace root to be validated against, which is the caller's job. */
 export function deployOptsFromRetry(r: RetryRequest): {
-  validateOnly: boolean; testLevel?: TestLevel; runTests?: string[];
+  validateOnly: boolean; testLevel?: TestLevel; runTests?: string[]; ignoreConflictsOverride?: boolean;
 } {
   return {
     validateOnly: r.validateOnly === true,
     testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
-    runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined
+    runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined,
+    // Only a literal `true` overrides — same strictness as validateOnly above,
+    // and for the same reason: the request is untrusted, and "no override" (the
+    // setting decides) is the safe reading of anything else.
+    ignoreConflictsOverride: r.ignoreConflicts === true ? true : undefined
   };
+}
+
+/** Bounded text a client-side source-conflict failure actually uses — the CLI's
+ *  own wording, never a bare "conflict" substring (a legitimate Apex/validation
+ *  problem can contain that word without being one of these). */
+const CONFLICT_TEXT_PATTERNS: readonly RegExp[] = [/conflict(s)?\s+detected/i, /source conflict/i];
+
+/**
+ * Whether a deploy/validate failure is the CLI's client-side source-tracking
+ * conflict check, not a real deploy problem — the one case where "Retry +
+ * overwrite" belongs beside the plain Retry, because the org was never even
+ * reached (see runDeploy's catch: the check runs INSIDE the submit call,
+ * before any job id exists, so a plain re-run hits the identical wall every
+ * time). Anchored on the CLI's own error NAME first (`SourceConflictError`,
+ * from the JSON envelope — see kit/sfCli.ts) and, as a fallback for CLI output
+ * that only names it in text, the two bounded phrases above. Accepts either
+ * the exception thrown at submit (`err` — the real path today) or a terminal
+ * DeployResult (`result` — its request-level `errorMessage`), so the same rule
+ * still applies if a future CLI version ever reports it the other way.
+ */
+export function isConflictFailure(errOrResult: unknown): boolean {
+  if (errOrResult instanceof SfCliError && errOrResult.errorName === 'SourceConflictError') return true;
+  let text = '';
+  if (errOrResult instanceof Error) {
+    text = errOrResult.message;
+  } else if (errOrResult && typeof errOrResult === 'object') {
+    const r = errOrResult as { errorMessage?: unknown };
+    if (typeof r.errorMessage === 'string') text = r.errorMessage;
+  }
+  return !!text && CONFLICT_TEXT_PATTERNS.some(re => re.test(text));
+}
+
+/**
+ * Buttons for a failed deploy/validate result card. `undefined` when there's no
+ * retry request to carry at all (a manifest retry has none — see
+ * buildRetryRequest/RetryRequest). Otherwise the plain Retry, unchanged from
+ * before this feature existed, plus — only when the failure is itself a
+ * client-side conflict AND the run wrote (never for validateOnly: a check-only
+ * run overwrites nothing, so there's nothing for the second button to offer) —
+ * "Retry + overwrite", carrying the SAME request with `ignoreConflicts: true`
+ * added. That field is NOT folded back into `retry` itself: it's a one-off for
+ * this click, and the request object here is only ever read, never mutated, so
+ * the plain Retry beside it — and any later card built from this same `retry`
+ * value — stays exactly as it was.
+ */
+export function deployFailureButtons(
+  retry: RetryRequest | undefined,
+  conflict: boolean
+): Array<{ label: string; send: { type: 'retryDeploy'; request: RetryRequest } }> | undefined {
+  if (!retry) return undefined;
+  const plain = { label: retry.validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy' as const, request: retry } };
+  if (!conflict || retry.validateOnly) return [plain];
+  return [plain, { label: 'Retry + overwrite', send: { type: 'retryDeploy' as const, request: { ...retry, ignoreConflicts: true } } }];
 }
 
 /** The check-only mode implied by a persisted job's verb. The verb is the ONLY

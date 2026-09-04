@@ -131,9 +131,32 @@ check('diff slow-path retrieve is NOT forced', () => {
   assert.ok(!/ignoreConflicts: true/.test(window), 'diff temp-dir retrieve must not force the flag');
 });
 
-check('deploy flag still comes from the setting, never hard-coded', () => {
+check('deploy flag still comes from the setting (with the one-off retry override), never hard-coded', () => {
   assert.ok(!/deployMetadata\([^\n]*ignoreConflicts: true/.test(src), 'deploy must not hard-code ignoreConflicts');
-  assert.ok(/const ignoreConflicts = this\.ignoreDeployConflicts\(\);/.test(src));
+  // runDeploy: the "Retry + overwrite" card button's per-click flag wins when
+  // present (opts.ignoreConflictsOverride, sourced ONLY from
+  // deployOptsFromRetry ← RetryRequest.ignoreConflicts — see
+  // check-retry-helpers.cjs), otherwise the machine-scoped setting decides —
+  // exactly as before this feature existed.
+  assert.ok(
+    /const ignoreConflicts = opts\.ignoreConflictsOverride \?\? this\.ignoreDeployConflicts\(\);/.test(src),
+    'runDeploy must read the override before falling back to the setting'
+  );
+  // A context-menu manifest deploy is untouched by this feature (no discrete key
+  // list for a "Retry + overwrite" request to carry — see buildRetryRequest) —
+  // it still reads the setting alone, with no override plumbing at all.
+  assert.ok(/const ignoreConflicts = this\.ignoreDeployConflicts\(\);\n/.test(src), 'runManifestDeploy must still read the plain setting');
+});
+
+check('nothing hard-codes the override to true — only deployOptsFromRetry\'s gated ternary sets it', () => {
+  // The literal substring "ignoreConflictsOverride: true" must never appear —
+  // deployOptsFromRetry writes `r.ignoreConflicts === true ? true : undefined`,
+  // where "true" is never adjacent to the field name. A future edit that
+  // collapses that ternary into a bare `ignoreConflictsOverride: true` (there or
+  // anywhere else) would force every deploy through the overwrite path.
+  const hits = src.match(/ignoreConflictsOverride:\s*true\b/g) || [];
+  assert.deepStrictEqual(hits, [], `unexpected hard-coded override(s): ${hits.join(', ')}`);
+  assert.ok(src.includes('ignoreConflictsOverride: r.ignoreConflicts === true ? true : undefined'), 'the gated ternary itself must still be there');
 });
 
 if (failed) { console.error(`retrieve-conflicts: ${failed}/${ran} checks FAILED`); process.exit(1); }

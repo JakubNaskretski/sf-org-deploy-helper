@@ -20,6 +20,14 @@
 //      button-builder fails this check until the entry goes too.
 //   4. The wiring, through the real pushCardHistory/cardHistory: a card persisted
 //      by an older version heals on restore, not only on write.
+//   5. isConflictFailure + deployFailureButtons (Feature: conflict-blocked
+//      deploy retry) — the pure functions behind the "Retry + overwrite"
+//      button: what counts as a client-side conflict failure (bounded, never a
+//      generic "conflict" substring) and when the second button appears
+//      (never without a retry request, never on a validate-only run). Reuses
+//      send.type 'retryDeploy' — no new card-button message type — so it rides
+//      the SAME persistence/pruning rules pinned above rather than needing its
+//      own.
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
@@ -33,8 +41,12 @@ Module._load = (req, ...rest) => (req === 'vscode' ? {
   Uri: { file: (fsPath) => ({ fsPath }) }
 } : origLoad(req, ...rest));
 
-const { DeployPanelProvider, pruneCardButtons, SUPPORTED_CARD_BUTTON_SENDS } =
+const { DeployPanelProvider, pruneCardButtons, SUPPORTED_CARD_BUTTON_SENDS, isConflictFailure, deployFailureButtons } =
   require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+// Same module the compiled panelProvider.js itself requires (by resolved path,
+// so `instanceof` below sees the identical class), used only to build realistic
+// SfCliError fixtures for isConflictFailure.
+const { SfCliError } = require(path.join(__dirname, '..', 'out', 'sfCliService.js'));
 
 let failed = 0;
 const queue = [];
@@ -188,6 +200,134 @@ check('quickDeploy is still stripped, and the live card keeps everything', () =>
 check('a corrupted stored history still degrades to empty, not a throw', () => {
   assert.deepStrictEqual(readHistory(providerWith('nonsense')), []);
   assert.deepStrictEqual(readHistory(providerWith([null, 7, { kind: 'ok' }])), [{ kind: 'ok' }]);
+});
+
+// ======================================================== isConflictFailure
+// "Retry + overwrite" (Feature: conflict-blocked deploy retry) offers a
+// destructive re-run — it must fire ONLY for the CLI's own client-side
+// source-conflict check, never for a generic failure that happens to mention
+// the word "conflict" in an unrelated sense.
+const CONFLICT_ERROR = () => { const e = new SfCliError('SourceConflictError: 3 conflicts detected'); e.errorName = 'SourceConflictError'; return e; };
+
+check('positive: errorName alone is enough, regardless of message wording', () => {
+  const e = new SfCliError('Deploy failed for an unrelated reason');
+  e.errorName = 'SourceConflictError';
+  assert.strictEqual(isConflictFailure(e), true);
+});
+
+check('positive: the CLI\'s own submit-time error (name + message)', () => {
+  assert.strictEqual(isConflictFailure(CONFLICT_ERROR()), true);
+});
+
+check('positive: message-only fallback, both bounded phrases, case-insensitive', () => {
+  assert.strictEqual(isConflictFailure(new SfCliError('1 conflict detected on ApexClass:OrderService')), true);
+  assert.strictEqual(isConflictFailure(new SfCliError('CONFLICTS DETECTED — aborting')), true);
+  assert.strictEqual(isConflictFailure(new SfCliError('Source Conflict Error: see below')), true);
+  assert.strictEqual(isConflictFailure(new Error('source conflict on 2 components')), true);
+});
+
+check('positive: a terminal DeployResult carries the same wording in errorMessage', () => {
+  assert.strictEqual(isConflictFailure({ success: false, status: 'Failed', errorMessage: '2 conflicts detected' }), true);
+});
+
+check('negative: a bare "conflict" substring never matches — the phrase must be bounded', () => {
+  // A real, unrelated failure can legitimately use the word "conflict" without
+  // being the CLI's source-tracking check (a naming/permission-set conflict,
+  // for instance) — a loose substring match would offer overwrite for it.
+  assert.strictEqual(isConflictFailure(new SfCliError('Field naming conflict on Account.Name__c')), false);
+  assert.strictEqual(isConflictFailure({ errorMessage: 'Merge conflict markers found in file' }), false);
+});
+
+check('negative: an unrelated deploy failure', () => {
+  assert.strictEqual(isConflictFailure(new SfCliError('Invalid type: Foo__mdt')), false);
+  assert.strictEqual(isConflictFailure({ success: false, status: 'Failed', errorMessage: 'Invalid type: Foo__mdt' }), false);
+});
+
+check('negative: errorName set to something else entirely', () => {
+  const e = new SfCliError('some message');
+  e.errorName = 'NamedOrgNotFound';
+  assert.strictEqual(isConflictFailure(e), false);
+});
+
+check('negative: nothing to read at all', () => {
+  for (const v of [undefined, null, 7, 'plain string', {}, [], { errorMessage: 42 }]) {
+    assert.strictEqual(isConflictFailure(v), false, `unexpected match: ${JSON.stringify(v)}`);
+  }
+});
+
+check('bounded: a 10k-char hostile message without the phrase never matches (and returns fast)', () => {
+  const hostile = 'x'.repeat(10_000);
+  const start = Date.now();
+  assert.strictEqual(isConflictFailure(new SfCliError(hostile)), false);
+  assert.strictEqual(isConflictFailure({ errorMessage: hostile }), false);
+  assert.ok(Date.now() - start < 500, 'isConflictFailure must not be a ReDoS surface');
+});
+
+check('bounded: the phrase is still found buried inside a 10k-char message', () => {
+  // Proves the check reads the whole string rather than only a truncated prefix.
+  const buried = `${'x'.repeat(9_000)} 4 conflicts detected ${'y'.repeat(900)}`;
+  assert.strictEqual(isConflictFailure(new SfCliError(buried)), true);
+});
+
+// ======================================================= deployFailureButtons
+const RETRY = { keys: ['ApexClass:OrderService'], validateOnly: false, testLevel: 'NoTestRun' };
+const RETRY_VALIDATE = { ...RETRY, validateOnly: true };
+
+check('no retry request → no buttons at all (manifest retry has none)', () => {
+  assert.strictEqual(deployFailureButtons(undefined, true), undefined);
+  assert.strictEqual(deployFailureButtons(undefined, false), undefined);
+});
+
+check('non-conflict failure → only the plain Retry, unchanged from before this feature', () => {
+  const out = deployFailureButtons(RETRY, false);
+  assert.deepStrictEqual(out.map(b => b.label), ['Retry deploy']);
+  assert.deepStrictEqual(out[0].send, { type: 'retryDeploy', request: RETRY });
+});
+
+check('conflict failure on a real deploy → both buttons, overwrite second', () => {
+  const out = deployFailureButtons(RETRY, true);
+  assert.deepStrictEqual(out.map(b => b.label), ['Retry deploy', 'Retry + overwrite']);
+  for (const b of out) assert.strictEqual(b.send.type, 'retryDeploy');
+  // The overwrite button's request is the SAME retry request plus the one flag —
+  // never a different key list, org, sourceDir or test plan.
+  assert.deepStrictEqual(out[1].send.request, { ...RETRY, ignoreConflicts: true });
+});
+
+check('conflict failure on a validate-only run → no overwrite button (nothing to overwrite)', () => {
+  const out = deployFailureButtons(RETRY_VALIDATE, true);
+  assert.deepStrictEqual(out.map(b => b.label), ['Retry validation']);
+});
+
+check('non-conflict validate-only failure → plain "Retry validation" only', () => {
+  const out = deployFailureButtons(RETRY_VALIDATE, false);
+  assert.deepStrictEqual(out.map(b => b.label), ['Retry validation']);
+});
+
+check('the input retry request is never mutated', () => {
+  const retry = { ...RETRY };
+  const frozen = JSON.stringify(retry);
+  deployFailureButtons(retry, true);
+  assert.strictEqual(JSON.stringify(retry), frozen);
+  assert.ok(!('ignoreConflicts' in retry), 'the one-off flag leaked back onto the base request');
+});
+
+check('both buttons use send.type retryDeploy — no new message type needed, and both survive pruning', () => {
+  const out = deployFailureButtons(RETRY, true);
+  for (const b of out) assert.ok(SUPPORTED_CARD_BUTTON_SENDS.has(b.send.type), b.send.type);
+  const card = { kind: 'err', buttons: out };
+  assert.strictEqual(pruneCardButtons(card), card, 'a conflict-failure card must not be rebuilt by pruning');
+});
+
+check('a conflict-failure card with both buttons survives a full persist/restore round trip', () => {
+  // The same 0.12.0 (persisted Retry) / 0.17.0 (stale-button pruning) guarantees
+  // the plain Retry button already had — proven here through the REAL
+  // pushCardHistory/cardHistory, not just pruneCardButtons in isolation.
+  const prov = providerWith([]);
+  const live = { kind: 'err', title: 'Deploy failed against acme-dev', buttons: deployFailureButtons(RETRY, true) };
+  pushHistory(prov, live);
+  const restored = readHistory(prov)[0];
+  assert.deepStrictEqual(restored.buttons.map(b => b.label), ['Retry deploy', 'Retry + overwrite']);
+  assert.deepStrictEqual(restored.buttons[1].send.request, { ...RETRY, ignoreConflicts: true });
 });
 
 (async () => {

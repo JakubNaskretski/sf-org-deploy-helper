@@ -19,8 +19,15 @@
 // handed to the CLI) and nothing else on the persisted card is read, so a field
 // left over from a removed feature can't steer a deploy.
 //
-// All three are module-level pure functions, so they are called directly rather
-// than standing up a provider + webview.
+// deployOptsFromRetry also carries RetryRequest.ignoreConflicts through as
+// runDeploy's `ignoreConflictsOverride` — the one-off flag a "Retry +
+// overwrite" card button sets (see check-card-buttons.cjs for the button
+// itself and isConflictFailure). Same untrusted-input discipline as
+// validateOnly: only a literal `true` counts, everything else reads as "no
+// override", which is what lets the machine-scoped setting decide.
+//
+// All are module-level pure functions, so they are called directly rather than
+// standing up a provider + webview.
 const path = require('path');
 const assert = require('assert');
 const Module = require('module');
@@ -141,16 +148,23 @@ check('it round-trips every buildRetryRequest shape faithfully', () => {
     assert.deepStrictEqual(deployOptsFromRetry(card), {
       validateOnly: !!opts.validateOnly,
       testLevel: level,
-      runTests: classes.length ? classes : undefined
+      runTests: classes.length ? classes : undefined,
+      // buildRetryRequest never sets `ignoreConflicts` — only a "Retry +
+      // overwrite" button's own request does (see deployFailureButtons) — so
+      // every card it snapshots reads back with no override at all.
+      ignoreConflictsOverride: undefined
     }, `run: ${JSON.stringify({ opts, level, classes })}`);
   }
 });
 
-check('it reads exactly three fields and invents nothing', () => {
+check('it reads exactly four fields and invents nothing', () => {
   // The result is SPREAD into runDeploy's options, so any extra key here becomes
   // a deploy option nobody chose.
   const card = buildRetryRequest({ validateOnly: true, sourceDir: '/w/force-app/main' }, ITEMS, 'RunLocalTests', []);
-  assert.deepStrictEqual(Object.keys(deployOptsFromRetry(card)).sort(), ['runTests', 'testLevel', 'validateOnly']);
+  assert.deepStrictEqual(
+    Object.keys(deployOptsFromRetry(card)).sort(),
+    ['ignoreConflictsOverride', 'runTests', 'testLevel', 'validateOnly']
+  );
 });
 
 check('sourceDir is deliberately NOT reconstructed here', () => {
@@ -165,6 +179,8 @@ check('sourceDir is deliberately NOT reconstructed here', () => {
 check('unknown and leftover fields on a persisted card are ignored', () => {
   // History cards outlive the features that wrote them. A field this version has
   // never heard of must be inert — not a mode, not a flag, not a CLI argument.
+  // `ignoreConflicts` is deliberately NOT in this list any more — it's a real
+  // RetryRequest field now (see the ignoreConflictsOverride checks below).
   const stale = {
     keys: KEYS,
     manifest: '/w/manifest/package.xml',
@@ -174,12 +190,11 @@ check('unknown and leftover fields on a persisted card are ignored', () => {
     runTests: undefined,
     dryRun: true,
     checkOnly: false,
-    ignoreConflicts: true,
     somethingElse: { nested: 1 }
   };
   const opts = deployOptsFromRetry(stale);
-  assert.deepStrictEqual(opts, { validateOnly: true, testLevel: 'RunLocalTests', runTests: undefined });
-  for (const leftover of ['dryRun', 'checkOnly', 'ignoreConflicts', 'somethingElse', 'manifest', 'keys']) {
+  assert.deepStrictEqual(opts, { validateOnly: true, testLevel: 'RunLocalTests', runTests: undefined, ignoreConflictsOverride: undefined });
+  for (const leftover of ['dryRun', 'checkOnly', 'somethingElse', 'manifest', 'keys']) {
     assert.ok(!(leftover in opts), `leftover field resurrected: ${leftover}`);
   }
 });
@@ -189,6 +204,36 @@ check('a stale dryRun flag cannot flip the mode a card re-runs in', () => {
   // validation to a write.
   assert.strictEqual(deployOptsFromRetry({ keys: KEYS, validateOnly: false, dryRun: true }).validateOnly, false);
   assert.strictEqual(deployOptsFromRetry({ keys: KEYS, validateOnly: true, dryRun: false }).validateOnly, true);
+});
+
+// ------------------------------------------------- ignoreConflictsOverride rules
+check('ignoreConflicts: true is the only value that sets an override', () => {
+  // "Retry + overwrite" is the only writer of this field — deployFailureButtons
+  // always sets it to the literal `true`. Everything else a persisted/forged
+  // card could carry must read as "no override" so the machine-scoped setting
+  // decides, exactly like a request that never had the field at all.
+  assert.strictEqual(deployOptsFromRetry({ keys: KEYS, ignoreConflicts: true }).ignoreConflictsOverride, true);
+  for (const forged of ['true', 1, {}, [], 'yes', false, 0, null, undefined]) {
+    assert.strictEqual(
+      deployOptsFromRetry({ keys: KEYS, ignoreConflicts: forged }).ignoreConflictsOverride, undefined,
+      `forged value became an override: ${JSON.stringify(forged)}`
+    );
+  }
+});
+
+check('a request with no ignoreConflicts field at all → undefined override → the setting wins', () => {
+  // This is the plain-Retry shape: runDeploy computes
+  // `opts.ignoreConflictsOverride ?? this.ignoreDeployConflicts()`, so undefined
+  // here must fall all the way through to the live setting, not silently pin
+  // either true or false.
+  const opts = deployOptsFromRetry({ keys: KEYS });
+  assert.strictEqual(opts.ignoreConflictsOverride, undefined);
+  assert.ok('ignoreConflictsOverride' in opts, 'the key itself must survive, only its value is undefined');
+});
+
+check('the override survives the JSON round trip a persisted/echoed card takes', () => {
+  const card = roundTrip({ keys: KEYS, ignoreConflicts: true });
+  assert.strictEqual(deployOptsFromRetry(card).ignoreConflictsOverride, true);
 });
 
 // ------------------------------------------------------------ validateOnly rules
