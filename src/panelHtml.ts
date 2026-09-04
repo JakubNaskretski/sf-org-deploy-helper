@@ -224,6 +224,10 @@ body.resizing { cursor: row-resize; user-select: none; }
   border-color: var(--vscode-editorInfo-foreground, #75beff);
 }
 .tree .row.org-only .name { opacity: 0.75; font-style: italic; }
+/* Source filter + the snapshot's age side by side (Feature: org cache). */
+#sourceFilterRow { align-items: center; gap: 6px; }
+#sourceFilterRow select { flex: 1; min-width: 0; }
+.org-as-of { flex: none; margin-top: 4px; font-size: 10px; color: var(--muted); white-space: nowrap; }
 .tree-search select {
   width: 100%; margin-top: 4px;
   background: var(--vscode-input-background);
@@ -494,6 +498,7 @@ body.resizing { cursor: row-resize; user-select: none; }
             <option value="org-only">Org only (not local)</option>
             <option value="both">In both</option>
           </select>
+          <span id="orgAsOf" class="org-as-of"></span>
         </div>
         <div id="typeFilterRow" class="type-filter-row" style="display:none;">
           <details id="typeFilterDetails">

@@ -82,6 +82,8 @@ function fetchStub(script) {
   stub.failureToast = (msg, lines) => toasts.push({ msg, lines });
   stub.output = { appendLine: l => log.push(l) };
   stub.withWindowProgress = (_t, body) => body(() => {});
+  // The snapshot write after a listing is check-org-cache.cjs's contract.
+  stub.context = { workspaceState: { get: () => undefined, update: () => Promise.resolve() } };
   stub.sf = {
     listMetadata: type => {
       calls.push(type);

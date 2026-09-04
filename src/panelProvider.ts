@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryRulesSource } from './registryRules';
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
@@ -140,6 +140,17 @@ const ACTIVE_JOB_KEY = 'activeDeployJob';
 /** Don't reattach to a persisted job older than this — a day-old id almost
  *  certainly finished long ago, and reattaching would just report stale state. */
 const ACTIVE_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** workspaceState key for the per-org membership snapshots (Feature: org cache):
+ *  `Record<username, OrgSnapshot>`, newest write last, at most ORG_CACHE_MAX_ORGS
+ *  entries — the panel opens on the last listing instead of ~90 `sf` spawns. */
+const ORG_CACHE_KEY = 'orgMembershipCache';
+const ORG_CACHE_MAX_ORGS = 5;
+/** Largest key list persisted — a bigger org is listed fresh each session rather
+ *  than ballooning the state DB. */
+const ORG_CACHE_MAX_KEYS = 50_000;
+/** One org's persisted membership: vetted "Type:Name" keys, when the org was
+ *  listed, and what the managed-package filter hid (per type). */
+interface OrgSnapshot { org: string; keys: string[]; at: number; managedHidden?: Record<string, number> }
 /** How long to wait between `deploy report` polls of a running job. */
 const DEPLOY_POLL_INTERVAL_MS = 5000;
 /** Consecutive poll failures tolerated before we declare contact lost. A single
@@ -182,6 +193,14 @@ interface RetryRequest {
   validateOnly?: boolean;
   testLevel?: TestLevel;
   runTests?: string[];
+  /** Set ONLY on the request a "Retry + overwrite" card button builds (the
+   *  normal retry request plus this one field) — never by buildRetryRequest, so
+   *  a plain Retry re-read from the same card never carries it. A one-off per
+   *  click, not a mode: deployOptsFromRetry maps `true` to runDeploy's
+   *  ignoreConflictsOverride; anything else (missing, false, forged) maps to
+   *  undefined, which lets the machine-scoped setting decide, exactly as a
+   *  plain Retry always has. */
+  ignoreConflicts?: boolean;
 }
 
 /** What a runDeploy call did. `aborted` covers every path that never reached the
@@ -278,6 +297,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The org username `orgMembers` was fetched from — guards against using a stale
    *  membership map after the user switches the target org. */
   private orgMembersOrg?: string;
+  /** When `orgMembers` was listed from the org — the snapshot's `at` and the
+   *  webview's "as of". Carried through hydration and later confirm/delete
+   *  mutations (a deploy vouches for one component, not the whole listing).
+   *  Undefined after an interrupted listing: never persisted, never "as of". */
+  private orgMembersAt?: number;
   /** Folders whose type resolution via the CLI registry failed — skipped on
    *  rescans so a refresh doesn't respawn `sf` for a lost cause. Backed by
    *  globalState with the learned-rules TTL; lazily loaded via `unresolvable()`.
@@ -304,7 +328,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private deployQueue: Array<{
     id: string;
     keys: string[];
-    opts: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string };
+    opts: {
+      validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string;
+      /** See enqueueDeploy/runDeploy — pinned at enqueue time, unlike the
+       *  machine-scoped setting itself. */
+      ignoreConflictsOverride?: boolean;
+    };
     org: string;
     orgLabel: string;
     noun: string;
@@ -316,6 +345,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Identity of the currently-watched target set; an unchanged one is left
    *  alone rather than re-created on every scan. */
   private watchedTargetsKey?: string;
+  /** A watcher setup failure used to be logged only — the tree then silently
+   *  went stale until a manual Refresh. Toast once per session (see
+   *  syncFileWatchers' catch); every failure after the first still logs. */
+  private watchFailureWarned = false;
+  /** floatFirstDiff's "moved to a new window" failure used to be logged only —
+   *  toast once per session (see runDiff); every failure after the first still
+   *  logs. Diffs still open fine as tabs either way. */
+  private diffFloatWarned = false;
   /** Collapses watcher notifications into one debounced, silent rescan. */
   private readonly rescanScheduler: RescanScheduler;
 
@@ -344,6 +381,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     context.subscriptions.push(orgStore.onDidChange(username => {
       if (this.orgMembersOrg && username !== this.orgMembersOrg) this.resetOrgMetadata();
       this.postOrgs();
+      // The new org's snapshot (if any) replaces the badges just dropped; only a
+      // STALE one fetches — with none, a switch stays manual as before.
+      if (username) this.maybeAutoFetchOrg(true);
     }));
     // Recompute the Changed lens when its base ref changes — the setting flips the
     // view between "uncommitted only" and "differs from <ref>" without a rescan.
@@ -480,6 +520,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   async deployFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'deploy'); }
   async retrieveFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'retrieve'); }
   async diffFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'diff'); }
+  /** Command-palette parity for the webview's 'openInOrg' message — resolves the
+   *  clicked file to a component the same way diffFile does (scan → static/learned
+   *  rules → CLI registry), then reuses openComponentInOrg. */
+  async openInOrg(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'openInOrg'); }
+  /** Command-palette parity for the webview's 'deleteFromOrg' message — same item
+   *  resolution as diffFile, then reuses runDelete (dry-run preview, PROD guard,
+   *  destructive confirm — unchanged). */
+  async deleteFromOrg(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'delete'); }
+  /** Command-palette parity for the webview's 'loginOrg' message. No uri: `sf org
+   *  login web` isn't file-scoped. */
+  async loginOrg(): Promise<void> { return this.runLogin(); }
 
   /**
    * "Deploy File + Dependencies" (context menu / palette): resolve the file's
@@ -670,7 +721,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return !!this.workspaceRoot;
   }
 
-  private async runByUri(uri: vscode.Uri, action: 'deploy' | 'retrieve' | 'diff', orgOverride?: string): Promise<void> {
+  private async runByUri(uri: vscode.Uri, action: 'deploy' | 'retrieve' | 'diff' | 'openInOrg' | 'delete', orgOverride?: string): Promise<void> {
     if (!uri || !uri.fsPath) {
       vscode.window.showInformationMessage('No file selected.');
       return;
@@ -722,6 +773,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const sourceDir = inferred ? match.filePath : undefined;
     if (action === 'deploy') { await this.runDeploy([key], { sourceDir }); return; }
     if (action === 'retrieve') return this.runRetrieve([key], { sourceDir });
+    // openInOrg/delete operate on the resolved component (key), same as the
+    // webview's own 'openInOrg'/'deleteFromOrg' messages — no sourceDir: they
+    // never reach the CLI via --source-dir, only --metadata / a Setup deep link.
+    if (action === 'openInOrg') return this.openComponentInOrg(key);
+    if (action === 'delete') return this.runDelete([key]);
     // The clicked path matters for folder-typed components (lwc/aura bundles,
     // objects): the folder has no meaningful diff, the file the user pointed at does.
     return this.runDiff([key], orgOverride, uri.fsPath);
@@ -1155,16 +1211,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** One automatic Fetch Org per session (`fetchOrgOnOpen`, default on), fired
    *  after the panel's first ready — badges appear without a manual click.
-   *  Skipped silently when disabled, no org/root yet, or an operation is running
-   *  (no "already running" toast for an action the user didn't take; the next
-   *  panel open retries in that case). A webview rebuild does NOT re-trigger it,
-   *  and later org switches stay manual — Fetch Org remains the refresh. */
+   *  The persisted snapshot comes first (Feature: org cache): a fresh one IS the
+   *  session's listing — badges show instantly and no `sf` spawns; a stale one
+   *  shows meanwhile and the fetch refreshes it in the background. Skipped
+   *  silently when disabled, no org/root yet, or an operation is running (no
+   *  "already running" toast for an action the user didn't take; the next panel
+   *  open retries in that case). A webview rebuild re-posts the membership but
+   *  does NOT re-fetch. `onSwitch` (org changed mid-session): the new org's
+   *  snapshot shows, and only a STALE one fetches — with none, the switch stays
+   *  manual as before; Fetch Org remains the refresh. */
   private autoFetchDone = false;
 
-  private maybeAutoFetchOrg(): void {
-    if (this.autoFetchDone) return;
+  private maybeAutoFetchOrg(onSwitch = false): void {
+    if (!this.workspaceRoot || !this.orgStore.get()) return;
+    const snapshot = this.hydrateOrgSnapshot();
+    if (onSwitch ? snapshot !== 'stale' : this.autoFetchDone || snapshot === 'fresh') return;
     if (!vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('fetchOrgOnOpen', true)) return;
-    if (this.busy || !this.workspaceRoot || !this.orgStore.get()) return;
+    if (this.busy) return;
     this.autoFetchDone = true;
     void this.loadOrgMetadata().catch(err =>
       this.output.appendLine(`[Fetch Org] auto-fetch failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -1353,14 +1416,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // member-named file at the top level and used to derive nothing.
         const fileNames = await listMetaFileNames(folder);
         let ruleFound = false;
-        // Derive only from a clean single-type folder — when two types share a
-        // folder, a same-named member could bind the other type's file suffix
-        // and the wrong cached rule would mislabel the whole folder on every
-        // scan until TTL expiry. Multi-type folders stay click-deployable.
-        if (types.length === 1) {
-          const rule = deriveRule(label, types[0].type, types[0].members, fileNames);
-          if (rule) { await this.rememberRule(rule); learned.push(rule); ruleFound = true; }
-        }
+        // Single-type folder: the plain derivation. Several types sharing a
+        // folder (wave/): one rule per type, but only when every type binds a
+        // distinct suffix — deriveRulesForTypes refuses anything ambiguous, so
+        // a wrong cached rule can't mislabel the folder until TTL expiry.
+        // A refused folder stays click-deployable.
+        const rules = types.length === 1
+          ? [deriveRule(label, types[0].type, types[0].members, fileNames)].filter((r): r is FolderRule => !!r)
+          : (deriveRulesForTypes(label, types, fileNames) ?? []);
+        for (const rule of rules) { await this.rememberRule(rule); learned.push(rule); ruleFound = true; }
         if (ruleFound) {
           this.output.appendLine(`[typeResolve] learned ${label} → ${types.map(t => t.type).join(', ')} (sf registry, cached ${this.typeCacheDays()}d)`);
         } else {
@@ -1585,6 +1649,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
       this.disposeFileWatchers();
       this.output.appendLine(`[watch] could not watch the package directories: ${err instanceof Error ? err.message : String(err)}`);
+      // A watcher failure otherwise had NO user-visible symptom until a new/deleted
+      // file went missing from the tree — surface it once so there's a chance of
+      // noticing before that. Every subsequent failure this session still logs above.
+      if (!this.watchFailureWarned) {
+        this.watchFailureWarned = true;
+        void vscode.window.showWarningMessage("SF Deploy: live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
+      }
     }
   }
 
@@ -1874,6 +1945,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  one line of modal text and nothing about what deploys, so unlike
        *  orgOverride/preConfirmed a forged value could not widen anything. */
       autoIncluded?: { count: number; entryKey: string };
+      /** One-off override of the machine-scoped ignoreDeployConflicts setting,
+       *  for exactly this run. Set only via a "Retry + overwrite" card button
+       *  (deployOptsFromRetry reading RetryRequest.ignoreConflicts) — every other
+       *  caller leaves it undefined so the live setting decides, as before this
+       *  existed. Never sticky: buildRetryRequest does not carry it forward into
+       *  the NEXT card's plain Retry request. */
+      ignoreConflictsOverride?: boolean;
     } = {}
   ): Promise<DeployOutcome> {
     // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
@@ -1947,7 +2025,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // it has to name the value this very run will pass to the CLI. A VS Code
       // modal is window-modal, so the setting can't be toggled from the panel or
       // the Settings editor while it's up — what the user reads is what runs.
-      const ignoreConflicts = this.ignoreDeployConflicts();
+      // `ignoreConflictsOverride` is the "Retry + overwrite" card button's one-off
+      // per-click flag (see deployFailureButtons) — set ONLY by that button's own
+      // request, never by the machine-scoped setting itself. It wins when present;
+      // every other caller leaves it undefined and falls through to the setting.
+      const ignoreConflicts = opts.ignoreConflictsOverride ?? this.ignoreDeployConflicts();
 
       // A drained (pre-confirmed) deploy skips the modal entirely — the user
       // already confirmed it, against this same pinned org, at enqueue time.
@@ -1971,6 +2053,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const testArg = testLevel !== 'NoTestRun'
         ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
         : '';
+
+      // Snapshot the retry request once, up front: the client-side conflict
+      // check throws from the submit call BELOW, before any job id exists, so
+      // the exception handler needs the exact same request the success path
+      // (buildRetryRequest inlined at the report call, below) would build.
+      const retry = buildRetryRequest(opts, items, testLevel, runTests);
 
       const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
@@ -2020,7 +2108,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 // Carries the run's own modes so Retry and an accepted dependency
                 // suggestion re-run as what this was — a validation must never turn
                 // into a deploy on its own.
-                retry: buildRetryRequest(opts, items, testLevel, runTests)
+                retry
               });
               // Set AFTER the report call: a throw out of reportDeployResult must
               // not leave sawTerminal true with detection unset, which would make
@@ -2045,7 +2133,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // Only the short submit call can time out now (polls are handled inside
           // drivePolledDeploy); killing it does NOT stop an already-enqueued deploy.
           this.reportDeployTimeout(labeledAction, err);
-        } else this.reportError(labeledAction, err);
+        } else this.reportError(labeledAction, err, retry);
       } finally {
         if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
@@ -2139,18 +2227,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const testLevel: TestLevel = validateForcesTests ? 'RunLocalTests' : requested;
 
     let runTests: string[] = [];
+    // Names dropped by the argv filter below, surfaced in the confirm modal (not
+    // just the Output channel) so a typo'd/pasted-junk class silently NOT running
+    // is visible before the deploy fires, not after the tests didn't run.
+    let ignoredNote = '';
     if (testLevel === 'RunSpecifiedTests') {
       const candidates = opts.runTests ?? this.runTests ?? [];
       // Class names become CLI argv (`--tests <name>`) — reject anything that
       // isn't a bare Apex identifier (dots allowed for `Namespace.Class`) so a
       // stray shell metacharacter typed into the panel can't inject an extra flag.
-      runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
-      if (runTests.length < candidates.length) {
-        this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
+      const isValidClassName = (c: string): boolean => /^[A-Za-z0-9_.]+$/.test(c);
+      runTests = candidates.filter(isValidClassName);
+      const dropped = candidates.filter(c => !isValidClassName(c));
+      if (dropped.length > 0) {
+        this.output.appendLine(`[RunSpecifiedTests] ignored ${dropped.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
       }
       if (runTests.length === 0) {
-        vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
+        // Every name was dropped (or none were given) — refuse rather than run
+        // the deploy with an effectively empty --tests list, which is silently
+        // NoTestRun in every way that matters except the label.
+        vscode.window.showWarningMessage(dropped.length > 0
+          ? `RunSpecifiedTests needs at least one valid test class name — all ${dropped.length} you gave were invalid.`
+          : 'RunSpecifiedTests needs at least one test class name.');
         return undefined;
+      }
+      if (dropped.length > 0) {
+        const shown = dropped.slice(0, 5).join(', ');
+        const more = dropped.length > 5 ? ` and ${dropped.length - 5} more` : '';
+        ignoredNote = `\nIgnored ${dropped.length} invalid test name${dropped.length === 1 ? '' : 's'}: ${shown}${more}`;
       }
     }
 
@@ -2166,14 +2270,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // meant it and the deploy is about to bounce. It warns rather than refuses
     // because NoTestRun is legitimate for an Apex-free payload, and nothing here
     // knows whether this one carries Apex.
-    const testNote = validateForcesTests
+    const testNote = (validateForcesTests
       ? '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
       : testLevel === 'NoTestRun'
         ? (isProd
           ? '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.'
           : '\n\nTests: none (NoTestRun)')
       : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
-      : `\n\nTests: ${testLevel}`;
+      : `\n\nTests: ${testLevel}`) + ignoredNote;
     return { testLevel, runTests, testNote };
   }
 
@@ -2239,6 +2343,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  deliberately NOT stored on the queue entry, because drainQueue re-enters
        *  runDeploy preConfirmed and shows no second modal. */
       autoIncluded?: { count: number; entryKey: string };
+      /** See runDeploy — unlike the machine-scoped setting (re-read fresh when the
+       *  queue drains, below), this one-off flag IS stored on the queue entry and
+       *  carried through unchanged: it names a single click, not something that
+       *  could legitimately change while the deploy waits its turn. */
+      ignoreConflictsOverride?: boolean;
     }
   ): Promise<void> {
     const root = this.requireRoot();
@@ -2269,14 +2378,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // because the modal await is a TOCTOU window (same shape as the cap).
     if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
 
-    // The override is machine-scoped and re-read by runDeploy when the queue
+    // The SETTING is machine-scoped and re-read by runDeploy when the queue
     // drains, so what's true NOW is only a snapshot — the queued variant of the
     // notice says so rather than pinning the flag (pinning would change which
-    // flags a queued deploy actually runs with).
+    // flags a queued deploy actually runs with). A "Retry + overwrite" click's
+    // own override is different: it's pinned below (on the queue entry itself),
+    // so name what will actually run — same `??` as runDeploy.
+    const ignoreConflicts = opts.ignoreConflictsOverride ?? this.ignoreDeployConflicts();
     const modal = this.deployConfirmModal(
       {
         noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
-        instanceUrl: orgInfo?.instanceUrl, ignoreConflicts: this.ignoreDeployConflicts(),
+        instanceUrl: orgInfo?.instanceUrl, ignoreConflicts,
         autoIncluded: opts.autoIncluded
       },
       true
@@ -2300,7 +2412,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.deployQueue.push({
       id: crypto.randomBytes(8).toString('hex'),
       keys: entryKeys,
-      opts: { validateOnly: opts.validateOnly, testLevel, runTests: runTests.length ? runTests : undefined, sourceDir: opts.sourceDir },
+      opts: {
+        validateOnly: opts.validateOnly, testLevel, runTests: runTests.length ? runTests : undefined,
+        sourceDir: opts.sourceDir, ignoreConflictsOverride: opts.ignoreConflictsOverride
+      },
       org,
       orgLabel,
       noun: `${opts.validateOnly ? 'Validate' : 'Deploy'} ${noun}`
@@ -2511,15 +2626,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.items,
         new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
       );
-      const buttons = ctx.retry
-        ? [
-            { label: validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy', request: ctx.retry } }
-            // "Retry + changed vs branch" was offered here in 0.15.0 and removed
-            // on user feedback — the Changed lens already owns that workflow. The
-            // retryDeployChanged handler stays: persisted 0.15.0 cards still
-            // carry the button, and it may return in some future form.
-          ]
-        : undefined;
+      // "Retry + changed vs branch" was offered here in 0.15.0 and removed on user
+      // feedback — the Changed lens already owns that workflow. The
+      // retryDeployChanged handler stays: persisted 0.15.0 cards still carry the
+      // button, and it may return in some future form. deployFailureButtons adds
+      // "Retry + overwrite" beside the plain Retry when this failure is itself a
+      // client-side conflict (see isConflictFailure) and the run wrote — in
+      // practice a completed DeployResult never carries one (the check throws at
+      // submit, before a job — and a conflict-blocked run reports through
+      // reportError instead, never reaching this function at all), but the same
+      // rule covers a CLI version that ever reports it this way instead.
+      const buttons = deployFailureButtons(ctx.retry, isConflictFailure(result));
       // Per-row suggestion candidates for the card's "Try with dependencies"
       // view. Same sourceDir exclusion as above (the retry couldn't carry the
       // added keys), and only when there's a discrete key list to extend (a
@@ -3571,6 +3688,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       for (const k of deletedKeys) this.orgMembers.delete(k);
       // Re-post so org-only rows / "on org" badges for the now-gone components vanish.
       this.postOrgMembership(orgLabel);
+      this.persistOrgSnapshot();
     }
     // Rescan: the deleted source files are gone, so the tree drops them and — via the
     // webview's 'files' pruning against local+org keys — so does the selection. This
@@ -3586,7 +3704,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const colon = k.indexOf(':');
       return { type: k.slice(0, colon), name: k.slice(colon + 1) };
     });
-    this.post({ type: 'orgMetadata', orgItems, orgLabel });
+    this.post({ type: 'orgMetadata', orgItems, orgLabel, asOf: this.orgMembersAt });
   }
 
   /** After a successful deploy or retrieve: the org itself just confirmed these
@@ -3652,7 +3770,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.orgMembers.set(key, true);
       added = true;
     }
-    if (added) this.postOrgMembership(orgLabel);
+    if (added) {
+      this.postOrgMembership(orgLabel);
+      this.persistOrgSnapshot();
+    }
   }
 
   /**
@@ -3878,7 +3999,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           floated = true;
           await Promise.resolve(
             vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow')
-          ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed — diffs stay as tabs: ${String(e)}`));
+          ).then(undefined, (e) => {
+            this.output.appendLine(`[Diff] float failed — diffs stay as tabs: ${String(e)}`);
+            // Otherwise the ONLY symptom was diffs quietly never floating — worth
+            // one toast so the setting doesn't look broken with no explanation.
+            if (!this.diffFloatWarned) {
+              this.diffFloatWarned = true;
+              void vscode.window.showInformationMessage("SF Deploy: couldn't open the diff in its own window — it stayed as a tab.");
+            }
+          });
         };
 
         // Fast path: Apex/Visualforce bodies come back from a single Tooling API
@@ -4073,7 +4202,67 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private resetOrgMetadata(): void {
     this.orgMembers = new Map();
     this.orgMembersOrg = undefined;
+    this.orgMembersAt = undefined;
     this.post({ type: 'orgMetadataReset' });
+  }
+
+  /** Show the selected org's persisted snapshot (Feature: org cache) — or, on a
+   *  webview rebuild, the membership already in memory — stamped with its age.
+   *  'none' when there is nothing to show; an interrupted listing reads as stale. */
+  private hydrateOrgSnapshot(): 'fresh' | 'stale' | 'none' {
+    const org = this.orgStore.get();
+    if (!org) return 'none';
+    if (this.orgMembersOrg !== org) {
+      const snap = this.readOrgCache()[org];
+      if (!snap) return 'none';
+      this.orgMembers = new Map(snap.keys.map(k => [k, true as const]));
+      this.orgMembersOrg = org;
+      this.orgMembersAt = snap.at;
+      const hidden = Object.values(snap.managedHidden ?? {}).reduce((a, b) => a + b, 0);
+      this.output.appendLine(`[org cache] ${org}: ${snap.keys.length} components as of ${new Date(snap.at).toLocaleString()}${hidden ? ` (${hidden} managed hidden)` : ''}`);
+    }
+    this.postOrgMembership(this.orgs.find(o => o.username === org)?.alias ?? org);
+    const hours = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('orgCacheMaxAgeHours', 24);
+    const maxAgeMs = Math.max(0, Math.min(720, Number.isFinite(hours) ? hours : 24)) * 3_600_000;
+    return Date.now() - (this.orgMembersAt ?? 0) >= maxAgeMs ? 'stale' : 'fresh';
+  }
+
+  /** The persisted snapshots, shape- and charset-guarded per entry (the state DB
+   *  can hand back anything after corruption or a hand edit). */
+  private readOrgCache(): Record<string, OrgSnapshot> {
+    const raw = this.context.workspaceState.get<unknown>(ORG_CACHE_KEY);
+    const out: Record<string, OrgSnapshot> = {};
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+    for (const [org, entry] of Object.entries(raw as Record<string, unknown>)) {
+      const snap = vetOrgSnapshot(org, entry);
+      if (snap) out[org] = snap;
+    }
+    return out;
+  }
+
+  /** Write the in-memory membership as the selected org's snapshot. Fire-and-forget
+   *  like the other workspaceState writes. `managedHidden` comes from a fetch; a
+   *  confirm/delete mutation keeps the previous snapshot's. The oldest org drops
+   *  past ORG_CACHE_MAX_ORGS; an over-cap listing is dropped instead of persisted
+   *  (and the org's older snapshot with it — a smaller stale one must not resurrect). */
+  private persistOrgSnapshot(managedHidden?: ReadonlyMap<string, number>): void {
+    const org = this.orgMembersOrg;
+    const at = this.orgMembersAt;
+    if (!org || at === undefined) return;
+    const cache = this.readOrgCache();
+    const prev = cache[org];
+    delete cache[org];
+    if (this.orgMembers.size > ORG_CACHE_MAX_KEYS) {
+      this.output.appendLine(`[org cache] ${org}: ${this.orgMembers.size} components exceed the ${ORG_CACHE_MAX_KEYS} cap — snapshot not persisted.`);
+    } else {
+      const snap: OrgSnapshot = { org, keys: [...this.orgMembers.keys()], at };
+      const hidden = managedHidden ? Object.fromEntries([...managedHidden].filter(([, n]) => n > 0)) : prev?.managedHidden;
+      if (hidden && Object.keys(hidden).length > 0) snap.managedHidden = hidden;
+      cache[org] = snap;
+    }
+    const next = Object.fromEntries(Object.entries(cache).slice(-ORG_CACHE_MAX_ORGS));
+    void Promise.resolve(this.context.workspaceState.update(ORG_CACHE_KEY, next))
+      .catch(err => this.output.appendLine(`[org cache] persist failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   /** Apply a target-org selection from the webview: persist it, drop org metadata
@@ -4251,6 +4440,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // we got (better than nothing), but flag the listing as incomplete so the badges
       // aren't trusted as exhaustive.
       const incomplete = fatal.length > 0;
+      // Only a complete listing earns a session-spanning snapshot — an interrupted
+      // one would open the next session on badges already known to be wrong.
+      this.orgMembersAt = incomplete ? undefined : Date.now();
+      this.persistOrgSnapshot(managedSkipped);
       const managedTotal = [...managedSkipped.values()].reduce((a, b) => a + b, 0);
       const metaParts = [`${orgItems.length} components`];
       if (managedTotal > 0) metaParts.push(`${managedTotal} managed skipped`);
@@ -4695,7 +4888,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private reportError(action: string, err: unknown): void {
+  /**
+   * `retry` is passed ONLY by callers that can name the exact deploy request
+   * that just failed (today: runDeploy's own catch — the client-side conflict
+   * check throws HERE, from the submit call, before any job id exists, so a
+   * conflict-blocked deploy never reaches reportDeployResult's card at all).
+   * Every other caller (org list, backup, diff, login, …) leaves it undefined
+   * and gets exactly the card this function has always built.
+   */
+  private reportError(action: string, err: unknown, retry?: RetryRequest): void {
     // Belt: reportError is the last line of defense, so a synchronous throw from
     // post()/history persistence here must not cascade into the caller's catch and
     // mask the real error. Fall back to the output channel, never rethrow.
@@ -4711,7 +4912,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           meta: 'See command log / output channel for details',
           errText: stripAnsi([message, stderr].filter(Boolean).join('\n')).trim(),
           actions: err instanceof SfCliError ? err.actions : undefined,
-          hint: hintForError(err)
+          hint: hintForError(err),
+          buttons: deployFailureButtons(retry, isConflictFailure(err))
         }
       });
       void vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
@@ -4788,7 +4990,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[backup] skipped — more than ${BACKUP_MAX_FILES} files would be backed up before retrieve`);
       return { note: `backup skipped — over ${BACKUP_MAX_FILES} files` };
     }
-    if (result.count === 0) return undefined;
+    // `offered` distinguishes "nothing local to save" (org-only items — no note,
+    // there was never a safety net to promise) from "there WERE local files but
+    // none survived isUnder/lstat" (missing, or resolved outside the workspace) —
+    // a safety net that quietly doesn't fire is worse than none, so that one gets
+    // a note too. No `dir` either way: the CLI conflict check below stays on.
+    if (result.count === 0) {
+      if (result.offered) {
+        return { note: `backup skipped — none of ${result.offered} local file${result.offered === 1 ? '' : 's'} could be saved (see Output)` };
+      }
+      return undefined;
+    }
     // `dir` rides along so the caller can offer the card's Restore/Discard buttons
     // (backupCardButtons) against this EXACT backup — never a re-derived "latest".
     return {
@@ -4807,7 +5019,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * Returns the fresh backup's absolute `dir` when count > 0, so a caller (e.g. the
    * retrieve flows) can offer it straight back for a scoped restore/discard.
    */
-  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean; dir?: string }> {
+  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean; dir?: string; offered?: number }> {
     const rootResolved = path.resolve(root);
     const seen = new Set<string>();
     const toCopy: string[] = [];
@@ -4830,9 +5042,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // A safety net that silently doesn't fire is worse than none. When real
       // candidates were offered (org-only '' entries excluded) but every one was
       // missing or resolved outside the workspace — e.g. a mis-cased inferred path
-      // that isUnder now folds, or a file already gone — leave a trace.
+      // that isUnder now folds, or a file already gone — leave a trace, and hand
+      // `offered` back so the caller can tell this apart from "nothing to save"
+      // (org-only items) and surface it on the retrieve card instead of staying silent.
       const offered = candidatePaths.filter(Boolean).length;
-      if (offered > 0) this.output.appendLine(`[backup] backup skipped ${offered} candidate(s): missing or outside the workspace`);
+      if (offered > 0) {
+        this.output.appendLine(`[backup] backup skipped ${offered} candidate(s): missing or outside the workspace`);
+        return { count: 0, offered };
+      }
       return { count: 0 };
     }
     if (toCopy.length > BACKUP_MAX_FILES) return { count: 0, skippedTooMany: true };
@@ -5419,6 +5636,30 @@ export function managedHiddenLine(byType: ReadonlyMap<string, number>): string {
   return `— Hidden managed-package components: ${shown.join(', ')}${rest > 0 ? ` and ${rest} more type${rest === 1 ? '' : 's'}` : ''} (enable sfOrgDeployWrapper.fetchIncludeManaged to show)`;
 }
 
+/** Shape- and charset-guard one persisted snapshot. Keys are vetted exactly as
+ *  confirmOnOrg vets org rows — they become `--metadata` argv via resolveKeys —
+ *  so a tampered entry can lose keys but never smuggle one in. A future stamp
+ *  reads as now. Exported for the harness. */
+export function vetOrgSnapshot(org: string, raw: unknown): OrgSnapshot | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const s = raw as Partial<OrgSnapshot>;
+  if (s.org !== org || typeof s.at !== 'number' || !Number.isFinite(s.at) || !Array.isArray(s.keys)) return undefined;
+  if (s.keys.length > ORG_CACHE_MAX_KEYS) return undefined;
+  const keys = s.keys.filter((k): k is string => {
+    if (typeof k !== 'string') return false;
+    const colon = k.indexOf(':');
+    if (colon < 1 || !/^[A-Za-z0-9_]+$/.test(k.slice(0, colon))) return false;
+    const name = k.slice(colon + 1);
+    return name !== '' && name !== 'package.xml' && !name.includes('*');
+  });
+  const snap: OrgSnapshot = { org, keys, at: Math.min(s.at, Date.now()) };
+  if (s.managedHidden && typeof s.managedHidden === 'object' && !Array.isArray(s.managedHidden)) {
+    const hidden = Object.fromEntries(Object.entries(s.managedHidden).filter(([, n]) => typeof n === 'number' && n > 0));
+    if (Object.keys(hidden).length > 0) snap.managedHidden = hidden;
+  }
+  return snap;
+}
+
 /** The local process-kill timeout (SfCliError whose message says it "timed out",
  *  thrown by the CLI runner after SIGTERM→SIGKILL). Distinct from a genuine deploy
  *  failure: killing the local `sf` does NOT stop the org-side deploy, so the caller
@@ -5495,13 +5736,70 @@ export function buildRetryRequest(
  *  against its own modal. `sourceDir` is deliberately NOT handled here: it needs
  *  the workspace root to be validated against, which is the caller's job. */
 export function deployOptsFromRetry(r: RetryRequest): {
-  validateOnly: boolean; testLevel?: TestLevel; runTests?: string[];
+  validateOnly: boolean; testLevel?: TestLevel; runTests?: string[]; ignoreConflictsOverride?: boolean;
 } {
   return {
     validateOnly: r.validateOnly === true,
     testLevel: isTestLevel(r.testLevel) ? r.testLevel : undefined,
-    runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined
+    runTests: Array.isArray(r.runTests) ? r.runTests.filter(t => typeof t === 'string') : undefined,
+    // Only a literal `true` overrides — same strictness as validateOnly above,
+    // and for the same reason: the request is untrusted, and "no override" (the
+    // setting decides) is the safe reading of anything else.
+    ignoreConflictsOverride: r.ignoreConflicts === true ? true : undefined
   };
+}
+
+/** Bounded text a client-side source-conflict failure actually uses — the CLI's
+ *  own wording, never a bare "conflict" substring (a legitimate Apex/validation
+ *  problem can contain that word without being one of these). */
+const CONFLICT_TEXT_PATTERNS: readonly RegExp[] = [/conflict(s)?\s+detected/i, /source conflict/i];
+
+/**
+ * Whether a deploy/validate failure is the CLI's client-side source-tracking
+ * conflict check, not a real deploy problem — the one case where "Retry +
+ * overwrite" belongs beside the plain Retry, because the org was never even
+ * reached (see runDeploy's catch: the check runs INSIDE the submit call,
+ * before any job id exists, so a plain re-run hits the identical wall every
+ * time). Anchored on the CLI's own error NAME first (`SourceConflictError`,
+ * from the JSON envelope — see kit/sfCli.ts) and, as a fallback for CLI output
+ * that only names it in text, the two bounded phrases above. Accepts either
+ * the exception thrown at submit (`err` — the real path today) or a terminal
+ * DeployResult (`result` — its request-level `errorMessage`), so the same rule
+ * still applies if a future CLI version ever reports it the other way.
+ */
+export function isConflictFailure(errOrResult: unknown): boolean {
+  if (errOrResult instanceof SfCliError && errOrResult.errorName === 'SourceConflictError') return true;
+  let text = '';
+  if (errOrResult instanceof Error) {
+    text = errOrResult.message;
+  } else if (errOrResult && typeof errOrResult === 'object') {
+    const r = errOrResult as { errorMessage?: unknown };
+    if (typeof r.errorMessage === 'string') text = r.errorMessage;
+  }
+  return !!text && CONFLICT_TEXT_PATTERNS.some(re => re.test(text));
+}
+
+/**
+ * Buttons for a failed deploy/validate result card. `undefined` when there's no
+ * retry request to carry at all (a manifest retry has none — see
+ * buildRetryRequest/RetryRequest). Otherwise the plain Retry, unchanged from
+ * before this feature existed, plus — only when the failure is itself a
+ * client-side conflict AND the run wrote (never for validateOnly: a check-only
+ * run overwrites nothing, so there's nothing for the second button to offer) —
+ * "Retry + overwrite", carrying the SAME request with `ignoreConflicts: true`
+ * added. That field is NOT folded back into `retry` itself: it's a one-off for
+ * this click, and the request object here is only ever read, never mutated, so
+ * the plain Retry beside it — and any later card built from this same `retry`
+ * value — stays exactly as it was.
+ */
+export function deployFailureButtons(
+  retry: RetryRequest | undefined,
+  conflict: boolean
+): Array<{ label: string; send: { type: 'retryDeploy'; request: RetryRequest } }> | undefined {
+  if (!retry) return undefined;
+  const plain = { label: retry.validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy' as const, request: retry } };
+  if (!conflict || retry.validateOnly) return [plain];
+  return [plain, { label: 'Retry + overwrite', send: { type: 'retryDeploy' as const, request: { ...retry, ignoreConflicts: true } } }];
 }
 
 /** The check-only mode implied by a persisted job's verb. The verb is the ONLY

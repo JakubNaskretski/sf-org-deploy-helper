@@ -78,6 +78,7 @@
     localKeys: new Set(),    // "Type:Name" keys that exist locally
     orgOnlyItems: [],        // { type, name } items on org but not local
     orgLoaded: false,        // has org metadata been fetched this session?
+    orgAsOf: null,           // ms — when the membership on screen was listed (snapshot stamp, or now)
     sourceFilter: 'all',     // 'all' | 'local-only' | 'org-only' | 'both'
     // View mode: one tree, three lenses. 'selected' shows only checked items
     // (replaces the old chip tray), 'changed' only git-modified components.
@@ -431,6 +432,8 @@
         // from it (empty states, badge tooltips) names the org, so a delayed
         // arrival after another quick org switch is never ambiguous.
         state.orgMetaLabel = msg.orgLabel || null;
+        // A persisted snapshot carries its listing time; a fresh fetch is "now".
+        state.orgAsOf = typeof msg.asOf === 'number' ? msg.asOf : Date.now();
         state.localKeys = new Set(state.items.map(i => `${i.type}:${i.name}`));
         state.orgKeys = new Set((msg.orgItems || []).map(i => `${i.type}:${i.name}`));
         state.orgOnlyItems = (msg.orgItems || []).filter(i => !state.localKeys.has(`${i.type}:${i.name}`));
@@ -448,6 +451,7 @@
         state.orgOnlyItems = [];
         state.orgLoaded = false;
         state.orgMetaLabel = null;
+        state.orgAsOf = null;
         state.sourceFilter = 'all';
         if ($('sourceFilter')) $('sourceFilter').value = 'all';
         // Drop any selected org-only keys that no longer exist locally — but only
@@ -674,7 +678,14 @@
 
   function renderSourceFilter() {
     const row = $('sourceFilterRow');
-    row.style.display = state.orgLoaded ? 'block' : 'none';
+    row.style.display = state.orgLoaded ? 'flex' : 'none';
+    // The snapshot's age sits where the badges are read — a day-old listing must
+    // not pass for live.
+    const note = $('orgAsOf');
+    if (note) {
+      note.textContent = state.orgLoaded && state.orgAsOf ? `org as of ${fmtAsOf(state.orgAsOf)}` : '';
+      note.title = state.orgAsOf ? `${state.orgMetaLabel || 'Org'} metadata listed ${new Date(state.orgAsOf).toLocaleString()} — Fetch Org re-lists it` : '';
+    }
   }
 
   function renderTypeFilter() {
@@ -1116,13 +1127,22 @@
   }
 
   // View-mode tabs: highlight the active lens and show live counts on the other two.
+  function visibleKeyCount(keys) {
+    let n = 0;
+    for (const k of keys) if (isTypeAllowed(k.slice(0, k.indexOf(':')))) n++;
+    return n;
+  }
+
   function renderViewModes() {
     const labels = { all: 'All', selected: 'Selected', changed: 'Changed' };
     document.querySelectorAll('#viewModes button').forEach((btn) => {
       const m = btn.dataset.mode;
       btn.classList.toggle('active', state.viewMode === m);
-      const count = m === 'selected' ? state.selected.size
-        : (m === 'changed' && state.changedKeys ? state.changedKeys.size : null);
+      // Counts honour the type filter, like the rows do: a key is `Type:Name`
+      // (split on the FIRST colon), so no item lookup is needed. Otherwise
+      // "Changed (3)" sat above a tree showing one row.
+      const count = m === 'selected' ? visibleKeyCount(state.selected)
+        : (m === 'changed' && state.changedKeys ? visibleKeyCount(state.changedKeys) : null);
       btn.textContent = count === null || count === 0 ? labels[m] : `${labels[m]} (${count})`;
     });
   }
@@ -1413,7 +1433,9 @@
     const orgSelect = $('orgSelect');
     if (orgSelect) { orgSelect.disabled = state.busy || state.orgs.length === 0; orgSelect.title = lockTip; }
     $('fetchOrgBtn').disabled = state.busy || pending;
-    $('fetchOrgBtn').title = pendingTip || lockTip;
+    $('fetchOrgBtn').title = pendingTip || lockTip || (state.orgLoaded && state.orgAsOf
+      ? `Re-list ${state.orgMetaLabel || 'the org'} — badges are as of ${fmtAsOf(state.orgAsOf)}`
+      : 'Fetch all metadata from the connected org and merge with local workspace');
     const refreshOrgs = $('refreshOrgs');
     refreshOrgs.disabled = state.busy || state.orgsLoading;
     refreshOrgs.title = lockTip || (state.orgsLoading ? 'Refreshing org list…' : 'Refresh org list');
@@ -1489,6 +1511,19 @@
   const MAX_CARD_LINES = 8;
 
   // Card timestamp: time-only for today, date + time for older history entries.
+  /** "17:42" today, "yesterday 17:42", else "Sep 2, 17:42" — the browser's
+   *  locale time, so the note reads like the user's own clock. */
+  function fmtAsOf(at) {
+    const d = new Date(at);
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const today = new Date();
+    if (d.toDateString() === today.toDateString()) return time;
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return `yesterday ${time}`;
+    return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+  }
+
   function fmtCardTime(at) {
     const d = new Date(at);
     const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;

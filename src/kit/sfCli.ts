@@ -141,12 +141,16 @@ export function resolveSfCommand(
   // on real Windows, but the logic must be host-independent.
   const win = path.win32;
   // Candidate shim names in PATHEXT-ish priority order. `sf.exe` first for the
-  // rare native build; then the cmd/ps1/bat shims the standard installer ships.
+  // rare native build; then the cmd/bat shims the npm installer ships. `.ps1` is
+  // deliberately EXCLUDED even when PATHEXT lists it: planSpawn below only knows
+  // how to rewrite `.cmd`/`.bat` for shell:false — a resolved `sf.ps1` would reach
+  // spawn unrewritten and fail to launch (PowerShell scripts aren't directly
+  // executable), so resolving one here would just move the failure later.
   const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
     .split(';')
     .map(e => e.trim().toLowerCase())
     .filter(Boolean);
-  const preferred = ['.exe', '.cmd', '.ps1', '.bat'].filter(e => exts.includes(e) || e === '.ps1');
+  const preferred = ['.exe', '.cmd', '.bat'].filter(e => exts.includes(e));
   const dirs = (env.PATH ?? env.Path ?? '').split(win.delimiter).filter(Boolean);
   for (const dir of dirs) {
     for (const ext of preferred) {

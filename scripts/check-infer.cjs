@@ -20,7 +20,7 @@ const vscodeStub = {
 };
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { inferItemForPath, parseManifestTypes, deriveRule, findItemForPath, foldPathKey, detectMissingDependencies, selectProjectRoot, listMetaFileNames, detectDataPackExports, scanWorkspace, DATAPACK_WARNING } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { inferItemForPath, parseManifestTypes, deriveRule, deriveRulesForTypes, findItemForPath, foldPathKey, detectMissingDependencies, selectProjectRoot, listMetaFileNames, detectDataPackExports, scanWorkspace, DATAPACK_WARNING } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep); // build OS-native paths
 let failed = 0;
 
@@ -149,6 +149,28 @@ try {
   // suffix like '.xml' must never be learned (would scoop unrelated files)
   assert.strictEqual(deriveRule('fooBars', 'FooBar', ['M'], ['M.foobar']), undefined);
   assert.strictEqual(deriveRule('things', 'Thing', ['M'], ['M.xml']), undefined);
+  // deriveRulesForTypes — multi-type folder (wave/): one rule per type when unambiguous
+  const WAVE_FILES = ['Sales.wds-meta.xml', 'Board.wdash-meta.xml', 'Board.wdash', 'Sales.wds'];
+  assert.deepStrictEqual(
+    deriveRulesForTypes('wave', [{ type: 'WaveDataset', members: ['Sales'] }, { type: 'WaveDashboard', members: ['Board'] }], WAVE_FILES),
+    [{ folder: 'wave', type: 'WaveDataset', primaryExt: ['.wds-meta.xml'] }, { folder: 'wave', type: 'WaveDashboard', primaryExt: ['.wdash-meta.xml'] }]
+  );
+  // same-named member in two types → both suffixes bind → refused wholesale
+  assert.strictEqual(
+    deriveRulesForTypes('wave', [{ type: 'WaveDataset', members: ['Same'] }, { type: 'WaveDashboard', members: ['Same'] }], ['Same.wds-meta.xml', 'Same.wdash-meta.xml']),
+    undefined
+  );
+  // a type with no derivable file → refused (never a partial rule set)
+  assert.strictEqual(
+    deriveRulesForTypes('wave', [{ type: 'WaveDataset', members: ['Sales'] }, { type: 'WaveLens', members: ['L'] }], ['Sales.wds-meta.xml', 'L.wlens']),
+    undefined
+  );
+  // two types claiming one suffix → refused; nested members ignored
+  assert.strictEqual(
+    deriveRulesForTypes('x', [{ type: 'A', members: ['A1'] }, { type: 'B', members: ['B1'] }], ['A1.thing-meta.xml', 'B1.thing-meta.xml']),
+    undefined
+  );
+  assert.deepStrictEqual(deriveRulesForTypes('x', [{ type: 'A', members: ['Folder/A1'] }], ['A1.a-meta.xml']), undefined);
   // nested fullName → no rule
   assert.strictEqual(deriveRule('reports', 'Report', ['Folder/Rep'], ['Rep.report-meta.xml']), undefined);
   // member not prefixing any file → no rule

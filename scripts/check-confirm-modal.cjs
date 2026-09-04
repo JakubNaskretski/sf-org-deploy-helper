@@ -254,16 +254,47 @@ check('no reachable combination produces an empty note', () => {
 
 check('the class-count wording only claims what was accepted', () => {
   // Invalid names are dropped by the argv filter, so the count must come from
-  // the surviving list, not the raw input.
+  // the surviving list, not the raw input — but the drop itself is now named in
+  // the note (see below), not just logged to Output.
   const p = plan({ pick: 'RunSpecifiedTests', classes: ['AcmeTest', 'rm -rf /'] });
   assert.strictEqual(p.runTests.length, 1);
-  assert.strictEqual(p.testNote, '\n\nTests: RunSpecifiedTests (1 class)');
+  assert.strictEqual(p.testNote, '\n\nTests: RunSpecifiedTests (1 class)\nIgnored 1 invalid test name: rm -rf /');
 });
 
 check('RunSpecifiedTests with no usable class refuses instead of noting', () => {
   warnings.length = 0;
   assert.strictEqual(plan({ pick: 'RunSpecifiedTests', classes: [] }), undefined);
   assert.deepStrictEqual(warnings, ['RunSpecifiedTests needs at least one test class name.']);
+});
+
+check('every given name invalid: the refusal says so, distinct from giving none at all', () => {
+  warnings.length = 0;
+  assert.strictEqual(plan({ pick: 'RunSpecifiedTests', classes: ['rm -rf /', '../../etc'] }), undefined);
+  assert.deepStrictEqual(warnings, ['RunSpecifiedTests needs at least one valid test class name — all 2 you gave were invalid.']);
+});
+
+check('the confirm modal surfaces ignored names — capped at 5, with an "and N more" tail', () => {
+  const many = ['Ok1', 'Ok2', 'bad 1', 'bad 2', 'bad 3', 'bad 4', 'bad 5', 'bad 6'];
+  const p = plan({ pick: 'RunSpecifiedTests', classes: many });
+  assert.strictEqual(p.runTests.length, 2);
+  assert.strictEqual(
+    p.testNote,
+    '\n\nTests: RunSpecifiedTests (2 classes)\nIgnored 6 invalid test names: bad 1, bad 2, bad 3, bad 4, bad 5 and 1 more'
+  );
+  // The modal builder folds testNote straight into its message — this is what a
+  // user actually sees before confirming, not just an Output-channel line.
+  const out = modal({ testNote: p.testNote });
+  assert.ok(out.message.includes('Ignored 6 invalid test names'), out.message);
+});
+
+check('a single ignored name gets singular wording, and no cap tail below 5', () => {
+  const p = plan({ pick: 'RunSpecifiedTests', classes: ['Ok', 'nope!'] });
+  assert.strictEqual(p.testNote, '\n\nTests: RunSpecifiedTests (1 class)\nIgnored 1 invalid test name: nope!');
+});
+
+check('nothing dropped: no ignored-names line at all', () => {
+  const p = plan({ pick: 'RunSpecifiedTests', classes: ['AcmeTest', 'BillingTest'] });
+  assert.ok(!p.testNote.includes('Ignored'), p.testNote);
 });
 
 // ------------------------------------------- validate cannot skip tests

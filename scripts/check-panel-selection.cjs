@@ -142,13 +142,18 @@ const IDS = [
   'selCount', 'sourceFilter', 'sourceFilterRow', 'splitter', 'status', 'statusHeader', 'testClasses',
   'testLevel', 'tree', 'typeFilterDetails', 'typeFilterLabel', 'typeFilterList', 'typeFilterRow',
   'useActive', 'useOpenTabs', 'validateBtn', 'viewModes',
-  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll'
+  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll', 'orgAsOf'
 ];
 
 /** Boot one panel instance over the given persisted webview state. */
 function panel(persisted) {
   const els = new Map();
   for (const id of IDS) { const e = new El('div'); e.id = id; els.set(id, e); }
+  // The three lens tabs are static markup in panelHtml.ts; renderViewModes finds
+  // them via querySelectorAll('#viewModes button') and rewrites their text.
+  for (const mode of ['all', 'selected', 'changed']) {
+    const b = new El('button'); b.dataset.mode = mode; els.get('viewModes').appendChild(b);
+  }
   const listeners = {};
   let stored = persisted ? JSON.parse(JSON.stringify(persisted)) : undefined;
   const outbound = [];
@@ -170,7 +175,7 @@ function panel(persisted) {
       getElementById: (id) => els.get(id) || null,
       createElement: (tag) => new El(tag),
       querySelector: () => null,
-      querySelectorAll: () => [],
+      querySelectorAll: (sel) => (sel === '#viewModes button' ? els.get('viewModes').children.slice() : []),
       addEventListener: () => {},
       removeEventListener: () => {}
     },
@@ -575,6 +580,38 @@ check('the provider replies orgsRefreshed however the listing ends', () => {
   assert.ok(shape.test(src), "refreshOrgs handler must be exactly: try { await this.loadOrgs(true); } finally { this.post({ type: 'orgsRefreshed' }); }");
 });
 
+// ------------------------------------------- 5b) the org snapshot's age
+// Membership can arrive from a persisted snapshot (Feature: org cache): the note
+// beside the source filter and the Fetch Org tooltip must say how old it is, a
+// fresh fetch (no `asOf`) reads as now, and an org switch clears it.
+const asOfText = (at) => {
+  const d = new Date(at);
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? time : `yesterday ${time}`;
+};
+check('"org as of" shows the snapshot time, reads as now without asOf, clears on reset', () => {
+  const p = panel(undefined);
+  p.deliver(FILES(THREE));
+  const note = p.el('orgAsOf');
+  const fetchBtn = p.el('fetchOrgBtn');
+  // Noon yesterday — a fixed calendar day, whatever the clock (or DST) says now.
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1); yesterday.setHours(12, 0, 0, 0);
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [], asOf: yesterday.getTime() });
+  assert.strictEqual(note.textContent, `org as of ${asOfText(yesterday)}`);
+  assert.ok(note.textContent.startsWith('org as of yesterday '), note.textContent);
+  assert.strictEqual(p.el('sourceFilterRow').style.display, 'flex');
+  assert.strictEqual(fetchBtn.title, `Re-list acme-dev — badges are as of ${asOfText(yesterday)}`);
+  // A fresh fetch posts no asOf: the note is "now" (either side of a minute tick).
+  const before = asOfText(Date.now());
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [] });
+  const after = asOfText(Date.now());
+  assert.ok([before, after].some(t => note.textContent === `org as of ${t}`), note.textContent);
+  p.deliver({ type: 'orgMetadataReset' });
+  assert.strictEqual(note.textContent, '');
+  assert.strictEqual(p.el('sourceFilterRow').style.display, 'none');
+  assert.strictEqual(fetchBtn.title, 'Fetch all metadata from the connected org and merge with local workspace');
+});
+
 // ---------------------------------------------------------- 6) the type filter
 // Driven the way the user drives it: the static All / None buttons, a row's
 // "only" button, and its checkbox (set `checked`, fire 'change' — the shim has
@@ -592,6 +629,26 @@ const groups = (p) => { const o = []; p.el('tree').find(e => { if (e.className =
 const names = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'name') o.push(e.textContent); return false; }); return o; };
 const onlyBtn = (p, type) => p.el('typeFilterList').find(e => e.tagName === 'BUTTON' && e.textContent === 'only' && e.title === `Show only ${type}`);
 const rowLabel = (p, type) => { const b = onlyBtn(p, type); return b && b.parentNode.children[0]; };
+const tab = (p, mode) => p.el('viewModes').children.find(b => b.dataset.mode === mode).textContent;
+
+// ---- 9. lens tab counts honour the type filter (0.22.0) ----
+check('Selected / Changed tab counts follow the type filter, like the rows do', () => {
+  const p = panel();
+  p.deliver({ type: 'files', objectChildTypes: [], items: [item('ApexClass', 'A1'), item('ApexClass', 'A2'), item('Flow', 'F1')] });
+  p.deliver({ type: 'selectKeys', keys: ['ApexClass:A1', 'ApexClass:A2', 'Flow:F1'], replace: true });
+  p.deliver({ type: 'changed', keys: ['ApexClass:A1', 'Flow:F1'] });
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
+  assert.strictEqual(tab(p, 'changed'), 'Changed (2)');
+  onlyBtn(p, 'Flow').fire('click');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (1)', 'only Flow → one selected row visible');
+  assert.strictEqual(tab(p, 'changed'), 'Changed (1)');
+  assert.strictEqual(p.liveCount(), 3, 'the live selection itself is untouched by the filter');
+  p.el('typeFilterNone').fire('click');
+  assert.strictEqual(tab(p, 'selected'), 'Selected', 'nothing visible → bare label');
+  p.el('typeFilterAll').fire('click');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
+  assert.strictEqual(tab(p, 'all'), 'All');
+});
 const tick = (p, type, on) => { const lbl = rowLabel(p, type); assert.ok(lbl, `no row for ${type}`); const cb = lbl.children[0]; cb.checked = on; cb.fire('change'); };
 const treeText = (p) => { const o = []; p.el('tree').find(e => { if (e.className === 'status-empty') o.push(e.textContent); return false; }); return o; };
 

@@ -52,7 +52,13 @@ export function activate(context: vscode.ExtensionContext): void {
     // Palette-only: undo the last (or an earlier) retrieve overwrite from the
     // pre-retrieve backups. No menu entry — it operates on the workspace, not a
     // clicked file.
-    registerSafe('sfOrgDeployWrapper.restoreRetrieveBackup', () => provider.restoreRetrieveBackup())
+    registerSafe('sfOrgDeployWrapper.restoreRetrieveBackup', () => provider.restoreRetrieveBackup()),
+    // Command-palette parity for webview-only actions (T-usability): same provider
+    // paths the webview messages use, so the busy gates / confirm modals / PROD
+    // guard are identical either way.
+    registerSafe('sfOrgDeployWrapper.loginOrg', () => provider.loginOrg()),
+    registerSafe('sfOrgDeployWrapper.openInOrg', (uri?: vscode.Uri) => provider.openInOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.deleteFromOrg', (uri?: vscode.Uri) => provider.deleteFromOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri))
   );
 
   // Settle the remembered org (one-time adoption of the family setting, then a

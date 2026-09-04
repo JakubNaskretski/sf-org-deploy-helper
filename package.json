@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.21.2",
+  "version": "0.22.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -88,6 +88,18 @@
       {
         "command": "sfOrgDeployWrapper.restoreRetrieveBackup",
         "title": "SF Deploy: Restore Retrieve Backup"
+      },
+      {
+        "command": "sfOrgDeployWrapper.loginOrg",
+        "title": "SF Deploy: Add Org (login)"
+      },
+      {
+        "command": "sfOrgDeployWrapper.openInOrg",
+        "title": "SF Deploy: Open in Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.deleteFromOrg",
+        "title": "SF Deploy: Delete from Org"
       }
     ],
     "menus": {
@@ -126,6 +138,16 @@
           "command": "sfOrgDeployWrapper.retrieveManifest",
           "when": "resourceFilename =~ /^package.*\\.xml$/",
           "group": "sfdeploy@6"
+        },
+        {
+          "command": "sfOrgDeployWrapper.openInOrg",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "group": "sfdeploy@7"
+        },
+        {
+          "command": "sfOrgDeployWrapper.deleteFromOrg",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "group": "sfdeploy@8"
         }
       ],
       "editor/context": [
@@ -153,6 +175,16 @@
           "command": "sfOrgDeployWrapper.deployFileWithDeps",
           "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@5"
+        },
+        {
+          "command": "sfOrgDeployWrapper.openInOrg",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "group": "sfdeploy@6"
+        },
+        {
+          "command": "sfOrgDeployWrapper.deleteFromOrg",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "group": "sfdeploy@7"
         }
       ]
     },
@@ -180,7 +212,7 @@
         "sfOrgDeployWrapper.fetchOrgOnOpen": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Run Fetch Org automatically once per session when the panel first opens, so local/org badges and org-only components appear without a manual click. Later refreshes — including after switching orgs — stay manual via the Fetch Org button. Turn off to avoid the org API calls on panel open."
+          "markdownDescription": "Run Fetch Org automatically when the panel first opens, so local/org badges and org-only components appear without a manual click. With a remembered listing (see `orgCacheMaxAgeHours`) the panel opens on it instantly and only re-lists in the background when it has gone stale — also after switching to an org whose remembered listing is stale. Switching to an org with no remembered listing, or a still-fresh one, stays manual via the Fetch Org button. Turn off to avoid every automatic org listing; Fetch Org then only runs when you click it."
         },
         "sfOrgDeployWrapper.fetchConcurrency": {
           "type": "number",
@@ -189,6 +221,13 @@
           "maximum": 12,
           "scope": "machine",
           "markdownDescription": "How many metadata types to fetch in parallel when browsing org metadata. Lower this if Fetch Org strains your machine; raise it for faster fetches on a capable machine. Machine-scoped — it's a machine-capability knob, so syncing one value across a desktop and a weak laptop would be wrong."
+        },
+        "sfOrgDeployWrapper.orgCacheMaxAgeHours": {
+          "type": "number",
+          "default": 24,
+          "minimum": 0,
+          "maximum": 720,
+          "markdownDescription": "How many hours a remembered org listing stays fresh. Org membership (the local/org badges and org-only rows) is kept per org across sessions, so the panel opens on the last listing instantly — stamped \"org as of HH:MM\" — instead of waiting on one `sf org list metadata` per type. With `fetchOrgOnOpen` on, a listing older than this is shown immediately and refreshed in the background; a newer one is not re-fetched. Set to 0 to re-fetch on every open (the old behaviour, minus the blank wait). Fetch Org always re-lists the org and replaces the remembered listing, whatever its age."
         },
         "sfOrgDeployWrapper.typeCacheDays": {
           "type": "number",
@@ -247,7 +286,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },
