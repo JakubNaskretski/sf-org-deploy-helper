@@ -3,6 +3,39 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.22.0
+
+- New: **The panel opens with your org badges already in place.** Org membership is remembered
+  per org across sessions, so opening the panel no longer waits on ninety CLI listings before
+  anything is badged. A small "org as of HH:MM" note says how old the snapshot is; a snapshot
+  older than `sfOrgDeployWrapper.orgCacheMaxAgeHours` (default 24) is shown immediately and
+  refreshed in the background, and Fetch Org always refreshes on demand.
+- New: **Retry with overwrite on a deploy the org refused for conflicts.** When the CLI blocks a
+  deploy because the org has newer changes, the failure card now offers "Retry + overwrite",
+  which re-runs that exact deploy with `--ignore-conflicts` after the usual confirmation. The
+  machine-scoped overwrite setting is untouched; this is a one-off, per-deploy choice.
+- Fixed: **Folders that mix component shapes now fill in from a scan.** A folder whose files
+  belong to several metadata types (CRM Analytics `wave/`: datasets, dashboards, lenses,
+  dataflows, recipes) used to be skipped by the type resolution entirely, so only right-clicking
+  each file brought its row in. One rule per type is now learned whenever every type has its own
+  unmistakable file suffix; anything ambiguous is still left alone rather than guessed.
+- Fixed: **The Selected and Changed tab counts follow the type filter.** Narrowing the types no
+  longer leaves "Changed (3)" above a tree showing one row.
+- Fixed: **Windows: the CLI could resolve to its PowerShell shim and fail to launch** on a machine
+  whose executable-extension list lacks `.CMD`. The `.cmd` shim is now always the one used.
+- Fixed: **A retrieve backup that saved nothing says so.** When none of the local files could be
+  copied, the result card used to show no backup note at all; it now says the backup was skipped
+  and why, and the CLI's own conflict check stays on for that retrieve.
+- Fixed: **Test names you typed are never dropped silently.** Invalid RunSpecifiedTests names are
+  now listed in the deploy confirmation instead of only in the Output channel, and the refusal
+  of an all-invalid list says that is why.
+- New: **Add Org, Open in Org and Delete from Org are commands too**, reachable from the Command
+  Palette and the file context menus, with the same confirmations as in the panel.
+- Changed: **Two failures that only reached the Output channel now tell you once:** when live
+  file watching could not be set up (use Refresh Metadata Files meanwhile), and when a diff
+  could not be floated into its own window and stayed as a tab.
+- Changed: **Every setting is documented** in the README, not just two of them.
+
 ## 0.21.2
 
 - Fixed: **A folder that mixes component shapes keeps all of them.** Since 0.21.1 a folder

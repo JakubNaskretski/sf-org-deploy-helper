@@ -19,19 +19,22 @@
 //   3. No focus (panel selection) and a click on the FOLDER itself keep the old
 //      unsupported verdict — the escape hatch needs a real file to be legitimate.
 const path = require('path');
+const fs = require('fs');
 const fsp = require('fs/promises');
 const assert = require('assert');
 const Module = require('module');
 
 // ---------------------------------------------------------------- vscode stub
-const ui = { diffs: [], warn: [] };
+const ui = { diffs: [], warn: [], info: [] };
 const editorListeners = [];
-const resetUi = () => { ui.diffs.length = 0; ui.warn.length = 0; editorListeners.length = 0; };
+// moveEditorToNewWindow's outcome per test — see the floatFirstDiff checks below.
+let moveEditorResult = () => Promise.resolve(undefined);
+const resetUi = () => { ui.diffs.length = 0; ui.warn.length = 0; ui.info.length = 0; editorListeners.length = 0; moveEditorResult = () => Promise.resolve(undefined); };
 
 const vscodeStub = {
   window: {
     setStatusBarMessage: () => ({ dispose: () => {} }),
-    showInformationMessage: () => Promise.resolve(undefined),
+    showInformationMessage: (message) => { ui.info.push(message); return Promise.resolve(undefined); },
     showWarningMessage: (message) => { ui.warn.push(message); return Promise.resolve(undefined); },
     showErrorMessage: () => Promise.resolve(undefined),
     withProgress: (_o, body) => body({ report: () => {} }, { onCancellationRequested: () => ({ dispose: () => {} }) }),
@@ -39,7 +42,8 @@ const vscodeStub = {
   },
   commands: {
     executeCommand: (id, ...args) => {
-      if (id === 'vscode.diff') ui.diffs.push({ left: args[0].fsPath, right: args[1].fsPath, title: args[2] });
+      if (id === 'vscode.diff') { ui.diffs.push({ left: args[0].fsPath, right: args[1].fsPath, title: args[2] }); return Promise.resolve(undefined); }
+      if (id === 'workbench.action.moveEditorToNewWindow') return moveEditorResult();
       return Promise.resolve(undefined);
     }
   },
@@ -166,6 +170,17 @@ let failed = 0;
 const queue = [];
 function check(name, fn) { queue.push([name, fn]); }
 
+const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
+check('source: the once-per-session flag is declared, and the toast sits inside floatFirstDiff\'s catch', () => {
+  assert.ok(/private diffFloatWarned = false;/.test(providerSrc), 'diffFloatWarned field not found');
+  const i = providerSrc.indexOf("float failed — diffs stay as tabs");
+  assert.ok(i > 0, 'floatFirstDiff catch not found');
+  const catchBlock = providerSrc.slice(i, i + 400);
+  assert.ok(/if \(!this\.diffFloatWarned\) \{/.test(catchBlock), 'toast must be gated on the flag');
+  assert.ok(/this\.diffFloatWarned = true;/.test(catchBlock), 'the flag must be set before/inside the toast, not after');
+  assert.ok(/vscode\.window\.showInformationMessage\(/.test(catchBlock), 'the toast call itself must be inside the catch');
+});
+
 // ------------------------------------------------------------------- checks
 check('the clicked .js diffs against the ORG js — not a sibling in the bundle', async () => {
   resetUi();
@@ -271,6 +286,53 @@ check('a file OUTSIDE the item folder is ignored as a focus', async () => {
   assert.strictEqual(ui.diffs.length, 0);
   assert.strictEqual(cards(posted)[0].title, 'Nothing to diff');
   drainTmpCleanup();
+});
+
+// -------------------------------------------------- floatFirstDiff toast
+// The bug: when openDiffInFloatingWindow is on but moving the diff to its own
+// window fails (no auxiliary-window support, etc.), the diff itself still opens
+// fine as a plain tab — but the ONLY trace that floating was even attempted was
+// an Output line nobody reads mid-flow. One info toast per session says so.
+check('floatFirstDiff failure toasts ONCE — the diff itself still opens as a tab', async () => {
+  resetUi();
+  const { stub, log } = diffStub([bundleItem()]);
+  moveEditorResult = () => Promise.reject(new Error('no auxiliary window support'));
+  await runDiff(stub, ['LightningComponentBundle:myCmp'], path.join(bundleDir, 'myCmp.js'));
+  drainTmpCleanup();
+  assert.strictEqual(ui.diffs.length, 1, 'floating is best-effort — the diff must still open');
+  assert.strictEqual(ui.info.length, 1, 'the first float failure this session must toast');
+  assert.match(ui.info[0], /stayed as a tab/);
+  assert.ok(log.some(l => l.includes('[Diff] float failed')), 'still logged too — the toast does not replace it');
+  assert.strictEqual(stub.diffFloatWarned, true);
+});
+
+check('a second diff in the SAME session does not re-toast the float failure', async () => {
+  resetUi();
+  const { stub } = diffStub([bundleItem()]);
+  moveEditorResult = () => Promise.reject(new Error('no auxiliary window support'));
+  await runDiff(stub, ['LightningComponentBundle:myCmp'], path.join(bundleDir, 'myCmp.js'));
+  drainTmpCleanup();
+  assert.strictEqual(ui.info.length, 1);
+  await runDiff(stub, ['LightningComponentBundle:myCmp'], path.join(bundleDir, 'myCmp.html'));
+  drainTmpCleanup();
+  assert.strictEqual(ui.info.length, 1, 'the same provider instance must not toast twice in one session');
+});
+
+check('a fresh session (new provider) toasts again on its own first failure', async () => {
+  resetUi();
+  const { stub } = diffStub([bundleItem()]);
+  moveEditorResult = () => Promise.reject(new Error('no auxiliary window support'));
+  await runDiff(stub, ['LightningComponentBundle:myCmp'], path.join(bundleDir, 'myCmp.js'));
+  drainTmpCleanup();
+  assert.strictEqual(ui.info.length, 1);
+});
+
+check('a successful float never toasts', async () => {
+  resetUi(); // moveEditorResult defaults back to resolve — the success path
+  const { stub } = diffStub([bundleItem()]);
+  await runDiff(stub, ['LightningComponentBundle:myCmp'], path.join(bundleDir, 'myCmp.js'));
+  drainTmpCleanup();
+  assert.strictEqual(ui.info.length, 0);
 });
 
 (async () => {

@@ -20,21 +20,41 @@
 //    echoed on the card is keyed on the same variable, so what the user sees is
 //    what ran. The deploy path is untouched: its flag is still gated on the
 //    setting, never hard-coded.
+//  - writeBackup / maybeBackupBeforeRetrieve, driven for real against a tmp
+//    workspace: "nothing to save" (org-only candidates) and "candidates existed
+//    but none were copyable" (missing / outside the workspace) used to collapse
+//    to the same silent `undefined` — the retrieve card said nothing, even
+//    though the second case means the safety net the setting promised did NOT
+//    fire. They must now read apart: the first stays undefined (there was
+//    never anything to back up), the second gets a note (no `dir`, so the
+//    conflict-check gate above stays on — there's nothing on disk to vouch for
+//    the overwrite).
 const path = require('path');
 const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
 const assert = require('assert');
 const Module = require('module');
+const vscodeStub = {
+  workspace: { getConfiguration: () => ({ get: (_k, fallback) => fallback }) },
+  Uri: {
+    file: fsPath => ({ fsPath }),
+    joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) })
+  }
+};
 const origLoad = Module._load;
-Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
+Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const { SfCliService } = require(path.join(__dirname, '..', 'out', 'sfCliService.js'));
+const { DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 
+// Queued + awaited (not run inline): the new writeBackup/maybeBackupBeforeRetrieve
+// checks below are genuinely async (real fs.lstat/copyFile against a tmp dir), and
+// a bare `fn()` would let their assertions fire after this script had already
+// exited 0.
 let failed = 0;
-let ran = 0;
-function check(name, fn) {
-  ran++;
-  try { fn(); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.message}`); }
-}
+const queue = [];
+function check(name, fn) { queue.push([name, fn]); }
 
 // Capture argv instead of spawning `sf`.
 function capture() {
@@ -114,14 +134,102 @@ check('both user-facing retrieve cards echo the flag keyed on the same variable'
 });
 
 check('the gate reads the value maybeBackupBeforeRetrieve returns (dir only when files were copied)', () => {
-  // `dir` is only set on the count>0 branch; disabled / over-cap / nothing-local
-  // return without it — so `backupDir !== undefined` is "a backup is on disk".
+  // `dir` is only set on the count>0 branch; disabled / over-cap / nothing-local /
+  // nothing-copyable all return without it — so `backupDir !== undefined` is "a
+  // backup is on disk".
   const fn = src.slice(src.indexOf('private async maybeBackupBeforeRetrieve('), src.indexOf('private async writeBackup('));
   assert.ok(/if \(!this\.backupsEnabled\(\)\) return undefined;/.test(fn), 'disabled → undefined');
-  assert.ok(/if \(result\.count === 0\) return undefined;/.test(fn), 'nothing local → undefined');
-  // `dir:` must appear only AFTER the count===0 guard, i.e. never on the over-cap branch.
+  assert.ok(/if \(result\.count === 0\) \{/.test(fn), 'count===0 branches (offered vs. nothing) instead of a flat return');
+  assert.ok(/if \(result\.offered\) \{/.test(fn), 'candidates offered but none copyable gets its own note');
+  assert.ok(!/note: `backup skipped — none of[^`]*`,\s*\n\s*dir:/.test(fn), 'the nothing-copyable note must never carry a dir');
+  // `dir:` must appear only AFTER the count===0 guard, i.e. never on the over-cap
+  // OR nothing-copyable branches.
   const guard = fn.indexOf('if (result.count === 0)');
   assert.ok(guard > 0 && !fn.slice(0, guard).includes('dir:') && fn.slice(guard).includes('dir: result.dir'), 'dir only on the copied branch');
+});
+
+// ---- writeBackup / maybeBackupBeforeRetrieve, driven for real ------------
+
+/** A minimal provider: only what writeBackup/maybeBackupBeforeRetrieve touch
+ *  (backupsRoot → context.globalStorageUri, output, and vscode's config stub
+ *  above for backupsEnabled). Real tmp dirs on disk — this exercises actual
+ *  fs.lstat/copyFile/mkdir, not a mock of them. */
+function backupProvider(storageDir) {
+  return Object.assign(Object.create(DeployPanelProvider.prototype), {
+    output: { appendLine: () => {} },
+    context: { globalStorageUri: { fsPath: storageDir } }
+  });
+}
+const maybeBackup = (prov, root, paths, org) =>
+  DeployPanelProvider.prototype.maybeBackupBeforeRetrieve.call(prov, root, paths, org);
+
+async function withTmpWorkspace(fn) {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), 'sf-backup-'));
+  const root = path.join(base, 'ws');
+  const storage = path.join(base, 'storage');
+  await fsp.mkdir(root, { recursive: true });
+  try { await fn(root, storage); } finally { await fsp.rm(base, { recursive: true, force: true }); }
+}
+
+check('org-only candidates (no local file at all) → undefined, nothing written', async () => {
+  await withTmpWorkspace(async (root, storage) => {
+    const prov = backupProvider(storage);
+    // '' is exactly what an org-only item contributes to candidatePaths (see
+    // runRetrieve: items.flatMap(i => [i.filePath, ...i.files])).
+    const result = await maybeBackup(prov, root, ['', ''], 'acme-dev');
+    assert.strictEqual(result, undefined);
+    assert.ok(!fs.existsSync(storage), 'no backup dir should be created for an empty offer');
+  });
+});
+
+check('candidates offered but none copyable (missing + outside workspace) → note, no dir', async () => {
+  await withTmpWorkspace(async (root, storage) => {
+    const prov = backupProvider(storage);
+    const missing = path.join(root, 'Missing.cls');
+    const outside = path.join(os.tmpdir(), 'not-in-workspace.cls');
+    await fsp.writeFile(outside, 'body', 'utf8'); // exists, but not under root
+    const result = await maybeBackup(prov, root, [missing, outside], 'acme-dev');
+    assert.ok(result, 'a real safety-net gap must not stay silent');
+    assert.strictEqual(result.dir, undefined, 'no dir — the CLI conflict check must stay on');
+    assert.strictEqual(result.note, "backup skipped — none of 2 local files could be saved (see Output)");
+    await fsp.rm(outside, { force: true });
+  });
+});
+
+check('one offered, none copyable → singular wording', async () => {
+  await withTmpWorkspace(async (root, storage) => {
+    const prov = backupProvider(storage);
+    const result = await maybeBackup(prov, root, [path.join(root, 'Gone.cls')], 'acme-dev');
+    assert.strictEqual(result.note, "backup skipped — none of 1 local file could be saved (see Output)");
+    assert.strictEqual(result.dir, undefined);
+  });
+});
+
+check('a real copyable file still backs up normally — dir present, note unchanged', async () => {
+  await withTmpWorkspace(async (root, storage) => {
+    const prov = backupProvider(storage);
+    const real = path.join(root, 'Real.cls');
+    await fsp.writeFile(real, 'public class Real {}', 'utf8');
+    const result = await maybeBackup(prov, root, [real], 'acme-dev');
+    assert.ok(result.dir, 'a copied file must still hand back a dir');
+    assert.strictEqual(result.note, "backed up 1 file — restore via 'SF Deploy: Restore Retrieve Backup'");
+    assert.ok(fs.existsSync(path.join(result.dir, 'Real.cls')));
+  });
+});
+
+check('a mix of copyable and non-copyable candidates counts only what was actually saved', async () => {
+  await withTmpWorkspace(async (root, storage) => {
+    const prov = backupProvider(storage);
+    const real = path.join(root, 'Real.cls');
+    await fsp.writeFile(real, 'public class Real {}', 'utf8');
+    const missing = path.join(root, 'Missing.cls');
+    const result = await maybeBackup(prov, root, [real, missing], 'acme-dev');
+    // 2 candidates, 1 copyable: this is the "copied branch" (count > 0), not the
+    // "none copyable" branch — the dropped candidate is only logged, since the
+    // backup as a whole still succeeded and has a dir to restore from.
+    assert.ok(result.dir);
+    assert.strictEqual(result.note, "backed up 1 file — restore via 'SF Deploy: Restore Retrieve Backup'");
+  });
 });
 
 check('diff slow-path retrieve is NOT forced', () => {
@@ -159,5 +267,10 @@ check('nothing hard-codes the override to true — only deployOptsFromRetry\'s g
   assert.ok(src.includes('ignoreConflictsOverride: r.ignoreConflicts === true ? true : undefined'), 'the gated ternary itself must still be there');
 });
 
-if (failed) { console.error(`retrieve-conflicts: ${failed}/${ran} checks FAILED`); process.exit(1); }
-console.log(`retrieve-conflicts: all ${ran} checks passed`);
+(async () => {
+  for (const [name, fn] of queue) {
+    try { await fn(); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.message}`); }
+  }
+  if (failed) { console.error(`retrieve-conflicts: ${failed}/${queue.length} checks FAILED`); process.exit(1); }
+  console.log(`retrieve-conflicts: all ${queue.length} checks passed`);
+})();

@@ -45,4 +45,13 @@ scan flags them but cannot list them.
 
 - `sfOrgDeployWrapper.commandTimeoutMs` — timeout for deploy/retrieve commands (default 180000).
 - `sfOrgDeployWrapper.ignoreDeployConflicts` — pass `--ignore-conflicts` to deploys. **Off by default** so the CLI refuses to overwrite org-side changes that aren't in your local source. Also available as **Overwrite org changes** in the panel.
+- `sfOrgDeployWrapper.fetchIncludeManaged` — include managed-package components when fetching org metadata (default off — they're read-only and add thousands of entries to the browse tree).
+- `sfOrgDeployWrapper.fetchOrgOnOpen` — run Fetch Org automatically once per session when the panel first opens (default on). Later refreshes stay manual via the Fetch Org button.
+- `sfOrgDeployWrapper.fetchConcurrency` — how many metadata types Fetch Org lists in parallel (default 5, 1–12). Machine-scoped: lower it on a weaker machine, raise it on a capable one.
 - `sfOrgDeployWrapper.orgCacheMaxAgeHours` — how long (hours, default 24) the remembered per-org listing counts as fresh: the panel opens on it instantly ("org as of HH:MM"), only an older one is re-fetched in the background, and Fetch Org always re-lists.
+- `sfOrgDeployWrapper.typeCacheDays` — how many days (default 7) to cache metadata-type rules learned from the `sf` CLI registry, and how long a folder that failed resolution is remembered as a lost cause. 0 disables both caches.
+- `sfOrgDeployWrapper.changedBaseRef` — when set (e.g. `main` or `origin/main`), the **Changed** view also shows components that differ from that git ref, not just uncommitted edits. Empty by default (uncommitted changes only).
+- `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
+- `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
+- `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
+- `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org).

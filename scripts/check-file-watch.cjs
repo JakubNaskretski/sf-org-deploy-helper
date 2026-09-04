@@ -86,10 +86,22 @@ Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, 
 const { RescanScheduler, affectsItemList, watchTargets, watchTargetsKey } =
   require(path.join(__dirname, '..', 'out', 'fileWatch.js'));
 const { DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
 
 let failed = 0;
 const queue = [];
 function check(name, fn) { queue.push([name, fn]); }
+
+check('source: the once-per-session flag is declared, and the toast sits inside syncFileWatchers\' catch', () => {
+  assert.ok(/private watchFailureWarned = false;/.test(providerSrc), 'watchFailureWarned field not found');
+  const catchBlock = providerSrc.slice(
+    providerSrc.indexOf('could not watch the package directories'),
+    providerSrc.indexOf('could not watch the package directories') + 600
+  );
+  assert.ok(/if \(!this\.watchFailureWarned\) \{/.test(catchBlock), 'toast must be gated on the flag');
+  assert.ok(/this\.watchFailureWarned = true;/.test(catchBlock), 'the flag must be set before/inside the toast, not after');
+  assert.ok(/vscode\.window\.showWarningMessage\(/.test(catchBlock), 'the toast call itself must be inside the catch');
+});
 const p = (...s) => path.join(...s);
 const flush = () => new Promise(r => setImmediate(r));
 // Project roots are always absolute in practice (discovery hands back a real
@@ -411,6 +423,7 @@ check('dispose during a rescan stops the follow-up', async () => {
 const provider = (over = {}) => Object.assign(Object.create(DeployPanelProvider.prototype), {
   fileWatchers: [],
   watchedTargetsKey: undefined,
+  watchFailureWarned: false,
   items: [],
   output: { appendLine: () => {} },
   rescanScheduler: { scheduled: 0, schedule() { this.scheduled++; } },
@@ -493,6 +506,7 @@ check('no project root means no watcher, and tears the current one down', async 
 
 check('a watcher API failure leaves nothing half-wired', async () => {
   watchers.length = 0;
+  resetUi();
   const prov = provider();
   const orig = vscodeStub.workspace.createFileSystemWatcher;
   vscodeStub.workspace.createFileSystemWatcher = () => { throw new Error('watcher refused'); };
@@ -506,6 +520,43 @@ check('a watcher API failure leaves nothing half-wired', async () => {
   // …and the retry really does re-arm.
   await sync(prov, projA);
   assert.strictEqual(prov.fileWatchers.length, 6);
+});
+
+check('a watcher failure toasts ONCE per session; every failure still logs, a second failure does not re-toast', async () => {
+  // The bug: this failure was logged to Output only — the tree then silently
+  // went stale (new/deleted files invisible) until a manual Refresh, with no
+  // signal that watching had stopped at all.
+  watchers.length = 0;
+  resetUi();
+  const prov = provider();
+  const orig = vscodeStub.workspace.createFileSystemWatcher;
+  vscodeStub.workspace.createFileSystemWatcher = () => { throw new Error('watcher refused'); };
+  try {
+    await sync(prov, projA);
+    assert.strictEqual(ui.warn.length, 1, 'the first failure this session must toast');
+    assert.match(ui.warn[0].message, /live file watching is off/i);
+    assert.match(ui.warn[0].message, /Refresh Metadata Files/);
+    assert.strictEqual(prov.watchFailureWarned, true);
+
+    await sync(prov, projB); // a second, distinct failure this session
+    assert.strictEqual(ui.warn.length, 1, 'a second failure must not toast again — logging alone covers it');
+  } finally {
+    vscodeStub.workspace.createFileSystemWatcher = orig;
+  }
+});
+
+check('a fresh provider (new session) toasts again on its own first failure', async () => {
+  watchers.length = 0;
+  resetUi();
+  const prov = provider(); // watchFailureWarned: false — a distinct session
+  const orig = vscodeStub.workspace.createFileSystemWatcher;
+  vscodeStub.workspace.createFileSystemWatcher = () => { throw new Error('watcher refused'); };
+  try {
+    await sync(prov, projA);
+  } finally {
+    vscodeStub.workspace.createFileSystemWatcher = orig;
+  }
+  assert.strictEqual(ui.warn.length, 1);
 });
 
 // A failure on the SECOND package directory is the interesting one: the first

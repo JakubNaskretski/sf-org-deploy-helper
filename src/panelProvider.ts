@@ -345,6 +345,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Identity of the currently-watched target set; an unchanged one is left
    *  alone rather than re-created on every scan. */
   private watchedTargetsKey?: string;
+  /** A watcher setup failure used to be logged only — the tree then silently
+   *  went stale until a manual Refresh. Toast once per session (see
+   *  syncFileWatchers' catch); every failure after the first still logs. */
+  private watchFailureWarned = false;
+  /** floatFirstDiff's "moved to a new window" failure used to be logged only —
+   *  toast once per session (see runDiff); every failure after the first still
+   *  logs. Diffs still open fine as tabs either way. */
+  private diffFloatWarned = false;
   /** Collapses watcher notifications into one debounced, silent rescan. */
   private readonly rescanScheduler: RescanScheduler;
 
@@ -512,6 +520,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   async deployFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'deploy'); }
   async retrieveFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'retrieve'); }
   async diffFile(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'diff'); }
+  /** Command-palette parity for the webview's 'openInOrg' message — resolves the
+   *  clicked file to a component the same way diffFile does (scan → static/learned
+   *  rules → CLI registry), then reuses openComponentInOrg. */
+  async openInOrg(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'openInOrg'); }
+  /** Command-palette parity for the webview's 'deleteFromOrg' message — same item
+   *  resolution as diffFile, then reuses runDelete (dry-run preview, PROD guard,
+   *  destructive confirm — unchanged). */
+  async deleteFromOrg(uri: vscode.Uri): Promise<void> { return this.runByUri(uri, 'delete'); }
+  /** Command-palette parity for the webview's 'loginOrg' message. No uri: `sf org
+   *  login web` isn't file-scoped. */
+  async loginOrg(): Promise<void> { return this.runLogin(); }
 
   /**
    * "Deploy File + Dependencies" (context menu / palette): resolve the file's
@@ -702,7 +721,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return !!this.workspaceRoot;
   }
 
-  private async runByUri(uri: vscode.Uri, action: 'deploy' | 'retrieve' | 'diff', orgOverride?: string): Promise<void> {
+  private async runByUri(uri: vscode.Uri, action: 'deploy' | 'retrieve' | 'diff' | 'openInOrg' | 'delete', orgOverride?: string): Promise<void> {
     if (!uri || !uri.fsPath) {
       vscode.window.showInformationMessage('No file selected.');
       return;
@@ -754,6 +773,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const sourceDir = inferred ? match.filePath : undefined;
     if (action === 'deploy') { await this.runDeploy([key], { sourceDir }); return; }
     if (action === 'retrieve') return this.runRetrieve([key], { sourceDir });
+    // openInOrg/delete operate on the resolved component (key), same as the
+    // webview's own 'openInOrg'/'deleteFromOrg' messages — no sourceDir: they
+    // never reach the CLI via --source-dir, only --metadata / a Setup deep link.
+    if (action === 'openInOrg') return this.openComponentInOrg(key);
+    if (action === 'delete') return this.runDelete([key]);
     // The clicked path matters for folder-typed components (lwc/aura bundles,
     // objects): the folder has no meaningful diff, the file the user pointed at does.
     return this.runDiff([key], orgOverride, uri.fsPath);
@@ -1625,6 +1649,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
       this.disposeFileWatchers();
       this.output.appendLine(`[watch] could not watch the package directories: ${err instanceof Error ? err.message : String(err)}`);
+      // A watcher failure otherwise had NO user-visible symptom until a new/deleted
+      // file went missing from the tree — surface it once so there's a chance of
+      // noticing before that. Every subsequent failure this session still logs above.
+      if (!this.watchFailureWarned) {
+        this.watchFailureWarned = true;
+        void vscode.window.showWarningMessage("SF Deploy: live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
+      }
     }
   }
 
@@ -2196,18 +2227,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const testLevel: TestLevel = validateForcesTests ? 'RunLocalTests' : requested;
 
     let runTests: string[] = [];
+    // Names dropped by the argv filter below, surfaced in the confirm modal (not
+    // just the Output channel) so a typo'd/pasted-junk class silently NOT running
+    // is visible before the deploy fires, not after the tests didn't run.
+    let ignoredNote = '';
     if (testLevel === 'RunSpecifiedTests') {
       const candidates = opts.runTests ?? this.runTests ?? [];
       // Class names become CLI argv (`--tests <name>`) — reject anything that
       // isn't a bare Apex identifier (dots allowed for `Namespace.Class`) so a
       // stray shell metacharacter typed into the panel can't inject an extra flag.
-      runTests = candidates.filter(c => /^[A-Za-z0-9_.]+$/.test(c));
-      if (runTests.length < candidates.length) {
-        this.output.appendLine(`[RunSpecifiedTests] ignored ${candidates.length - runTests.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
+      const isValidClassName = (c: string): boolean => /^[A-Za-z0-9_.]+$/.test(c);
+      runTests = candidates.filter(isValidClassName);
+      const dropped = candidates.filter(c => !isValidClassName(c));
+      if (dropped.length > 0) {
+        this.output.appendLine(`[RunSpecifiedTests] ignored ${dropped.length} invalid class name(s) (must match /^[A-Za-z0-9_.]+$/)`);
       }
       if (runTests.length === 0) {
-        vscode.window.showWarningMessage('RunSpecifiedTests needs at least one test class name.');
+        // Every name was dropped (or none were given) — refuse rather than run
+        // the deploy with an effectively empty --tests list, which is silently
+        // NoTestRun in every way that matters except the label.
+        vscode.window.showWarningMessage(dropped.length > 0
+          ? `RunSpecifiedTests needs at least one valid test class name — all ${dropped.length} you gave were invalid.`
+          : 'RunSpecifiedTests needs at least one test class name.');
         return undefined;
+      }
+      if (dropped.length > 0) {
+        const shown = dropped.slice(0, 5).join(', ');
+        const more = dropped.length > 5 ? ` and ${dropped.length - 5} more` : '';
+        ignoredNote = `\nIgnored ${dropped.length} invalid test name${dropped.length === 1 ? '' : 's'}: ${shown}${more}`;
       }
     }
 
@@ -2223,14 +2270,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // meant it and the deploy is about to bounce. It warns rather than refuses
     // because NoTestRun is legitimate for an Apex-free payload, and nothing here
     // knows whether this one carries Apex.
-    const testNote = validateForcesTests
+    const testNote = (validateForcesTests
       ? '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
       : testLevel === 'NoTestRun'
         ? (isProd
           ? '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.'
           : '\n\nTests: none (NoTestRun)')
       : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
-      : `\n\nTests: ${testLevel}`;
+      : `\n\nTests: ${testLevel}`) + ignoredNote;
     return { testLevel, runTests, testNote };
   }
 
@@ -3952,7 +3999,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           floated = true;
           await Promise.resolve(
             vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow')
-          ).then(undefined, (e) => this.output.appendLine(`[Diff] float failed — diffs stay as tabs: ${String(e)}`));
+          ).then(undefined, (e) => {
+            this.output.appendLine(`[Diff] float failed — diffs stay as tabs: ${String(e)}`);
+            // Otherwise the ONLY symptom was diffs quietly never floating — worth
+            // one toast so the setting doesn't look broken with no explanation.
+            if (!this.diffFloatWarned) {
+              this.diffFloatWarned = true;
+              void vscode.window.showInformationMessage("SF Deploy: couldn't open the diff in its own window — it stayed as a tab.");
+            }
+          });
         };
 
         // Fast path: Apex/Visualforce bodies come back from a single Tooling API
@@ -4935,7 +4990,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[backup] skipped — more than ${BACKUP_MAX_FILES} files would be backed up before retrieve`);
       return { note: `backup skipped — over ${BACKUP_MAX_FILES} files` };
     }
-    if (result.count === 0) return undefined;
+    // `offered` distinguishes "nothing local to save" (org-only items — no note,
+    // there was never a safety net to promise) from "there WERE local files but
+    // none survived isUnder/lstat" (missing, or resolved outside the workspace) —
+    // a safety net that quietly doesn't fire is worse than none, so that one gets
+    // a note too. No `dir` either way: the CLI conflict check below stays on.
+    if (result.count === 0) {
+      if (result.offered) {
+        return { note: `backup skipped — none of ${result.offered} local file${result.offered === 1 ? '' : 's'} could be saved (see Output)` };
+      }
+      return undefined;
+    }
     // `dir` rides along so the caller can offer the card's Restore/Discard buttons
     // (backupCardButtons) against this EXACT backup — never a re-derived "latest".
     return {
@@ -4954,7 +5019,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * Returns the fresh backup's absolute `dir` when count > 0, so a caller (e.g. the
    * retrieve flows) can offer it straight back for a scoped restore/discard.
    */
-  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean; dir?: string }> {
+  private async writeBackup(root: string, candidatePaths: string[], orgLabel: string, opts: { protect?: string } = {}): Promise<{ count: number; skippedTooMany?: boolean; dir?: string; offered?: number }> {
     const rootResolved = path.resolve(root);
     const seen = new Set<string>();
     const toCopy: string[] = [];
@@ -4977,9 +5042,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // A safety net that silently doesn't fire is worse than none. When real
       // candidates were offered (org-only '' entries excluded) but every one was
       // missing or resolved outside the workspace — e.g. a mis-cased inferred path
-      // that isUnder now folds, or a file already gone — leave a trace.
+      // that isUnder now folds, or a file already gone — leave a trace, and hand
+      // `offered` back so the caller can tell this apart from "nothing to save"
+      // (org-only items) and surface it on the retrieve card instead of staying silent.
       const offered = candidatePaths.filter(Boolean).length;
-      if (offered > 0) this.output.appendLine(`[backup] backup skipped ${offered} candidate(s): missing or outside the workspace`);
+      if (offered > 0) {
+        this.output.appendLine(`[backup] backup skipped ${offered} candidate(s): missing or outside the workspace`);
+        return { count: 0, offered };
+      }
       return { count: 0 };
     }
     if (toCopy.length > BACKUP_MAX_FILES) return { count: 0, skippedTooMany: true };
