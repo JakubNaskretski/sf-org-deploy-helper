@@ -46,7 +46,7 @@ scan flags them but cannot list them.
 - `sfOrgDeployWrapper.commandTimeoutMs` — timeout for deploy/retrieve commands (default 180000).
 - `sfOrgDeployWrapper.ignoreDeployConflicts` — pass `--ignore-conflicts` to deploys. **Off by default** so the CLI refuses to overwrite org-side changes that aren't in your local source. Also available as **Overwrite org changes** in the panel.
 - `sfOrgDeployWrapper.fetchIncludeManaged` — include managed-package components when fetching org metadata (default off — they're read-only and add thousands of entries to the browse tree).
-- `sfOrgDeployWrapper.fetchOrgOnOpen` — run Fetch Org automatically once per session when the panel first opens (default on). Later refreshes stay manual via the Fetch Org button.
+- `sfOrgDeployWrapper.fetchOrgOnOpen` — run Fetch Org automatically when the panel first opens (default on). A remembered listing is shown instantly and re-listed in the background only when stale — also after switching to an org whose remembered listing is stale; otherwise later refreshes stay manual via the Fetch Org button.
 - `sfOrgDeployWrapper.fetchConcurrency` — how many metadata types Fetch Org lists in parallel (default 5, 1–12). Machine-scoped: lower it on a weaker machine, raise it on a capable one.
 - `sfOrgDeployWrapper.orgCacheMaxAgeHours` — how long (hours, default 24) the remembered per-org listing counts as fresh: the panel opens on it instantly ("org as of HH:MM"), only an older one is re-fetched in the background, and Fetch Org always re-lists.
 - `sfOrgDeployWrapper.typeCacheDays` — how many days (default 7) to cache metadata-type rules learned from the `sf` CLI registry, and how long a folder that failed resolution is remembered as a lost cause. 0 disables both caches.

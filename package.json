@@ -212,7 +212,7 @@
         "sfOrgDeployWrapper.fetchOrgOnOpen": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Run Fetch Org automatically once per session when the panel first opens, so local/org badges and org-only components appear without a manual click. Later refreshes — including after switching orgs — stay manual via the Fetch Org button. Turn off to avoid the org API calls on panel open."
+          "markdownDescription": "Run Fetch Org automatically when the panel first opens, so local/org badges and org-only components appear without a manual click. With a remembered listing (see `orgCacheMaxAgeHours`) the panel opens on it instantly and only re-lists in the background when it has gone stale — also after switching to an org whose remembered listing is stale. Switching to an org with no remembered listing, or a still-fresh one, stays manual via the Fetch Org button. Turn off to avoid every automatic org listing; Fetch Org then only runs when you click it."
         },
         "sfOrgDeployWrapper.fetchConcurrency": {
           "type": "number",
