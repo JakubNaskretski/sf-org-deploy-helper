@@ -3,6 +3,15 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.21.2
+
+- Fixed: **A folder that mixes component shapes keeps all of them.** Since 0.21.1 a folder
+  holding both a type the CLI registry describes and one it does not (CRM Analytics `wave/`
+  is the typical case: datasets next to dashboards, lenses, dataflows and recipes) lost the
+  second kind from the tree, and the "couldn't resolve" banner that used to say so was gone too.
+  Registry rules now only replace a learned rule for the same folder *and* file suffix, and a
+  folder with files the registry rules don't describe is offered to the CLI again as before.
+
 ## 0.21.1
 
 - Changed: **Every metadata type the CLI knows is recognized outright.** The scanner now reads

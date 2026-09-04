@@ -16,7 +16,8 @@ import { FolderRule } from './metadataScanner';
 const REGISTRY_REL = ['node_modules', '@salesforce', 'source-deploy-retrieve', 'lib', 'src', 'registry', 'metadataRegistry.json'];
 /** Type names and suffixes later feed `--metadata Type:Name` argv and file globs. */
 const TOKEN = /^[A-Za-z0-9_]+$/;
-const DIR_TOKEN = /^[A-Za-z0-9_.-]+$/;
+// Needs at least one alphanumeric, so `.` / `..` can never become a folder.
+const DIR_TOKEN = /^(?=.*[A-Za-z0-9])[A-Za-z0-9_.-]+$/;
 const MAX_WALK_UP = 6;
 
 /** Find the registry via the `sf` on PATH: realpath the binary (npm/Homebrew
