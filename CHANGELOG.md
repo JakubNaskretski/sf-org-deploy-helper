@@ -3,6 +3,16 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.21.1
+
+- Changed: **Every metadata type the CLI knows is recognized outright.** The scanner now reads
+  the sf CLI's own metadata registry from disk, so any standard-shaped type — one `-meta.xml`
+  file per component, which is most of the several hundred types the CLI supports — shows in the
+  tree immediately, without a CLI lookup per folder and without the seven-day cache that used to
+  govern it. Bundles, objects and folder-based types keep their dedicated rules; anything the
+  registry file does not settle still falls back to the CLI as before, and with no CLI on the
+  PATH nothing changes. The Output channel says how many rules were read and from where.
+
 ## 0.21.0
 
 - New: **All / None sit above the type list, and every type has an "only" shortcut.** With many

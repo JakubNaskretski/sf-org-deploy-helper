@@ -6,7 +6,8 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { loadRegistryRules, registryRulesSource } from './registryRules';
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
@@ -651,7 +652,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       else {
         // Expired rules included: this scan never re-resolves, so dropping
         // them could only lose the clicked file's own row.
-        const scan = await scanWorkspace(this.learnedRules(true));
+        await this.ensureRegistryRules();
+        const scan = await scanWorkspace(this.ruleSet(true));
         if (scan.projectError || !scan.root) {
           this.applyProjectDiscoveryFailure(scan.projectError ?? 'Could not determine the Salesforce DX project root.');
           return false;
@@ -687,7 +689,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!match) {
       // Static + learned rules first (pure path logic); the CLI registry as the
       // authoritative last resort — if that says no, it genuinely isn't metadata.
-      match = inferItemForPath(uri.fsPath, this.learnedRules());
+      match = inferItemForPath(uri.fsPath, this.ruleSet());
       if (!match) {
         try {
           match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath));
@@ -1233,6 +1235,36 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  file event after the TTL. An expired rule stays in force until the next
    *  explicit scan re-verifies the folder against the registry and re-stamps
    *  it. Cache off (0 days) → none. */
+  /** Rules read from the sf CLI's own registry file (see registryRules.ts). Loaded
+   *  once per session and re-read on explicit scans; empty when no CLI is on
+   *  PATH, in which case the static + learned + CLI-manifest path is unchanged. */
+  private registryRules: FolderRule[] = [];
+  private registryRulesLoaded = false;
+
+  private async ensureRegistryRules(refresh = false): Promise<void> {
+    if (this.registryRulesLoaded && !refresh) return;
+    // `?? []`: harnesses drive these methods on a bare prototype where field
+    // initializers never ran.
+    const before = (this.registryRules ?? []).length;
+    this.registryRules = await loadRegistryRules(STATIC_RULE_FOLDERS, { refresh });
+    if (!this.registryRulesLoaded || before !== this.registryRules.length) {
+      const src = registryRulesSource();
+      this.output.appendLine(src
+        ? `[typeResolve] ${this.registryRules.length} folder rules from the sf CLI registry (${src})`
+        : '[typeResolve] sf CLI registry not found on PATH — folder types resolve via static rules and the CLI manifest fallback');
+    }
+    this.registryRulesLoaded = true;
+  }
+
+  /** The rule set every scan uses: static (inside scanWorkspace) → registry →
+   *  learned. A learned rule for a folder the registry already covers is
+   *  redundant (the registry knows every suffix of that folder) and dropped. */
+  private ruleSet(includeExpired = false): FolderRule[] {
+    const registry = this.registryRules ?? [];
+    const covered = new Set(registry.map(r => r.folder));
+    return [...registry, ...this.learnedRules(includeExpired).filter(r => !covered.has(r.folder))];
+  }
+
   private learnedRules(includeExpired = false): FolderRule[] {
     const days = this.typeCacheDays();
     if (days <= 0) return [];
@@ -1406,7 +1438,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private async doLoadFiles(opts: LoadFilesOptions = {}): Promise<void> {
     // The silent path keeps expired learned rules (see learnedRules): it never
     // re-resolves, so expiry there could only empty the tree of those types.
-    let scan = await scanWorkspace(this.learnedRules(!!opts.silent));
+    // Registry rules: re-read on explicit scans (a CLI upgrade lands without a
+    // window reload), cached for the watcher's silent rescans.
+    await this.ensureRegistryRules(!opts.silent);
+    let scan = await scanWorkspace(this.ruleSet(!!opts.silent));
     if (scan.projectError || !scan.root) {
       // A background rescan must never ESCALATE a discovery failure. Emptying the
       // tree, dropping org metadata and popping an error toast because a stray
@@ -1458,7 +1493,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot));
       // Fresh rules are passed directly (not just via the cache) so the rescan
       // sees them even with typeCacheDays 0.
-      if (fresh.length) scan = await scanWorkspace([...this.learnedRules(), ...fresh]);
+      if (fresh.length) scan = await scanWorkspace([...this.ruleSet(), ...fresh]);
       if (scan.projectError || !scan.root) {
         this.applyProjectDiscoveryFailure(scan.projectError ?? 'Could not determine the Salesforce DX project root.');
         return;
