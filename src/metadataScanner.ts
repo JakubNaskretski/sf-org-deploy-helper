@@ -225,9 +225,14 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
   // duplicate items, which the existing type:name dedupe below collapses.
   const rules = [...RULES, ...extraRules];
   // Top-level folders under the package default dir that no rule covers — the
-  // caller can resolve their types via the sf CLI registry and rescan.
+  // caller can resolve their types via the sf CLI registry and rescan. A static
+  // folder is fully owned. A folder only EXTRA rules cover (registry/learned,
+  // always per-file suffix rules) is still unknown when it holds -meta.xml files
+  // none of those suffixes match: a mixed folder such as wave/ must keep
+  // reaching the CLI for the shapes the registry rules don't describe.
   const unknownFolders: string[] = [];
-  const knownFolders = new Set([...rules.map(r => r.folder), 'objects']);
+  const extraExts = new Map<string, string[]>();
+  for (const r of extraRules) extraExts.set(r.folder, [...(extraExts.get(r.folder) ?? []), ...(r.primaryExt ?? [])]);
   for (const pkg of pkgDirs) {
     // Standard layout is <pkg>/main/default, but SFDX only requires <pkg>; metadata
     // can sit directly under the package dir. Fall back to <pkg> when main/default is
@@ -239,9 +244,12 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
     // Collect unrecognized sibling folders that hold metadata-looking files.
     try {
       for (const e of await fs.readdir(defaultDir, { withFileTypes: true })) {
-        if (!e.isDirectory() || shouldSkipDir(e.name) || knownFolders.has(e.name)) continue;
+        if (!e.isDirectory() || shouldSkipDir(e.name) || STATIC_RULE_FOLDERS.has(e.name)) continue;
         const p = path.join(defaultDir, e.name);
-        if ((await walkForFilesMatching(p, ['-meta.xml'])).length) unknownFolders.push(p);
+        const metas = await walkForFilesMatching(p, ['-meta.xml']);
+        const exts = extraExts.get(e.name);
+        const residual = exts ? metas.filter(f => !exts.some(x => f.endsWith(x))) : metas;
+        if (residual.length) unknownFolders.push(p);
       }
     } catch { /* unreadable dir — nothing to report */ }
     for (const rule of rules) {

@@ -20,10 +20,23 @@ const os = require('os');
 const assert = require('assert');
 const Module = require('module');
 const origLoad = Module._load;
-Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
+// scanWorkspace needs project discovery (workspaceFolders + findFiles); the
+// rest never touches the stub.
+const ws = { folders: [], projectFiles: [] };
+const vscodeStub = {
+  workspace: {
+    get workspaceFolders() { return ws.folders; },
+    findFiles: async () => ws.projectFiles.map(f => ({ fsPath: f })),
+    asRelativePath: uri => uri.fsPath
+  },
+  RelativePattern: class { constructor(base, pattern) { Object.assign(this, { base, pattern }); } },
+  Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) }
+};
+Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const { rulesFromRegistry, locateRegistry, loadRegistryRules } = require(path.join(__dirname, '..', 'out', 'registryRules.js'));
-const { STATIC_RULE_FOLDERS, inferItemForPath } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { STATIC_RULE_FOLDERS, inferItemForPath, scanWorkspace } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 
 let failed = 0;
 let ran = 0;
@@ -71,6 +84,46 @@ const FIXTURE = {
     for (const bad of [null, undefined, 42, 'x', {}, { types: 'nope' }, { types: { a: 'str' } }, { types: {}, childTypes: 'x' }]) {
       assert.deepStrictEqual(rulesFromRegistry(bad, STATIC), []);
     }
+  });
+
+  await check('a directoryName of "." or ".." can never become a folder', () => {
+    const reg = { types: { dot: { name: 'Dot', directoryName: '.', suffix: 'dot' }, dots: { name: 'Dots', directoryName: '..', suffix: 'dots' }, ok: { name: 'Ok', directoryName: 'ok.dir', suffix: 'ok' } } };
+    assert.deepStrictEqual(rulesFromRegistry(reg, STATIC).map(r => r.folder), ['ok.dir']);
+  });
+
+  // ---- mixed folders: registry rules must not shadow other shapes (0.21.2) ----
+  const WDS = { folder: 'wave', type: 'WaveDataset', primaryExt: ['.wds-meta.xml'] };
+  const WDASH = { folder: 'wave', type: 'WaveDashboard', primaryExt: ['.wdash-meta.xml'] };
+
+  await check('ruleSet keeps a learned rule for the same folder with a different suffix, drops an identical one', () => {
+    const fake = { registryRules: [WDS], learnedRules: () => [WDASH, { ...WDS, type: 'WaveDatasetTwin' }] };
+    const set = DeployPanelProvider.prototype.ruleSet.call(fake, true);
+    assert.deepStrictEqual(set.map(r => r.type), ['WaveDataset', 'WaveDashboard'], JSON.stringify(set));
+    const bare = DeployPanelProvider.prototype.ruleSet.call({ learnedRules: () => [WDASH] });
+    assert.deepStrictEqual(bare, [WDASH], 'no registry (bare prototype object) → learned rules pass through');
+  });
+
+  await check('scanWorkspace: a folder with -meta.xml files no extra rule describes stays unknown; a fully described one does not; static folders never are', async () => {
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-mixed-'));
+    const pkg = path.join(proj, 'force-app', 'main', 'default');
+    fs.mkdirSync(path.join(pkg, 'wave'), { recursive: true });
+    fs.mkdirSync(path.join(pkg, 'classes'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'sfdx-project.json'), JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }] }));
+    fs.writeFileSync(path.join(pkg, 'wave', 'Sales.wds-meta.xml'), '<x/>');
+    fs.writeFileSync(path.join(pkg, 'wave', 'Board.wdash-meta.xml'), '<x/>');
+    fs.writeFileSync(path.join(pkg, 'classes', 'Acme.cls'), '');
+    fs.writeFileSync(path.join(pkg, 'classes', 'Acme.cls-meta.xml'), '<x/>');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'mixed', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const partial = await scanWorkspace([WDS]);
+    assert.deepStrictEqual(partial.unknownFolders.map(f => path.basename(f)), ['wave'], 'residual .wdash → wave stays unknown');
+    assert.deepStrictEqual(partial.items.map(i => `${i.type}:${i.name}`).sort(), ['ApexClass:Acme', 'WaveDataset:Sales']);
+    const full = await scanWorkspace([WDS, WDASH]);
+    assert.deepStrictEqual(full.unknownFolders, [], 'every -meta.xml described → not unknown');
+    assert.deepStrictEqual(full.items.map(i => `${i.type}:${i.name}`).sort(), ['ApexClass:Acme', 'WaveDashboard:Board', 'WaveDataset:Sales']);
+    const none = await scanWorkspace([]);
+    assert.deepStrictEqual(none.unknownFolders.map(f => path.basename(f)), ['wave'], 'no rule at all → unknown, classes (static) never');
+    fs.rmSync(proj, { recursive: true, force: true });
   });
 
   // ---- locateRegistry against a fake CLI install ----
@@ -150,7 +203,7 @@ const FIXTURE = {
     assert.ok(/scanWorkspace\(\[\.\.\.this\.ruleSet\(\), \.\.\.fresh\]\)/.test(src), 'post-resolution rescan');
     assert.ok(/inferItemForPath\(uri\.fsPath, this\.ruleSet\(\)\)/.test(src), 'right-click inference');
     assert.ok(!/scanWorkspace\(this\.learnedRules\(/.test(src) && !/inferItemForPath\([^)]*this\.learnedRules\(/.test(src), 'no call site bypasses the registry');
-    assert.ok(/private ruleSet\(includeExpired = false\)[\s\S]*?this\.learnedRules\(includeExpired\)\.filter\(r => !covered\.has\(r\.folder\)\)/.test(src));
+    assert.ok(/private ruleSet\(includeExpired = false\)[\s\S]*?this\.learnedRules\(includeExpired\)\.filter\(r => !covered\.has\(key\(r\)\)\)/.test(src), 'coverage keyed on folder+suffix, never folder alone');
   });
   await check('explicit scans refresh the registry rules, silent rescans reuse them', () => {
     assert.ok(/await this\.ensureRegistryRules\(!opts\.silent\);\s*\n\s*let scan = await scanWorkspace\(this\.ruleSet\(!!opts\.silent\)\)/.test(src));

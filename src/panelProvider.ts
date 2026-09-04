@@ -1257,12 +1257,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /** The rule set every scan uses: static (inside scanWorkspace) → registry →
-   *  learned. A learned rule for a folder the registry already covers is
-   *  redundant (the registry knows every suffix of that folder) and dropped. */
+   *  learned. A learned rule is redundant only when the registry emitted the
+   *  SAME folder + suffix. Folder alone is not enough: a folder can mix a
+   *  default-shaped type the registry covers with one it doesn't (wave/ holds
+   *  WaveDataset .wds next to WaveDashboard .wdash, a matching-content type),
+   *  and the learned rule for the latter must survive. */
   private ruleSet(includeExpired = false): FolderRule[] {
     const registry = this.registryRules ?? [];
-    const covered = new Set(registry.map(r => r.folder));
-    return [...registry, ...this.learnedRules(includeExpired).filter(r => !covered.has(r.folder))];
+    const key = (r: FolderRule): string => `${r.folder}|${r.primaryExt?.join(',') ?? ''}`;
+    const covered = new Set(registry.map(key));
+    return [...registry, ...this.learnedRules(includeExpired).filter(r => !covered.has(key(r)))];
   }
 
   private learnedRules(includeExpired = false): FolderRule[] {
