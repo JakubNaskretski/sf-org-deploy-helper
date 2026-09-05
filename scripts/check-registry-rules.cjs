@@ -34,7 +34,7 @@ const vscodeStub = {
 };
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { rulesFromRegistry, locateRegistry, loadRegistryRules } = require(path.join(__dirname, '..', 'out', 'registryRules.js'));
+const { rulesFromRegistry, locateRegistry, loadRegistryRules, nonDerivableFolders, registryNonDerivable } = require(path.join(__dirname, '..', 'out', 'registryRules.js'));
 const { STATIC_RULE_FOLDERS, inferItemForPath, scanWorkspace } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const { DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 
@@ -72,7 +72,17 @@ const FIXTURE = {
     const byType = Object.fromEntries(rules.map(r => [r.type, r]));
     assert.deepStrictEqual(byType.Alpha, { folder: 'alphas', type: 'Alpha', primaryExt: ['.alpha-meta.xml'] });
     assert.deepStrictEqual(byType.Deflt, { folder: 'deflts', type: 'Deflt', primaryExt: ['.deflt-meta.xml'] });
-    for (const t of ['Bundlish', 'Infold', 'Parent', 'Kid', 'Stat', 'Bad-Name', 'BadDir', 'NoSuffix', 'AlphaTwin']) assert.ok(!byType[t], `${t} must be skipped`);
+    // A parent with children but no strategy is still one -meta.xml file (AssignmentRules…).
+    assert.deepStrictEqual(byType.Parent, { folder: 'parents', type: 'Parent', primaryExt: ['.parent-meta.xml'] });
+    for (const t of ['Bundlish', 'Infold', 'Kid', 'Stat', 'Bad-Name', 'BadDir', 'NoSuffix', 'AlphaTwin']) assert.ok(!byType[t], `${t} must be skipped`);
+  });
+
+  await check('nonDerivableFolders: bundle / folder-based types only, static folders and child types excluded', () => {
+    const m = nonDerivableFolders(FIXTURE, STATIC);
+    assert.deepStrictEqual([...m.entries()].sort(), [['bundlish', 'Bundlish'], ['infolds', 'Infold']]);
+    assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'classes', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed');
+    assert.deepStrictEqual([...nonDerivableFolders(null, STATIC).keys()], []);
+    assert.deepStrictEqual([...registryNonDerivable().keys()].length >= 0, true, 'getter is safe before any load');
   });
 
   await check('two types sharing a folder with different suffixes both get a rule', () => {
@@ -177,9 +187,18 @@ const FIXTURE = {
       const byType = Object.fromEntries(rules.map(r => [r.type, r]));
       assert.ok(rules.length > 300, `expected hundreds of rules, got ${rules.length}`);
       assert.deepStrictEqual(byType.PermissionSetGroup, { folder: 'permissionsetgroups', type: 'PermissionSetGroup', primaryExt: ['.permissionsetgroup-meta.xml'] });
-      for (const t of ['ApexClass', 'LightningComponentBundle', 'StaticResource', 'CustomObject', 'CustomField', 'Report', 'EmailTemplate', 'CustomLabels', 'OmniUiCard', 'Flow', 'Layout']) {
-        assert.ok(!byType[t], `${t} must not come from the registry (static rule or non-default shape)`);
+      // 0.22.1: parents-with-children that are still one file come from the registry.
+      assert.deepStrictEqual(byType.AssignmentRules, { folder: 'assignmentRules', type: 'AssignmentRules', primaryExt: ['.assignmentRules-meta.xml'] });
+      assert.deepStrictEqual(byType.MatchingRules, { folder: 'matchingRules', type: 'MatchingRules', primaryExt: ['.matchingRule-meta.xml'] });
+      for (const t of ['SharingRules', 'EscalationRules', 'AutoResponseRules']) assert.ok(byType[t], `${t} must come from the registry`);
+      for (const t of ['ApexClass', 'LightningComponentBundle', 'StaticResource', 'CustomObject', 'CustomObjectTranslation', 'Bot', 'CustomField', 'Report', 'Dashboard', 'EmailTemplate', 'CustomLabels', 'Workflow', 'OmniUiCard', 'Flow', 'Layout']) {
+        assert.ok(!byType[t], `${t} must not come from the registry (static rule, decomposed, folder-based or bundle)`);
       }
+      const nd = nonDerivableFolders(JSON.parse(fs.readFileSync(real, 'utf8')), STATIC_RULE_FOLDERS);
+      assert.strictEqual(nd.get('documents'), 'Document');
+      assert.strictEqual(nd.get('experiences'), 'ExperienceBundle');
+      assert.strictEqual(nd.get('bots'), 'Bot');
+      for (const f of ['reports', 'dashboards', 'email', 'classes', 'lwc', 'objects', 'assignmentRules', 'permissionsetgroups']) assert.ok(!nd.has(f), `${f} must not be listed as non-derivable`);
       for (const r of rules) {
         assert.ok(/^[A-Za-z0-9_]+$/.test(r.type) && /^\.[A-Za-z0-9_]+-meta\.xml$/.test(r.primaryExt[0]), JSON.stringify(r));
         assert.ok(!STATIC_RULE_FOLDERS.has(r.folder), `static folder leaked: ${r.folder}`);
@@ -199,12 +218,27 @@ const FIXTURE = {
   // ---- source pins ----
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
   await check('every scan/infer call site goes through ruleSet(); learnedRules() is only called inside it', () => {
-    assert.strictEqual((src.match(/scanWorkspace\(this\.ruleSet\(/g) || []).length, 2, 'fast scan + explicit scan');
+    assert.strictEqual((src.match(/scanWorkspace\(this\.ruleSet\(/g) || []).length, 3, 'fast scan + explicit scan + discovery retry');
     assert.ok(/scanWorkspace\(\[\.\.\.this\.ruleSet\(\), \.\.\.fresh\]\)/.test(src), 'post-resolution rescan');
     assert.ok(/inferItemForPath\(uri\.fsPath, this\.ruleSet\(\)\)/.test(src), 'right-click inference');
     assert.ok(!/scanWorkspace\(this\.learnedRules\(/.test(src) && !/inferItemForPath\([^)]*this\.learnedRules\(/.test(src), 'no call site bypasses the registry');
     assert.ok(/private ruleSet\(includeExpired = false\)[\s\S]*?this\.learnedRules\(includeExpired\)\.filter\(r => !covered\.has\(key\(r\)\)\)/.test(src), 'coverage keyed on folder+suffix, never folder alone');
   });
+  await check('known-shape folders skip the CLI and get their own banner; CLI resolutions run 3 at a time', () => {
+    assert.ok(/const nonDerivable = registryNonDerivable\(\);/.test(src));
+    assert.ok(/const known = nonDerivable\.get\(path\.basename\(folder\)\);\s*\n\s*if \(known\) \{\s*\n\s*this\.markUnresolvable\(folder\);/.test(src), 'known shape → negative-cached without a CLI call');
+    assert.ok(/const limit = 3;/.test(src) && /Array\.from\(\{ length: Math\.min\(limit, toResolve\.length\) \}, worker\)/.test(src), 'bounded concurrency');
+    assert.ok(/Not shown in the tree \(folder-based or bundle types, deploy via right-click\): \$\{this\.knownShapeSkips\.join\(', '\)\}/.test(src));
+    assert.ok(/Couldn't resolve metadata type for: \$\{realFailures\.join\(', '\)\}/.test(src), 'real failures keep the error wording');
+  });
+
+  await check('an explicit scan that finds no project retries before believing it; folder changes rescan', () => {
+    assert.ok(/if \(!opts\.silent && isProjectNotFound\(scan\)\) \{\s*\n\s*scan = await retryProjectNotFound\(scan, \(\) => scanWorkspace\(this\.ruleSet\(\)\), DeployPanelProvider\.discoveryRetryDelays/.test(src));
+    assert.ok(/const DISCOVERY_RETRY_DELAYS_MS = \[1500, 4000, 10000\];/.test(src));
+    assert.ok(/static discoveryRetryDelays: number\[\] = DISCOVERY_RETRY_DELAYS_MS;/.test(src), 'harness-overridable');
+    assert.ok(/vscode\.workspace\.onDidChangeWorkspaceFolders\(\(\) => \{\s*\n\s*this\.loadFiles\(\)\.catch/.test(src));
+  });
+
   await check('explicit scans refresh the registry rules, silent rescans reuse them', () => {
     assert.ok(/await this\.ensureRegistryRules\(!opts\.silent\);\s*\n\s*let scan = await scanWorkspace\(this\.ruleSet\(!!opts\.silent\)\)/.test(src));
     assert.ok(/await this\.ensureRegistryRules\(\);\s*\n\s*const scan = await scanWorkspace\(this\.ruleSet\(true\)\)/.test(src), 'context-menu fast scan loads (cached) rules first');

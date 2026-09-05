@@ -45,6 +45,9 @@ export interface FolderRule {
   /** when true, primary files live one folder deeper (e.g. email/<Folder>/<Template>.email) and the
    *  fullName takes the form `Folder/Name`. */
   nested?: boolean;
+  /** flat rule whose fullName keeps the path below the type folder (a nested
+   *  ReportFolder `reports/Parent/Child.reportFolder-meta.xml` is `Parent/Child`). */
+  relName?: boolean;
 }
 
 const RULES: FolderRule[] = [
@@ -81,6 +84,14 @@ const RULES: FolderRule[] = [
   { folder: 'testSuites', type: 'ApexTestSuite', primaryExt: ['.testSuite-meta.xml'] },
   { folder: 'platformEventSubscriberConfigs', type: 'PlatformEventSubscriberConfig', primaryExt: ['.platformEventSubscriberConfig-meta.xml'] },
   { folder: 'email', type: 'EmailTemplate', primaryExt: ['.email'], metaSuffix: '.email-meta.xml', nested: true },
+  // Folder-based types: <dir>/<Folder>/<Name>.<suffix>-meta.xml (fullName
+  // `Folder/Name`), plus the folder's own <dir>/<Folder>.<x>Folder-meta.xml at
+  // depth 1 — the flat rule's recursive walk only ever matches that suffix there.
+  { folder: 'email', type: 'EmailFolder', primaryExt: ['.emailFolder-meta.xml'], relName: true },
+  { folder: 'reports', type: 'Report', primaryExt: ['.report-meta.xml'], nested: true },
+  { folder: 'reports', type: 'ReportFolder', primaryExt: ['.reportFolder-meta.xml'], relName: true },
+  { folder: 'dashboards', type: 'Dashboard', primaryExt: ['.dashboard-meta.xml'], nested: true },
+  { folder: 'dashboards', type: 'DashboardFolder', primaryExt: ['.dashboardFolder-meta.xml'], relName: true },
   // OmniStudio, standard runtime — directoryName/suffix straight from the sf
   // registry. One default-adapter `<fullName>.<suffix>-meta.xml` per component:
   // no content/meta pair, no bundle, no decomposition. Static so the tree never
@@ -213,6 +224,29 @@ export async function discoverProjectRoot(): Promise<ProjectRootDiscovery> {
   };
 }
 
+/** The "not found" discovery outcome, as opposed to "more than one" or "search
+ *  failed": the one worth retrying — at startup VS Code's file search can answer
+ *  empty before it has settled, and a plugin that believes that first answer sits
+ *  on "no project" until the user clicks Refresh. */
+export function isProjectNotFound(scan: { root?: string; projectError?: string }): boolean {
+  return !scan.root && !!scan.projectError && scan.projectError.startsWith('No Salesforce DX project found');
+}
+
+/** Re-run `rescan` after each delay while the result is still "not found".
+ *  `onWait` fires before each wait (banner). Returns the last result. Pure so a
+ *  harness can pass zero delays. */
+export async function retryProjectNotFound<T extends { root?: string; projectError?: string }>(
+  first: T, rescan: () => Promise<T>, delays: number[], onWait?: (attempt: number) => void
+): Promise<T> {
+  let scan = first;
+  for (let i = 0; i < delays.length && isProjectNotFound(scan); i++) {
+    onWait?.(i + 1);
+    await new Promise(resolve => setTimeout(resolve, delays[i]));
+    scan = await rescan();
+  }
+  return scan;
+}
+
 export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<WorkspaceScan> {
   const discovery = await discoverProjectRoot();
   if (!discovery.root) {
@@ -264,25 +298,22 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
           items.push({ type: rule.type, name: path.basename(bundlePath), filePath: bundlePath, files });
         }
       } else if (rule.nested) {
-        // e.g. email/<Folder>/<Template>.email — fullName is `Folder/Template`
-        const folderEntries = await fs.readdir(dir, { withFileTypes: true });
+        // e.g. email/<Folder>/<Template>.email — fullName is `Folder/Template`.
+        // Folders nest (reports/Parent/Child/x.report-meta.xml → `Parent/Child/x`):
+        // walk to any depth and keep every segment below `dir`. A file directly
+        // under `dir` is the folder's own meta (or noise), never a component.
         const primaryExts = rule.primaryExt ?? [];
-        for (const folderEntry of folderEntries) {
-          if (!folderEntry.isDirectory()) continue;
-          const sub = path.join(dir, folderEntry.name);
-          const inner = await fs.readdir(sub, { withFileTypes: true });
-          for (const e of inner) {
-            if (!e.isFile()) continue;
-            const ext = matchExt(e.name, primaryExts);
-            if (!ext) continue;
-            const filePath = path.join(sub, e.name);
-            const localBase = e.name.slice(0, e.name.length - ext.length);
-            const name = `${folderEntry.name}/${localBase}`;
-            const metaPath = rule.metaSuffix ? path.join(sub, localBase + rule.metaSuffix) : undefined;
-            const files = [filePath];
-            if (metaPath && (await pathExists(metaPath))) files.push(metaPath);
-            items.push({ type: rule.type, name, filePath, metaPath: metaPath && (await pathExists(metaPath)) ? metaPath : undefined, files });
-          }
+        for (const filePath of await walkForFilesMatching(dir, primaryExts)) {
+          const rel = path.relative(dir, filePath).split(path.sep);
+          if (rel.length < 2) continue;
+          const base = rel[rel.length - 1];
+          const ext = matchExt(base, primaryExts);
+          if (!ext) continue;
+          const localBase = base.slice(0, base.length - ext.length);
+          const name = [...rel.slice(0, -1), localBase].join('/');
+          const metaPath = rule.metaSuffix ? path.join(path.dirname(filePath), localBase + rule.metaSuffix) : undefined;
+          const metaExists = !!(metaPath && (await pathExists(metaPath)));
+          items.push({ type: rule.type, name, filePath, metaPath: metaExists ? metaPath : undefined, files: metaExists && metaPath ? [filePath, metaPath] : [filePath] });
         }
       } else {
         // Walk recursively — SFDX permits org-hint subfolders under classes/triggers/etc.,
@@ -293,7 +324,12 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
           const ext = matchExt(path.basename(filePath), primaryExts);
           if (!ext) continue;
           const baseName = path.basename(filePath);
-          const name = baseName.slice(0, baseName.length - ext.length);
+          const stem = baseName.slice(0, baseName.length - ext.length);
+          // relName: a nested folder object keeps its path (`Parent/Child`);
+          // everything else flattens to the stem (org-hint subfolders).
+          const name = rule.relName
+            ? [...path.relative(dir, filePath).split(path.sep).slice(0, -1), stem].join('/')
+            : stem;
           const parentDir = path.dirname(filePath);
           const metaPath = rule.metaSuffix ? path.join(parentDir, name + rule.metaSuffix) : undefined;
           const files = [filePath];

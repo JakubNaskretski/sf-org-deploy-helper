@@ -3,6 +3,24 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.22.1
+
+- Fixed: **"No Salesforce DX project found" right after startup no longer sticks.** The first
+  scan could run before the editor's file search had settled, and the panel then believed that
+  empty answer until you clicked Refresh. An explicit scan that finds nothing now retries a few
+  times with a "Looking for a Salesforce DX project…" notice, and a workspace folder restored
+  later triggers a scan on its own.
+- Fixed: **Assignment, auto-response, escalation, matching and sharing rules show in the tree.**
+  Their folders were being sent to the CLI for type resolution on every cache expiry although the
+  CLI's own registry already describes them; they are now recognized outright.
+- New: **Reports, dashboards and their folders show in the tree**, named `Folder/Name` like
+  email templates.
+- Changed: **Folders whose shape cannot be listed are named for what they are.** Bundle,
+  mixed-content and folder-based types the registry identifies (experience bundles, documents,
+  bots…) are no longer sent to the CLI to fail, and the banner says "Not shown in the tree
+  (folder-based or bundle types)" with the type name, instead of "Couldn't resolve metadata
+  type". The remaining genuine resolutions run three at a time instead of one after another.
+
 ## 0.22.0
 
 - New: **The panel opens with your org badges already in place.** Org membership is remembered

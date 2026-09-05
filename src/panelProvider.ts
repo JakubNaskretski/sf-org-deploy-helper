@@ -6,8 +6,11 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
-import { loadRegistryRules, registryRulesSource } from './registryRules';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
+
+/** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
+const DISCOVERY_RETRY_DELAYS_MS = [1500, 4000, 10000];
 import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTargetsKey } from './fileWatch';
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
@@ -389,6 +392,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // view between "uncommitted only" and "differs from <ref>" without a rescan.
     // Fire-and-forget: postChangedComponents never throws. Disposed with the
     // extension via context.subscriptions.
+    // Folders restored or added after activation: the ready-time scan may have
+    // run against an empty workspace — scan again instead of waiting for a click.
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      this.loadFiles().catch(() => undefined);
+    }));
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('sfOrgDeployWrapper.changedBaseRef')) void this.postChangedComponents();
       if (e.affectsConfiguration('sfOrgDeployWrapper.ignoreDeployConflicts')) this.postIgnoreDeployConflicts();
@@ -1303,6 +1311,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  PATH, in which case the static + learned + CLI-manifest path is unchanged. */
   private registryRules: FolderRule[] = [];
   private registryRulesLoaded = false;
+  /** Backoff for the startup "no project" retry. Static so a harness that
+   *  drives the real provider against a stub with no project can zero it. */
+  static discoveryRetryDelays: number[] = DISCOVERY_RETRY_DELAYS_MS;
 
   private async ensureRegistryRules(refresh = false): Promise<void> {
     if (this.registryRulesLoaded && !refresh) return;
@@ -1407,7 +1418,40 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private async learnRulesForFolders(folders: string[], root: string): Promise<FolderRule[]> {
     const learned: FolderRule[] = [];
     this.resolveErrorSample = undefined;
+    this.knownShapeSkips = [];
+    // Folders the registry already identifies as folder-based / bundle / mixed
+    // content: no per-file rule can come out of the CLI call, so don't spawn it —
+    // remember the type for the banner and negative-cache the folder as before.
+    const nonDerivable = registryNonDerivable();
+    const toResolve: string[] = [];
     for (const folder of folders) {
+      const known = nonDerivable.get(path.basename(folder));
+      if (known) {
+        this.markUnresolvable(folder);
+        this.knownShapeSkips.push(`${path.basename(folder)} (${known})`);
+        this.output.appendLine(`[typeResolve] ${path.basename(folder)}: ${known} — folder-based or bundle shape, not shown in tree (deploy via right-click still works)`);
+      } else toResolve.push(folder);
+    }
+    // The remaining CLI calls run a few at a time instead of one after another:
+    // ten unknown folders used to mean ten sequential spawns.
+    const limit = 3;
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < toResolve.length) {
+        const folder = toResolve[next++];
+        await this.learnRuleForFolder(folder, root, learned);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, toResolve.length) }, worker));
+    return learned;
+  }
+
+  /** Folders the last explicit scan skipped because the registry knows their
+   *  shape can't yield a per-file rule — `<folder> (<Type>)`, for the banner. */
+  private knownShapeSkips: string[] = [];
+
+  private async learnRuleForFolder(folder: string, root: string, learned: FolderRule[]): Promise<void> {
+    {
       const label = path.basename(folder);
       try {
         const xml = await this.sf.generateManifest([folder], root);
@@ -1439,7 +1483,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.output.appendLine(`[typeResolve] ${label}: ${msg}`);
       }
     }
-    return learned;
   }
 
   /** Last-resort resolution for a single clicked file the rules don't cover: ask
@@ -1510,6 +1553,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // window reload), cached for the watcher's silent rescans.
     await this.ensureRegistryRules(!opts.silent);
     let scan = await scanWorkspace(this.ruleSet(!!opts.silent));
+    // An explicit scan that finds NO project retries with backoff before
+    // believing it: at startup VS Code's file search can answer empty before it
+    // has settled, and the panel then sat on "no project" until a manual
+    // refresh. The banner says what is going on meanwhile.
+    if (!opts.silent && isProjectNotFound(scan)) {
+      scan = await retryProjectNotFound(scan, () => scanWorkspace(this.ruleSet()), DeployPanelProvider.discoveryRetryDelays,
+        attempt => this.post({ type: 'scanBanner', message: `Looking for a Salesforce DX project (sfdx-project.json)… attempt ${attempt + 1}` }));
+    }
     if (scan.projectError || !scan.root) {
       // A background rescan must never ESCALATE a discovery failure. Emptying the
       // tree, dropping org metadata and popping an error toast because a stray
@@ -1568,10 +1619,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
       resolveFailures = pending.filter(f => this.unresolvable().has(foldPathKey(f))).map(f => path.basename(f));
     }
-    const scanNotice = resolveFailures.length
-      ? `Couldn't resolve metadata type for: ${resolveFailures.join(', ')}` +
+    // Two different messages: a folder whose shape the registry KNOWS can't be
+    // shown (honest, permanent) versus a folder the CLI could not resolve
+    // (an error, retried on the next explicit refresh).
+    const skippedSet = new Set((this.knownShapeSkips ?? []).map(s => s.slice(0, s.indexOf(' ('))));
+    const realFailures = resolveFailures.filter(f => !skippedSet.has(f));
+    const notices: string[] = [];
+    if ((this.knownShapeSkips ?? []).length) notices.push(`Not shown in the tree (folder-based or bundle types, deploy via right-click): ${this.knownShapeSkips.join(', ')}`);
+    if (realFailures.length) {
+      notices.push(`Couldn't resolve metadata type for: ${realFailures.join(', ')}` +
         (this.resolveErrorSample ? ` — ${this.resolveErrorSample}` : '') +
-        (this.resolveErrorSample && hintForError(new Error(this.resolveErrorSample)) ? ` — ${hintForError(new Error(this.resolveErrorSample))}` : '')
+        (this.resolveErrorSample && hintForError(new Error(this.resolveErrorSample)) ? ` — ${hintForError(new Error(this.resolveErrorSample))}` : ''));
+    }
+    const scanNotice = notices.length
+      ? notices.join(' · ')
       : scan.warning ?? (scan.items.length === 0 && scan.root ? 'No metadata found in workspace package directories.' : '');
     this.post({ type: 'scanBanner', message: scanNotice });
     const { items, root } = scan;

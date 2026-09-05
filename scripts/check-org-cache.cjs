@@ -43,7 +43,8 @@ const vscodeStub = {
   },
   workspace: {
     getConfiguration: () => ({ get: (k, fallback) => (k in cfg ? cfg[k] : fallback) }),
-    onDidChangeConfiguration: () => ({ dispose: () => {} })
+    onDidChangeConfiguration: () => ({ dispose: () => {} }),
+    onDidChangeWorkspaceFolders: () => ({ dispose: () => {} })
   },
   Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
@@ -53,6 +54,9 @@ const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const { DeployPanelProvider, vetOrgSnapshot } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+// This harness's stub finds no project; the startup "no project" retry (0.22.1)
+// would otherwise wait 15s inside every ready.
+DeployPanelProvider.discoveryRetryDelays = [];
 const { SfCliError } = require(path.join(__dirname, '..', 'out', 'sfCliService.js'));
 const proto = DeployPanelProvider.prototype;
 const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');

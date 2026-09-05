@@ -67,10 +67,12 @@ export function rulesFromRegistry(registry: unknown, staticFolders: ReadonlySet<
     if (!t || typeof t !== 'object' || childIds.has(id)) continue;
     const { name, directoryName, suffix } = t;
     // Default adapter only. Bundles (lwc), mixedContent (staticresources),
-    // matchingContentFile (classes), decomposed (objects), folder types
-    // (reports) and parents with children (labels) all have other shapes.
+    // matchingContentFile (classes), decomposed (objects) and folder types
+    // (reports) have other shapes. A parent with children but no strategy
+    // (AssignmentRules, MatchingRules, SharingRules, EscalationRules…) is still
+    // ONE `<name>.<suffix>-meta.xml` — the children are elements inside it.
     const adapter = (t.strategies as { adapter?: unknown } | undefined)?.adapter;
-    if ((t.strategies && adapter !== 'default') || t.inFolder || t.children) continue;
+    if ((t.strategies && adapter !== 'default') || t.inFolder) continue;
     if (typeof name !== 'string' || typeof directoryName !== 'string' || typeof suffix !== 'string') continue;
     if (!TOKEN.test(name) || !DIR_TOKEN.test(directoryName) || !TOKEN.test(suffix)) continue;
     if (staticFolders.has(directoryName)) continue;
@@ -84,7 +86,29 @@ export function rulesFromRegistry(registry: unknown, staticFolders: ReadonlySet<
   return out;
 }
 
-let cached: { registryPath: string | undefined; rules: FolderRule[] } | undefined;
+/** Folders the registry KNOWS cannot yield a per-file rule — folder-based
+ *  types (documents), bundles, mixed/matching content, decomposed types — keyed
+ *  by directoryName → type name. The scanner uses this to skip the CLI call
+ *  that could only fail, and to tell the user the honest reason. Static
+ *  folders are excluded (they have their own shape rules). */
+export function nonDerivableFolders(registry: unknown, staticFolders: ReadonlySet<string>): Map<string, string> {
+  const r = registry as { types?: Record<string, RegistryType>; childTypes?: Record<string, unknown> } | null;
+  const out = new Map<string, string>();
+  if (!r || typeof r !== 'object' || !r.types || typeof r.types !== 'object') return out;
+  const childIds = new Set(Object.keys(r.childTypes && typeof r.childTypes === 'object' ? r.childTypes : {}));
+  for (const [id, t] of Object.entries(r.types)) {
+    if (!t || typeof t !== 'object' || childIds.has(id)) continue;
+    const { name, directoryName } = t;
+    if (typeof name !== 'string' || typeof directoryName !== 'string' || !TOKEN.test(name) || !DIR_TOKEN.test(directoryName)) continue;
+    if (staticFolders.has(directoryName)) continue;
+    const adapter = (t.strategies as { adapter?: unknown } | undefined)?.adapter;
+    const derivable = !(t.strategies && adapter !== 'default') && !t.inFolder;
+    if (!derivable && !out.has(directoryName)) out.set(directoryName, name);
+  }
+  return out;
+}
+
+let cached: { registryPath: string | undefined; rules: FolderRule[]; nonDerivable: Map<string, string> } | undefined;
 
 /** Session cache: explicit scans pass `refresh` (a CLI upgrade lands without a
  *  reload), silent rescans reuse. Any failure — no CLI, unreadable or malformed
@@ -94,17 +118,29 @@ export async function loadRegistryRules(staticFolders: ReadonlySet<string>, opts
   if (cached && !opts.refresh) return cached.rules;
   let registryPath: string | undefined;
   let rules: FolderRule[] = [];
+  let nonDerivable = new Map<string, string>();
   try {
     registryPath = await locateRegistry();
-    if (registryPath) rules = rulesFromRegistry(JSON.parse(await fs.readFile(registryPath, 'utf8')), staticFolders);
+    if (registryPath) {
+      const registry: unknown = JSON.parse(await fs.readFile(registryPath, 'utf8'));
+      rules = rulesFromRegistry(registry, staticFolders);
+      nonDerivable = nonDerivableFolders(registry, staticFolders);
+    }
   } catch {
     rules = [];
+    nonDerivable = new Map();
   }
-  cached = { registryPath, rules };
+  cached = { registryPath, rules, nonDerivable };
   return rules;
 }
 
 /** Where the rules came from, for the output channel. */
 export function registryRulesSource(): string | undefined {
   return cached?.registryPath;
+}
+
+/** directoryName → type for folders the registry says can't yield a per-file
+ *  rule (empty until loadRegistryRules ran, or when no CLI was found). */
+export function registryNonDerivable(): ReadonlyMap<string, string> {
+  return cached?.nonDerivable ?? new Map();
 }

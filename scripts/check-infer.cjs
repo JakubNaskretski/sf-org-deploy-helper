@@ -20,7 +20,7 @@ const vscodeStub = {
 };
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { inferItemForPath, parseManifestTypes, deriveRule, deriveRulesForTypes, findItemForPath, foldPathKey, detectMissingDependencies, selectProjectRoot, listMetaFileNames, detectDataPackExports, scanWorkspace, DATAPACK_WARNING } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { inferItemForPath, parseManifestTypes, deriveRule, deriveRulesForTypes, findItemForPath, isProjectNotFound, retryProjectNotFound, foldPathKey, detectMissingDependencies, selectProjectRoot, listMetaFileNames, detectDataPackExports, scanWorkspace, DATAPACK_WARNING } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep); // build OS-native paths
 let failed = 0;
 
@@ -328,6 +328,50 @@ try {
     assert.strictEqual(again.warning, DATAPACK_WARNING, 'the scan carries the DataPack warning');
     assert.strictEqual(again.items.length, 5, 'DataPack exports never become items');
   } catch (e) { failed++; console.error('FAIL scanWorkspace (OmniStudio):', e.message); }
+
+  // Folder-based types (0.22.1): reports/dashboards/email folders — nested
+  // `Folder/Name` components plus the folder's own depth-1 meta file.
+  try {
+    const proj = path.join(tmp, 'folders');
+    const pkg = 'folders/force-app/main/default/'; // w() resolves relative to tmp
+    await w('folders/sfdx-project.json', JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }] }));
+    await w(pkg + 'reports/Acme_Reports.reportFolder-meta.xml');
+    await w(pkg + 'reports/Acme_Reports/Pipeline.report-meta.xml');
+    await w(pkg + 'reports/Acme_Reports/Sub.reportFolder-meta.xml');
+    await w(pkg + 'reports/Acme_Reports/Sub/Deep.report-meta.xml'); // nested folder → Folder/Sub/Deep
+    await w(pkg + 'dashboards/Acme_Dash.dashboardFolder-meta.xml');
+    await w(pkg + 'dashboards/Acme_Dash/Exec.dashboard-meta.xml');
+    await w(pkg + 'email/Acme_Mail.emailFolder-meta.xml');
+    await w(pkg + 'email/Acme_Mail/Welcome.email');
+    await w(pkg + 'email/Acme_Mail/Welcome.email-meta.xml');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'folders', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const scan = await scanWorkspace();
+    assert.deepStrictEqual(scan.unknownFolders, [], 'reports/dashboards/email are static now');
+    assert.deepStrictEqual(scan.items.map(i => `${i.type}:${i.name}`).sort(), [
+      'Dashboard:Acme_Dash/Exec', 'DashboardFolder:Acme_Dash', 'EmailFolder:Acme_Mail', 'EmailTemplate:Acme_Mail/Welcome',
+      'Report:Acme_Reports/Pipeline', 'Report:Acme_Reports/Sub/Deep', 'ReportFolder:Acme_Reports', 'ReportFolder:Acme_Reports/Sub'
+    ]);
+    const mail = scan.items.find(i => i.type === 'EmailTemplate');
+    assert.ok(mail.metaPath && mail.files.length === 2, 'nested content+meta pair still paired');
+  } catch (e) { failed++; console.error('FAIL scanWorkspace (folder-based types):', e.message); }
+
+  // Discovery retry (0.22.1): only the "not found" outcome is retried.
+  try {
+    const notFound = { projectError: 'No Salesforce DX project found in this workspace. Expected exactly one sfdx-project.json.' };
+    const tooMany = { projectError: 'Found more than one Salesforce DX project in this workspace.' };
+    const found = { root: '/ws' };
+    assert.ok(isProjectNotFound(notFound) && !isProjectNotFound(tooMany) && !isProjectNotFound(found) && !isProjectNotFound({ projectError: 'No workspace folder is open.' }));
+    let calls = 0; const waits = [];
+    const r1 = await retryProjectNotFound(notFound, async () => (++calls === 2 ? found : notFound), [0, 0, 0], a => waits.push(a));
+    assert.strictEqual(r1, found); assert.strictEqual(calls, 2); assert.deepStrictEqual(waits, [1, 2]);
+    calls = 0;
+    const r2 = await retryProjectNotFound(notFound, async () => { calls++; return notFound; }, [0, 0], () => {});
+    assert.strictEqual(r2, notFound); assert.strictEqual(calls, 2, 'gives up after the delays are spent');
+    calls = 0;
+    assert.strictEqual(await retryProjectNotFound(tooMany, async () => { calls++; return found; }, [0]), tooMany); assert.strictEqual(calls, 0, 'other failures are not retried');
+    assert.strictEqual(await retryProjectNotFound(found, async () => { calls++; return notFound; }, [0]), found); assert.strictEqual(calls, 0);
+  } catch (e) { failed++; console.error('FAIL retryProjectNotFound:', e.message); }
 
   await fsp.rm(tmp, { recursive: true, force: true });
   if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
