@@ -29,6 +29,7 @@
 //      context menu explicitly matches lwc/aura paths) and an all-missing run both
 //      reach the notification, and a run that opened editors does not.
 const path = require('path');
+const fs = require('fs');
 const assert = require('assert');
 const Module = require('module');
 
@@ -83,14 +84,15 @@ const vscodeStub = {
   workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   Uri: { file: (fsPath) => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
-  ProgressLocation: { Notification: 15 }
+  ProgressLocation: { Notification: 15, Window: 10 }
 };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const {
-  DeployPanelProvider, classifyDiffOutcome, nothingDiffableNotice
+  DeployPanelProvider, classifyDiffOutcome, nothingDiffableNotice, notifyHeadline
 } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
 
 let failed = 0;
 // Checks are queued and run in order: several of them drive the real runDiff and
@@ -504,6 +506,216 @@ check('WIRING: a cancel carrying a NOTE surfaces it — the click does not imply
     'SF Deploy (warning): Deploy to acme-dev cancelled — The org-side deploy may still complete — check the org.'
   ]);
   assert.strictEqual(ui.notices.length, 0, 'the org may still be deploying — this one waits to be read');
+});
+
+// ============================================================ notify() — the flood gate
+// The 0.22.1 report: at panel open, several PERSISTENT toasts land within the same
+// few seconds — a project-discovery error, a Fetch Org failure, the org-list
+// warning, the once-per-session watcher/diff-float notices, all stacking in VS
+// Code's non-scrollable notification area until it is unreadable. failureToast,
+// reportError, reportDeployTimeout, applyProjectDiscoveryFailure, the org-list
+// warning, the watcher warning and the diff-float notice now all go through one
+// gate, notify(), pinned here:
+//   1. the headline shown is the first non-empty line only, ANSI-stripped and
+//      whitespace-collapsed, capped at 140 chars — a multi-line CLI error can no
+//      longer render as a wall of text in a toast;
+//   2. a VISIBLE panel (the card is already on screen) gets a status-bar line,
+//      never a toast — the same rule notifyIfPanelHidden already applies to
+//      verdicts, extended to this gate;
+//   3. an identical headline within 60s is suppressed and counted, not re-shown;
+//   4. more than 3 toasts within 10s collapse the rest into ONE summary toast
+//      pointing at the Output channel, since VS Code cannot update one already
+//      on screen.
+// notify()'s de-dup/rate-limit windows are real seconds/minutes of wall time, so
+// the checks below drive it through an overridable now() (a plain field on the
+// stub, exactly like withWindowProgress/reserveBusy elsewhere in this file) —
+// the same trick as RescanScheduler's injected clock, without which this script
+// would have to actually sleep 70+ seconds.
+const notifyFn = DeployPanelProvider.prototype.notify;
+const withWindowProgress = DeployPanelProvider.prototype.withWindowProgress;
+
+function clockedProvider(view) {
+  const log = [];
+  let now = 0;
+  const p = Object.assign(Object.create(DeployPanelProvider.prototype), {
+    view,
+    output: { appendLine: (l) => log.push(l), show: () => {} },
+    now: () => now
+  });
+  return { p, log, advance: (ms) => { now += ms; } };
+}
+
+check('notifyHeadline: first non-empty line only, ANSI stripped, whitespace collapsed', () => {
+  assert.strictEqual(notifyHeadline('[31mLine one[0m\nLine two'), 'Line one');
+  assert.strictEqual(notifyHeadline('\n\n  \n  padded   line   here  \nmore'), 'padded line here');
+  assert.strictEqual(notifyHeadline(''), '');
+});
+
+check('notifyHeadline: capped at 140 chars with an ellipsis, and never longer', () => {
+  const long = 'x'.repeat(200);
+  const headline = notifyHeadline(long);
+  assert.strictEqual(headline.length, 140, 'a capped headline must still fit in one toast line');
+  assert.ok(headline.endsWith('…'));
+  assert.strictEqual(headline.slice(0, 139), 'x'.repeat(139));
+  assert.strictEqual(notifyHeadline('y'.repeat(140)), 'y'.repeat(140), 'exactly at the cap is left alone');
+});
+
+check('notify: a VISIBLE panel gets the status bar, never a toast — the card is on screen', () => {
+  resetUi();
+  const { p } = clockedProvider({ visible: true });
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev', { buttons: ['Show Panel', 'Show Output'] });
+  assert.deepStrictEqual(ui.status[0], { text: '$(error) SF Deploy: Fetch Org failed against acme-dev', ms: 8000 });
+  assert.deepStrictEqual([ui.error.length, ui.warn.length, ui.info.length], [0, 0, 0]);
+});
+
+check('notify: the status-bar icon matches the kind', () => {
+  resetUi();
+  const { p } = clockedProvider({ visible: true });
+  notifyFn.call(p, 'warn', 'live file watching is off');
+  notifyFn.call(p, 'info', "couldn't open the diff in its own window");
+  assert.strictEqual(ui.status[0].text, '$(warning) SF Deploy: live file watching is off');
+  assert.strictEqual(ui.status[1].text, "$(info) SF Deploy: couldn't open the diff in its own window");
+});
+
+check('notify: force shows a toast even with the panel visible', () => {
+  resetUi();
+  const { p } = clockedProvider({ visible: true });
+  notifyFn.call(p, 'error', 'Forced notice', { force: true });
+  assert.strictEqual(ui.status.length, 0);
+  assert.strictEqual(ui.error.length, 1);
+});
+
+check('notify: hidden panel toasts, with exactly the buttons the caller asked for', () => {
+  resetUi();
+  const { p } = clockedProvider(undefined);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev', { buttons: ['Show Panel', 'Show Output'] });
+  assert.deepStrictEqual(ui.error[0], { message: 'SF Deploy: Fetch Org failed against acme-dev', items: ['Show Panel', 'Show Output'] });
+});
+
+check('notify: a never-opened panel (view undefined) toasts too', () => {
+  resetUi();
+  const { p } = clockedProvider(undefined);
+  notifyFn.call(p, 'warn', 'No authenticated Salesforce orgs found.');
+  assert.strictEqual(ui.warn.length, 1);
+});
+
+check('notify: a multi-line message toasts only its first line — the rest stays in Output/card', () => {
+  resetUi();
+  const { p } = clockedProvider(undefined);
+  notifyFn.call(p, 'error', 'Deploy to acme-dev failed. Line one of stderr\nLine two of stderr\nLine three');
+  assert.strictEqual(ui.error[0].message, 'SF Deploy: Deploy to acme-dev failed. Line one of stderr');
+});
+
+// ---------------------------------------------------------- de-duplication (60s)
+check('notify: an identical headline within 60s is suppressed and counted, not re-shown', () => {
+  resetUi();
+  const { p, log, advance } = clockedProvider(undefined);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev');
+  advance(30_000);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev');
+  advance(29_000);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev');
+  assert.strictEqual(ui.error.length, 1, 'a repeat within 60s must not toast again');
+  assert.ok(log.some(l => l.includes('[notify] suppressed duplicate ×2')), log.join(' | '));
+});
+
+check('notify: the same headline AFTER 60s toasts again', () => {
+  resetUi();
+  const { p, advance } = clockedProvider(undefined);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev');
+  advance(60_001);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev');
+  assert.strictEqual(ui.error.length, 2);
+});
+
+check('notify: a DIFFERENT headline is never suppressed', () => {
+  resetUi();
+  const { p } = clockedProvider(undefined);
+  notifyFn.call(p, 'error', 'Fetch Org failed against acme-dev');
+  notifyFn.call(p, 'error', 'Deploy to acme-dev failed');
+  assert.strictEqual(ui.error.length, 2);
+});
+
+// ---------------------------------------------------------- rate limit (10s / 3)
+check('notify: more than 3 toasts within 10s collapse the rest into ONE summary', () => {
+  resetUi();
+  const { p, log, advance } = clockedProvider(undefined);
+  for (let i = 0; i < 6; i++) {
+    advance(1); // distinct headlines each time so 60s de-dup never masks this
+    notifyFn.call(p, 'error', `Failure #${i}`);
+  }
+  assert.strictEqual(ui.error.length, 3, 'only the first 3 in the window may toast individually');
+  assert.strictEqual(ui.warn.length, 1, 'the rest of the window collapses into one summary');
+  assert.ok(/SF Deploy: \d+ more notices? — see Output/.test(ui.warn[0].message), ui.warn[0].message);
+  assert.deepStrictEqual(ui.warn[0].items, ['Show Output']);
+  assert.ok(log.some(l => l.includes('[notify] rate-limited ×3 this window')),
+    'the Output channel must keep counting even after the one summary toast');
+});
+
+check('notify: the summary shows once per 10s window; a later window earns its own', () => {
+  resetUi();
+  const { p, advance } = clockedProvider(undefined);
+  for (let i = 0; i < 5; i++) { advance(1); notifyFn.call(p, 'error', `Burst A #${i}`); }
+  assert.strictEqual(ui.warn.length, 1);
+  advance(10_001); // the overflow window has fully elapsed
+  for (let i = 0; i < 5; i++) { advance(1); notifyFn.call(p, 'error', `Burst B #${i}`); }
+  assert.strictEqual(ui.warn.length, 2, 'a fresh flood 10s later earns its own summary');
+});
+
+check('notify: the visible-panel path never counts against the toast rate limit', () => {
+  resetUi();
+  const { p } = clockedProvider({ visible: true });
+  for (let i = 0; i < 6; i++) notifyFn.call(p, 'error', `Status-only #${i}`);
+  assert.strictEqual(ui.status.length, 6, 'status-bar updates are not toasts and must not be throttled');
+  assert.deepStrictEqual([ui.error.length, ui.warn.length], [0, 0]);
+});
+
+// ---------------------------------------------------- quiet progress (Window vs Notification)
+check('withWindowProgress: the default is a cancellable Notification', () => {
+  resetUi();
+  const p = Object.assign(Object.create(DeployPanelProvider.prototype), { cancelCurrent: () => {} });
+  withWindowProgress.call(p, 'Doing a thing', () => Promise.resolve('ok'));
+  assert.strictEqual(ui.notices[0].options.location, vscodeStub.ProgressLocation.Notification);
+  assert.strictEqual(ui.notices[0].options.cancellable, true);
+});
+
+check('withWindowProgress: quiet uses the status-bar spinner, no Cancel button', () => {
+  resetUi();
+  const p = Object.assign(Object.create(DeployPanelProvider.prototype), { cancelCurrent: () => {} });
+  withWindowProgress.call(p, 'Fetching metadata from acme-dev', () => Promise.resolve('ok'), { quiet: true });
+  assert.strictEqual(ui.notices[0].options.location, vscodeStub.ProgressLocation.Window);
+  assert.strictEqual(ui.notices[0].options.cancellable, false);
+});
+
+// The two places quiet must reach, and nowhere else — source-pinned, since driving
+// loadOrgMetadata for real needs the full sf.listMetadata/org-store rig that
+// check-fetch-org.cjs already owns (its `run()` calls it with no args, so the new
+// `quiet = false` default leaves every one of its checks exactly as before).
+check('source: exactly one call site passes { quiet } — loadOrgMetadata\'s own progress', () => {
+  const count = (providerSrc.match(/\}, \{ quiet \}\);/g) || []).length;
+  assert.strictEqual(count, 1, 'loadOrgMetadata must pass quiet to its own withWindowProgress call, and nowhere else');
+  const i = providerSrc.indexOf('`Fetching metadata from ${orgLabel}`');
+  assert.ok(i > 0 && providerSrc.slice(i, i + 3000).includes('}, { quiet });'),
+    'the quiet flag must reach the Fetch Org progress notification');
+});
+
+check('source: exactly one call site hardcodes { quiet: true } — background type resolution', () => {
+  const count = (providerSrc.match(/, \{ quiet: true \}\);/g) || []).length;
+  assert.strictEqual(count, 1, 'only the background registry resolution may hardcode quiet');
+  const i = providerSrc.indexOf("'Resolving metadata types (sf registry)'");
+  assert.ok(i > 0 && providerSrc.slice(i, i + 300).includes('{ quiet: true }'),
+    'the ordinary-scan type-resolution progress must be quiet, not a Notification');
+});
+
+check('source: the automatic Fetch Org on open requests quiet; a manual click does not', () => {
+  const autoIdx = providerSrc.indexOf('private maybeAutoFetchOrg');
+  assert.ok(autoIdx > 0, 'maybeAutoFetchOrg not found');
+  assert.ok(/this\.loadOrgMetadata\(true\)/.test(providerSrc.slice(autoIdx, autoIdx + 1400)),
+    'maybeAutoFetchOrg must fetch quietly — a Notification firing unasked at panel open is the flood itself');
+  const manualIdx = providerSrc.indexOf("case 'fetchOrgMetadata':");
+  assert.ok(manualIdx > 0, "'fetchOrgMetadata' case not found");
+  assert.ok(/this\.loadOrgMetadata\(\);/.test(providerSrc.slice(manualIdx, manualIdx + 400)),
+    'a manual Fetch Org click must keep the full cancellable Notification');
 });
 
 void (async () => {

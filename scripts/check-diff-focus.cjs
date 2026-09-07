@@ -178,7 +178,9 @@ check('source: the once-per-session flag is declared, and the toast sits inside 
   const catchBlock = providerSrc.slice(i, i + 400);
   assert.ok(/if \(!this\.diffFloatWarned\) \{/.test(catchBlock), 'toast must be gated on the flag');
   assert.ok(/this\.diffFloatWarned = true;/.test(catchBlock), 'the flag must be set before/inside the toast, not after');
-  assert.ok(/vscode\.window\.showInformationMessage\(/.test(catchBlock), 'the toast call itself must be inside the catch');
+  // The toast itself now goes through the shared notify() gate (flood fix) rather
+  // than calling vscode.window.showInformationMessage directly.
+  assert.ok(/this\.notify\('info', /.test(catchBlock), 'the toast call itself must be inside the catch');
 });
 
 // ------------------------------------------------------------------- checks

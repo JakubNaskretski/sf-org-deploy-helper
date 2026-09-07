@@ -259,6 +259,16 @@ const WATCH_DEBOUNCE_MS = 600;
  *  progress notification from the Notification Center entirely). */
 const NOTICE_AUTO_DISMISS_MS = 20_000;
 
+/** notify()'s tuning: a toast headline is capped so one line of a multi-line CLI
+ *  message can never read as the whole message; an identical headline within
+ *  NOTIFY_DEDUPE_MS is noise, not news; and more than NOTIFY_RATE_LIMIT toasts
+ *  within NOTIFY_RATE_WINDOW_MS is the flood itself — the rest of that window
+ *  collapses into one summary. */
+const NOTIFY_HEADLINE_MAX = 140;
+const NOTIFY_DEDUPE_MS = 60_000;
+const NOTIFY_RATE_WINDOW_MS = 10_000;
+const NOTIFY_RATE_LIMIT = 3;
+
 interface BackupManifest { at: number; org: string; fileCount: number; workspaceRoot: string }
 /** One backup offered for restore: its on-disk dir plus the manifest fields. */
 interface BackupEntry { dir: string; at: number; org: string; fileCount: number }
@@ -356,6 +366,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  toast once per session (see runDiff); every failure after the first still
    *  logs. Diffs still open fine as tabs either way. */
   private diffFloatWarned = false;
+  /** notify()'s bookkeeping — the last headline shown/suppressed (60s de-dup)
+   *  and the timestamps of toasts actually shown (10s flood rate-limit), plus
+   *  the current overflow-summary window. Lazily created, like
+   *  noticeDismissers, so a bare test stub never needs to seed them. */
+  private notifyDedupe?: { headline: string; at: number; count: number };
+  private notifyToastTimes?: number[];
+  private notifyOverflow?: { windowStart: number; count: number };
   /** Collapses watcher notifications into one debounced, silent rescan. */
   private readonly rescanScheduler: RescanScheduler;
 
@@ -1237,7 +1254,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('fetchOrgOnOpen', true)) return;
     if (this.busy) return;
     this.autoFetchDone = true;
-    void this.loadOrgMetadata().catch(err =>
+    // Quiet: nobody clicked this — a Notification (with its own Cancel button)
+    // firing unasked at panel open is the flood being fixed here. The panel's own
+    // Cancel still reaches it (cancelCurrent is wired before withWindowProgress
+    // starts, independent of which progress UI is showing).
+    void this.loadOrgMetadata(true).catch(err =>
       this.output.appendLine(`[Fetch Org] auto-fetch failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
@@ -1280,7 +1301,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (this.orgMembersOrg && this.orgStore.get() !== this.orgMembersOrg) this.resetOrgMetadata();
     this.postOrgs();
     if (notify && this.orgs.length === 0) {
-      vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
+      this.notify('warn', 'No authenticated Salesforce orgs found.');
     } else if (notify) {
       // An unchanged list re-renders identically — say it finished.
       vscode.window.setStatusBarMessage(`$(check) SF Deploy: org list refreshed — ${this.orgs.length} org${this.orgs.length === 1 ? '' : 's'}`, 4000);
@@ -1609,7 +1630,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const scanRoot = scan.root;
       // Under window progress — this spawns `sf` (30s timeout per folder) and
       // would otherwise stall the tree with zero feedback on panel open/refresh.
-      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot));
+      // Quiet: this fires on an ordinary panel open/refresh, not a deliberate
+      // "resolve types" click, so a Notification here is exactly the flood a
+      // status-bar spinner exists to replace.
+      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot), { quiet: true });
       // Fresh rules are passed directly (not just via the cache) so the rescan
       // sees them even with typeCacheDays 0.
       if (fresh.length) scan = await scanWorkspace([...this.ruleSet(), ...fresh]);
@@ -1715,7 +1739,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // noticing before that. Every subsequent failure this session still logs above.
       if (!this.watchFailureWarned) {
         this.watchFailureWarned = true;
-        void vscode.window.showWarningMessage("SF Deploy: live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
+        this.notify('warn', "live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
       }
     }
   }
@@ -1768,7 +1792,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Root ambiguity is a hard blocker, not the dismissible scan notice used for
     // individual metadata folders the registry could not classify.
     this.post({ type: 'banner', message });
-    if (isNew) vscode.window.showErrorMessage(`SF Deploy: ${message}`);
+    if (isNew) this.notify('error', message);
   }
 
   private clearProjectDiscoveryError(): void {
@@ -4066,7 +4090,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             // one toast so the setting doesn't look broken with no explanation.
             if (!this.diffFloatWarned) {
               this.diffFloatWarned = true;
-              void vscode.window.showInformationMessage("SF Deploy: couldn't open the diff in its own window — it stayed as a tab.");
+              this.notify('info', "couldn't open the diff in its own window — it stayed as a tab.");
             }
           });
         };
@@ -4341,7 +4365,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.postOrgs();
   }
 
-  private async loadOrgMetadata(): Promise<void> {
+  /** `quiet` is set by the automatic Fetch Org on open (maybeAutoFetchOrg) — see
+   *  its own call site. A manual click ('fetchOrgMetadata' from the webview)
+   *  leaves it false and keeps the full cancellable Notification. */
+  private async loadOrgMetadata(quiet = false): Promise<void> {
     // No await between this check and setBusy below (requireRoot/Org and config
     // reads are synchronous), so reserving here is race-free. reserveBusy keeps the
     // "already running" messaging consistent with the other ops.
@@ -4449,7 +4476,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         };
         await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
         if (fetchCancelled) throw new SfCliCancelledError();
-      });
+      }, { quiet });
 
       // If the user switched the target org while this fetch was in flight, the
       // result describes the wrong org — discard it rather than badge org B's tree
@@ -4665,6 +4692,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The "already running" info-message, shared by reserveBusy and the palette-only
    *  commands (refreshFiles/pickOrg) that must refuse mid-op WITHOUT taking the slot. */
   private notifyBusy(): void {
+    // NOT routed through notify(): this is the direct, synchronous answer to a
+    // click the user just made (not a background event), so it must always be
+    // visible regardless of the panel-visible rule — check-double-click.cjs
+    // pins this feedback on every refused click.
     vscode.window.showInformationMessage(this.currentAction
       ? `${this.currentAction} is already running — cancel it from the panel or wait for it to finish.`
       : 'Another operation is already running.');
@@ -4672,10 +4703,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** Run `body` under a cancellable VS Code progress notification so operations
    *  give feedback even when the panel is hidden (context-menu flows). The
-   *  notification's Cancel button maps onto the currently running sf command. */
-  private withWindowProgress<T>(title: string, body: (report: (message: string) => void) => Promise<T>): Promise<T> {
+   *  notification's Cancel button maps onto the currently running sf command.
+   *
+   *  `quiet` swaps that for a status-bar spinner (ProgressLocation.Window) — no
+   *  toast, no Cancel button of its own — for background work nobody clicked:
+   *  the automatic Fetch Org on open and background type resolution. The
+   *  panel's own Cancel button still reaches the running command either way,
+   *  since cancelCurrent is wired independently of which progress UI is up. */
+  private withWindowProgress<T>(
+    title: string,
+    body: (report: (message: string) => void) => Promise<T>,
+    opts: { quiet?: boolean } = {}
+  ): Promise<T> {
     return Promise.resolve(vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `SF Deploy: ${title}`, cancellable: true },
+      {
+        location: opts.quiet ? vscode.ProgressLocation.Window : vscode.ProgressLocation.Notification,
+        title: `SF Deploy: ${title}`,
+        cancellable: !opts.quiet
+      },
       (progress, token) => {
         const sub = token.onCancellationRequested(() => this.cancelCurrent());
         return body(message => progress.report({ message })).finally(() => sub.dispose());
@@ -4931,6 +4976,89 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Injection point for notify()'s de-dup/rate-limit clock — real time in
+   *  production; a test stub overrides it to drive the windows deterministically
+   *  instead of sleeping real seconds. */
+  private now(): number { return Date.now(); }
+
+  /**
+   * The single gate every background "something happened" toast goes through —
+   * failureToast, reportError, reportDeployTimeout, applyProjectDiscoveryFailure,
+   * the org-list warning, the watcher warning, the diff-float notice, and
+   * notifyBusy. Confirm modals, QuickPicks and notifyIfPanelHidden's own paths
+   * (a different rule for verdicts — see its own doc comment) do NOT go through
+   * here.
+   *
+   * The reported bug: several of the above can fire within the same few seconds
+   * of a panel opening, stacking unreadably in VS Code's non-scrollable
+   * notification area. Three rules address that:
+   *  - a VISIBLE panel already carries the detail on a card — a toast on top of
+   *    it is pure noise, so only the status bar gets a line (unless `force`,
+   *    unused today but kept as a hook);
+   *  - an identical headline within a minute is a repeat, not news — counted
+   *    and logged instead of shown again;
+   *  - more than a few toasts within ten seconds IS the flood — the rest of
+   *    that window collapses into one pointer at the Output channel, since VS
+   *    Code has no way to update a toast already on screen.
+   * The headline itself is the first non-empty line only, so a multi-line CLI
+   * message can never render as an unreadable wall of text in the toast — the
+   * full message always stays on the card / in the Output channel.
+   */
+  private notify(
+    kind: 'error' | 'warn' | 'info',
+    message: string,
+    opts: { buttons?: Array<'Show Panel' | 'Show Output'>; force?: boolean } = {}
+  ): void {
+    const headline = notifyHeadline(message);
+    const now = this.now();
+
+    const dup = this.notifyDedupe;
+    if (dup && dup.headline === headline && now - dup.at < NOTIFY_DEDUPE_MS) {
+      dup.count++;
+      dup.at = now;
+      this.output.appendLine(`[notify] suppressed duplicate ×${dup.count}: ${headline}`);
+      return;
+    }
+    this.notifyDedupe = { headline, at: now, count: 1 };
+
+    const icon = kind === 'error' ? '$(error)' : kind === 'warn' ? '$(warning)' : '$(info)';
+    if (this.view?.visible && !opts.force) {
+      // The card is already on screen — see notifyIfPanelHidden's own doc for
+      // why the same rule applies here.
+      vscode.window.setStatusBarMessage(`${icon} SF Deploy: ${headline}`, 8000);
+      return;
+    }
+
+    const times = (this.notifyToastTimes ??= []).filter(t => now - t < NOTIFY_RATE_WINDOW_MS);
+    this.notifyToastTimes = times;
+    if (times.length >= NOTIFY_RATE_LIMIT) {
+      const overflow = this.notifyOverflow && now - this.notifyOverflow.windowStart < NOTIFY_RATE_WINDOW_MS
+        ? this.notifyOverflow
+        : (this.notifyOverflow = { windowStart: now, count: 0 });
+      overflow.count++;
+      this.output.appendLine(`[notify] rate-limited ×${overflow.count} this window: ${headline}`);
+      // VS Code cannot update a toast already on screen, so only the FIRST
+      // overflow in a window shows one — later ones just bump the Output count.
+      if (overflow.count === 1) {
+        void Promise.resolve(
+          vscode.window.showWarningMessage(`SF Deploy: ${overflow.count} more notice${overflow.count === 1 ? '' : 's'} — see Output`, 'Show Output')
+        ).then(choice => { if (choice === 'Show Output') this.output.show(true); }, () => undefined);
+      }
+      return;
+    }
+    times.push(now);
+
+    const text = `SF Deploy: ${headline}`;
+    const buttons = opts.buttons ?? [];
+    const promise = kind === 'error' ? vscode.window.showErrorMessage(text, ...buttons)
+      : kind === 'warn' ? vscode.window.showWarningMessage(text, ...buttons)
+      : vscode.window.showInformationMessage(text, ...buttons);
+    void Promise.resolve(promise).then(choice => {
+      if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+      if (choice === 'Show Output') this.output.show(true);
+    }, () => undefined);
+  }
+
   private failureToast(message: string, lines: Array<string | { text: string }> = []): void {
     // Belt: this is a reporting path, so a synchronous throw from post()/output must
     // not cascade into the caller's catch and mask the real failure. Fall back to the
@@ -4940,10 +5068,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // first; the details are ALSO mirrored into the output channel so
       // "Show Output" opens a log that actually mentions the failure.
       this.logResultLines(message, lines);
-      void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Panel', 'Show Output').then(choice => {
-        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-        if (choice === 'Show Output') this.output.show(true);
-      }, () => undefined);
+      this.notify('error', message, { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[failureToast] failed to report "${message}": ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -4977,10 +5102,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           buttons: deployFailureButtons(retry, isConflictFailure(err))
         }
       });
-      void vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
-        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-        if (choice === 'Show Output') this.output.show(true);
-      }, () => undefined);
+      this.notify('error', `${action} failed. ${message}`, { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[reportError] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -5006,13 +5128,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large deployments.`
         }
       });
-      void vscode.window.showWarningMessage(
-        `SF Deploy: ${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
-        'Show Panel', 'Show Output'
-      ).then(choice => {
-        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-        if (choice === 'Show Output') this.output.show(true);
-      }, () => undefined);
+      this.notify('warn', `${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
+        { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[reportDeployTimeout] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -5591,6 +5708,17 @@ interface ToolingCodeRecord {
   Name?: string;
   NamespacePrefix?: string | null;
   [field: string]: unknown;
+}
+
+/** notify()'s toast text: the first non-empty line of `message`, ANSI-stripped,
+ *  whitespace-collapsed, and capped so a multi-line CLI error can never render
+ *  as an unreadable wall of text in a toast — the full message stays on the
+ *  card and in the Output channel. Pure, and exported so the cap and the
+ *  first-line rule are assertable on their own. */
+export function notifyHeadline(message: string): string {
+  const firstLine = stripAnsi(message).split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '';
+  const collapsed = firstLine.replace(/\s+/g, ' ').trim();
+  return collapsed.length > NOTIFY_HEADLINE_MAX ? `${collapsed.slice(0, NOTIFY_HEADLINE_MAX - 1)}…` : collapsed;
 }
 
 /**
