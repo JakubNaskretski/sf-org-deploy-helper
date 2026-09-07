@@ -577,6 +577,18 @@ check('notify: the status-bar icon matches the kind', () => {
   assert.strictEqual(ui.status[1].text, "$(info) SF Deploy: couldn't open the diff in its own window");
 });
 
+check('notify: a VISIBLE panel is never deduped — a repeated headline still updates the status bar', () => {
+  // The status bar replaces rather than stacks, so there is nothing to throttle;
+  // a second failure with the same first line (different detail on its card)
+  // must still register live. Reviewer finding on 0.22.2.
+  resetUi();
+  const { p } = clockedProvider({ visible: true });
+  notifyFn.call(p, 'error', 'Deploy failed. Source Conflict Error\nfirst detail');
+  notifyFn.call(p, 'error', 'Deploy failed. Source Conflict Error\nsecond, different detail');
+  assert.strictEqual(ui.status.length, 2, 'both failures reach the status bar');
+  assert.deepStrictEqual([ui.error.length, ui.warn.length], [0, 0]);
+});
+
 check('notify: force shows a toast even with the panel visible', () => {
   resetUi();
   const { p } = clockedProvider({ visible: true });

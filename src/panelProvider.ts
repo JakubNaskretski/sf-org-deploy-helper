@@ -1757,6 +1757,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // noticing before that. Every subsequent failure this session still logs above.
       if (!this.watchFailureWarned) {
         this.watchFailureWarned = true;
+        // A card too: with the panel visible notify() only writes an 8-second
+        // status-bar line, and this once-per-session notice needs a lasting record.
+        this.post({
+          type: 'status',
+          card: { kind: 'warn', title: 'Live file watching is off', meta: "New or deleted files won't appear until you run SF Deploy: Refresh Metadata Files.", lines: [stripAnsi(err instanceof Error ? err.message : String(err))] }
+        });
         this.notify('warn', "live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
       }
     }
@@ -4165,6 +4171,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             // one toast so the setting doesn't look broken with no explanation.
             if (!this.diffFloatWarned) {
               this.diffFloatWarned = true;
+              // Same as the watcher notice: a card so the explanation outlives
+              // the status-bar line when the panel is visible.
+              this.post({
+                type: 'status',
+                card: { kind: 'warn', title: 'Diff stayed as a tab', meta: 'This window could not float the diff into its own window (sfOrgDeployWrapper.openDiffInFloatingWindow).', lines: [String(e)] }
+              });
               this.notify('info', "couldn't open the diff in its own window — it stayed as a tab.");
             }
           });
@@ -5087,6 +5099,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const headline = notifyHeadline(message);
     const now = this.now();
 
+    const icon = kind === 'error' ? '$(error)' : kind === 'warn' ? '$(warning)' : '$(info)';
+    if (this.view?.visible && !opts.force) {
+      // The card is already on screen — see notifyIfPanelHidden's own doc for
+      // why the same rule applies here. Checked BEFORE the dedupe: a status-bar
+      // line replaces the previous one rather than stacking, so there is nothing
+      // to throttle, and a second failure with the same first line must still
+      // register live (the card differs; the headline may not).
+      vscode.window.setStatusBarMessage(`${icon} SF Deploy: ${headline}`, 8000);
+      return;
+    }
+
     const dup = this.notifyDedupe;
     if (dup && dup.headline === headline && now - dup.at < NOTIFY_DEDUPE_MS) {
       dup.count++;
@@ -5095,14 +5118,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.notifyDedupe = { headline, at: now, count: 1 };
-
-    const icon = kind === 'error' ? '$(error)' : kind === 'warn' ? '$(warning)' : '$(info)';
-    if (this.view?.visible && !opts.force) {
-      // The card is already on screen — see notifyIfPanelHidden's own doc for
-      // why the same rule applies here.
-      vscode.window.setStatusBarMessage(`${icon} SF Deploy: ${headline}`, 8000);
-      return;
-    }
 
     const times = (this.notifyToastTimes ??= []).filter(t => now - t < NOTIFY_RATE_WINDOW_MS);
     this.notifyToastTimes = times;

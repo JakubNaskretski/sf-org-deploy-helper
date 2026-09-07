@@ -175,7 +175,7 @@ check('source: the once-per-session flag is declared, and the toast sits inside 
   assert.ok(/private diffFloatWarned = false;/.test(providerSrc), 'diffFloatWarned field not found');
   const i = providerSrc.indexOf("float failed — diffs stay as tabs");
   assert.ok(i > 0, 'floatFirstDiff catch not found');
-  const catchBlock = providerSrc.slice(i, i + 400);
+  const catchBlock = providerSrc.slice(i, i + 900); // room for the card posted before the toast (0.22.2)
   assert.ok(/if \(!this\.diffFloatWarned\) \{/.test(catchBlock), 'toast must be gated on the flag');
   assert.ok(/this\.diffFloatWarned = true;/.test(catchBlock), 'the flag must be set before/inside the toast, not after');
   // The toast itself now goes through the shared notify() gate (flood fix) rather
@@ -297,7 +297,7 @@ check('a file OUTSIDE the item folder is ignored as a focus', async () => {
 // an Output line nobody reads mid-flow. One info toast per session says so.
 check('floatFirstDiff failure toasts ONCE — the diff itself still opens as a tab', async () => {
   resetUi();
-  const { stub, log } = diffStub([bundleItem()]);
+  const { stub, posted, log } = diffStub([bundleItem()]);
   moveEditorResult = () => Promise.reject(new Error('no auxiliary window support'));
   await runDiff(stub, ['LightningComponentBundle:myCmp'], path.join(bundleDir, 'myCmp.js'));
   drainTmpCleanup();
@@ -306,6 +306,10 @@ check('floatFirstDiff failure toasts ONCE — the diff itself still opens as a t
   assert.match(ui.info[0], /stayed as a tab/);
   assert.ok(log.some(l => l.includes('[Diff] float failed')), 'still logged too — the toast does not replace it');
   assert.strictEqual(stub.diffFloatWarned, true);
+  // 0.22.2: a card as the lasting record — with the panel visible, notify() only
+  // writes an 8-second status-bar line.
+  const tabCard = cards(posted).find(c => c.title === 'Diff stayed as a tab');
+  assert.ok(tabCard && tabCard.kind === 'warn' && /no auxiliary window support/.test(tabCard.lines[0]), `card missing: ${JSON.stringify(cards(posted).map(c => c.title))}`);
 });
 
 check('a second diff in the SAME session does not re-toast the float failure', async () => {
