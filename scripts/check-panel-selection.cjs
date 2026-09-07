@@ -157,6 +157,13 @@ function panel(persisted) {
   const listeners = {};
   let stored = persisted ? JSON.parse(JSON.stringify(persisted)) : undefined;
   const outbound = [];
+  // sendAction defers renderActions()/renderStatus() via requestAnimationFrame
+  // (debugTiming/click-latency fix) so the click handler returns right after
+  // postMessage — the whole point being that the outbound message exists BEFORE
+  // the render runs. Captured here instead of firing immediately, so a check can
+  // assert exactly that ordering, then call flush() to run the deferred render
+  // and get the old "render already happened" behaviour back.
+  const pendingFrames = [];
 
   const sandbox = {
     console,
@@ -164,7 +171,11 @@ function panel(persisted) {
     // The progress card's elapsed clock is a real setInterval; a panel left busy
     // at the end of a check must not keep this process alive.
     setInterval: (fn, ms) => { const t = setInterval(fn, ms); t.unref(); return t; },
-    requestAnimationFrame: (fn) => setTimeout(fn, 0),
+    requestAnimationFrame: (fn) => { pendingFrames.push(fn); return pendingFrames.length; },
+    // panel.js stamps clickSpan with performance.now() (sendAction, debugTiming) —
+    // Date.now()-based is precise enough for these checks (they only need a
+    // finite, non-negative number, not sub-ms resolution).
+    performance: { now: () => Date.now() },
     acquireVsCodeApi: () => ({
       postMessage: (m) => outbound.push(m),
       getState: () => stored,
@@ -199,7 +210,9 @@ function panel(persisted) {
     /** The LIVE selection, read the way the user reads it (toolbar count). */
     liveCount: () => Number(/^(\d+)/.exec(els.get('selCount').textContent)?.[1] ?? -1),
     el: (id) => els.get(id),
-    outbound
+    outbound,
+    pendingRenders: pendingFrames,
+    flush: () => { while (pendingFrames.length) pendingFrames.shift()(); }
   };
 }
 
@@ -985,6 +998,7 @@ for (const [id, type] of GUARDED) {
     const b = p.el(id);
     assert.ok(click(b));
     assert.strictEqual(sent(p, type), 1);
+    p.flush(); // renderActions is deferred (sendAction) — flush before reading DOM state
     assert.strictEqual(b.disabled, true);
     assert.strictEqual(b.title, 'Sending…');
     assert.ok(!click(b));
@@ -999,11 +1013,45 @@ for (const [id, type] of GUARDED) {
   });
 }
 
+// ---------------------------------------------- 9) click-to-post ordering
+// The user-visible symptom (several seconds between clicking Deploy and the
+// confirm modal) turned out to be outside the extension-host path — so the fix
+// is to remove the only thing on OUR side that could sit between the click and
+// the postMessage call: rendering. sendAction now posts first and defers
+// renderActions()/renderStatus() to a rAF/setTimeout callback (see check 8's
+// flush() above), and stamps clickedAt/clickSpan for the [timing] log
+// (panelProvider.ts, debugTiming) to measure the rest of the trip.
+check('Deploy click posts before the deferred render runs', () => {
+  const p = armed();
+  const b = p.el('deployBtn');
+  assert.strictEqual(p.pendingRenders.length, 0, 'a render was already pending before the click');
+  assert.ok(click(b));
+  // The message is already in the outbound queue — the deferred render has not
+  // run yet (nothing has flushed it).
+  assert.strictEqual(sent(p, 'deploy'), 1, 'sendAction must post before deferring the render');
+  assert.strictEqual(p.pendingRenders.length, 1, 'renderActions/renderStatus must be deferred, not run inline');
+  assert.strictEqual(b.disabled, false, 'the DOM must not reflect the click yet — the render is still pending');
+  p.flush();
+  assert.strictEqual(b.disabled, true, 'flushing the deferred render must lock the button');
+});
+
+check('every slot-taking action stamps clickedAt/clickSpan as finite, non-negative numbers', () => {
+  const p = armed();
+  assert.ok(click(p.el('deployBtn')));
+  p.flush();
+  const [msg] = p.outbound.filter(m => m.type === 'deploy');
+  assert.strictEqual(typeof msg.clickedAt, 'number');
+  assert.ok(Number.isFinite(msg.clickedAt) && msg.clickedAt > 0, `clickedAt: ${msg.clickedAt}`);
+  assert.strictEqual(typeof msg.clickSpan, 'number');
+  assert.ok(Number.isFinite(msg.clickSpan) && msg.clickSpan >= 0, `clickSpan: ${msg.clickSpan}`);
+});
+
 check('Deploy queues while busy but never sends while its previous click is unanswered', () => {
   const p = armed({ busy: 'Retrieve' });
   const b = p.el('deployBtn');
   assert.ok(click(b));
   assert.strictEqual(sent(p, 'deploy'), 1);
+  p.flush(); // renderActions is deferred (sendAction) — flush before reading DOM state
   assert.strictEqual(b.disabled, true);
   assert.ok(!click(b));
   p.deliver({ type: 'busy', busy: true, action: 'Retrieve' }); // the provider's re-sync: same state
@@ -1029,6 +1077,7 @@ for (const [label, send, expect] of CARD_BTNS) {
     click(findBtn(p, label));
     click(findBtn(p, label)); // re-found: a render replaces the element under the cursor
     assert.strictEqual(sent(p, send.type), expect);
+    p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
     if (expect === 1) {
       assert.strictEqual(findBtn(p, label).disabled, true);
       assert.strictEqual(findBtn(p, label).title, 'Sending…');
@@ -1045,6 +1094,7 @@ check('card Retry queues while busy, not while pending', () => {
   p.deliver(CARD([{ label: 'Retry deploy', send: { type: 'retryDeploy', request: { keys: DC.selected } } }]));
   assert.ok(click(findBtn(p, 'Retry deploy')));
   assert.strictEqual(sent(p, 'retryDeploy'), 1);
+  p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
   assert.ok(!click(findBtn(p, 'Retry deploy')));
   p.deliver({ type: 'busy', busy: true, action: 'Deploy' });
   assert.strictEqual(findBtn(p, 'Retry deploy').title, 'Will queue behind Deploy');

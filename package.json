@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.22.1",
+  "version": "0.22.2",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -273,6 +273,11 @@
           "default": false,
           "scope": "machine",
           "markdownDescription": "Follow and publish the Salesforce org shared across the Skrety SF plugins (`skrety.salesforce.targetOrg`). Off: this plugin keeps its own org and ignores switches made in sibling plugins."
+        },
+        "sfOrgDeployWrapper.debugTiming": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Diagnose a slow confirmation dialog by logging click-to-modal timing to the **SF Deploy** Output channel. When on, clicking Deploy, Validate, Retrieve, Diff, or Fetch Org logs a `[timing]` line: for Deploy/Validate, the time from click to `postMessage` (in the panel), panel-to-extension delivery, reserving the operation slot, and reaching the confirm dialog; for Retrieve/Diff/Fetch Org, just the click-to-arrival time. Off by default — it's for tracking down where a click-to-confirmation delay is coming from, not for everyday use."
         },
         "skrety.salesforce.targetOrg": {
           "type": "string",

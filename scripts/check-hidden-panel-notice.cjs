@@ -714,7 +714,9 @@ check('source: the automatic Fetch Org on open requests quiet; a manual click do
     'maybeAutoFetchOrg must fetch quietly — a Notification firing unasked at panel open is the flood itself');
   const manualIdx = providerSrc.indexOf("case 'fetchOrgMetadata':");
   assert.ok(manualIdx > 0, "'fetchOrgMetadata' case not found");
-  assert.ok(/this\.loadOrgMetadata\(\);/.test(providerSrc.slice(manualIdx, manualIdx + 400)),
+  // 500, not 400: the debugTiming receive-stamp (logReceiveTiming) added one more
+  // line ahead of the call this pin is looking for.
+  assert.ok(/this\.loadOrgMetadata\(\);/.test(providerSrc.slice(manualIdx, manualIdx + 500)),
     'a manual Fetch Org click must keep the full cancellable Notification');
 });
 

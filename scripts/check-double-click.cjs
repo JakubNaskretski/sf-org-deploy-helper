@@ -39,6 +39,10 @@ const picks = [];      // { items, options, resolve }
 const toasts = [];     // showInformationMessage / showErrorMessage
 const statusBar = [];
 let modalThrows = false; // next modal rejects (window closed) — see check 2
+// debugTiming (sfOrgDeployWrapper.debugTiming): the only setting these checks need
+// to flip live — everything else in this file is happy with getConfiguration's
+// plain default fallback.
+let debugTimingOn = false;
 const vscodeStub = {
   window: {
     showWarningMessage: (message, options, ...items) => {
@@ -55,7 +59,12 @@ const vscodeStub = {
     setStatusBarMessage: (m) => { statusBar.push(m); return { dispose() {} }; },
     withProgress: (_o, body) => body({ report() {} }, { onCancellationRequested: () => ({ dispose() {} }) })
   },
-  workspace: { getConfiguration: () => ({ get: (_k, d) => d, update: async () => {} }) },
+  workspace: {
+    getConfiguration: () => ({
+      get: (k, d) => (k === 'debugTiming' ? debugTimingOn : d),
+      update: async () => {}
+    })
+  },
   commands: { executeCommand: async () => {} },
   Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
@@ -74,7 +83,7 @@ const queue = [];
 const check = (name, fn) => queue.push([name, fn]);
 const tick = () => new Promise(r => setImmediate(r));
 const ticks = async (n = 3) => { for (let i = 0; i < n; i++) await tick(); };
-function reset() { modals.length = 0; picks.length = 0; toasts.length = 0; statusBar.length = 0; modalThrows = false; }
+function reset() { modals.length = 0; picks.length = 0; toasts.length = 0; statusBar.length = 0; modalThrows = false; debugTimingOn = false; }
 
 // ---------------------------------------------------------------- provider
 const cls = (name) => ({ type: 'ApexClass', name, filePath: `/ws/force-app/classes/${name}.cls`, files: [`/ws/force-app/classes/${name}.cls`] });
@@ -384,6 +393,69 @@ check('the message wiring re-syncs busy in a finally, thrown or not', () => {
   assert.ok(wiring.test(src), "onDidReceiveMessage must be: handleMessage(m).catch(reportError).finally(() => this.postBusy())");
   const rescan = /case 'refreshFiles':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.refreshFiles\(\); \} finally \{ this\.post\(\{ type: 'filesRefreshed' \}\); \}\n\s*return;/;
   assert.ok(rescan.test(src), "refreshFiles handler must be exactly: try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }");
+});
+
+// ------------------------------------------------------------ 8) debugTiming
+// The user-visible symptom was a several-second gap between clicking Deploy
+// and the confirm modal, with nothing else running — so debugTiming logs a
+// click-to-modal breakdown to the Output channel, off by default and inert
+// unless the setting is on.
+const TIMING_LINE = /^\[timing\] deploy: click→post (\d+ ms|n\/a) · post→host (\d+ ms|n\/a) · host→busy \d+ ms · busy→modal \d+ ms$/;
+const timingLines = (p) => p.log.filter(l => l.startsWith('[timing]'));
+
+check('debugTiming on: a deploy click produces one [timing] line with the four spans', async () => {
+  reset();
+  debugTimingOn = true;
+  const p = provider();
+  p.send({ type: 'deploy', keys: KEYS, clickedAt: Date.now() - 5, clickSpan: 1.5 });
+  await ticks();
+  assert.strictEqual(modals.length, 1);
+  modals[0].resolve(confirmOf(modals[0]));
+  await ticks();
+  const lines = timingLines(p);
+  assert.strictEqual(lines.length, 1, `expected exactly one [timing] line, got: ${p.log.join(' | ')}`);
+  assert.ok(TIMING_LINE.test(lines[0]), lines[0]);
+});
+
+check('debugTiming off: no [timing] line for a deploy click, however it resolves', async () => {
+  reset();
+  // debugTimingOn stays false (reset's default) — the message still carries
+  // clickedAt/clickSpan, but the host must ignore them entirely.
+  const p = provider();
+  p.send({ type: 'deploy', keys: KEYS, clickedAt: Date.now(), clickSpan: 2 });
+  await ticks();
+  modals[0].resolve(confirmOf(modals[0]));
+  await ticks();
+  assert.strictEqual(timingLines(p).length, 0, `unexpected timing log: ${p.log.join(' | ')}`);
+});
+
+check('debugTiming on: garbage clickedAt/clickSpan are omitted, never NaN in the log', async () => {
+  reset();
+  debugTimingOn = true;
+  const p = provider();
+  // A stale or hostile webview could send anything — a string, a negative
+  // number, Infinity — none of it may reach the Output channel as NaN.
+  p.send({ type: 'deploy', keys: KEYS, clickedAt: 'not-a-number', clickSpan: -5 });
+  await ticks();
+  modals[0].resolve(confirmOf(modals[0]));
+  await ticks();
+  const lines = timingLines(p);
+  assert.strictEqual(lines.length, 1);
+  assert.ok(!/NaN/.test(lines[0]), lines[0]);
+  assert.ok(TIMING_LINE.test(lines[0]), lines[0]);
+  assert.ok(lines[0].includes('click→post n/a'), lines[0]);
+  assert.ok(lines[0].includes('post→host n/a'), lines[0]);
+});
+
+check('debugTiming on: retrieve/diff/fetchOrgMetadata log a click→post/post→host receive stamp', async () => {
+  reset();
+  debugTimingOn = true;
+  const p = provider();
+  p.send({ type: 'retrieve', keys: KEYS, clickedAt: Date.now() - 3, clickSpan: 0.4 });
+  await ticks();
+  const lines = timingLines(p);
+  assert.strictEqual(lines.length, 1, `expected exactly one [timing] line, got: ${p.log.join(' | ')}`);
+  assert.ok(/^\[timing\] retrieve: click→post \d+ ms · post→host \d+ ms$/.test(lines[0]), lines[0]);
 });
 
 (async () => {

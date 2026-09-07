@@ -140,6 +140,13 @@
 
   function send(type, payload) { vscode.postMessage({ type, ...(payload || {}) }); }
 
+  // debugTiming (sfOrgDeployWrapper.debugTiming): host tells us on 'ready'/config
+  // change (see the 'debugTiming' case below) whether to stamp and log. Off by
+  // default — every sendAction still stamps clickedAt/clickSpan on the message
+  // (cheap, and the host ignores them when its own copy of the setting is off),
+  // but only logs to console when this is true.
+  let debugTiming = false;
+
   // The funnel for every click that takes (or asks for) the operation slot —
   // toolbar, context menu and card buttons alike. The provider answers EVERY
   // message with a `busy` post once its handler is done (reserved, refused,
@@ -148,12 +155,24 @@
   // a duplicate queue entry, or a misleading "already running" toast.
   // Deploy/Validate/Retry stay clickable while BUSY (they queue), never while
   // PENDING. Returns false when the previous click is still unanswered.
+  //
+  // debugTiming: stamped here (clickedAt/clickSpan) so a slow confirmation can be
+  // measured end to end (see panelProvider.ts's [timing] log). `send()` — the
+  // postMessage call — fires BEFORE renderActions()/renderStatus(): those are
+  // pure DOM work with no bearing on whether the message went out, and used to
+  // run first, on the critical path between the click and the host receiving it.
+  // Deferring them (rAF, falling back to setTimeout(0) if unavailable) lets the
+  // click handler return right after postMessage.
+  const deferRender = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
   function sendAction(type, payload) {
+    const t0 = performance.now();
     if (state.pendingAction) return false;
     state.pendingAction = type;
-    send(type, payload);
-    renderActions();
-    renderStatus(); // card buttons lock too
+    const clickSpan = performance.now() - t0;
+    const clickedAt = Date.now();
+    send(type, { ...(payload || {}), clickedAt, clickSpan });
+    if (debugTiming) console.log(`[timing] ${type}: clickedAt=${clickedAt} clickSpan=${clickSpan.toFixed(2)}ms`);
+    deferRender(() => { renderActions(); renderStatus(); });
     return true;
   }
 
@@ -522,6 +541,9 @@
       case 'ignoreDeployConflicts':
         state.ignoreDeployConflicts = msg.enabled === true;
         renderIgnoreDeployConflicts();
+        return;
+      case 'debugTiming':
+        debugTiming = msg.enabled === true;
         return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;

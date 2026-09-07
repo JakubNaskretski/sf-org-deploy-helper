@@ -3,6 +3,19 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.22.2
+
+- Fixed: **Far fewer notifications, and readable ones.** When the panel is visible, failures and
+  warnings go to the card that is already on screen and to a short status-bar line, not to a
+  pop-up; pop-ups only appear when the panel is hidden. Every pop-up is one line (the first line
+  of the message, capped), the same notice is not repeated within a minute, and a burst collapses
+  into a single "N more notices — see Output". The automatic org listing on panel open and the
+  metadata-type resolution now show a quiet status-bar spinner instead of a notification.
+- Changed: **The time from clicking Deploy to the confirmation is now measurable.** Turn on
+  `sfOrgDeployWrapper.debugTiming` and the Output channel logs each step, from the click in the
+  panel to the moment the confirmation is requested, with milliseconds. The panel also sends the
+  click before it repaints anything, so nothing in the sidebar can delay it.
+
 ## 0.22.1
 
 - Fixed: **"No Salesforce DX project found" right after startup no longer sticks.** The first

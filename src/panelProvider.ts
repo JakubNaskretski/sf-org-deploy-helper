@@ -20,19 +20,23 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'refreshOrgs' }
   | { type: 'refreshFiles' }
-  | { type: 'fetchOrgMetadata'; username?: string }
+  // clickedAt/clickSpan (debugTiming): the webview's Date.now()/performance.now()
+  // stamps from sendAction, present on every slot-taking action it sends. Read
+  // only when the setting is on, and only as untrusted numbers (see safeMs) —
+  // never trusted for anything but a diagnostic log line.
+  | { type: 'fetchOrgMetadata'; username?: string; clickedAt?: number; clickSpan?: number }
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
   | { type: 'useOpenTabs' }
-  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] }
+  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; clickedAt?: number; clickSpan?: number }
   | { type: 'setTestLevel'; testLevel?: TestLevel; runTests?: string[] }
   | { type: 'setIgnoreDeployConflicts'; enabled: boolean }
   | { type: 'resumeDeploy'; jobId?: string }
   | { type: 'quickDeploy'; jobId: string }
-  | { type: 'retrieve'; keys: string[] }
+  | { type: 'retrieve'; keys: string[]; clickedAt?: number; clickSpan?: number }
   | { type: 'deleteFromOrg'; keys: string[] }
   | { type: 'loginOrg' }
-  | { type: 'diff'; keys: string[] }
+  | { type: 'diff'; keys: string[]; clickedAt?: number; clickSpan?: number }
   | { type: 'openFile'; key: string; line?: number; column?: number }
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
@@ -417,6 +421,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('sfOrgDeployWrapper.changedBaseRef')) void this.postChangedComponents();
       if (e.affectsConfiguration('sfOrgDeployWrapper.ignoreDeployConflicts')) this.postIgnoreDeployConflicts();
+      if (e.affectsConfiguration('sfOrgDeployWrapper.debugTiming')) this.postDebugTiming();
     }));
     // Files created or deleted OUTSIDE the panel's own operations (a new Apex
     // class, a branch switch, a deleted component) used to be invisible until a
@@ -832,6 +837,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // the authoritative value on every rebuild so the visible warning toggle
         // always matches what deploys (including context-menu deploys) will do.
         this.postIgnoreDeployConflicts();
+        // Tell the webview whether to stamp/log click timings — see debugTiming.
+        this.postDebugTiming();
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
@@ -887,6 +894,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }
         return;
       case 'fetchOrgMetadata':
+        this.logReceiveTiming('fetchOrg', msg.clickedAt, msg.clickSpan);
         // Trust the org the webview has selected, applied before we read it back —
         // otherwise a fetch fired right after first-launch auto-selection could race
         // the persisted selection and fetch the default org instead of the picked one.
@@ -929,15 +937,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         );
         return;
       }
-      case 'deploy':
+      case 'deploy': {
+        // debugTiming: the receive stamp the confirm-modal breakdown (runDeploy)
+        // measures host→busy/busy→modal from — captured HERE, at the top of the
+        // handler, so it also covers the (negligible, synchronous) hop into runDeploy.
+        const receivedAt = Date.now();
         // Fields built explicitly, one by one — NEVER spread `msg` into runDeploy's
         // opts. runDeploy's opts type also carries internal-only `orgOverride` /
         // `preConfirmed` fields that drainQueue uses to replay a queued deploy
         // without a second confirm; spreading the raw webview message would let a
         // compromised webview forge those and skip the confirm modal / retarget
         // the org.
-        await this.runDeploy(msg.keys, { validateOnly: msg.validateOnly, testLevel: msg.testLevel, runTests: msg.runTests });
+        await this.runDeploy(msg.keys, {
+          validateOnly: msg.validateOnly, testLevel: msg.testLevel, runTests: msg.runTests,
+          clickedAt: msg.clickedAt, clickSpan: msg.clickSpan, receivedAt
+        });
         return;
+      }
       case 'quickDeploy':
         await this.runQuickDeploy(msg.jobId);
         return;
@@ -945,6 +961,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.resumeDeployMonitoring(msg.jobId);
         return;
       case 'retrieve':
+        this.logReceiveTiming('retrieve', msg.clickedAt, msg.clickSpan);
         await this.runRetrieve(msg.keys);
         return;
       case 'deleteFromOrg':
@@ -954,6 +971,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await this.runLogin();
         return;
       case 'diff':
+        this.logReceiveTiming('diff', msg.clickedAt, msg.clickSpan);
         await this.runDiff(msg.keys);
         return;
       case 'openFile': {
@@ -2010,6 +2028,49 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'ignoreDeployConflicts', enabled: this.ignoreDeployConflicts() });
   }
 
+  /** Diagnosing a slow confirmation (see the click-timing log below) needs the
+   *  webview to know whether to bother stamping/logging at all — read fresh
+   *  each time since, unlike ignoreDeployConflicts, this isn't machine-scoped. */
+  private debugTiming(): boolean {
+    return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('debugTiming', false);
+  }
+
+  private postDebugTiming(): void {
+    this.post({ type: 'debugTiming', enabled: this.debugTiming() });
+  }
+
+  /** debugTiming: click→post/post→host receive stamp for the actions that don't
+   *  have a busy/modal breakdown worth logging (retrieve/diff/Fetch Org just
+   *  need to show whether the delay is on our side of the postMessage hop at
+   *  all). No-op when the setting is off — the message's timing fields are
+   *  otherwise ignored entirely. */
+  private logReceiveTiming(action: string, clickedAt: unknown, clickSpan: unknown): void {
+    if (!this.debugTiming()) return;
+    const receivedAt = Date.now();
+    const clickedAtMs = safeMs(clickedAt);
+    const postToHost = clickedAtMs === undefined ? undefined : receivedAt - clickedAtMs;
+    this.output.appendLine(`[timing] ${action}: click→post ${fmtSpan(safeMs(clickSpan))} · post→host ${fmtSpan(postToHost)}`);
+  }
+
+  /** debugTiming: click-to-modal breakdown for a deploy/validate confirm,
+   *  logged once the modal is answered so writing to the Output channel can't
+   *  itself skew when the modal appears. clickedAt/clickSpan are the webview's —
+   *  untrusted (see safeMs). No-op for a run that didn't originate from a
+   *  webview click (context-menu deploy, retry, a drained queue entry) —
+   *  receivedAt is only set by the 'deploy' message handler. */
+  private logDeployTiming(
+    verb: DeployVerb, clickedAt: unknown, clickSpan: unknown,
+    receivedAt: number | undefined, busyAt: number, modalAt: number
+  ): void {
+    if (receivedAt === undefined) return;
+    const clickedAtMs = safeMs(clickedAt);
+    const postToHost = clickedAtMs === undefined ? undefined : receivedAt - clickedAtMs;
+    this.output.appendLine(
+      `[timing] ${verb.toLowerCase()}: click→post ${fmtSpan(safeMs(clickSpan))} · post→host ${fmtSpan(postToHost)} · `
+      + `host→busy ${fmtSpan(busyAt - receivedAt)} · busy→modal ${fmtSpan(modalAt - busyAt)}`
+    );
+  }
+
   // ---- Operations ----
   private async runDeploy(
     keys: string[],
@@ -2037,6 +2098,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  existed. Never sticky: buildRetryRequest does not carry it forward into
        *  the NEXT card's plain Retry request. */
       ignoreConflictsOverride?: boolean;
+      /** debugTiming diagnostics — the webview's click stamps and this handler's
+       *  own receive stamp (case 'deploy'), threaded through so the confirm-modal
+       *  breakdown below can log host→busy/busy→modal. Untrusted (safeMs
+       *  validates); receivedAt undefined means this run didn't originate from a
+       *  webview click (context-menu deploy, retry, a drained queue entry), and
+       *  logDeployTiming no-ops on that. */
+      clickedAt?: number;
+      clickSpan?: number;
+      receivedAt?: number;
     } = {}
   ): Promise<DeployOutcome> {
     // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
@@ -2064,6 +2134,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // re-enabling the UI mid-op (busy-flag TOCTOU). Release on any early
     // return with `releaseBusy()`.
     if (!this.reserveBusy(verb)) return ABORTED;
+    const busyAt = Date.now(); // debugTiming: host→busy span (logDeployTiming below)
     let reserved = true;
     const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
     // Set by the terminal result callback; drives the auto-resolve loop in the
@@ -2126,7 +2197,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           },
           false
         );
+        const modalAt = Date.now(); // debugTiming: busy→modal span
         const confirm = await this.awaitConfirm(modal);
+        // Logged AFTER the modal is answered so writing to the Output channel
+        // can't itself delay the modal's appearance.
+        if (this.debugTiming()) this.logDeployTiming(verb, opts.clickedAt, opts.clickSpan, opts.receivedAt, busyAt, modalAt);
         if (!confirm) return ABORTED;
       }
 
@@ -5610,6 +5685,18 @@ function sameKeySet(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   const set = new Set(a);
   return b.every(k => set.has(k));
+}
+
+/** debugTiming: a webview click-timing field is untrusted (postMessage from a
+ *  possibly-stale or compromised webview) — accepted only if finite and
+ *  non-negative, else the span is omitted rather than printing NaN. */
+function safeMs(n: unknown): number | undefined {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/** Renders one debugTiming span; 'n/a' for a missing/garbage value. */
+function fmtSpan(ms: number | undefined): string {
+  return ms === undefined ? 'n/a' : `${Math.round(ms)} ms`;
 }
 
 function isUnder(root: string, abs: string): boolean {
