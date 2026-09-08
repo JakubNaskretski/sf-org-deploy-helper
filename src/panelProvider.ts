@@ -211,15 +211,14 @@ interface RetryRequest {
 }
 
 /** What a runDeploy call did. `aborted` covers every path that never reached the
- *  org (queued, busy slot refused, no root/org, user dismissed the confirm) —
- *  an auto-resolve loop must stop on it rather than spin. */
+ *  org (queued, busy slot refused, no root/org, user dismissed the confirm) — a
+ *  caller reacting to the result (a suggestion retry, deployFileWithDeps) must
+ *  treat it as "nothing ran", never as a failure. */
 interface DeployOutcome {
   status: 'ok' | 'failed' | 'aborted';
-  missing: string[];
-  unresolved: string[];
 }
 
-const ABORTED: DeployOutcome = { status: 'aborted', missing: [], unresolved: [] };
+const ABORTED: DeployOutcome = { status: 'aborted' };
 
 /** Cap on how many changed components one "Retry + changed vs branch" click may
  *  add. A branch that many components ahead of the failed deploy is a release
@@ -865,6 +864,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        // Re-attach the "Try with dependencies" button for any suggestion still
+        // alive server-side: the persisted copy above dropped the live payload
+        // (stripSuggestForHistory), so a webview rebuilt after that — sidebar
+        // collapsed/reopened, window reload — would otherwise show only the
+        // folded-back guidance text with no way to act on it. The webview merges
+        // each payload into the history card carrying the matching `suggestId`.
+        for (const [id, live] of this.liveSuggestions) {
+          this.post({ type: 'suggestionRestore', id, candidates: live.candidates, unresolved: live.unresolved });
+        }
         // Re-sync the deploy-queue strip too — a webview rebuilt mid-session (e.g.
         // sidebar collapsed/reopened) must not show an empty strip while the
         // provider's in-memory queue still has items waiting.
@@ -1138,7 +1146,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (typeof msg.id !== 'string') return;
         const live = this.liveSuggestions.get(msg.id);
         if (!live) {
-          vscode.window.showInformationMessage('This suggestion has expired — use Retry deploy instead.');
+          // Un-fold the card too: without this the button click left it stuck
+          // showing "Retrying…" forever (panel.js only clears that on a reset).
+          this.notify('info', 'This suggestion has expired — use Retry deploy instead.');
+          this.post({ type: 'suggestionReset', id: msg.id });
           return;
         }
         // Selection: intersect the webview's picks with the server-side candidate
@@ -1149,14 +1160,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           ? [...new Set(msg.keys.filter(k => typeof k === 'string' && offered.has(k)))]
           : [];
         if (picked.length === 0) {
-          vscode.window.showInformationMessage('No suggested components selected.');
+          this.notify('info', 'No suggested components selected.');
+          this.post({ type: 'suggestionReset', id: msg.id });
           return;
         }
         // A running operation would QUEUE this deploy, and the log would then
         // record 'retry not run' for a retry that actually runs later. Refuse
         // up front — nothing is consumed or logged, the card stays actionable.
         if (this.busy) {
-          vscode.window.showInformationMessage('A deployment is already running — retry the suggestion when it finishes.');
+          this.notify('info', 'A deployment is already running — retry the suggestion when it finishes.');
           this.post({ type: 'suggestionReset', id: msg.id });
           return;
         }
@@ -1170,14 +1182,37 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           accepted: picked, declined: declined.length ? declined : undefined,
           verdict: undefined, outcome: undefined
         });
+        // writeSuggestionEntry awaited a workspaceState write — busy can have
+        // changed in that window (another op grabbed the slot). Re-check rather
+        // than fall through to enqueueDeploy: the log above already says "not
+        // run", and silently queuing the retry would contradict it.
+        if (this.busy) {
+          await this.writeSuggestionEntry(msg.id, { outcome: 'aborted' });
+          this.post({ type: 'suggestionReset', id: msg.id });
+          return;
+        }
         // Reflect the acceptance in the component tree IMMEDIATELY (before the
-        // deploy settles): the added components join the selection and scroll
-        // into view, so the retry's contents are visible, not just implied.
-        this.post({ type: 'selectKeys', keys: picked, scroll: true });
+        // deploy settles): the added rows scroll into view so the retry's
+        // contents are visible — transient, so they never join the PERSISTED
+        // selection (a plain Deploy click right after must not silently pick up
+        // components the user never ticked themselves).
+        this.post({ type: 'selectKeys', keys: picked, scroll: true, transient: true });
+        // entryKey names ONE failing component for the confirm modal's "auto-
+        // included as local dependencies of X" line — prefer the accepted
+        // candidate's own attribution, falling back to the retry's first key for
+        // an envelope-level failure that named no per-component `from`.
+        const entryKey = live.candidates.find(c => picked.includes(c.key))?.from ?? baseKeys[0] ?? picked[0];
         // Server-side truth (liveSuggestions), so these are the ORIGINAL run's own
         // modes: a suggestion accepted from a validation failure re-validates, it
-        // does not deploy.
-        const outcome = await this.runDeploy([...new Set([...baseKeys, ...picked])], deployOptsFromRetry(live.retry));
+        // does not deploy. orgOverride pins the retry to the org the FAILURE
+        // happened on, not wherever the panel's org selector has since moved —
+        // and now that the deploy actually goes there, the `org: live.orgLabel`
+        // written into the log above is finally the org that ran, not just the
+        // org that was named.
+        const outcome = await this.runDeploy(
+          [...new Set([...baseKeys, ...picked])],
+          { ...deployOptsFromRetry(live.retry), orgOverride: live.org, autoIncluded: { count: picked.length, entryKey } }
+        );
         if (outcome.status === 'aborted') {
           // Dismissed confirm / no org / refused slot: nothing reached the org.
           // Keep the suggestion alive and un-fold the card so the user can go
@@ -2105,20 +2140,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     keys: string[],
     opts: {
       sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[];
-      /** Internal only — set by drainQueue to run a previously-queued deploy
-       *  against the org PINNED at enqueue time, bypassing the currently-selected
-       *  org. The 'deploy' Inbound handler builds its opts explicitly (see the
-       *  comment there) and never spreads the raw webview message, so a
-       *  compromised webview can never set this itself. */
+      /** Internal only — set by drainQueue (a previously-queued deploy, pinned to
+       *  the org selected at enqueue time) and by the suggestionDeploy handler (a
+       *  suggestion retry, pinned to the org the ORIGINAL failure happened on,
+       *  which the panel's live selector may have since moved past). The 'deploy'
+       *  Inbound handler builds its opts explicitly (see the comment there) and
+       *  never spreads the raw webview message, so a compromised webview can
+       *  never set this itself. */
       orgOverride?: string;
       /** Internal only — set by drainQueue to skip the confirm modal for a
        *  deploy the user already confirmed at enqueue time. Same invariant as
        *  orgOverride: only drainQueue sets it. */
       preConfirmed?: boolean;
-      /** Internal only — set by deployFileWithDeps so the confirm modal can say
-       *  how much of the count the user did NOT pick. Display only: it changes
-       *  one line of modal text and nothing about what deploys, so unlike
-       *  orgOverride/preConfirmed a forged value could not widen anything. */
+      /** Internal only — set by deployFileWithDeps and by the suggestionDeploy
+       *  handler so the confirm modal can say how much of the count the user did
+       *  NOT explicitly pick. Display only: it changes one line of modal text and
+       *  nothing about what deploys, so unlike orgOverride/preConfirmed a forged
+       *  value could not widen anything. */
       autoIncluded?: { count: number; entryKey: string };
       /** One-off override of the machine-scoped ignoreDeployConflicts setting,
        *  for exactly this run. Set only via a "Retry + overwrite" card button
@@ -2166,12 +2204,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const busyAt = Date.now(); // debugTiming: host→busy span (logDeployTiming below)
     let reserved = true;
     const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
-    // Set by the terminal result callback; drives the auto-resolve loop in the
-    // retryDeploy handler. Declared out here so the outcome survives the try/
-    // finally that owns the busy slot. `sawTerminal` distinguishes a real
-    // success from a run that never produced a terminal result at all
-    // (exception, cancelled submit, lost contact) — both leave `detection`
-    // undefined, but only the first is an 'ok' the caller may act on.
+    // Set by the terminal result callback; a truthy value is what turns the
+    // outcome below into 'failed' rather than 'ok'. Declared out here so it
+    // survives the try/finally that owns the busy slot. `sawTerminal`
+    // distinguishes a real success from a run that never produced a terminal
+    // result at all (exception, cancelled submit, lost contact) — both leave
+    // `detection` undefined, but only the first is an 'ok' the caller may act on.
     let detection: MissingDependencies | undefined;
     let sawTerminal = false;
     try {
@@ -2359,11 +2397,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } finally {
       releaseBusy();
     }
-    if (detection) return { status: 'failed', missing: detection.keys, unresolved: detection.unresolved };
+    if (detection) return { status: 'failed' };
     // A run that never reached a terminal result (or was cancelled org-side,
-    // which reportPolledDeploy already carded) is NOT a success — an
-    // auto-resolve loop must stop without claiming the deploy landed.
-    return sawTerminal ? { status: 'ok', missing: [], unresolved: [] } : ABORTED;
+    // which reportPolledDeploy already carded) is NOT a success — the caller
+    // must not report the deploy as landed.
+    return sawTerminal ? { status: 'ok' } : ABORTED;
   }
 
   // ---- Dependency suggestions (failure-card "Try with dependencies") ----
@@ -2372,10 +2410,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  The webview only ever echoes an id and a SELECTION; every key it picks is
    *  validated against this map, so a forged message can neither mint a deploy
    *  key nor resurrect an expired suggestion. Bounded: oldest evicted. */
-  private liveSuggestions = new Map<string, { candidates: SuggestionCandidateInfo[]; retry: RetryRequest; orgLabel: string }>();
+  private liveSuggestions = new Map<string, { candidates: SuggestionCandidateInfo[]; unresolved: string[]; retry: RetryRequest; orgLabel: string; org: string }>();
   private suggestionSeq = 0;
 
-  private rememberSuggestion(id: string, data: { candidates: SuggestionCandidateInfo[]; retry: RetryRequest; orgLabel: string }): void {
+  private rememberSuggestion(id: string, data: { candidates: SuggestionCandidateInfo[]; unresolved: string[]; retry: RetryRequest; orgLabel: string; org: string }): void {
     this.liveSuggestions.set(id, data);
     // A handful of live cards is plenty — suggestions are meant to be acted on
     // right after the failure, and stale ones render inert after a reload anyway.
@@ -2709,10 +2747,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** Render the status card for a completed deploy/validate, including Apex test
    *  failures (surfaced when a test-level ran) and a Quick Deploy affordance for a
-   *  successful validation. */
-  /** Posts the deploy/validate result card. Returns the dependency detection for
-   *  a FAILED deploy (undefined on success) so an auto-resolving retry can decide
-   *  whether another round would add anything. */
+   *  successful validation. Returns the dependency detection for a FAILED deploy
+   *  (undefined on success) so runDeploy's caller can report 'failed' vs 'ok'. */
   private reportDeployResult(
     result: DeployResult,
     ctx: {
@@ -2841,10 +2877,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         problem: fileProblem(f) ?? ''
       }));
       if (envProblem) problemRows.push({ problem: envProblem });
+      // A test-only failure (the deploy itself succeeded, but a test assertion
+      // named a missing dependency — "System.NullPointerException" from a class
+      // referencing a __mdt record the org doesn't have, say) used to never reach
+      // the detector at all: testFailures never joined problemRows.
+      for (const t of testFailures) {
+        if (t.message) problemRows.push({ from: t.name ? `ApexClass:${t.name}` : undefined, problem: t.message });
+      }
+      // Vouches for a missing field's parent object too (detectMissingDependencies'
+      // "No such column" rule) — only when THIS org's membership was actually
+      // fetched; otherwise isLocalOnly stays undefined and the rule no-ops exactly
+      // as it did before it existed.
+      const isLocalOnly = this.orgMembersOrg === org ? (key: string): boolean => !this.orgMembers.has(key) : undefined;
       const deps = detectMissingDependencies(
         problemRows.map(row => row.problem),
         this.items,
-        new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
+        new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`)),
+        { isLocalOnly }
       );
       // "Retry + changed vs branch" was offered here in 0.15.0 and removed on user
       // feedback — the Changed lens already owns that workflow. The
@@ -2864,12 +2913,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // keeps the authority: liveSuggestions holds the server-side truth the
       // webview's clicks are validated against.
       const suggest = retryKeys && !ctx.retry?.sourceDir
-        ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys))
+        ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys), { isLocalOnly })
         : [];
       let suggestPayload: { id: string; candidates: SuggestionCandidateInfo[]; unresolved: string[] } | undefined;
       if (suggest.length && ctx.retry) {
         const id = `sug-${Date.now()}-${this.suggestionSeq++}`;
-        this.rememberSuggestion(id, { candidates: suggest, retry: ctx.retry, orgLabel });
+        // `org` (the username, not the alias) rides along so an accepted retry
+        // can be PINNED to it — the panel's org selector may have moved on by the
+        // time the user acts on the suggestion.
+        this.rememberSuggestion(id, { candidates: suggest, unresolved: deps.unresolved, retry: ctx.retry, orgLabel, org });
         suggestPayload = { id, candidates: suggest, unresolved: deps.unresolved };
       }
       // The unresolved diagnosis still renders as a guidance line when there is
@@ -2902,9 +2954,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           ...(suggestPayload ? { suggest: suggestPayload } : {})
         }
       });
-      // An auto-resolving retry round that is about to run again suppresses its
-      // own toast — otherwise one logical "resolve the dependencies" action
-      // fires a failure toast per round. The final round always reports.
       const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
       // Details also mirror into the output channel so "Show Output" opens a log
       // that actually mentions the failure.
@@ -5044,6 +5093,35 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'orgs', orgs: payload, selected: this.orgStore.get() ?? null });
   }
 
+  /** The persisted-history copy of a card carrying a live suggestion payload.
+   *  The payload itself never survives into storage (see the comment at the call
+   *  site), but without it a card restored after a reload used to say NOTHING
+   *  about what was found — silently dropping guidance the live card had shown.
+   *  This folds that guidance back in as plain `lines` text (the same wording
+   *  reportDeployResult's guidanceLines would have used had there been no
+   *  suggestion UI to carry it), and keeps the suggestion's id under a separate
+   *  `suggestId` field — inert on its own, but a later 'ready' can match it
+   *  against `liveSuggestions` and re-attach the button (see the 'ready' handler)
+   *  if the suggestion is still alive when the webview rebuilds. */
+  private stripSuggestForHistory(card: Record<string, unknown>): Record<string, unknown> {
+    const suggest = card.suggest as { id?: string; candidates?: SuggestionCandidateInfo[]; unresolved?: string[] };
+    const candidates = suggest.candidates ?? [];
+    const unresolved = suggest.unresolved ?? [];
+    const guidanceLines = [
+      ...(candidates.length ? [`Missing but available locally: ${candidates.map(c => c.key).join(', ')} — add them to the deploy by hand.`] : []),
+      ...(unresolved.length
+        ? [`Referenced but not found in your workspace: ${unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
+        : [])
+    ];
+    const existingLines = Array.isArray(card.lines) ? card.lines : [];
+    return {
+      ...card,
+      suggest: undefined,
+      ...(typeof suggest.id === 'string' ? { suggestId: suggest.id } : {}),
+      lines: [...guidanceLines, ...existingLines]
+    };
+  }
+
   private post(msg: unknown): void {
     const m = msg as { type?: string; card?: Record<string, unknown> } | null;
     if (m?.type === 'status' && m.card) {
@@ -5054,7 +5132,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // The suggestion UI is live-only: a card restored after a reload renders
       // without it (inert), so stale checkboxes can't deploy through an expired
       // liveSuggestions entry. History gets a copy WITHOUT the payload.
-      this.pushCardHistory(m.card.suggest ? { ...m.card, suggest: undefined } : m.card);
+      this.pushCardHistory(m.card.suggest ? this.stripSuggestForHistory(m.card) : m.card);
     }
     this.view?.webview.postMessage(msg);
   }
@@ -5160,8 +5238,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  covers the "command succeeded, deployment failed" outcomes. The status card
    *  in the panel stays the durable, detailed record. */
   /** Mirror a result and its detail lines into the output channel. Split out of
-   *  failureToast so a QUIET auto-resolve round still records why it failed —
-   *  suppressing the toast must never suppress the diagnostics. */
+   *  failureToast so the diagnostics are recorded independently of the toast. */
   private logResultLines(message: string, lines: Array<string | { text: string }> = []): void {
     try {
       this.output.appendLine(`[result] ${message}`);

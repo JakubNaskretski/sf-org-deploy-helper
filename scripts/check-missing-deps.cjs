@@ -12,7 +12,7 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
-const { detectMissingDependencies } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { detectMissingDependencies, buildSuggestionCandidates } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const p = (...s) => s.join(path.sep);
 
 let failed = 0;
@@ -131,6 +131,37 @@ check('typed field failure on an unknown object is unresolved, not guessed', () 
   assert.deepStrictEqual(out.unresolved, ['Opportunity.Status__c']);
 });
 
+// B14: "No such column" offers the field only — if the OBJECT is also missing
+// on the org that costs a second failed round. isLocalOnly lets the caller (who
+// knows the org membership snapshot; detectMissingDependencies itself does not)
+// vouch that the object needs deploying too.
+check('B14: the field\'s parent object is ALSO offered when the caller vouches it is local-only', () => {
+  const isLocalOnly = (key) => key === 'CustomObject:Widget__c';
+  const out = detectMissingDependencies(
+    ["No such column 'Size__c' on entity 'Widget__c'"], ITEMS, new Set(), { isLocalOnly });
+  assert.deepStrictEqual(out.keys, ['CustomField:Widget__c.Size__c', 'CustomObject:Widget__c']);
+});
+
+check('B14: with no isLocalOnly at all (no org snapshot), behaviour is unchanged — field only', () => {
+  assert.deepStrictEqual(run("No such column 'Size__c' on entity 'Widget__c'").keys, ['CustomField:Widget__c.Size__c']);
+});
+
+check('B14: isLocalOnly saying the object IS confirmed on the org does not add it', () => {
+  const isLocalOnly = () => false;
+  const out = detectMissingDependencies(
+    ["No such column 'Size__c' on entity 'Widget__c'"], ITEMS, new Set(), { isLocalOnly });
+  assert.deepStrictEqual(out.keys, ['CustomField:Widget__c.Size__c']);
+});
+
+check('B14: an object isLocalOnly vouches for but that has no LOCAL item is never minted', () => {
+  // Security invariant unchanged: isLocalOnly only gates whether the object try
+  // is ATTEMPTED — a real local item is still required to mint the key.
+  const isLocalOnly = () => true;
+  const out = detectMissingDependencies(
+    ["No such column 'Status__c' on entity 'Opportunity'"], ITEMS, new Set(), { isLocalOnly });
+  assert.deepStrictEqual(out.keys, []);
+});
+
 // ------------------------------------------------- pattern 5: "Invalid type: X"
 check('THE REPORTED CASE — Invalid type: smth__mdt resolves to the CustomObject', () => {
   assert.deepStrictEqual(run('Invalid type: smth__mdt').keys, ['CustomObject:smth__mdt']);
@@ -200,6 +231,32 @@ check('ambiguity collapses to unique once the other candidate is already deployi
 
 check('unknown bare name is unresolved', () => {
   assert.deepStrictEqual(run('Variable does not exist: nope__c').unresolved, ['nope__c']);
+});
+
+// --------------------------- B13: two more bare-field wordings (layout/SOQL) ---
+// Same shape as "Variable does not exist" — no reliable parent object in the
+// text, so both resolve unique-match-only through the SAME bare-name lookup.
+check('B13: "Field X does not exist. Check spelling." resolves the unique local field', () => {
+  assert.deepStrictEqual(run('Field Size__c does not exist. Check spelling.').keys, ['CustomField:Widget__c.Size__c']);
+});
+
+check('B13: an ambiguous "Field X does not exist" is never guessed between', () => {
+  const out = run('Field Status__c does not exist. Check spelling.');
+  assert.deepStrictEqual(out.keys, []);
+  assert.ok(out.unresolved[0].includes('ambiguous'), out.unresolved[0]);
+});
+
+check('B13: "Unknown field \'X\' in Y" resolves the unique local field — Y is NOT trusted as the parent', () => {
+  // Y names Case, but the only local Status__c that matters is the UNIQUE bare
+  // match — this pins that Y is ignored, not used to disambiguate.
+  assert.deepStrictEqual(
+    run("Unknown field 'Size__c' in Opportunity").keys,
+    ['CustomField:Widget__c.Size__c']
+  );
+});
+
+check('B13: an unknown "Unknown field" name is reported, never guessed', () => {
+  assert.deepStrictEqual(run("Unknown field 'Ghost__c' in Account").unresolved, ['Ghost__c']);
 });
 
 // --------------------------------------------------------- exclusion / dedupe
@@ -459,6 +516,22 @@ check('a failure naming many bare names stays fast on a large workspace', () => 
   detectMissingDependencies(problems, big, new Set());
   const ms = Date.now() - t0;
   assert.ok(ms < 1000, `took ${ms}ms — the bare-name lookup regressed to a per-candidate scan`);
+});
+
+check('B2 PRODUCT SHAPE: buildSuggestionCandidates over 200 failing rows on a 20k-item workspace stays fast', () => {
+  // Regression guard for the index-per-row bug: buildSuggestionCandidates used to
+  // call detectMissingDependencies once per failing row, and EACH call rebuilt
+  // byExact/byCiName/byBareName from scratch — O(rows x items), measured at
+  // 1494ms in the terminal deploy-result callback (a single detectMissingDependencies
+  // call over the same shape takes ~19ms). The index must now build ONCE.
+  const big = ITEMS.slice();
+  for (let i = 0; i < 20000; i++) big.push(item('CustomField', `Obj${i}__c.F${i}__c`, `objects/Obj${i}__c/fields/F${i}__c.field-meta.xml`));
+  const failures = [];
+  for (let i = 0; i < 200; i++) failures.push({ from: `ApexClass:Src${i}`, problem: `Variable does not exist: Nope${i}__c` });
+  const t0 = Date.now();
+  buildSuggestionCandidates(failures, big, new Set());
+  const ms = Date.now() - t0;
+  assert.ok(ms < 300, `took ${ms}ms — buildSuggestionCandidates regressed to a per-row index rebuild`);
 });
 
 // ==================================================== org-verified real strings
@@ -785,16 +858,35 @@ check('ORG-VERIFIED: "of type resourceUrl" resolves a StaticResource', () => {
   );
 });
 
+check('"of type messageChannel" resolves a LightningMessageChannel, c/ prefix stripped', () => {
+  const items2 = [item('LightningMessageChannel', 'OrderChannel', 'messageChannels/OrderChannel.messageChannel-meta.xml')];
+  const out = detectMissingDependencies(
+    ['Invalid reference c/OrderChannel of type messageChannel in file errProbe.js'], items2, new Set());
+  assert.deepStrictEqual(out.keys, ['LightningMessageChannel:OrderChannel']);
+});
+
+check('the c. prefix form still works for a label (regression for the widened c[./] group)', () => {
+  assert.deepStrictEqual(
+    run('Invalid reference c.Greeting_Label of type label in file errProbe.js').keys,
+    ['CustomLabel:Greeting_Label']
+  );
+});
+
 check('ORG-VERIFIED: the captured missing label is reported with its type', () => {
   const out = run('Invalid reference c.Zz_Missing_Label_123 of type label in file errProbe.js');
   assert.deepStrictEqual(out.keys, []);
   assert.deepStrictEqual(out.unresolved, ['CustomLabel:Zz_Missing_Label_123']);
 });
 
-check('an unverified "of type" value is left alone rather than mapped to a guessed type', () => {
+check('an unverified "of type" value is reported as unresolved, never mapped to a guessed type', () => {
+  // Neither label, resourceUrl nor messageChannel — B9: silence used to be the
+  // bug here too; it's now display-only text, exactly like any other referent
+  // this workspace can't help with, and it still cannot mint a key.
   const out = run('Invalid reference somethingElse of type apexMethod in file errProbe.js');
   assert.deepStrictEqual(out.keys, []);
-  assert.deepStrictEqual(out.unresolved, []);
+  assert.strictEqual(out.unresolved.length, 1);
+  assert.ok(out.unresolved[0].includes('somethingElse'), out.unresolved[0]);
+  assert.ok(out.unresolved[0].includes('apexMethod'), out.unresolved[0]);
 });
 
 // --- markup:// references ---------------------------------------------------

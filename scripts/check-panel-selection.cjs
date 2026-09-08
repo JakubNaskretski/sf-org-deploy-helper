@@ -348,6 +348,35 @@ check('replace also re-snapshots the Selected lens instead of stranding old rows
   assert.deepStrictEqual(rows, ['AcmeInvoiceService'], `lens still lists: ${rows.join(', ')}`);
 });
 
+// -------------------------------------------------- 3c) B4: transient selectKeys
+// A suggestion accept reveals what it added to its own retry WITHOUT joining the
+// persisted selection — a plain Deploy click right after must not silently pick
+// these up, and the user stays in whatever lens/mode they were already in.
+check('a transient selectKeys never joins the live selection or persisted state', () => {
+  const p = panel(RESTORED);
+  p.deliver(FILES(THREE));
+  const before = p.persisted().selected.slice().sort();
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeInvoiceService')], scroll: true, transient: true });
+  assert.strictEqual(p.liveCount(), 3, 'a transient key must not join the live selection');
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), before, 'a transient key must not be persisted');
+});
+
+check('a transient selectKeys still reveals the row (group auto-expands so it can be scrolled to)', () => {
+  const acmeNames = (p) => { const o = []; p.el('tree').find(e => { if (e.tagName === 'SPAN' && /^Acme/.test(e.textContent)) o.push(e.textContent); return false; }); return o; };
+  const p = panel({ ...RESTORED, selected: [], expandedGroups: [] });
+  p.deliver(FILES(THREE));
+  assert.ok(!acmeNames(p).includes('AcmeInvoiceService'), 'row already visible before the reveal — fixture is broken');
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeInvoiceService')], scroll: true, transient: true });
+  assert.ok(acmeNames(p).includes('AcmeInvoiceService'), 'the transient key never became visible');
+});
+
+check('a transient selectKeys does not force the user out of the Changed lens (replace/plain selectKeys does)', () => {
+  const p = panel({ ...RESTORED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeInvoiceService')], scroll: true, transient: true });
+  assert.strictEqual(p.persisted().viewMode, 'changed', 'transient must not switch the lens like a real selection does');
+});
+
 // ------------------------------------------ the Changed lens's bulk selection
 // "Select all (N)" reads the GROUP data, not the DOM, so the render cap can't
 // shrink what the button promises — and it is gated to local components, because
@@ -1151,6 +1180,104 @@ check('the context-menu paths and the provider\'s Rescan reply share the same gu
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
   const shape = /case 'refreshFiles':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.refreshFiles\(\); \} finally \{ this\.post\(\{ type: 'filesRefreshed' \}\); \}\n\s*return;/;
   assert.ok(shape.test(src), "refreshFiles handler must be exactly: try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }");
+});
+
+// ---------------------------------- 10) B1/B8: dependency-suggestion rendering
+// The provider-side contract (liveSuggestions, orgOverride, transient selectKeys,
+// suggestionRestore payload shape) is covered end to end in
+// check-suggestion-flow.cjs against the REAL provider; this section is the
+// webview-only half — panel.js is a browser IIFE with no exports of its own, so
+// it can only be driven the way check-panel-selection.cjs already does, by
+// delivering messages and reading back the DOM/state.
+const suggestCard = (overrides = {}) => ({
+  type: 'status',
+  card: {
+    kind: 'err', title: 'Deploy failed', at: 1,
+    lines: ['ApexClass:MyThing — Invalid type: smth__mdt'],
+    suggest: {
+      id: 'sug-1000-0',
+      candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing', why: 'Invalid type: smth__mdt' }],
+      unresolved: ['Ghost__mdt']
+    },
+    ...overrides
+  }
+});
+const openSuggestBtn = (p) => p.el('status').find(e => e.tagName === 'BUTTON' && /^Try with dependencies/.test(e.textContent));
+const statusLines = (p) => { const o = []; p.el('status').find(e => { if (e.tagName === 'LI') o.push(e.textContent); return false; }); return o; };
+const suggestWhys = (p) => { const o = []; p.el('status').find(e => { if (e.className === 'suggest-why') o.push(e.textContent); return false; }); return o; };
+const suggestRows = (p) => p.el('status').find(e => e.className === 'suggest-rows');
+const suggestUnresolved = (p) => p.el('status').find(e => e.className === 'suggest-unresolved');
+
+check('B11: the "Try with dependencies" button renders even with no other card.buttons', () => {
+  const p = panel(null);
+  p.deliver(suggestCard()); // no `buttons` field at all
+  assert.ok(openSuggestBtn(p), 'the button must not be gated behind card.buttons');
+});
+
+check('B8: opening the suggestion keeps the org error lines visible above the checkbox rows', () => {
+  const p = panel(null);
+  p.deliver(suggestCard());
+  openSuggestBtn(p).fire('click');
+  assert.ok(suggestRows(p), 'checkbox rows did not render');
+  assert.ok(statusLines(p).some(l => l.includes('smth__mdt')), `expected the org error line to stay visible: ${JSON.stringify(statusLines(p))}`);
+});
+
+check('B8: the "why" reason renders under its checkbox', () => {
+  const p = panel(null);
+  p.deliver(suggestCard());
+  openSuggestBtn(p).fire('click');
+  assert.deepStrictEqual(suggestWhys(p), ['Invalid type: smth__mdt']);
+});
+
+check('B8: a candidate with no why renders no suggest-why row (field is optional)', () => {
+  const p = panel(null);
+  p.deliver(suggestCard({ suggest: { id: 'sug-1000-1', candidates: [{ key: 'CustomObject:smth__mdt' }], unresolved: [] } }));
+  openSuggestBtn(p).fire('click');
+  assert.deepStrictEqual(suggestWhys(p), []);
+});
+
+check('B11: the unresolved wording says "Not found in your workspace (retrieve it, or its type is not scanned)"', () => {
+  const p = panel(null);
+  p.deliver(suggestCard());
+  openSuggestBtn(p).fire('click');
+  const el = suggestUnresolved(p);
+  assert.ok(el, 'no suggest-unresolved element');
+  assert.ok(el.textContent.startsWith('Not found in your workspace (retrieve it, or its type is not scanned): '), el.textContent);
+  assert.ok(el.textContent.includes('Ghost__mdt'), el.textContent);
+});
+
+check('B1: suggestionRestore merges the payload into the matching history card by suggestId, and the button reappears', () => {
+  const p = panel(null);
+  // What a webview rebuild actually receives: the STRIPPED persisted copy —
+  // `suggest` is gone, `suggestId` is what correlates a later restore.
+  p.deliver({
+    type: 'statusHistory',
+    cards: [{
+      kind: 'err', title: 'Deploy failed', at: 1, suggestId: 'sug-2000-0',
+      lines: ['Missing but available locally: CustomObject:smth__mdt — add them to the deploy by hand.', 'ApexClass:MyThing — Invalid type: smth__mdt']
+    }]
+  });
+  assert.ok(!openSuggestBtn(p), 'a stripped history card must not show the button before restore');
+  p.deliver({ type: 'suggestionRestore', id: 'sug-2000-0', candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing' }], unresolved: [] });
+  const btn = openSuggestBtn(p);
+  assert.ok(btn, 'suggestionRestore did not bring the button back');
+  assert.strictEqual(btn.textContent, 'Try with dependencies (1)');
+  // And it is fully live — opening it works exactly like a fresh suggestion.
+  btn.fire('click');
+  assert.ok(suggestRows(p), 'the restored suggestion cannot be opened');
+});
+
+check('B1: suggestionRestore for an id with no matching card, or already carrying a live suggest, is a no-op', () => {
+  const p = panel(null);
+  p.deliver({ type: 'statusHistory', cards: [{ kind: 'err', title: 'X', at: 1, suggestId: 'sug-3000-0', lines: [] }] });
+  p.deliver({ type: 'suggestionRestore', id: 'sug-nonexistent', candidates: [{ key: 'CustomObject:X' }], unresolved: [] });
+  assert.ok(!openSuggestBtn(p), 'restore attached to the wrong card');
+  // A card that already has a live suggest (e.g. the session's own posted card,
+  // never stripped) must not be clobbered by a stale restore for the same id.
+  const q = panel(null);
+  q.deliver(suggestCard({ suggestId: 'sug-1000-0' }));
+  q.deliver({ type: 'suggestionRestore', id: 'sug-1000-0', candidates: [{ key: 'CustomObject:different' }], unresolved: [] });
+  assert.strictEqual(openSuggestBtn(q).textContent, 'Try with dependencies (1)', 'a live suggest was overwritten by a restore');
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

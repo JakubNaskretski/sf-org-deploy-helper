@@ -31,9 +31,28 @@ check('per-row attribution: each candidate carries the failing component', () =>
     { from: 'ApexClass:PayFlow', problem: 'Invalid type: MyHelper' }
   ], ITEMS, new Set());
   assert.deepStrictEqual(out, [
-    { key: 'CustomObject:Billing__mdt', from: 'ApexClass:OrderSvc' },
-    { key: 'ApexClass:MyHelper', from: 'ApexClass:PayFlow' }
+    { key: 'CustomObject:Billing__mdt', from: 'ApexClass:OrderSvc', why: 'Invalid type: Billing__mdt' },
+    { key: 'ApexClass:MyHelper', from: 'ApexClass:PayFlow', why: 'Invalid type: MyHelper' }
   ]);
+});
+
+// -------------------------------------------------------------- B8: `why`
+check('why carries the org sentence that produced the candidate, ANSI-stripped and bounded', () => {
+  const out = buildSuggestionCandidates(
+    [{ from: 'ApexClass:A', problem: `Invalid type: MyHelper ([31mline 12[0m)   extra   spaces` }],
+    ITEMS, new Set()
+  );
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].why, 'Invalid type: MyHelper (line 12) extra spaces');
+});
+
+check('why is length-capped at 160', () => {
+  const out = buildSuggestionCandidates(
+    [{ from: 'ApexClass:A', problem: `Invalid type: MyHelper — ${'x'.repeat(300)}` }],
+    ITEMS, new Set()
+  );
+  assert.strictEqual(out.length, 1);
+  assert.ok(out[0].why.length <= 160, `len ${out[0].why.length}`);
 });
 
 check('two rows naming the same missing component dedupe to the FIRST row', () => {
