@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
@@ -228,6 +228,29 @@ const ABORTED: DeployOutcome = { status: 'aborted', missing: [], unresolved: [] 
  *  names a COUNT, so past this size "deploy N components?" stops being an
  *  informed yes. */
 const CHANGED_RETRY_MAX_ADDED = 100;
+
+/** Above this many components, deploy/validate/retrieve switch from one
+ *  `--metadata Type:Name` argv token per component to a generated package.xml
+ *  passed via `--manifest` — real argv, so ~500 components already blows
+ *  Windows' ~32 KB command-line limit, and the CLI is slower building/parsing
+ *  thousands of flags than reading one file. Only the argv shape changes: the
+ *  component set, keys, retry request and result mapping are all unaffected. */
+const MANIFEST_THRESHOLD = 30;
+
+/** Cap the ECHOED `--metadata` list at this many tokens ("… (+N more)") — the
+ *  command-log text shown the instant a deploy/retrieve/delete starts, before
+ *  the CLI has even been asked to run. Display only: the REAL argv (the exact
+ *  text sfCliService's formatCmd echoes once the command actually runs) is
+ *  never capped, and beginCmd's text is replaced with that real echo by the
+ *  time the run finishes. */
+const ECHO_METADATA_CAP = 20;
+
+/** Cap on a status card's `lines` — a deploy/retrieve over a few thousand
+ *  components would otherwise render (and persist) every single one. Shared
+ *  with pushCardHistory's own bound below, so a card capLines already trimmed
+ *  to CARD_LINE_CAP+1 (the summary tail counts as one line) isn't re-truncated
+ *  a second time on the way into history. */
+const CARD_LINE_CAP = 100;
 
 /** Pre-retrieve backup limits. A retrieve that would overwrite more than
  *  BACKUP_MAX_FILES local files skips the backup (a copy that large is almost
@@ -2172,6 +2195,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const isProd = isLikelyProduction(orgInfo);
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
+      // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
+      // ~32 KB command-line limit well under 1,000 components — switch to a
+      // generated package.xml. A sourceDir-pinned deploy (one picked file/dir)
+      // is never this big and keeps its own target.
+      const useManifest = !opts.sourceDir && n > MANIFEST_THRESHOLD;
 
       // RunSpecifiedTests needs an actual class list — resolved now (before the
       // confirm modal) so an empty list can refuse the deploy outright instead of
@@ -2199,7 +2227,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const modal = this.deployConfirmModal(
           {
             noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
-            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded
+            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, useManifest
           },
           false
         );
@@ -2226,7 +2254,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (buildRetryRequest inlined at the report call, below) would build.
       const retry = buildRetryRequest(opts, items, testLevel, runTests);
 
-      const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
+      // useManifest: write the temp package.xml now that the run is confirmed —
+      // its path feeds both the echoed command below and the real deploy call.
+      // Keys/retry/reattach/badge-flip all still key on Type:Name (unchanged
+      // above); only the argv target changes.
+      let manifest: { path: string; dir: string } | undefined;
+      if (useManifest) {
+        try {
+          manifest = await this.writeTempManifest(items);
+        } catch (err) {
+          this.reportError(`${verb} ${orgPrep(verb)} ${orgLabel}`, err, retry);
+          return ABORTED;
+        }
+      }
+
+      const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
       // owns releasing it, so stop the early-return releaser from double-firing.
       reserved = false;
@@ -2242,6 +2284,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // Submit ASYNC: the CLI enqueues the deploy (client-side conflict check
           // still runs here) and returns a job id in seconds. Cancel during this
           // brief window kills the submit before any job exists.
+          // The metadata list is passed as usual even when useManifest is set —
+          // deployMetadata's own precedence (manifest wins) ignores it in that
+          // case, same as every other caller of this method.
           const handle = this.sf.deployMetadata(
             items.map(i => `${i.type}:${i.name}`),
             org,
@@ -2250,6 +2295,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               ignoreConflicts,
               timeoutMs: this.timeoutMs(),
               sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined,
+              manifest: manifest?.path,
               validateOnly: opts.validateOnly,
               testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
               runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined,
@@ -2306,6 +2352,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.currentDeployJobId = undefined;
         this.currentDeployOrg = undefined;
         this.setBusy(false);
+        // A reattach only re-polls the existing job id — it never resubmits — so
+        // the manifest file is never needed again after this point either way.
+        await this.cleanupTempManifest(manifest?.dir);
       }
     } finally {
       releaseBusy();
@@ -2458,25 +2507,27 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
       instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: { count: number; entryKey: string };
+      useManifest?: boolean;
     },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
     const overwriteLine = overwriteNotice(ignoreConflicts, validateOnly, queued);
     const autoLine = autoIncludedNotice(autoIncluded);
+    const manifestLine = manifestNotice(useManifest);
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
-        options: { modal: true, detail: [instanceUrl ?? '', autoLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
+        options: { modal: true, detail: [instanceUrl ?? '', autoLine, manifestLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
     }
     // Below prod: keep the pre-existing shape — with no lines to show at all the
     // `detail` key stays absent rather than becoming an empty string.
-    const rest = [autoLine, overwriteLine, queueNote].filter(Boolean);
+    const rest = [autoLine, manifestLine, overwriteLine, queueNote].filter(Boolean);
     const detail = isProd
       ? [instanceUrl ?? '', ...rest].filter(Boolean).join('\n')
       : (rest.length > 0 ? rest.join('\n') : undefined);
@@ -2531,6 +2582,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const isProd = isLikelyProduction(orgInfo);
     const n = items.length;
     const noun = `${n} component${n === 1 ? '' : 's'}`;
+    // Display only here — see runDeploy, which computes the same thing again
+    // when the queued entry actually runs and generates the manifest there.
+    const useManifest = !opts.sourceDir && n > MANIFEST_THRESHOLD;
 
     const plan = this.resolveTestPlan(opts, isProd);
     if (!plan) return;
@@ -2555,7 +2609,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       {
         noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
         instanceUrl: orgInfo?.instanceUrl, ignoreConflicts,
-        autoIncluded: opts.autoIncluded
+        autoIncluded: opts.autoIncluded, useManifest
       },
       true
     );
@@ -2711,7 +2765,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
             : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
           meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
-          lines: [...lines, ...skipLines],
+          lines: this.capForCard(`Deployed to ${orgLabel} — full component list`, [...lines, ...skipLines]),
           // Built from the ITEMS, not from the display lines: a manifest deploy
           // synthesizes its items straight from <members> (wildcards and all) and
           // a reattached job synthesizes them from the org's own report, so those
@@ -2838,12 +2892,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           kind: 'err',
           title: validateOnly ? `Validation failed against ${orgLabel}` : `Deploy failed against ${orgLabel}`,
           meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}, ${successes.length} success${testFailures.length ? ` · ${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}` : ''}`,
-          lines: [
+          lines: this.capForCard(`Deploy failed against ${orgLabel} — full detail list`, [
             ...guidanceLines,
             ...errLines,
             ...testLines,
             ...skipLines
-          ],
+          ]),
           ...(buttons ? { buttons } : {}),
           ...(suggestPayload ? { suggest: suggestPayload } : {})
         }
@@ -3311,6 +3365,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (items.length === 0) return;
       const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
       const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
+      // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
+      // ~32 KB command-line limit well under 1,000 components — see runDeploy.
+      const useManifest = !opts.sourceDir && items.length > MANIFEST_THRESHOLD;
 
       const orgOnlyCount = items.filter(i => !i.filePath).length;
       const localCount = items.length - orgOnlyCount;
@@ -3321,7 +3378,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           : 'This will overwrite your local files.';
       const confirm = await vscode.window.showWarningMessage(
         `Retrieve ${noun} from ${orgLabel}?`,
-        { modal: true, detail },
+        { modal: true, detail: [detail, manifestNotice(useManifest)].filter(Boolean).join('\n') },
         'Retrieve'
       );
       if (confirm !== 'Retrieve') return;
@@ -3350,13 +3407,27 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // check stays as the last safety net. Deploy keeps its opt-in toggle — there
       // the overwrite hits the org, not a backed-up file.
       const ignoreConflicts = backupDir !== undefined;
-      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
+      // useManifest: same temp package.xml approach as runDeploy — Type:Name keys
+      // and the result mapping below are unaffected, only the argv target changes.
+      let manifest: { path: string; dir: string } | undefined;
+      if (useManifest) {
+        try {
+          manifest = await this.writeTempManifest(items);
+        } catch (err) {
+          this.reportError(`Retrieve from ${orgLabel}`, err);
+          return; // releaseBusy() in the outer finally frees the slot
+        }
+      }
+      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
       reserved = false;
       const start = Date.now();
       try {
         await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
         this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
-        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, ignoreConflicts });
+        // The metadata list is passed as usual even when useManifest is set —
+        // retrieveMetadata's own precedence (manifest wins) ignores it, same as
+        // the manifest-file retrieve feature below (runManifestRetrieve).
+        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, manifest: manifest?.path, ignoreConflicts });
         this.currentCancel = handle.cancel;
         const { result, cmd } = await handle.promise;
         this.updateCmd(cmdId, cmd);
@@ -3380,7 +3451,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: 'ok',
               title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
               ...(backupNote ? { meta: backupNote } : {}),
-              lines: ok.map(f => `${f.type}:${f.fullName}`),
+              lines: this.capForCard(`Retrieved from ${orgLabel} — full component list`, ok.map(f => `${f.type}:${f.fullName}`)),
               ...this.backupCardButtons(backupDir)
             }
           });
@@ -3397,9 +3468,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           });
           this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
         } else {
+          // Failures FIRST: capForCard cuts off the TAIL, and a failure must
+          // never be the thing that gets cut just because there were more
+          // successes ahead of it in the list.
           const lines: string[] = [];
-          for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
           for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`);
+          for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
           for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
           lines.push(...msgLines);
           this.post({
@@ -3408,7 +3482,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: failed.length > 0 ? 'err' : 'warn',
               title: `Retrieve from ${orgLabel} completed with issues`,
               meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing${backupNote ? ` · ${backupNote}` : ''}`,
-              lines,
+              lines: this.capForCard(`Retrieve from ${orgLabel} — full detail list`, lines),
               ...this.backupCardButtons(backupDir)
             }
           });
@@ -3428,6 +3502,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       } finally {
         this.currentCancel = undefined;
         this.setBusy(false);
+        await this.cleanupTempManifest(manifest?.dir);
       }
     } finally {
       releaseBusy();
@@ -4722,15 +4797,49 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return byPath ? `${byPath.type}:${byPath.name}` : undefined;
   }
 
+  /** Echoed `--metadata` list, capped at ECHO_METADATA_CAP tokens — display only,
+   *  see its doc comment. */
   private metadataArgs(items: MetadataItem[]): string {
-    return items.map(i => `--metadata ${i.type}:${i.name}`).join(' ');
+    const shown = items.slice(0, ECHO_METADATA_CAP).map(i => `--metadata ${i.type}:${i.name}`).join(' ');
+    const more = items.length - ECHO_METADATA_CAP;
+    return more > 0 ? `${shown} … (+${more} more)` : shown;
   }
 
-  /** Echoed-command target: an explicit `--source-dir <path>` when deploying/retrieving
-   *  a pointed-at file, else the per-component `--metadata` list. */
-  private targetArg(sourceDir: string | undefined, items: MetadataItem[]): string {
-    if (!sourceDir) return this.metadataArgs(items);
-    return `--source-dir ${/\s/.test(sourceDir) ? `"${sourceDir}"` : sourceDir}`;
+  /** Echoed-command target, in the same precedence sfCliService's deployMetadata/
+   *  retrieveMetadata apply: an explicit manifest path (MANIFEST_THRESHOLD) wins,
+   *  then `--source-dir <path>` for a pointed-at file, else the per-component
+   *  `--metadata` list. */
+  private targetArg(sourceDir: string | undefined, items: MetadataItem[], manifestPath?: string): string {
+    if (manifestPath) {
+      const quoted = /\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath;
+      return `--manifest ${quoted} (${items.length} component${items.length === 1 ? '' : 's'})`;
+    }
+    if (sourceDir) return `--source-dir ${/\s/.test(sourceDir) ? `"${sourceDir}"` : sourceDir}`;
+    return this.metadataArgs(items);
+  }
+
+  /** Write a component set to a per-run temp package.xml for the manifest deploy/
+   *  retrieve path (MANIFEST_THRESHOLD) — a fresh mkdtemp dir per run, so
+   *  concurrent queued runs can never collide. The caller removes it via
+   *  cleanupTempManifest once the run is done. */
+  private async writeTempManifest(items: MetadataItem[]): Promise<{ path: string; dir: string }> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-manifest-'));
+    const apiVersion = await resolveApiVersion(this.workspaceRoot ?? process.cwd());
+    const file = path.join(dir, 'package.xml');
+    await fs.writeFile(file, buildManifestXml(items.map(i => ({ type: i.type, name: i.name })), apiVersion), 'utf8');
+    return { path: file, dir };
+  }
+
+  /** Best-effort cleanup for writeTempManifest's dir. The deploy/retrieve already
+   *  ran either way, so a failure here is not the user's problem — log the path
+   *  once (it's a single attempt, not a loop) instead of surfacing an error. */
+  private async cleanupTempManifest(dir: string | undefined): Promise<void> {
+    if (!dir) return;
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch (err) {
+      this.output.appendLine(`[manifest] couldn't remove temp manifest dir ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private timeoutMs(): number {
@@ -4986,8 +5095,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (typeof persistable.errText === 'string' && persistable.errText.length > 8_000) {
       persistable.errText = `${persistable.errText.slice(0, 8_000)}\n… (truncated in history)`;
     }
-    if (Array.isArray(persistable.lines) && persistable.lines.length > 100) {
-      persistable.lines = [...persistable.lines.slice(0, 100), `… ${persistable.lines.length - 100} more (truncated in history)`];
+    // > CARD_LINE_CAP + 1, not just > CARD_LINE_CAP: capForCard/capLines already
+    // trims a live card to at most CARD_LINE_CAP real lines plus its own summary
+    // tail (one extra line) — re-slicing at the plain cap would chop that tail
+    // off and replace it with this less useful generic note.
+    if (Array.isArray(persistable.lines) && persistable.lines.length > CARD_LINE_CAP + 1) {
+      persistable.lines = [...persistable.lines.slice(0, CARD_LINE_CAP), `… ${persistable.lines.length - CARD_LINE_CAP} more (truncated in history)`];
     }
     // Same bloat bound for a button that carries a key list ("Select these N"):
     // 50 cards × an unbounded deploy set is state-DB weight nobody asked for.
@@ -5061,6 +5174,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       this.output.appendLine(`[logResultLines] failed to log "${message}": ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
+   *  list into the Output channel first when it's about to be cut — a deploy/
+   *  retrieve over a few thousand components is inconvenient to scroll in a
+   *  card, but the full list must never simply be gone. */
+  private capForCard(header: string, lines: Array<string | { text: string }>): Array<string | { text: string }> {
+    if (lines.length > CARD_LINE_CAP) this.logResultLines(header, lines);
+    return capLines(lines);
   }
 
   /** Injection point for notify()'s de-dup/rate-limit clock — real time in
@@ -5978,6 +6100,13 @@ function overwriteNotice(ignoreConflicts: boolean, validateOnly: boolean, queued
   return queued ? `${body} The setting is re-read when this queued run starts.` : body;
 }
 
+/** Modal detail line for a run above MANIFEST_THRESHOLD: names why the command
+ *  log will show `--manifest <path>` instead of one `--metadata` flag per
+ *  component, so the changed shape doesn't read as a bug. */
+function manifestNotice(useManifest: boolean | undefined): string | undefined {
+  return useManifest ? 'Large selection — sent via a generated package.xml manifest, not one --metadata flag per component.' : undefined;
+}
+
 /**
  * Modal detail line for "Deploy File + Dependencies": the one deploy path where
  * the confirmed set is mostly NOT what the user selected. The count alone
@@ -5990,6 +6119,20 @@ function overwriteNotice(ignoreConflicts: boolean, validateOnly: boolean, queued
 export function autoIncludedNotice(auto: { count: number; entryKey: string } | undefined): string | undefined {
   if (!auto || auto.count <= 0) return undefined;
   return `Includes ${auto.count} component${auto.count === 1 ? '' : 's'} auto-included as local dependencies of ${auto.entryKey} — the result card lists each one and what referenced it.`;
+}
+
+/** Bound a status card's `lines` at `max`, appending one summary line instead of
+ *  rendering (and persisting) every entry — a deploy/retrieve over a few
+ *  thousand components would otherwise do exactly that. Pure and order-
+ *  preserving: callers that need failures to survive the cut put those lines
+ *  first. */
+export function capLines<T extends string | { text: string }>(
+  lines: T[],
+  max: number = CARD_LINE_CAP,
+  more: (n: number) => string = n => `… and ${n} more — full list in the Output channel`
+): Array<T | string> {
+  if (lines.length <= max) return lines;
+  return [...lines.slice(0, max), more(lines.length - max)];
 }
 
 /** Preposition for a verb in card / progress / toast text: a check-only run

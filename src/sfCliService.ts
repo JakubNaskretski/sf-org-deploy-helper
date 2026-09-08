@@ -251,6 +251,12 @@ export class SfCliService extends KitSfCliService {
    * confirmation (the caller confirms in VS Code first, and stdin isn't wired up).
    * With `opts.dryRun` it validates the delete without executing — used to preview
    * exactly what would be removed before the destructive confirm.
+   *
+   * No `manifest` option (unlike deployMetadata/retrieveMetadata): `sf project
+   * delete source` has no `--manifest` flag, only `--metadata`/`--source-dir` — so
+   * the large-selection manifest optimization (MANIFEST_THRESHOLD, panelProvider)
+   * does not apply here. A very large delete still argvs one `--metadata` per
+   * component.
    */
   deleteSource(
     metadata: string[],

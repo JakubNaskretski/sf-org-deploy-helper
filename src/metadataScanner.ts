@@ -163,6 +163,51 @@ export async function resolvePackageDirs(root: string): Promise<string[]> {
   return ['force-app'];
 }
 
+/** Fallback `<version>` for a generated manifest (large-selection deploy/retrieve,
+ *  see MANIFEST_THRESHOLD in panelProvider.ts) when the project names none — a
+ *  recent, still-supported API version beats failing the whole run over one field. */
+const DEFAULT_MANIFEST_API_VERSION = '62.0';
+
+/** Read `sourceApiVersion` from sfdx-project.json (the same field the CLI itself
+ *  defaults deploys to) for a generated manifest's `<version>`. Same read-and-
+ *  fall-back shape as resolvePackageDirs. */
+export async function resolveApiVersion(root: string): Promise<string> {
+  try {
+    const cfg = await fs.readFile(path.join(root, 'sfdx-project.json'), 'utf8');
+    const parsed = JSON.parse(cfg) as { sourceApiVersion?: string };
+    if (typeof parsed.sourceApiVersion === 'string' && /^\d+\.\d+$/.test(parsed.sourceApiVersion)) return parsed.sourceApiVersion;
+  } catch {
+    // ignore
+  }
+  return DEFAULT_MANIFEST_API_VERSION;
+}
+
+/** Build a package.xml for a component set, types and members both sorted and
+ *  XML-escaped, for deterministic output. Used above MANIFEST_THRESHOLD so a
+ *  deploy/validate/retrieve sends `--manifest <file>` instead of one
+ *  `--metadata Type:Name` argv token per component — the real failure mode is
+ *  Windows' ~32 KB command-line limit, hit around 500 components. Pure (no I/O),
+ *  so it's directly unit-testable. */
+export function buildManifestXml(items: Array<{ type: string; name: string }>, apiVersion: string): string {
+  const byType = new Map<string, Set<string>>();
+  for (const { type, name } of items) {
+    let names = byType.get(type);
+    if (!names) { names = new Set(); byType.set(type, names); }
+    names.add(name);
+  }
+  const escape = (s: string): string => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+  const typeBlocks = [...byType.keys()].sort().map(type => {
+    const members = [...byType.get(type)!].sort().map(n => `    <members>${escape(n)}</members>`).join('\n');
+    return `  <types>\n${members}\n    <name>${escape(type)}</name>\n  </types>`;
+  }).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n${typeBlocks}\n  <version>${escape(apiVersion)}</version>\n</Package>\n`;
+}
+
 /**
  * Reduce file-search results to one project root. Kept separate from the VS Code
  * search so the duplicate/multiple-project contract is directly testable.
