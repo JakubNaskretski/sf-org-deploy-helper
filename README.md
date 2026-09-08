@@ -33,6 +33,21 @@ are hidden unless `sfOrgDeployWrapper.fetchIncludeManaged` is on (the card says 
 type). DataPack exports (`vlocity/`, `*_DataPack.json`) are data, not Metadata API source: the
 scan flags them but cannot list them.
 
+## Deploy File + Dependencies
+
+Right-click an Apex class/trigger, an LWC or Aura bundle, or a Visualforce page/component
+(also on the command palette, and on an explorer multi-selection of up to 20 files) for
+**SF Deploy: Deploy File + Dependencies**. It reads the file's own source for references to
+other workspace components — Apex classes it calls, custom objects/fields it touches, child
+LWC/Aura bundles, message channels, static resources, Visualforce controllers/extensions —
+and deploys the whole local closure as ONE deploy, instead of failing layer by layer and
+being patched one failure card at a time. Best-effort, not a parser: a false positive just
+deploys an unchanged copy of an unrelated component (harmless), and a miss falls back to the
+usual failure card. The confirm modal names how many components were auto-included on top of
+what you picked (and why, for the first few); the result card lists every one of them with
+the component whose source pulled it in. `sfOrgDeployWrapper.dependencyMaxDepth` and
+`sfOrgDeployWrapper.dependencyMaxComponents` bound how far and how wide the scan goes.
+
 ## Requirements
 
 - Salesforce CLI (`sf`) installed and on `PATH`.
@@ -56,3 +71,5 @@ scan flags them but cannot list them.
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
 - `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org).
 - `sfOrgDeployWrapper.debugTiming` — log click-to-modal timing to the **SF Deploy** Output channel, to diagnose a slow confirmation dialog (default off).
+- `sfOrgDeployWrapper.dependencyMaxDepth` — how many reference layers **Deploy File + Dependencies** follows below the file(s) you picked (default 2, 1–3).
+- `sfOrgDeployWrapper.dependencyMaxComponents` — cap on how many components **Deploy File + Dependencies** may auto-include (default 40, 5–200).

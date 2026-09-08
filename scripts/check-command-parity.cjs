@@ -16,6 +16,9 @@
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
+const Module = require('module');
+const origLoad = Module._load;
+Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
 let failed = 0;
 let ran = 0;
@@ -27,6 +30,7 @@ function check(name, fn) {
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
 const extSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
 const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
+const dg = require(path.join(__dirname, '..', 'out', 'depGraph.js'));
 
 const manifestIds = pkg.contributes.commands.map(c => c.command);
 // Every `registerSafe('id', ...)` call in extension.ts.
@@ -73,6 +77,33 @@ check('openInOrg and deleteFromOrg carry the SAME context-menu `when` as diffFil
 check('loginOrg has no context-menu entry — it is not file-scoped', () => {
   for (const menuName of ['explorer/context', 'editor/context']) {
     assert.ok(!pkg.contributes.menus[menuName].some(m => m.command === 'sfOrgDeployWrapper.loginOrg'), `loginOrg unexpectedly in ${menuName}`);
+  }
+});
+
+// A7/A12: "Deploy File + Dependencies" only scans Apex classes/triggers, LWC/
+// Aura bundles and Visualforce pages/components (depGraph.canScanDependencies)
+// — the OTHER file-scoped commands (Deploy/Retrieve/Diff/…) share the far
+// broader FILE_WHEN clause above (also matches resource/email/-meta.xml),
+// because THEY don't run a scan at all. This pins the narrower clause exactly
+// AND cross-checks its extension list against the runtime function, so the
+// two can never quietly drift apart again.
+check('deployFileWithDeps\' context-menu `when` names exactly the types canScanDependencies accepts', () => {
+  const DEPS_WHEN = 'resourceExtname =~ /\\.(cls|trigger|page|component)$/ || resourceFilename =~ /\\.(cls|trigger|page|component)-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/';
+  for (const menuName of ['explorer/context', 'editor/context']) {
+    const entry = pkg.contributes.menus[menuName].find(m => m.command === 'sfOrgDeployWrapper.deployFileWithDeps');
+    assert.ok(entry, `deployFileWithDeps missing from ${menuName}`);
+    assert.strictEqual(entry.when, DEPS_WHEN, `deployFileWithDeps in ${menuName} has an unexpected when clause`);
+  }
+  const EXT_TYPE = { cls: 'ApexClass', trigger: 'ApexTrigger', page: 'ApexPage', component: 'ApexComponent' };
+  for (const [ext, type] of Object.entries(EXT_TYPE)) {
+    assert.strictEqual(dg.canScanDependencies(type), true, `.${ext} (${type}) is in the when clause but canScanDependencies rejects it`);
+  }
+  assert.strictEqual(dg.canScanDependencies('LightningComponentBundle'), true);
+  assert.strictEqual(dg.canScanDependencies('AuraDefinitionBundle'), true);
+  // Nothing scannable is missing from either list, and nothing unscannable
+  // sneaks in.
+  for (const type of ['CustomObject', 'CustomField', 'Flow', 'StaticResource', 'Layout', 'PermissionSet']) {
+    assert.strictEqual(dg.canScanDependencies(type), false, `test bug: ${type} should not be scannable`);
   }
 });
 

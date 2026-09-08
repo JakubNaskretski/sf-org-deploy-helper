@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.22.2",
+  "version": "0.23.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -126,7 +126,7 @@
         },
         {
           "command": "sfOrgDeployWrapper.deployFileWithDeps",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component)$/ || resourceFilename =~ /\\.(cls|trigger|page|component)-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@5"
         },
         {
@@ -173,7 +173,7 @@
         },
         {
           "command": "sfOrgDeployWrapper.deployFileWithDeps",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component)$/ || resourceFilename =~ /\\.(cls|trigger|page|component)-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@5"
         },
         {
@@ -278,6 +278,20 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Diagnose a slow confirmation dialog by logging click-to-modal timing to the **SF Deploy** Output channel. When on, clicking Deploy, Validate, Retrieve, Diff, or Fetch Org logs a `[timing]` line: for Deploy/Validate, the time from click to `postMessage` (in the panel), panel-to-extension delivery, reserving the operation slot, and reaching the confirm dialog; for Retrieve/Diff/Fetch Org, just the click-to-arrival time. Off by default — it's for tracking down where a click-to-confirmation delay is coming from, not for everyday use."
+        },
+        "sfOrgDeployWrapper.dependencyMaxDepth": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 3,
+          "markdownDescription": "How many reference layers **SF Deploy: Deploy File + Dependencies** follows below the file you picked (1 = only what it directly references). VS Code doesn't enforce the `minimum`/`maximum` below at runtime, so the extension itself clamps whatever you set here. Each extra layer multiplies the guesswork — the scan is token matching, not a real parser — so raising this trades a bigger implicit deploy set for fewer failure-card round-trips."
+        },
+        "sfOrgDeployWrapper.dependencyMaxComponents": {
+          "type": "number",
+          "default": 40,
+          "minimum": 5,
+          "maximum": 200,
+          "markdownDescription": "Cap on how many components **SF Deploy: Deploy File + Dependencies** may auto-include on top of the file(s) you picked. VS Code doesn't enforce the `minimum`/`maximum` below at runtime, so the extension itself clamps whatever you set here. Past this size \"deploy N components?\" stops being an informed yes — the confirm modal and the result card both say when the scan hit this cap and that the included set may be incomplete."
         },
         "skrety.salesforce.targetOrg": {
           "type": "string",

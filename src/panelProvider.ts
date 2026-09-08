@@ -210,15 +210,46 @@ interface RetryRequest {
   ignoreConflicts?: boolean;
 }
 
-/** What a runDeploy call did. `aborted` covers every path that never reached the
- *  org (queued, busy slot refused, no root/org, user dismissed the confirm) — a
- *  caller reacting to the result (a suggestion retry, deployFileWithDeps) must
- *  treat it as "nothing ran", never as a failure. */
+/** What a runDeploy call did. `aborted` covers every path that never reached a
+ *  terminal org result (queued, busy slot refused, no root/org, user dismissed
+ *  the confirm, submit itself threw, org-side cancel) — a caller reacting to the
+ *  result (a suggestion retry, deployFileWithDeps) must treat it as "nothing
+ *  landed", never as a failure.
+ *
+ *  `confirmed` (A5) narrows that further: true once the user affirmatively said
+ *  yes to a confirm modal for THIS request — the immediate modal, a drained
+ *  pre-confirmed queue entry, or an enqueue's own "Queue: " modal that actually
+ *  queued it — even though nothing reached the org yet (queued) or the org
+ *  submission itself threw (a conflict). False covers every path where nothing
+ *  was confirmed at all: a dismissed modal, no root/org, a refused busy slot, an
+ *  already-queued twin. A caller that explains WHAT was about to deploy
+ *  (deployFileWithDeps' attribution card) keys off `confirmed`, not `status`,
+ *  because `status: 'aborted'` alone conflates "the user said yes but it hasn't
+ *  landed" with "nothing happened". */
 interface DeployOutcome {
   status: 'ok' | 'failed' | 'aborted';
+  confirmed?: boolean;
+}
+
+/** Modal/card explanation for "Deploy File + Dependencies" and the suggestion
+ *  accept path (A1): how many components were added beyond what the user
+ *  picked, and — for the dependency scan specifically — per-key attribution and
+ *  whether/how much the scan's own caps cut. `refs`/`truncated`/`dropped`/
+ *  `maxDepth`/`maxComponents` are absent on the suggestion path (it has no
+ *  depth/count caps of its own); autoIncludedNotice renders sensibly either
+ *  way — see its own doc comment. */
+interface AutoIncludedInfo {
+  count: number;
+  entryKey: string;
+  truncated?: boolean;
+  dropped?: number;
+  refs?: Array<{ key: string; from: string }>;
+  maxDepth?: number;
+  maxComponents?: number;
 }
 
 const ABORTED: DeployOutcome = { status: 'aborted' };
+const ABORTED_CONFIRMED: DeployOutcome = { status: 'aborted', confirmed: true };
 
 /** Cap on how many changed components one "Retry + changed vs branch" click may
  *  add. A branch that many components ahead of the failed deploy is a release
@@ -250,6 +281,13 @@ const ECHO_METADATA_CAP = 20;
  *  to CARD_LINE_CAP+1 (the summary tail counts as one line) isn't re-truncated
  *  a second time on the way into history. */
 const CARD_LINE_CAP = 100;
+
+/** Cap on how many explorer-selected files "Deploy File + Dependencies" (A11)
+ *  scans as entries in one go — each is its own BFS root, so an unbounded
+ *  multi-select would multiply the scan (and the eventual deploy set) by
+ *  however many files got selected. Twenty covers a deliberate "these classes
+ *  belong together" pick; a bigger release belongs in a manifest. */
+const DEPLOY_DEPS_MAX_FILES = 20;
 
 /** Pre-retrieve backup limits. A retrieve that would overwrite more than
  *  BACKUP_MAX_FILES local files skips the backup (a copy that large is almost
@@ -585,17 +623,25 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   async loginOrg(): Promise<void> { return this.runLogin(); }
 
   /**
-   * "Deploy File + Dependencies" (context menu / palette): resolve the file's
-   * LOCAL dependency closure up front (depGraph — Apex tokens plus LWC/Aura
-   * declared references, best-effort) and deploy entry + dependencies as ONE
-   * set, instead of reacting to org errors
-   * layer by layer the way the failure-card suggestions do. Every dependency key comes
-   * from a scanned MetadataItem, so this path upholds the same invariant as the
-   * error-driven one: file text can never mint a `--metadata` key that isn't a
-   * real workspace component. runDeploy's confirm modal names the full count
-   * before anything reaches the org.
+   * "Deploy File + Dependencies" (context menu / palette): resolve the
+   * selected file(s)' LOCAL dependency closure up front (depGraph — Apex
+   * tokens, LWC/Aura/Visualforce declared references, best-effort) and deploy
+   * entry + dependencies as ONE set, instead of reacting to org errors layer
+   * by layer the way the failure-card suggestions do. Every dependency key
+   * comes from a scanned MetadataItem, so this path upholds the same
+   * invariant as the error-driven one: file text can never mint a
+   * `--metadata` key that isn't a real workspace component. runDeploy's
+   * confirm modal names the full count before anything reaches the org.
+   *
+   * `uris` (A11) is the full explorer multi-selection when the command was
+   * invoked that way — `uri` is just the clicked item, already included in it.
+   * Capped and deduped so a "select everything, deploy deps" click can't kick
+   * off an unbounded scan; every selected file becomes its OWN BFS entry (the
+   * resolver already accepts an array — see resolveLocalDependencies), so two
+   * selected files that reference each other never double up (each is
+   * pre-seeded into the seen-set as an entry, never reported as a dependency).
    */
-  async deployFileWithDeps(uri: vscode.Uri): Promise<void> {
+  async deployFileWithDeps(uri: vscode.Uri, uris?: vscode.Uri[]): Promise<void> {
     if (!uri || !uri.fsPath) {
       vscode.window.showInformationMessage('No file selected.');
       return;
@@ -604,59 +650,103 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Orgs load for the same reason as runByUri: the production guard must be
     // able to classify the target even when the panel never opened.
     if (this.orgs.length === 0) await this.loadOrgs();
-    const match = findItemForPath(this.items, uri.fsPath);
-    if (!match) {
+
+    const paths = uris && uris.length > 1
+      ? [...new Set(uris.map(u => u.fsPath))].slice(0, DEPLOY_DEPS_MAX_FILES)
+      : [uri.fsPath];
+    const matched: MetadataItem[] = [];
+    let unscannedCount = 0;
+    for (const p of paths) {
+      const m = findItemForPath(this.items, p);
+      if (m) matched.push(m); else unscannedCount++;
+    }
+    if (matched.length === 0) {
       // No infer/CLI fallback here, unlike runByUri: an inferred (out-of-package)
       // item deploys via --source-dir, which beats --metadata in the CLI argv
       // (sfCliService.deployMetadata) and would silently discard every dependency
       // key — the one thing this command exists to add. Plain "Deploy to Org"
       // still handles such files.
-      vscode.window.showInformationMessage(
-        'Not a scanned Salesforce metadata file — dependency resolution needs a file inside the project\'s package directories. Use "SF Deploy: Deploy to Org" for this one.'
-      );
+      this.notify('info', 'Not a scanned Salesforce metadata file — dependency resolution needs a file inside the project\'s package directories. Use "SF Deploy: Deploy to Org" for this one.');
       return;
     }
-    const key = `${match.type}:${match.name}`;
-    if (!canScanDependencies(match.type)) {
+    if (unscannedCount > 0) {
+      this.output.appendLine(`[deployFileWithDeps] ${unscannedCount} selected file(s) are not scanned workspace components — skipped.`);
+    }
+    // Two different selected paths (e.g. a .cls and its .cls-meta.xml sidecar)
+    // can resolve to the SAME component — one entry, not two.
+    const seenEntryKeys = new Set<string>();
+    const entries: MetadataItem[] = [];
+    for (const m of matched) {
+      const k = `${m.type}:${m.name}`;
+      if (seenEntryKeys.has(k)) continue;
+      seenEntryKeys.add(k);
+      entries.push(m);
+    }
+    const entryKeys = entries.map(e => `${e.type}:${e.name}`);
+    const label = entries.length === 1 ? entryKeys[0] : `${entries.length} selected files`;
+
+    if (!entries.some(e => canScanDependencies(e.type))) {
       // Still a useful deploy — just be honest that no scan happened, so the
       // user doesn't assume referenced components were included.
-      vscode.window.showInformationMessage(
-        `Dependency scanning follows Apex, LWC and Aura source — deploying ${key} on its own.`
-      );
-      await this.runDeploy([key]);
+      this.notify('info', `Dependency scanning follows Apex, LWC and Aura source (plus Visualforce pages/components) — deploying ${label} on its own.`);
+      await this.runDeploy(entryKeys);
       return;
     }
-    const deps = await resolveLocalDependencies([match], this.items, async p => {
+    const maxDepth = this.dependencyMaxDepth();
+    const maxComponents = this.dependencyMaxComponents();
+    const deps = await resolveLocalDependencies(entries, this.items, async p => {
       try { return await fs.readFile(p, 'utf8'); } catch { return undefined; }
-    });
+    }, { maxDepth, maxDeps: maxComponents });
+
+    // A10: an unreadable ENTRY file must never look identical to "genuinely
+    // has no dependencies" — logged unconditionally (Output), regardless of
+    // what the user does with the confirm modal below.
+    const byKey = new Map(entries.map(e => [`${e.type}:${e.name}`, e]));
+    for (const k of deps.unreadableEntries) {
+      this.output.appendLine(`[deployFileWithDeps] could not read ${byKey.get(k)?.filePath ?? k} — deploying it without a dependency scan.`);
+    }
+    const hasUnreadable = deps.unreadableEntries.length > 0;
+
     // The confirm modal is the LAST point where this set can be refused, and it
     // otherwise names only a total — a number the user cannot check, because they
-    // picked one file and the rest was chosen for them. autoIncluded makes the
+    // picked the file(s) and the rest was chosen for them. autoIncluded makes the
     // split explicit there (see deployConfirmModal); the attribution card below
     // then answers "which, and referenced by what".
-    const outcome = await this.runDeploy([key, ...deps.keys], {
-      autoIncluded: deps.keys.length ? { count: deps.keys.length, entryKey: key } : undefined
-    });
+    const autoIncluded: AutoIncludedInfo | undefined = deps.keys.length ? {
+      count: deps.keys.length,
+      entryKey: label,
+      truncated: deps.truncated,
+      dropped: deps.dropped,
+      refs: deps.refs.map(r => ({ key: r.key, from: r.from })),
+      maxDepth,
+      maxComponents
+    } : undefined;
+    const outcome = await this.runDeploy([...entryKeys, ...deps.keys], { autoIncluded });
     // Post-hoc visibility: the result card lists every key but doesn't say which
     // were auto-included or WHY — this card does, so a surprising extra component
     // is traceable to the reference that pulled it in rather than looking like
     // panel state gone wrong.
-    // An aborted outcome posts nothing: either no deploy happened (dismissed
-    // modal, no org) or it was queued — and a queued run's confirm already named
-    // the full count, with the eventual result card listing every key.
-    if (deps.keys.length === 0 || outcome.status === 'aborted') return;
+    // A5: post it whenever the user actually confirmed something — the
+    // immediate modal, a queued run's own "Queue: " modal, or a submit that
+    // threw AFTER confirm (a conflict) — never for a dismissed modal or a
+    // request that never reached a confirm at all (no org, busy-slot twin…).
+    if (deps.keys.length === 0 && !hasUnreadable) return;
+    if (outcome.status === 'aborted' && !outcome.confirmed) return;
     this.post({
       type: 'status',
       card: {
-        kind: outcome.status === 'ok' && !deps.truncated ? 'ok' : 'warn',
-        title: `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${key}`,
+        kind: outcome.status === 'ok' && !deps.truncated && !hasUnreadable ? 'ok' : 'warn',
+        title: deps.keys.length > 0
+          ? `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${label}`
+          : `Dependency scan incomplete for ${label}`,
         meta: 'Each line names the component whose source referenced it.',
-        lines: [
+        lines: capLines([
+          ...deps.unreadableEntries.map(k => `could not read ${byKey.get(k)?.filePath ?? k}`),
           ...(deps.truncated
-            ? [`Dependency scan stopped at its caps (depth ${DEFAULT_MAX_DEPTH}, ${DEFAULT_MAX_DEPS} components, ${DEFAULT_MAX_BUNDLE_FILES} files per bundle) — the included set may be incomplete.`]
+            ? [`Dependency scan stopped at its caps (depth ${maxDepth}, ${maxComponents} components, ${DEFAULT_MAX_BUNDLE_FILES} files per bundle) — at least ${deps.dropped} more reference${deps.dropped === 1 ? '' : 's'} ${deps.dropped === 1 ? 'was' : 'were'} not followed.`]
             : []),
           ...formatDependencyAttribution(deps.refs)
-        ]
+        ], CARD_LINE_CAP)
       }
     });
   }
@@ -2103,6 +2193,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'debugTiming', enabled: this.debugTiming() });
   }
 
+  /** "Deploy File + Dependencies" caps (A13) — clamped the same way
+   *  fetchConcurrency is: VS Code's settings UI enforces the schema's min/max,
+   *  but a hand-edited settings.json does not, so the extension clamps too. */
+  private dependencyMaxDepth(): number {
+    return Math.max(1, Math.min(3,
+      vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('dependencyMaxDepth', DEFAULT_MAX_DEPTH)));
+  }
+
+  private dependencyMaxComponents(): number {
+    return Math.max(5, Math.min(200,
+      vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('dependencyMaxComponents', DEFAULT_MAX_DEPS)));
+  }
+
   /** debugTiming: click→post/post→host receive stamp for the actions that don't
    *  have a busy/modal breakdown worth logging (retrieve/diff/Fetch Org just
    *  need to show whether the delay is on our side of the postMessage hop at
@@ -2157,7 +2260,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  NOT explicitly pick. Display only: it changes one line of modal text and
        *  nothing about what deploys, so unlike orgOverride/preConfirmed a forged
        *  value could not widen anything. */
-      autoIncluded?: { count: number; entryKey: string };
+      autoIncluded?: AutoIncludedInfo;
       /** One-off override of the machine-scoped ignoreDeployConflicts setting,
        *  for exactly this run. Set only via a "Retry + overwrite" card button
        *  (deployOptsFromRetry reading RetryRequest.ignoreConflicts) — every other
@@ -2192,8 +2295,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         vscode.window.setStatusBarMessage('$(warning) SF Deploy: answer the open confirmation first', 4000);
         return ABORTED;
       }
-      await this.enqueueDeploy(keys, opts);
-      return ABORTED;
+      const queued = await this.enqueueDeploy(keys, opts);
+      // queued names whether enqueueDeploy ITSELF actually queued the entry
+      // (its "Queue: " modal was confirmed) or not (dismissed / cap full / an
+      // already-queued twin) — that, not this call's own status, is what
+      // `confirmed` must reflect (A5).
+      return queued ? ABORTED_CONFIRMED : ABORTED;
     }
     // Reserve the busy slot synchronously, before the first await (the confirm
     // modal): otherwise a second deploy/retrieve/diff fired during the modal
@@ -2302,7 +2409,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           manifest = await this.writeTempManifest(items);
         } catch (err) {
           this.reportError(`${verb} ${orgPrep(verb)} ${orgLabel}`, err, retry);
-          return ABORTED;
+          // Past the confirm gate above — the user already said yes (A5).
+          return ABORTED_CONFIRMED;
         }
       }
 
@@ -2398,10 +2506,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       releaseBusy();
     }
     if (detection) return { status: 'failed' };
-    // A run that never reached a terminal result (or was cancelled org-side,
-    // which reportPolledDeploy already carded) is NOT a success — the caller
-    // must not report the deploy as landed.
-    return sawTerminal ? { status: 'ok' } : ABORTED;
+    // A run that never reached a terminal result (a submit-time throw/timeout —
+    // reportError/reportDeployTimeout already carded it — or an org-side
+    // cancel, which reportPolledDeploy already carded) is NOT a success — the
+    // caller must not report the deploy as landed. Every path down here is past
+    // the confirm gate above (A5), so it is always `confirmed`.
+    return sawTerminal ? { status: 'ok' } : ABORTED_CONFIRMED;
   }
 
   // ---- Dependency suggestions (failure-card "Try with dependencies") ----
@@ -2544,7 +2654,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private deployConfirmModal(
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
-      instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: { count: number; entryKey: string };
+      instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: AutoIncludedInfo;
       useManifest?: boolean;
     },
     queued: boolean
@@ -2588,7 +2698,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  deployConfirmModal — just prefixed "Queue: " with a note that it waits for
    *  the current operation. The target org is PINNED right now (named in the
    *  modal, and used again by drainQueue) — a later org switch in the panel
-   *  can't retarget an already-queued deploy. */
+   *  can't retarget an already-queued deploy. Returns whether the entry was
+   *  actually pushed onto the queue (A5) — false for every path that answers
+   *  the request WITHOUT queuing it (dismissed modal, no root/org, queue full,
+   *  an already-queued twin) — so runDeploy can tell a genuine "queued" outcome
+   *  from a request that landed nowhere. */
   private async enqueueDeploy(
     keys: string[],
     opts: {
@@ -2597,22 +2711,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  that lands on a busy slot discloses the same split at confirm time; it is
        *  deliberately NOT stored on the queue entry, because drainQueue re-enters
        *  runDeploy preConfirmed and shows no second modal. */
-      autoIncluded?: { count: number; entryKey: string };
+      autoIncluded?: AutoIncludedInfo;
       /** See runDeploy — unlike the machine-scoped setting (re-read fresh when the
        *  queue drains, below), this one-off flag IS stored on the queue entry and
        *  carried through unchanged: it names a single click, not something that
        *  could legitimately change while the deploy waits its turn. */
       ignoreConflictsOverride?: boolean;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
     const root = this.requireRoot();
-    if (!root) return;
+    if (!root) return false;
     const org = this.requireOrg();
-    if (!org) return;
+    if (!org) return false;
     const items = this.resolveKeys(keys).filter(i => !!i.filePath);
     if (items.length === 0) {
       vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
-      return;
+      return false;
     }
 
     const orgInfo = this.orgs.find(o => o.username === org);
@@ -2625,7 +2739,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const useManifest = !opts.sourceDir && n > MANIFEST_THRESHOLD;
 
     const plan = this.resolveTestPlan(opts, isProd);
-    if (!plan) return;
+    if (!plan) return false;
     const { testLevel, runTests, testNote } = plan;
     const entryKeys = items.map(i => `${i.type}:${i.name}`);
     const validateOnly = !!opts.validateOnly;
@@ -2634,7 +2748,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // twice (a different set still queues). Before the modal so the user isn't
     // asked to confirm a request that can't be honoured; again at the push
     // because the modal await is a TOCTOU window (same shape as the cap).
-    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
+    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return false; }
 
     // The SETTING is machine-scoped and re-read by runDeploy when the queue
     // drains, so what's true NOW is only a snapshot — the queued variant of the
@@ -2655,18 +2769,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // wastes the user's read of a modal that could never be honored.
     if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
       vscode.window.showInformationMessage(`SF Deploy: queue full (${DEPLOY_QUEUE_MAX} max) — wait for a queued operation to run before adding another.`);
-      return;
+      return false;
     }
     const confirm = await this.awaitConfirm(modal);
-    if (!confirm) return;
+    if (!confirm) return false;
     // Re-check at the push: the early check avoids showing a doomed modal, but
     // the await above is a TOCTOU window — concurrent enqueues could all pass
     // the early check and overshoot the cap (safety gate finding, probe-proven).
     if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
       vscode.window.showInformationMessage(`SF Deploy: the queue filled up while the confirmation was open (${DEPLOY_QUEUE_MAX} max) — this deploy was NOT queued.`);
-      return;
+      return false;
     }
-    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
+    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return false; }
     this.deployQueue.push({
       id: crypto.randomBytes(8).toString('hex'),
       keys: entryKeys,
@@ -2685,6 +2799,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // ever run this item (post-release review, MED). If the slot is already
     // free, kick the drain ourselves.
     if (!this.busy) queueMicrotask(() => this.drainQueue());
+    return true;
   }
 
   /** Is an identical entry — same pinned org, same key set, same mode — already
@@ -6184,18 +6299,48 @@ function manifestNotice(useManifest: boolean | undefined): string | undefined {
   return useManifest ? 'Large selection — sent via a generated package.xml manifest, not one --metadata flag per component.' : undefined;
 }
 
+/** Cap on the per-key attribution lines autoIncludedNotice renders in the
+ *  MODAL — a confirm dialog (unlike the post-deploy card) has to stay readable
+ *  on a PROD warning too, so this is far tighter than CARD_LINE_CAP; the
+ *  full list always lives on the result card (A1). */
+const AUTO_NOTICE_LINE_CAP = 8;
+
 /**
- * Modal detail line for "Deploy File + Dependencies": the one deploy path where
- * the confirmed set is mostly NOT what the user selected. The count alone
- * ("Deploy 26 components to …") reads as panel state gone wrong when the user
- * right-clicked a single file, so name the split — the file they picked, plus how
- * many the dependency scan added — while the deploy can still be refused.
- * Undefined for every other path, which keeps their modals byte-for-byte as they
- * were, and for a scan that added nothing (the count is then simply the truth).
+ * Modal detail block for "Deploy File + Dependencies" (and the suggestion
+ * accept path): the one confirm where the set is mostly NOT what the user
+ * picked. The count alone ("Deploy 26 components to …") reads as panel state
+ * gone wrong when the user right-clicked a single file, so this names the
+ * split AND — when per-key attribution is available (`refs`) — the first few
+ * additions and why, capped so a PROD warning modal stays readable, plus an
+ * honest note when the scan itself hit its caps (A1/A13: `dropped` is a floor,
+ * "at least N", never a guess pretending to be exact).
+ *
+ * `refs` is absent on the suggestion path (no dependency scan runs there) —
+ * that falls back to the original one-line summary pointing at the result
+ * card, so an existing caller that never passed `refs` keeps working exactly
+ * as before. Undefined for every other deploy path (auto.count <= 0), which
+ * keeps their modals byte-for-byte as they were.
  */
-export function autoIncludedNotice(auto: { count: number; entryKey: string } | undefined): string | undefined {
+export function autoIncludedNotice(auto: AutoIncludedInfo | undefined): string | undefined {
   if (!auto || auto.count <= 0) return undefined;
-  return `Includes ${auto.count} component${auto.count === 1 ? '' : 's'} auto-included as local dependencies of ${auto.entryKey} — the result card lists each one and what referenced it.`;
+  const noun = `component${auto.count === 1 ? '' : 's'}`;
+  const refs = auto.refs ?? [];
+  if (refs.length === 0) {
+    return `Includes ${auto.count} ${noun} auto-included as local dependencies of ${auto.entryKey} — the result card lists each one and what referenced it.`;
+  }
+  const lines = [
+    `Includes ${auto.count} ${noun} auto-included as local dependencies of ${auto.entryKey}:`,
+    ...capLines(refs.map(r => `${r.key} — via ${r.from}`), AUTO_NOTICE_LINE_CAP)
+  ];
+  if (auto.truncated) {
+    const depth = auto.maxDepth ?? DEFAULT_MAX_DEPTH;
+    const cap = auto.maxComponents ?? DEFAULT_MAX_DEPS;
+    const dropped = Math.max(auto.dropped ?? 0, 0);
+    lines.push(
+      `The scan hit its limits (depth ${depth}, ${cap} components) — at least ${dropped} more reference${dropped === 1 ? '' : 's'} ${dropped === 1 ? 'was' : 'were'} not followed.`
+    );
+  }
+  return lines.join('\n');
 }
 
 /** Bound a status card's `lines` at `max`, appending one summary line instead of

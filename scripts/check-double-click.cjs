@@ -382,9 +382,12 @@ check('every deploy-family modal goes through awaitConfirm, whose try/finally ow
 });
 
 check('runDeploy refuses the twin BEFORE enqueueing, and the twin check sits at the push', () => {
-  const guard = /if \(this\.busy && !opts\.preConfirmed\) \{(?:\n\s*\/\/[^\n]*)*\n\s*if \(this\.confirmOpen\) \{\n\s*vscode\.window\.setStatusBarMessage\('[^']*answer the open confirmation first'[^\n]*\n\s*return ABORTED;\n\s*\}\n\s*await this\.enqueueDeploy\(keys, opts\);/;
+  // A5: enqueueDeploy now RETURNS whether it actually queued the entry, so
+  // runDeploy can tell a genuine queue from a dismissed/capped/twin request —
+  // the call itself may now be captured into a variable.
+  const guard = /if \(this\.busy && !opts\.preConfirmed\) \{(?:\n\s*\/\/[^\n]*)*\n\s*if \(this\.confirmOpen\) \{\n\s*vscode\.window\.setStatusBarMessage\('[^']*answer the open confirmation first'[^\n]*\n\s*return ABORTED;\n\s*\}\n\s*(?:const \w+ = )?await this\.enqueueDeploy\(keys, opts\);/;
   assert.ok(guard.test(src), 'the confirmOpen refusal must precede enqueueDeploy inside the busy branch');
-  const push = /if \(this\.twinQueued\(org, entryKeys, validateOnly\)\) \{ this\.notifyAlreadyQueued\(noun, orgLabel, validateOnly\); return; \}\n\s*this\.deployQueue\.push\(\{/;
+  const push = /if \(this\.twinQueued\(org, entryKeys, validateOnly\)\) \{ this\.notifyAlreadyQueued\(noun, orgLabel, validateOnly\); return false; \}\n\s*this\.deployQueue\.push\(\{/;
   assert.ok(push.test(src), 'twinQueued must be re-checked immediately before deployQueue.push');
 });
 

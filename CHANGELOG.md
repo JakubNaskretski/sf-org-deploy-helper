@@ -3,6 +3,35 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.23.0
+
+- Fixed: **Large deploys and retrieves no longer pass one flag per component.** Above 30 components
+  the plugin writes a package.xml and hands the CLI that instead, so a deploy of thousands of
+  components launches (the old command line could exceed the OS limit, notably on Windows), the
+  command log shows one short line, and result cards list at most 100 components with the full list
+  in the Output channel.
+- Fixed: **The confirmation for a dependency deploy names what it adds.** "Deploy File +
+  Dependencies" now lists the auto-included components and what referenced them before you confirm,
+  says when the scan hit its limits and how many references it did not follow, and posts its
+  explanation card even when the deploy is refused by the org's conflict check or queued. The depth
+  and size limits are settings now (`dependencyMaxDepth`, `dependencyMaxComponents`).
+- Fixed: **Dependency scanning is more accurate.** Apex references must match a component's exact
+  name, so a variable or parameter spelled like a class no longer drags that class in. A bare
+  object mention no longer pulls the whole object when a field on it was already found. Relationship
+  fields (`Obj.Rel__r.Field`), Visualforce pages and their controllers, `Page.X`, Aura `$Resource`,
+  and object names inside SOQL strings are recognized. Selecting several files and choosing the
+  command scans all of them; the command only appears on file types it can scan.
+- Fixed: **"Try with dependencies" survives a panel reload and a hidden panel.** The button and the
+  "missing but available locally" line were lost when the deploy came from the right-click menu or
+  after the sidebar was rebuilt. An expired suggestion no longer leaves the card stuck on
+  "Retrying…". Accepting a suggestion no longer adds components to your ticked selection behind your
+  back, and the retry goes to the org the card names, not whatever the dropdown says now.
+- Changed: **Suggestions explain themselves.** Each suggested component shows the org error that
+  produced it, the error list stays visible while you decide, the confirmation says how many were
+  added, and more org wordings are recognized (unknown field, "check spelling", flow field references,
+  message channels, failures reported inside a test). Building suggestions for a large failure no
+  longer freezes the extension for a second.
+
 ## 0.22.2
 
 - Fixed: **Far fewer notifications, and readable ones.** When the panel is visible, failures and

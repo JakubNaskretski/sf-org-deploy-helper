@@ -39,7 +39,10 @@ export function activate(context: vscode.ExtensionContext): void {
     registerSafe('sfOrgDeployWrapper.selectOrg', () => provider.pickOrg()),
     registerSafe('sfOrgDeployWrapper.refreshFiles', () => provider.refreshFiles()),
     registerSafe('sfOrgDeployWrapper.deployFile', (uri?: vscode.Uri) => provider.deployFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    registerSafe('sfOrgDeployWrapper.deployFileWithDeps', (uri?: vscode.Uri) => provider.deployFileWithDeps(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    // `uris` is VS Code's full explorer multi-selection (A11) — undefined from
+    // the palette/editor, where there's only ever the one active file.
+    registerSafe('sfOrgDeployWrapper.deployFileWithDeps', (uri?: vscode.Uri, uris?: vscode.Uri[]) =>
+      provider.deployFileWithDeps(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri, uris)),
     registerSafe('sfOrgDeployWrapper.showSuggestionLog', () => provider.showSuggestionLog()),
     registerSafe('sfOrgDeployWrapper.retrieveFile', (uri?: vscode.Uri) => provider.retrieveFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
     registerSafe('sfOrgDeployWrapper.diffFile', (uri?: vscode.Uri) => provider.diffFile(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
@@ -72,8 +75,8 @@ export function activate(context: vscode.ExtensionContext): void {
   // A rejected command handler (e.g. the status-bar org pick failing to save this
   // plugin's remembered org — or, with syncOrgWithFamily on, to publish it to the
   // family) is otherwise an unhandled rejection the user never sees.
-  function registerSafe(id: string, fn: (...args: [vscode.Uri?]) => Promise<void> | void): vscode.Disposable {
-    return vscode.commands.registerCommand(id, (...args: [vscode.Uri?]) => {
+  function registerSafe(id: string, fn: (...args: [vscode.Uri?, vscode.Uri[]?]) => Promise<void> | void): vscode.Disposable {
+    return vscode.commands.registerCommand(id, (...args: [vscode.Uri?, vscode.Uri[]?]) => {
       void Promise.resolve(fn(...args)).catch(err => {
         const msg = err instanceof Error ? err.message : String(err);
         output.appendLine(`[${id}] ${msg}`);

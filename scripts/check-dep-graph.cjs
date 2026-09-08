@@ -249,15 +249,40 @@ check('multi-entry: entry keys are excluded even when they reference each other'
 });
 
 // ------------------------------------------- sObject / field token matching
-check('trigger source: __c and __mdt identifiers match CustomObject, Obj.Field matches CustomField', async () => {
+check('trigger source: __mdt identifier matches CustomObject, Obj.Field matches CustomField', async () => {
   const out = await resolve([ITEMS.find(i => i.name === 'WidgetTrigger')]);
-  // Identifiers land before dotted pairs — that per-file order is the contract.
-  assert.deepStrictEqual(out.keys, [
-    'CustomObject:Widget__c',
-    'CustomObject:DepFixRule__mdt',
-    'CustomField:Widget__c.Size__c'
-  ]);
+  // A3: Widget__c.Size__c (a field on Widget__c) matched from this SAME file,
+  // so the bare `Widget__c` identifier's whole-object match is dropped —
+  // DepFixRule__mdt has no field match on it, so it survives as a bare object.
+  assert.deepStrictEqual(out.keys, ['CustomObject:DepFixRule__mdt', 'CustomField:Widget__c.Size__c']);
   assert.strictEqual(out.truncated, false);
+  const objRef = out.refs.find(r => r.key === 'CustomObject:DepFixRule__mdt');
+  assert.strictEqual(objRef.bareObject, true, JSON.stringify(objRef));
+  assert.ok(!out.keys.includes('CustomObject:Widget__c'), 'Widget__c should be suppressed — its field already matched');
+});
+
+// A3: honesty note on a standalone bare-object match (no field on it matched
+// from the same file) — "deploys its local child metadata too".
+check('a bare object match with no co-occurring field is included, flagged, and explained', async () => {
+  const entry = item('ApexClass', 'AcmeBareOnly', 'classes/AcmeBareOnly.cls');
+  SOURCES.set(entry.filePath, 'public class AcmeBareOnly { List<Widget__c> ws; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['CustomObject:Widget__c']);
+  assert.strictEqual(out.refs[0].bareObject, true);
+  assert.deepStrictEqual(formatDependencyAttribution(out.refs), [
+    'CustomObject:Widget__c — referenced by ApexClass:AcmeBareOnly (deploys its local child metadata too)'
+  ]);
+});
+
+// A3: the SAME file naming both the field and the bare object — only the
+// field survives, and it carries NO bare-object note (it was never a bare
+// match).
+check('a field match on the same object, same file, suppresses the redundant bare-object match', async () => {
+  const entry = item('ApexClass', 'AcmeFieldAndObj', 'classes/AcmeFieldAndObj.cls');
+  SOURCES.set(entry.filePath, 'public class AcmeFieldAndObj { Widget__c w; Object f = Widget__c.Size__c; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['CustomField:Widget__c.Size__c']);
+  assert.ok(!out.refs[0].bareObject, JSON.stringify(out.refs[0]));
 });
 
 check('an sObject-suffixed token with no scanned object matches nothing', async () => {
@@ -301,11 +326,14 @@ check('an identifier inside a string literal is NOT matched', async () => {
 check('depth cap stops expansion and reports truncation when it cut something', async () => {
   const out = await resolve([ITEMS[0]], { maxDepth: 1 }); // Service → Helper (→ Queue cut)
   assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:DepFixHelper'], truncated: true });
+  // A13: DepFixQueue is exactly what the cap cut — nothing else was still queued.
+  assert.strictEqual(out.dropped, 1);
 });
 
 check('depth cap that cuts nothing reports truncated false (boundary is probed, not guessed)', async () => {
   const out = await resolve([ITEMS[0]], { maxDepth: 2 }); // Queue at depth 2 references nothing
   assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:DepFixHelper', 'ApexClass:DepFixQueue'], truncated: false });
+  assert.strictEqual(out.dropped, 0);
 });
 
 // ----------------------------------------------------------------- deps cap
@@ -314,12 +342,17 @@ check('maxDeps cap trims in discovery order and flags truncated', async () => {
   SOURCES.set(entry.filePath, 'public class AcmeGenRoot { AcmeGen0 a; AcmeGen1 b; AcmeGen2 c; }\n');
   const out = await resolve([entry], { maxDeps: 2 });
   assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:AcmeGen0', 'ApexClass:AcmeGen1'], truncated: true });
+  // A13: AcmeGen2 is the unseen find sitting right at the cutoff (+1), plus
+  // AcmeGen0/AcmeGen1 are themselves still sitting in the abandoned queue (+2)
+  // — "at least 3", the bounded no-extra-walk estimate, not a guess.
+  assert.strictEqual(out.dropped, 3);
 });
 
 check('a set landing exactly on maxDeps is NOT truncated', async () => {
   const entry = item('ApexClass', 'AcmeGenRoot', 'classes/AcmeGenRoot.cls');
   const out = await resolve([entry], { maxDeps: 3 });
   assert.deepStrictEqual(setOf(out), { keys: ['ApexClass:AcmeGen0', 'ApexClass:AcmeGen1', 'ApexClass:AcmeGen2'], truncated: false });
+  assert.strictEqual(out.dropped, 0);
 });
 
 // ---------------------------------------------------------- non-Apex entries
@@ -334,11 +367,53 @@ check('a CustomObject entry is a leaf too', async () => {
 });
 
 // --------------------------------------------------------- casing & resilience
-check('case-insensitive matches return the ITEM canonical casing, never the token', async () => {
+// A4: the Apex branch now requires EXACT case against the item's canonical
+// name — case-folding was the false-positive source (a variable/parameter/
+// method name coincidentally spelling an unrelated component). Wrong-case
+// tokens that used to fold-match now match NOTHING; correctly-cased ones
+// still resolve (covered throughout the rest of this file).
+check('wrong-case Apex tokens no longer fold-match — the Apex branch is exact-case only', async () => {
   const entry = item('ApexClass', 'AcmeCase', 'classes/AcmeCase.cls');
   SOURCES.set(entry.filePath, 'public class AcmeCase { depfixqueue q; Object o = WIDGET__C.SIZE__C; }\n');
   const out = await resolve([entry]);
-  assert.deepStrictEqual(out.keys, ['ApexClass:DepFixQueue', 'CustomObject:Widget__c', 'CustomField:Widget__c.Size__c']);
+  assert.deepStrictEqual(out.keys, []);
+});
+
+check('exact-case tokens still resolve and return the ITEM canonical casing', async () => {
+  const entry = item('ApexClass', 'AcmeExact', 'classes/AcmeExact.cls');
+  SOURCES.set(entry.filePath, 'public class AcmeExact { DepFixQueue q; Object o = Widget__c.Size__c; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['ApexClass:DepFixQueue', 'CustomField:Widget__c.Size__c']);
+});
+
+// A4 probe FPs, verbatim: a variable/parameter/method name that happens to
+// spell an unrelated scanned class must never be offered as a reference —
+// only a token matching the CLASS'S OWN declared spelling may.
+check('A4 FP: `AcmeOrder__c acmeOrder` must not add ApexClass:AcmeOrder (only the object, exact-case)', async () => {
+  const decoys = [
+    item('ApexClass', 'AcmeOrder', 'classes/AcmeOrder.cls'),
+    item('CustomObject', 'AcmeOrder__c', 'objects/AcmeOrder__c')
+  ];
+  SOURCES.set(decoys[0].filePath, 'public class AcmeOrder {}\n');
+  const entry = item('ApexClass', 'AcmeBooking', 'classes/AcmeBooking.cls');
+  SOURCES.set(entry.filePath, 'public class AcmeBooking { AcmeOrder__c acmeOrder = new AcmeOrder__c(); }\n');
+  const out = await resolve([entry], undefined, [...ITEMS, ...decoys]);
+  assert.deepStrictEqual(out.keys, ['CustomObject:AcmeOrder__c']);
+  assert.ok(!out.keys.includes('ApexClass:AcmeOrder'), out.keys.join(','));
+});
+
+check('A4 FP: `void notify(String payload)` must not add ApexClass:Notify or ApexClass:Payload', async () => {
+  const decoys = [
+    item('ApexClass', 'Notify', 'classes/Notify.cls'),
+    item('ApexClass', 'Payload', 'classes/Payload.cls')
+  ];
+  SOURCES.set(decoys[0].filePath, 'public class Notify {}\n');
+  SOURCES.set(decoys[1].filePath, 'public class Payload {}\n');
+  const entry = item('ApexClass', 'AcmeSender', 'classes/AcmeSender.cls');
+  SOURCES.set(entry.filePath,
+    'public class AcmeSender {\n  private void notify(String payload) { }\n  public void go() { notify(\'x\'); }\n}\n');
+  const out = await resolve([entry], undefined, [...ITEMS, ...decoys]);
+  assert.deepStrictEqual(out.keys, []);
 });
 
 check('an unreadable entry file degrades to no deps, never a throw', async () => {
@@ -551,11 +626,14 @@ check('maxBundleFiles trims the read list (in rank/path order) and flags truncat
   src('lwc/depFixWide', 'extra.html', ['<template><c-dep-fix-tile></c-dep-fix-tile></template>']);
   const cut = await resolve([entry], { maxBundleFiles: 1 });
   assert.deepStrictEqual(setOf(cut), { keys: ['ApexClass:AcmeGen0'], truncated: true });
+  // A13: the two files never opened (depFixWide.html, extra.html).
+  assert.strictEqual(cut.dropped, 2);
   const whole = await resolve([entry], { maxBundleFiles: 3 });
   assert.deepStrictEqual(setOf(whole), {
     keys: ['ApexClass:AcmeGen0', 'LightningComponentBundle:depFixChild', 'LightningComponentBundle:depFixTile'],
     truncated: false
   });
+  assert.strictEqual(whole.dropped, 0);
 });
 
 check('the depth cap applies to bundle expansion too', async () => {
@@ -567,7 +645,8 @@ check('the depth cap applies to bundle expansion too', async () => {
 
 // ------------------------------------------------------- scannable-type gate
 check('canScanDependencies accepts exactly the types with readable source', () => {
-  for (const t of ['ApexClass', 'ApexTrigger', 'LightningComponentBundle', 'AuraDefinitionBundle']) {
+  // A6/A14: ApexPage/ApexComponent (Visualforce) joined the readable set.
+  for (const t of ['ApexClass', 'ApexTrigger', 'ApexPage', 'ApexComponent', 'LightningComponentBundle', 'AuraDefinitionBundle']) {
     assert.strictEqual(canScanDependencies(t), true, t);
   }
   for (const t of ['CustomObject', 'CustomField', 'Layout', 'Flow', 'StaticResource', 'LightningMessageChannel']) {
@@ -688,6 +767,148 @@ check('the default depth follows service → helper → utility and no further',
   assert.deepStrictEqual(out.keys, ['ApexClass:AcmeD1', 'ApexClass:AcmeD2']);
   assert.strictEqual(out.truncated, true); // AcmeD3 is exactly what got cut
   assert.deepStrictEqual(out.refs.map(r => r.depth), [1, 2]);
+});
+
+// --------------------------------------------------------------- A10: entries
+check('an unreadable ENTRY is named in unreadableEntries — not just a silent empty set', async () => {
+  const entry = item('ApexClass', 'AcmeUnreadable', 'classes/AcmeUnreadable.cls'); // no SOURCES entry
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unreadableEntries, ['ApexClass:AcmeUnreadable']);
+});
+
+check('an unreadable DEPENDENCY (not an entry) stays silent, best-effort as before', async () => {
+  const entry = item('ApexClass', 'AcmeMissingDep', 'classes/AcmeMissingDep.cls');
+  const ghostDep = item('ApexClass', 'AcmeGhostDep', 'classes/AcmeGhostDep.cls'); // no SOURCES entry
+  SOURCES.set(entry.filePath, 'public class AcmeMissingDep { AcmeGhostDep g; }\n');
+  const out = await resolve([entry], undefined, [...ITEMS, ghostDep]);
+  assert.deepStrictEqual(out.keys, ['ApexClass:AcmeGhostDep']);
+  assert.deepStrictEqual(out.unreadableEntries, []);
+});
+
+// ------------------------------------------------------------------- A6: Page.X
+ITEMS.push(item('ApexPage', 'DepFixPage', 'pages/DepFixPage.page'));
+check('Page.X resolves the scanned ApexPage', async () => {
+  const entry = item('ApexClass', 'AcmePageRef', 'classes/AcmePageRef.cls');
+  SOURCES.set(entry.filePath, 'public class AcmePageRef { PageReference pr = Page.DepFixPage; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['ApexPage:DepFixPage']);
+});
+
+check('Page.X requires exact case too (A4 applies to every Apex-branch match)', async () => {
+  const entry = item('ApexClass', 'AcmePageWrongCase', 'classes/AcmePageWrongCase.cls');
+  SOURCES.set(entry.filePath, 'public class AcmePageWrongCase { PageReference pr = Page.depfixpage; }\n');
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, []);
+});
+
+// ------------------------------------------------------------ A6: Type.forName
+check("Type.forName('X') resolves the class named in the string", async () => {
+  const entry = item('ApexClass', 'AcmeDynamicRef', 'classes/AcmeDynamicRef.cls');
+  SOURCES.set(entry.filePath, "public class AcmeDynamicRef { Type t = Type.forName('DepFixQueue'); }\n");
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['ApexClass:DepFixQueue']);
+});
+
+check('Type.forName is a DECLARED reference, so — unlike bare identifiers — it stays case-insensitive', async () => {
+  const entry = item('ApexClass', 'AcmeDynamicCase', 'classes/AcmeDynamicCase.cls');
+  SOURCES.set(entry.filePath, "public class AcmeDynamicCase { Type t = Type.forName('DEPFIXQUEUE'); }\n");
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['ApexClass:DepFixQueue']);
+});
+
+check('a class name spelled in a string OUTSIDE Type.forName(...) is still not matched', async () => {
+  const entry = item('ApexClass', 'AcmeStringDecoy', 'classes/AcmeStringDecoy.cls');
+  SOURCES.set(entry.filePath, "public class AcmeStringDecoy { String s = 'DepFixQueue is not dynamic here'; }\n");
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, []);
+});
+
+// --------------------------------------------------------------- A6: FROM X__c
+check("a SOQL 'FROM X__c' / 'FROM X__mdt' string resolves the CustomObject", async () => {
+  const entry = item('ApexClass', 'AcmeSoql', 'classes/AcmeSoql.cls');
+  SOURCES.set(entry.filePath,
+    "public class AcmeSoql {\n"
+    + "  List<SObject> a = Database.query('SELECT Id FROM Widget__c');\n"
+    + "  List<SObject> b = Database.query('SELECT Id FROM DepFixRule__mdt');\n"
+    + "}\n");
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, ['CustomObject:Widget__c', 'CustomObject:DepFixRule__mdt']);
+});
+
+check('every OTHER string shape stays blanked — only Type.forName and FROM X__c/__mdt are read', async () => {
+  const entry = item('ApexClass', 'AcmeStringBlind', 'classes/AcmeStringBlind.cls');
+  SOURCES.set(entry.filePath,
+    "public class AcmeStringBlind {\n"
+    + "  String a = 'DepFixQueue';\n"                        // bare mention, not Type.forName
+    + "  String b = 'SELECT Id, Widget__c FROM Account';\n"  // FROM names a STANDARD object
+    + "}\n");
+  const out = await resolve([entry]);
+  assert.deepStrictEqual(out.keys, []);
+});
+
+// -------------------------------------------------------------------- A7: __r
+check('@salesforce/schema/Obj.Rel__r.Field ALSO tries the __c field the relationship is built on', () => {
+  const refs = extractLwcModuleRefs("import n from '@salesforce/schema/Widget__c.Account__r.Name';");
+  assert.deepStrictEqual(refs[0].tries, [
+    { type: 'CustomField', name: 'Widget__c.Account__r' },
+    { type: 'CustomField', name: 'Widget__c.Account__c' }
+  ]);
+});
+
+check('the __r fallback resolves end to end when only the __c field is scanned', async () => {
+  const decoy = item('CustomField', 'Widget__c.Account__c', 'objects/Widget__c/fields/Account__c.field-meta.xml');
+  const entry = bundle('LightningComponentBundle', 'depFixRel', 'lwc/depFixRel', ['depFixRel.js']);
+  src('lwc/depFixRel', 'depFixRel.js', ["import n from '@salesforce/schema/Widget__c.Account__r.Name';"]);
+  const out = await resolve([entry], undefined, [...ITEMS, decoy]);
+  assert.deepStrictEqual(out.keys, ['CustomField:Widget__c.Account__c']);
+});
+
+// --------------------------------------------------------- A8: $Resource in Aura
+ITEMS.push(bundle('AuraDefinitionBundle', 'DepFixResourceUser', 'aura/DepFixResourceUser', ['DepFixResourceUser.cmp']));
+src('aura/DepFixResourceUser', 'DepFixResourceUser.cmp', [
+  '<aura:component>',
+  '  <ltng:require styles="{!$Resource.DepFixAssets}"/>',
+  '</aura:component>'
+]);
+check('Aura markup: $Resource.X resolves the StaticResource', async () => {
+  const out = await resolve([byName('DepFixResourceUser')]);
+  assert.deepStrictEqual(out.keys, ['StaticResource:DepFixAssets']);
+});
+
+// --------------------------------------------------------- A6/A14: Visualforce
+ITEMS.push(
+  item('ApexPage', 'DepFixVfPage', 'pages/DepFixVfPage.page'),
+  item('ApexComponent', 'DepFixVfWidget', 'components/DepFixVfWidget.component'),
+  item('ApexComponent', 'DepFixVfHidden', 'components/DepFixVfHidden.component')
+);
+src('pages', 'DepFixVfPage.page', [
+  '<apex:page controller="DepFixHelper" extensions="DepFixQueue,AcmeGen0" standardController="Account">',
+  '  <apex:image value="{!$Resource.DepFixAssets}"/>',
+  '  <c:DepFixVfWidget/>',
+  '  <!-- <c:DepFixVfHidden/> -->',
+  '</apex:page>'
+]);
+src('components', 'DepFixVfWidget.component', ['<apex:component></apex:component>']);
+
+check('Visualforce: controller/extensions/$Resource/<c:x> all resolve; standardController is ignored', async () => {
+  const out = await resolve([byName('DepFixVfPage')]);
+  assert.deepStrictEqual(out.keys, [
+    'ApexClass:DepFixHelper',
+    'ApexClass:DepFixQueue',
+    'ApexClass:AcmeGen0',
+    'StaticResource:DepFixAssets',
+    'ApexComponent:DepFixVfWidget'
+  ]);
+  assert.ok(!out.keys.includes('CustomObject:Account'), 'standardController="Account" must not resolve anything');
+  assert.ok(!out.keys.includes('ApexComponent:DepFixVfHidden'), 'the commented-out <c:x> must not resolve');
+});
+
+check('an unreadable Visualforce ENTRY is reported the same way as an unreadable Apex entry', async () => {
+  const entry = item('ApexPage', 'DepFixVfGhost', 'pages/DepFixVfGhost.page'); // no SOURCES entry
+  const out = await resolve([entry], undefined, [...ITEMS, entry]);
+  assert.deepStrictEqual(out.keys, []);
+  assert.deepStrictEqual(out.unreadableEntries, ['ApexPage:DepFixVfGhost']);
 });
 
 (async () => {

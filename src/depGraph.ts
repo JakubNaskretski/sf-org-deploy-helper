@@ -66,9 +66,12 @@ const BUNDLE_READ_EXTS = new Map<string, string[]>([
 /** Types whose source this module can read. Everything else is a leaf: it either
  *  has no source (CustomObject is a folder of XML) or nothing that names another
  *  workspace component in a shape worth guessing at. Exported so the command can
- *  tell the user the truth BEFORE deploying instead of silently scanning nothing. */
+ *  tell the user the truth BEFORE deploying instead of silently scanning nothing.
+ *  ApexPage/ApexComponent (Visualforce) read their own markup — see
+ *  extractVisualforceRefs — the same way LWC/Aura read theirs. */
 export function canScanDependencies(type: string): boolean {
-  return type === 'ApexClass' || type === 'ApexTrigger' || BUNDLE_READ_EXTS.has(type);
+  return type === 'ApexClass' || type === 'ApexTrigger' || type === 'ApexPage' || type === 'ApexComponent'
+    || BUNDLE_READ_EXTS.has(type);
 }
 
 // Blank out line comments, block comments and single-quoted string literals,
@@ -296,10 +299,15 @@ function specifierRef(spec: string): BundleRef | undefined {
     if (family === 'schema') {
       // `schema/Obj.Field` names the FIELD (its own deployable child); a
       // relationship path `Obj.Rel.Field` still starts with the local hop.
-      // `schema/Obj` alone names the object.
-      return parts.length >= 2
-        ? { tries: [{ type: 'CustomField', name: `${parts[0]}.${parts[1]}` }] }
-        : { tries: [{ type: 'CustomObject', name: parts[0] }] };
+      // `schema/Obj` alone names the object. A `Rel__r` hop is the relationship
+      // NAME, not a field — `Obj.Rel__r` can never resolve — so when it ends in
+      // `__r` also try the `__c` field the relationship is built on (A7).
+      if (parts.length >= 2) {
+        const tries = [{ type: 'CustomField', name: `${parts[0]}.${parts[1]}` }];
+        if (/__r$/i.test(parts[1])) tries.push({ type: 'CustomField', name: `${parts[0]}.${parts[1].replace(/__r$/i, '__c')}` });
+        return { tries };
+      }
+      return { tries: [{ type: 'CustomObject', name: parts[0] }] };
     }
     if (family === 'messageChannel') {
       // The specifier carries the `__c` that the source file name does NOT
@@ -375,6 +383,113 @@ export function extractAuraRefs(source: string): BundleRef[] {
     const name = m[1].slice(m[1].lastIndexOf('.') + 1).trim();
     if (name) refs.push({ tries: [{ type: 'ApexClass', name }] });
   }
+  // `{!$Resource.X}` (an attribute value) or `$Resource.X` (inside an
+  // expression like ltng:require's styles) — either way the static resource
+  // name follows the same dotted token (A8).
+  const resource = /\$Resource\.(\w+)/g;
+  while ((m = resource.exec(markup))) refs.push({ tries: [{ type: 'StaticResource', name: m[1] }] });
+  return refs;
+}
+
+/**
+ * Referents declared by one Visualforce `.page`/`.component` file's markup
+ * (A6/A14). Unlike Aura's `c:` (which can address either an Aura bundle or an
+ * LWC), VF's `c:` namespace addresses a Visualforce custom COMPONENT only — a
+ * single try, not a chain. `standardController="Account"` is deliberately NOT
+ * matched: the regex below requires the exact attribute name `controller`, and
+ * VF's camelCase `standardController` never contains that lowercase word at a
+ * boundary, so no separate exclusion is needed.
+ */
+export function extractVisualforceRefs(source: string): BundleRef[] {
+  const markup = stripMarkupComments(source);
+  const refs: BundleRef[] = [];
+  let m: RegExpExecArray | null;
+  const controller = /\bcontroller\s*=\s*["']([^"']+)["']/g;
+  while ((m = controller.exec(markup))) refs.push({ tries: [{ type: 'ApexClass', name: m[1].trim() }] });
+  const extensions = /\bextensions\s*=\s*["']([^"']+)["']/g;
+  while ((m = extensions.exec(markup))) {
+    for (const name of m[1].split(',')) {
+      const trimmed = name.trim();
+      if (trimmed) refs.push({ tries: [{ type: 'ApexClass', name: trimmed }] });
+    }
+  }
+  const resource = /\$Resource\.(\w+)/g;
+  while ((m = resource.exec(markup))) refs.push({ tries: [{ type: 'StaticResource', name: m[1] }] });
+  const componentTag = /<\s*c:([A-Za-z_]\w*)/g;
+  while ((m = componentTag.exec(markup))) refs.push({ tries: [{ type: 'ApexComponent', name: m[1] }] });
+  return refs;
+}
+
+/** Like stripApexNoise, but records string-literal CONTENT (with its opening
+ *  quote's offset) instead of blanking it — needed only by the narrow
+ *  string-literal reference pass below, which has to read the text
+ *  stripApexNoise deliberately throws away. Same comment/string rules as
+ *  stripApexNoise (single-quote only, backslash escape, block comments don't
+ *  nest, an unterminated literal is cut at the newline) — kept as a separate
+ *  function rather than a shared flag so stripApexNoise's hot path (every Apex
+ *  file read) stays untouched by this narrower need. */
+export function scanApexStrings(source: string): JsStringScan {
+  const out = source.split('');
+  const strings: Array<{ value: string; at: number }> = [];
+  type State = 'code' | 'line' | 'block' | 'str';
+  let state: State = 'code';
+  let at = -1;
+  let value = '';
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (state === 'code') {
+      if (c === '/' && next === '/') { state = 'line'; out[i] = ' '; }
+      else if (c === '/' && next === '*') { state = 'block'; out[i] = ' '; }
+      else if (c === '\'') { state = 'str'; at = i; value = ''; out[i] = ' '; }
+    } else if (state === 'line') {
+      if (c === '\n') state = 'code';
+      else out[i] = ' ';
+    } else if (state === 'block') {
+      if (c === '*' && next === '/') { state = 'code'; out[i] = ' '; out[i + 1] = ' '; i++; }
+      else if (c !== '\n') out[i] = ' ';
+    } else { // str
+      if (c === '\\') { out[i] = ' '; if (next !== undefined && next !== '\n') { out[i + 1] = ' '; value += next; i++; } }
+      else if (c === '\'') { state = 'code'; out[i] = ' '; strings.push({ value, at }); }
+      else if (c === '\n') state = 'code'; // unterminated literal — damage stops here
+      else { out[i] = ' '; value += c; }
+    }
+  }
+  return { code: out.join(''), strings };
+}
+
+const TYPE_FORNAME_WINDOW = 40;
+const TYPE_FORNAME_BEFORE = /(?:^|[^\w.])Type\s*\.\s*forName\s*\(\s*$/;
+const FROM_OBJECT = /\bFROM\s+([A-Za-z_]\w*(?:__c|__mdt))\b/i;
+
+/**
+ * Two narrow, declared-looking shapes read out of Apex string literals (A6) —
+ * every OTHER string in the file stays invisible to the token matcher (see
+ * stripApexNoise), so reaching into just these two costs no new false-positive
+ * surface as long as the shape stays this specific:
+ *  - `Type.forName('X')` — dynamic Apex, the one place a class name is only
+ *    ever a string, never a token;
+ *  - a SOQL `FROM X__c` / `FROM X__mdt` clause inside any string (typically
+ *    `Database.query('SELECT … FROM X__c')`) — the query text is what
+ *    matters, not what wraps it.
+ * Matched against the RAW literal text, so case-folding is intentionally kept
+ * here — unlike the identifier/dottedPair branch (see A4's exact-case fix): a
+ * hardcoded string is a deliberate, authored reference, not a token collision
+ * with a variable/parameter/method name, so lookupRef's case-insensitive
+ * resolution is exactly the bundle-ref precedent, not the risk A4 removed.
+ */
+export function extractApexStringRefs(source: string): BundleRef[] {
+  const { code, strings } = scanApexStrings(source);
+  const refs: BundleRef[] = [];
+  for (const lit of strings) {
+    const from = Math.max(0, lit.at - TYPE_FORNAME_WINDOW);
+    if (TYPE_FORNAME_BEFORE.test(code.slice(from, lit.at))) {
+      refs.push({ tries: [{ type: 'ApexClass', name: lit.value }] });
+      continue;
+    }
+    const m = FROM_OBJECT.exec(lit.value);
+    if (m) refs.push({ tries: [{ type: 'CustomObject', name: m[1] }] });
+  }
   return refs;
 }
 
@@ -385,8 +500,8 @@ export function extractAuraRefs(source: string): BundleRef[] {
  *  stable across runs. */
 type ScanIndex = Map<string, Map<string, MetadataItem>>;
 
-const INDEXED_TYPES = ['ApexClass', 'CustomObject', 'CustomField', 'LightningComponentBundle',
-  'AuraDefinitionBundle', 'LightningMessageChannel', 'StaticResource'];
+const INDEXED_TYPES = ['ApexClass', 'ApexPage', 'ApexComponent', 'CustomObject', 'CustomField',
+  'LightningComponentBundle', 'AuraDefinitionBundle', 'LightningMessageChannel', 'StaticResource'];
 
 function buildIndex(items: MetadataItem[]): ScanIndex {
   const idx: ScanIndex = new Map(INDEXED_TYPES.map(t => [t, new Map<string, MetadataItem>()]));
@@ -431,7 +546,7 @@ async function collectBundleRefs(
   idx: ScanIndex,
   readFile: (p: string) => Promise<string | undefined>,
   maxFiles: number
-): Promise<{ found: MetadataItem[]; trimmed: boolean }> {
+): Promise<{ found: MetadataItem[]; trimmed: boolean; skippedFiles: number; unreadable: boolean }> {
   const exts = BUNDLE_READ_EXTS.get(item.type) ?? [];
   const ranked = item.files
     .filter(f => !BUNDLE_SKIP_DIR.test(f))
@@ -441,9 +556,13 @@ async function collectBundleRefs(
 
   const found: MetadataItem[] = [];
   const taken = new Set<string>();
+  let attempted = 0;
+  let readOk = 0;
   for (const cand of ranked.slice(0, maxFiles)) {
+    attempted++;
     const text = await readFile(cand.file);
     if (text === undefined) continue; // unreadable file — best-effort, as with Apex
+    readOk++;
     const refs = item.type === 'AuraDefinitionBundle'
       ? extractAuraRefs(text)
       : cand.rank === 0 ? extractLwcModuleRefs(text) : extractLwcTemplateRefs(text);
@@ -457,7 +576,17 @@ async function collectBundleRefs(
       found.push(hit);
     }
   }
-  return { found, trimmed: ranked.length > maxFiles };
+  return {
+    found,
+    trimmed: ranked.length > maxFiles,
+    // Files never opened because of the cap — an "at least N more" component of
+    // `dropped` (A13), same bounded-no-extra-walk stance as the depth/count caps.
+    skippedFiles: Math.max(0, ranked.length - maxFiles),
+    // Every candidate file was attempted AND every attempt failed — as opposed
+    // to a bundle with no matching-extension file at all (attempted stays 0),
+    // which is "nothing to scan", not "could not read" (A10).
+    unreadable: attempted > 0 && readOk === 0
+  };
 }
 
 /** One auto-included component, WITH the reason it is in the set. A bare key list
@@ -475,6 +604,13 @@ export interface LocalDependencyRef {
   from: string;
   /** Layers below the entry — 1 for something the entry itself references. */
   depth: number;
+  /** True when this was a BARE type token (`Foo__c`) rather than a reference to
+   *  one of its fields — deploying it sends the whole CustomObject folder
+   *  (every field, validation rule, …), not just the token that named it. Unset
+   *  when a CustomField on the SAME object already matched from the same file
+   *  (A3): the field alone is included and the redundant whole-object match is
+   *  dropped, so this flag only ever appears on a standalone object match. */
+  bareObject?: boolean;
 }
 
 export interface LocalDependencyResult {
@@ -488,30 +624,60 @@ export interface LocalDependencyResult {
    *  reference, or maxBundleFiles left part of a bundle unread. Either way the
    *  set may be incomplete. */
   truncated: boolean;
+  /** At least this many more reachable references were never followed once a
+   *  cap fired — the remaining BFS queue plus the still-unseen finds sitting at
+   *  the exact point a cap cut them, deduped (A13). Zero unless `truncated`.
+   *  A floor, not a proof: none of it costs another read (bounded, no extra
+   *  walk), so it undercounts whatever those unexplored nodes would have found. */
+  dropped: number;
+  /** `Type:Name` keys of ENTRY items (depth 0) whose file could not be read —
+   *  never a deeper dependency, where a miss is ordinary best-effort silence.
+   *  An unreadable entry produces an empty dependency set that looks exactly
+   *  like "genuinely has none" unless the caller surfaces this (A10). */
+  unreadableEntries: string[];
 }
 
 /** One display line per auto-included component, naming the component that
  *  referenced it. The depth is spelled out only past the first layer: at depth 1
  *  `from` IS the file the user right-clicked, so "(depth 1)" would only add noise.
- *  Matches the failure-card suggestion rows' cause-then-effect reading order. */
+ *  A bare-object match (see LocalDependencyRef.bareObject) gets its own honest
+ *  parenthetical — deploying it is not just "this one component". Matches the
+ *  failure-card suggestion rows' cause-then-effect reading order. */
 export function formatDependencyAttribution(refs: LocalDependencyRef[]): string[] {
-  return refs.map(r => `${r.key} — referenced by ${r.from}${r.depth > 1 ? ` (depth ${r.depth})` : ''}`);
+  return refs.map(r => {
+    const depthNote = r.depth > 1 ? ` (depth ${r.depth})` : '';
+    const bareNote = r.bareObject ? ' (deploys its local child metadata too)' : '';
+    return `${r.key} — referenced by ${r.from}${depthNote}${bareNote}`;
+  });
 }
 
 /**
  * BFS the local reference graph from `entry`. Only items canScanDependencies
  * accepts are READ; every discovered dependency must match a scanned item in
- * `items`. From Apex source (tokens):
+ * `items`. From Apex/trigger source (tokens), EXACT CASE against the item's
+ * canonical name — no folding (A4: a case-folded hit here is what let a local
+ * variable/parameter/method name masquerade as a reference to an unrelated
+ * class of the same name folded; case-folding stays for bundle/string refs
+ * below, which are declared rather than cropped):
  *
- *  - identifier == ApexClass name (case-insensitive) → that class, and it is
- *    enqueued for further expansion;
+ *  - identifier == ApexClass name → that class, enqueued for further expansion;
  *  - identifier with an sObject suffix (SOBJECT_SUFFIX) == CustomObject name →
- *    that object (leaf);
- *  - dotted pair `Obj.Field` == CustomField `Obj.Field` → that field (leaf).
+ *    that object (leaf) — UNLESS a CustomField on the same object already
+ *    matched from the same file (A3: the field alone is included, and the
+ *    redundant whole-object match — which would deploy every other field and
+ *    rule on top of it — is dropped; when a bare object IS added, its
+ *    attribution line says so, see formatDependencyAttribution);
+ *  - dotted pair `Obj.Field` == CustomField `Obj.Field` → that field (leaf);
+ *  - dotted pair `Page.X` == ApexPage `X` → that page (A6, enqueued: a VF page
+ *    can itself declare further references);
+ *  - two narrow string-literal shapes — `Type.forName('X')` and a SOQL
+ *    `FROM X__c`/`FROM X__mdt` clause — see extractApexStringRefs (A6).
  *
  * From an LWC/Aura bundle (declared references — see collectBundleRefs): Apex
  * classes, objects, fields, message channels, static resources, and child
- * bundles, which are enqueued like a class.
+ * bundles, which are enqueued like a class. From a Visualforce page/component
+ * (declared references — see extractVisualforceRefs, A6/A14): Apex classes
+ * (controller/extensions), static resources, and child VF components.
  *
  * Exclusions, applied BEFORE lookup: platform names (isPlatformName — a
  * platform name in a lookup can only ever be a false positive, e.g. a scanned
@@ -526,8 +692,12 @@ export function formatDependencyAttribution(refs: LocalDependencyRef[]): string[
  * reported as its own dependency). Items dequeued AT maxDepth are read as a
  * PROBE only: their finds are not added, but an unseen find proves the cap
  * genuinely trimmed something, so `truncated` is exact rather than guessed —
- * bought with one extra layer of bounded reads. An unreadable file is skipped
- * (best-effort stance above: the deploy will tell the truth anyway).
+ * bought with one extra layer of bounded reads; `dropped` then bounds HOW MUCH
+ * was cut (A13), cheaply (remaining queue + unseen finds at the cutoff, no
+ * extra reads). An unreadable file is skipped (best-effort stance above: the
+ * deploy will tell the truth anyway) — EXCEPT for an entry (depth 0) itself,
+ * which is surfaced via `unreadableEntries` (A10) so a read failure can never
+ * look identical to "genuinely has no dependencies".
  */
 export async function resolveLocalDependencies(
   entry: MetadataItem[],
@@ -543,10 +713,13 @@ export async function resolveLocalDependencies(
   const apexByName = idx.get('ApexClass')!;
   const objectByName = idx.get('CustomObject')!;
   const fieldByName = idx.get('CustomField')!;
+  const pageByName = idx.get('ApexPage')!;
 
   const seen = new Set<string>(entry.map(e => `${e.type}:${e.name}`));
   const refs: LocalDependencyRef[] = [];
   let truncated = false;
+  let dropped = 0;
+  const unreadableEntries: string[] = [];
 
   // BFS queue of readable items. Depth is monotonically non-decreasing, so
   // once the cap fires everything behind it is at the boundary too.
@@ -557,59 +730,132 @@ export async function resolveLocalDependencies(
   outer:
   while (queue.length) {
     const { item: current, depth } = queue.shift()!;
+    const currentKey = `${current.type}:${current.name}`;
 
     // Per-file match order: identifiers in appearance order, then dotted pairs
-    // in appearance order (bundles: per file, in read order) — combined with
-    // FIFO expansion this fixes the output order completely (deterministic
-    // across runs).
+    // (fields, then Page.X) in appearance order, then string-literal refs
+    // (bundles: per file, in read order) — combined with FIFO expansion this
+    // fixes the output order completely (deterministic across runs).
     const found: MetadataItem[] = [];
+    const bareObjectKeys = new Set<string>();
     if (BUNDLE_READ_EXTS.has(current.type)) {
       const bundle = await collectBundleRefs(current, idx, readFile, maxBundleFiles);
       for (const hit of bundle.found) found.push(hit);
-      if (bundle.trimmed) truncated = true;
+      if (bundle.trimmed) { truncated = true; dropped += bundle.skippedFiles; }
+      if (depth === 0 && bundle.unreadable) unreadableEntries.push(currentKey);
+    } else if (current.type === 'ApexPage' || current.type === 'ApexComponent') {
+      const source = await readFile(current.filePath);
+      if (source === undefined) { if (depth === 0) unreadableEntries.push(currentKey); continue; }
+      for (const ref of extractVisualforceRefs(source)) {
+        const hit = lookupRef(ref, idx);
+        if (hit) found.push(hit);
+      }
     } else {
       const source = await readFile(current.filePath);
-      if (source === undefined) continue;
+      if (source === undefined) { if (depth === 0) unreadableEntries.push(currentKey); continue; }
       const { identifiers, dottedPairs } = extractTokens(source);
+
+      // Dotted pairs are scanned FIRST (but appended AFTER identifiers below, to
+      // keep the existing identifiers-then-pairs output order) so the object/
+      // field co-occurrence rule (A3) can see every field match on THIS file
+      // before identifiers decide whether a bare object token is redundant.
+      const dottedFinds: MetadataItem[] = [];
+      const fieldObjectNames = new Set<string>();
+      for (const pair of dottedPairs) {
+        if (isPlatformName(pair)) continue;
+        // CustomField `Obj.Field` — exact case only (A4): a dotted pair cropped
+        // from raw source is still a guess, same false-positive risk as a bare
+        // identifier.
+        const fld = fieldByName.get(pair.toLowerCase());
+        if (fld && fld.name === pair) {
+          dottedFinds.push(fld);
+          const dot = fld.name.indexOf('.');
+          if (dot > 0) fieldObjectNames.add(fld.name.slice(0, dot).toLowerCase());
+          continue; // a pair that named a field can't also be a Page.X pair
+        }
+        // `Page.X` (A6) — "Page" is a fixed language keyword, not looked up, so
+        // only the captured name needs the exact-case check.
+        const pageMatch = /^Page\.(.+)$/i.exec(pair);
+        if (pageMatch) {
+          const pg = pageByName.get(pageMatch[1].toLowerCase());
+          if (pg && pg.name === pageMatch[1]) dottedFinds.push(pg);
+        }
+      }
+
       for (const ident of identifiers) {
         if (ident.length < 3 || isPlatformName(ident)) continue;
         const lower = ident.toLowerCase();
+        // ApexClass — exact-case match against the item's canonical name (A4):
+        // a case-folded hit here is what let a local variable/parameter/method
+        // name (`acmeOrder`, `notify`, `payload` …) masquerade as a reference to
+        // an unrelated class of the same name folded. Real Apex references a
+        // class by its declared spelling, so this costs no genuine reference.
         const cls = apexByName.get(lower);
-        if (cls) found.push(cls);
+        if (cls && cls.name === ident) found.push(cls);
         // The suffix gate keeps a bare word from pulling in a same-named object:
         // only `Foo__c`-shaped tokens can be sObject references.
         if (SOBJECT_SUFFIX.test(ident)) {
           const obj = objectByName.get(lower);
-          if (obj) found.push(obj);
+          if (obj && obj.name === ident) {
+            // A3: a CustomField on this SAME object already matched from this
+            // SAME file — deploying that field's CustomObject key would also
+            // deploy the whole folder (every other field, every validation
+            // rule…) on top of it, purely because the bare type name also
+            // appeared. Drop the redundant whole-object match; the field alone
+            // already carries the reference.
+            if (!fieldObjectNames.has(lower)) {
+              found.push(obj);
+              bareObjectKeys.add(`${obj.type}:${obj.name}`);
+            }
+          }
         }
       }
-      for (const pair of dottedPairs) {
-        if (isPlatformName(pair)) continue;
-        const fld = fieldByName.get(pair.toLowerCase());
-        if (fld) found.push(fld);
+      found.push(...dottedFinds);
+
+      // Narrow string-literal shapes (A6): Type.forName('X'), SOQL 'FROM X__c'.
+      // Declared, not cropped — case-folded resolution is safe here (see
+      // extractApexStringRefs' own doc comment).
+      for (const ref of extractApexStringRefs(source)) {
+        const hit = lookupRef(ref, idx);
+        if (hit) found.push(hit);
       }
     }
 
-    for (const dep of found) {
+    for (let i = 0; i < found.length; i++) {
+      const dep = found[i];
       const depKey = `${dep.type}:${dep.name}`;
       if (seen.has(depKey)) continue;
-      if (depth >= maxDepth) {
-        // Probe layer: this unseen find is exactly what the depth cap cut.
+      if (depth >= maxDepth || refs.length >= maxDeps) {
+        // Probe layer / count cap: this unseen find is exactly what the cap
+        // cut. `dropped` bounds the rest of the damage without walking any
+        // further — the still-unseen finds sitting at this exact cutoff
+        // (deduped among themselves) plus every item still waiting in the
+        // queue, each of which is now abandoned mid-BFS too.
         truncated = true;
-        break outer;
-      }
-      if (refs.length >= maxDeps) {
-        truncated = true;
+        const remainingUnseen = new Set<string>();
+        for (let j = i; j < found.length; j++) {
+          const k = `${found[j].type}:${found[j].name}`;
+          if (!seen.has(k)) remainingUnseen.add(k);
+        }
+        dropped += remainingUnseen.size + queue.length;
         break outer;
       }
       seen.add(depKey);
       // `current` is the component whose source was just read, so it IS the
       // referrer — recorded here, at the only point where both sides are known.
-      refs.push({ key: depKey, from: `${current.type}:${current.name}`, depth: depth + 1 });
-      // A class or a child bundle can reference further components; a field,
-      // object, channel or resource is a leaf.
-      if (dep.type === 'ApexClass' || BUNDLE_READ_EXTS.has(dep.type)) queue.push({ item: dep, depth: depth + 1 });
+      refs.push({
+        key: depKey, from: currentKey, depth: depth + 1,
+        // Sparse like every other optional field here — omitted (not `false`)
+        // when it doesn't apply, so every EXISTING attribution shape (no
+        // bare-object matches in play) round-trips through deepStrictEqual
+        // unchanged.
+        ...(bareObjectKeys.has(depKey) ? { bareObject: true as const } : {})
+      });
+      // Anything else this module can itself read may reference further
+      // components (a class, a bundle, a VF page/component); a field, object,
+      // channel or resource is a leaf.
+      if (canScanDependencies(dep.type)) queue.push({ item: dep, depth: depth + 1 });
     }
   }
-  return { keys: refs.map(r => r.key), refs, truncated };
+  return { keys: refs.map(r => r.key), refs, truncated, dropped, unreadableEntries };
 }
