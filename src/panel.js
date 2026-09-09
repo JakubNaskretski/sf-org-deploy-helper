@@ -55,6 +55,11 @@
     seenTypesBaseline: Array.isArray(persisted.seenTypes) && persisted.seenTypes.length > 0,
     busy: false,
     busyAction: null,
+    // The running operation is being cancelled: the button reads "Cancelling…"
+    // and ignores repeats. Set on click for instant feedback, then owned by the
+    // provider's `busy` posts (`cancelling`), which say whether the click actually
+    // consumed a cancel handler — see the click handler and the busy case.
+    cancelRequested: false,
     progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
@@ -265,7 +270,17 @@
   $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
   $('diffBtn').addEventListener('click', () => action('diff'));
-  $('cancelBtn').addEventListener('click', () => send('cancel'));
+  // One Cancel per operation. sendAction's pending lock is the wrong shape here:
+  // the provider answers the message in milliseconds while the cancel itself
+  // takes seconds. The lock set here holds until a `busy` post says otherwise —
+  // `cancelling: true` keeps it until the op ends; `false` (nothing to cancel,
+  // e.g. a picker holding the slot) releases it at once.
+  $('cancelBtn').addEventListener('click', () => {
+    if (state.cancelRequested) return;
+    state.cancelRequested = true;
+    send('cancel');
+    renderActions();
+  });
   $('useActive').addEventListener('click', () => send('useActiveFile'));
   $('useOpenTabs').addEventListener('click', () => send('useOpenTabs'));
   $('clearSel').addEventListener('click', () => {
@@ -613,8 +628,15 @@
         const busy = !!msg.busy;
         const busyAction = msg.action || null;
         const changed = busy !== state.busy || busyAction !== state.busyAction;
+        // The provider's word on the Cancel lock (see the cancelBtn click handler):
+        // a re-sync that consumed no handler unlocks a click that hit nothing, the
+        // notification's Cancel locks the panel's button too, and the op ending
+        // (setBusy always posts cancelling:false) releases it.
+        const cancelling = !!msg.cancelling;
+        const lockChanged = cancelling !== state.cancelRequested;
         state.busy = busy;
         state.busyAction = busyAction;
+        state.cancelRequested = cancelling;
         if (changed) {
           if (busy) {
             state.progress = { text: busyAction ? `${busyAction} running…` : 'Working…', startedAt: Date.now() };
@@ -624,7 +646,7 @@
             stopProgressTimer();
           }
         }
-        if (changed || hadPending) {
+        if (changed || hadPending || lockChanged) {
           renderActions();
           renderStatus();
         }
@@ -1460,7 +1482,8 @@
       if (testLevel) testLevel.style.display = 'none';
       clearSel.style.display = 'none';
       cancelBtn.style.display = '';
-      cancelBtn.textContent = state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel';
+      cancelBtn.disabled = state.cancelRequested;
+      cancelBtn.textContent = state.cancelRequested ? 'Cancelling…' : (state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel');
     } else {
       retrieveBtn.style.display = '';
       diffBtn.style.display = '';

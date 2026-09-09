@@ -614,6 +614,59 @@ check('⟳ locks on click, ignores repeats, survives an orgs broadcast, unlocks 
   assert.strictEqual(sent(), 2);
 });
 
+check('Cancel locks on click ("Cancelling…"), ignores repeats, holds on a cancelling re-sync, unlocks when the slot frees', () => {
+  const p = panel(undefined);
+  const btn = p.el('cancelBtn');
+  const sent = () => p.outbound.filter(m => m.type === 'cancel').length;
+  p.deliver({ type: 'busy', busy: true, action: 'Fetch Org', cancelling: false });
+  assert.strictEqual(btn.style.display, '');
+  assert.strictEqual(btn.disabled, false);
+  assert.strictEqual(btn.textContent, 'Cancel Fetch Org');
+  btn.fire('click');
+  assert.strictEqual(sent(), 1);
+  assert.strictEqual(btn.disabled, true);
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  btn.fire('click'); btn.fire('click'); // spam — the kill must not re-fire
+  assert.strictEqual(sent(), 1);
+  // The provider answers the cancel message within milliseconds with a busy
+  // re-sync (still busy, same op) that says a handler was consumed — that holds.
+  p.deliver({ type: 'busy', busy: true, action: 'Fetch Org', cancelling: true });
+  assert.strictEqual(btn.disabled, true);
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  btn.fire('click');
+  assert.strictEqual(sent(), 1);
+  p.deliver({ type: 'busy', busy: false, cancelling: false });
+  assert.strictEqual(btn.style.display, 'none');
+  // The next op gets a fresh Cancel.
+  p.deliver({ type: 'busy', busy: true, action: 'Retrieve', cancelling: false });
+  assert.strictEqual(btn.disabled, false);
+  assert.strictEqual(btn.textContent, 'Cancel Retrieve');
+  btn.fire('click');
+  assert.strictEqual(sent(), 2);
+});
+
+check('a Cancel that hit nothing unlocks on the reply; the notification\'s Cancel locks the panel\'s too', () => {
+  const p = panel(undefined);
+  const btn = p.el('cancelBtn');
+  // A picker holding the slot installs no cancel handler: the click locks for
+  // instant feedback, the reply (cancelling:false) says nothing was consumed.
+  p.deliver({ type: 'busy', busy: true, action: 'Restore backup', cancelling: false });
+  btn.fire('click');
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  p.deliver({ type: 'busy', busy: true, action: 'Restore backup', cancelling: false });
+  assert.strictEqual(btn.disabled, false, 'a click that cancelled nothing must not strand the button');
+  assert.strictEqual(btn.textContent, 'Cancel Restore backup');
+  // Cancel pressed on the progress notification instead: the provider posts
+  // cancelling:true unasked, and the panel's button follows.
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy', cancelling: false });
+  assert.strictEqual(btn.disabled, false);
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy', cancelling: true });
+  assert.strictEqual(btn.disabled, true);
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  btn.fire('click');
+  assert.strictEqual(p.outbound.filter(m => m.type === 'cancel').length, 1, 'locked — nothing sent');
+});
+
 check('the provider replies orgsRefreshed however the listing ends', () => {
   // The unlock has exactly one trigger, so the reply must be unconditional: the
   // exact shape is pinned — a guard, or a plain await outside a finally, fails here.

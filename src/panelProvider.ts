@@ -81,10 +81,10 @@ type Inbound =
 // in workingTreeChanges/indexChanges). Rejects for an unknown ref.
 interface GitChangeLite { uri?: vscode.Uri }
 interface GitRepoLite {
-  state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[] };
+  state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[]; onDidChange: vscode.Event<void> };
   diffWith(ref: string): Promise<GitChangeLite[]>;
 }
-interface GitApiLite { repositories: GitRepoLite[] }
+interface GitApiLite { repositories: GitRepoLite[]; onDidOpenRepository: vscode.Event<GitRepoLite> }
 interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
@@ -152,6 +152,9 @@ const ACTIVE_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  *  entries — the panel opens on the last listing instead of ~90 `sf` spawns. */
 const ORG_CACHE_KEY = 'orgMembershipCache';
 const ORG_CACHE_MAX_ORGS = 5;
+/** Default `orgCacheMaxAgeHours`: a week. A day meant one background re-listing per
+ *  working day for anyone who opens VS Code each morning. */
+const ORG_CACHE_DEFAULT_HOURS = 168;
 /** Largest key list persisted — a bigger org is listed fresh each session rather
  *  than ballooning the state DB. */
 const ORG_CACHE_MAX_KEYS = 50_000;
@@ -349,6 +352,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private projectDiscoveryError?: string;
   private busy = false;
   private currentCancel?: () => void;
+  /** A cancel handler was consumed for the running op (see cancelCurrent). */
+  private cancelling = false;
   private currentAction?: string;
   private currentProgressText?: string;
   /** A deploy-family confirm modal is up (runDeploy's, enqueueDeploy's "Queue:"
@@ -525,13 +530,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         .finally(() => this.postBusy());
     });
     const editorChangeSub = vscode.window.onDidChangeActiveTextEditor(() => this.sendActiveFile());
-    // Keep the "Changed" lens and its tab badge live through the edit→deploy loop:
-    // saving a file is the moment git-dirty state actually changes. Debounced —
-    // and cheap anyway (reads the git extension's in-memory state, no spawn).
-    const saveSub = vscode.workspace.onDidSaveTextDocument(() => this.scheduleChangedRefresh());
+    // Keep the "Changed" lens and its tab badge live: the git extension's own
+    // state events (watchGitState) — a save listener used to do this and raced
+    // vscode.git's status re-read, showing the pre-save answer.
+    const gitSub = this.watchGitState();
+    // A refresh held while the panel was hidden (scheduleChangedRefresh) runs
+    // once it shows again.
+    const visSub = view.onDidChangeVisibility(() => { if (view.visible && this.changedRefreshHeld) this.scheduleChangedRefresh(); });
     view.onDidDispose(() => {
       editorChangeSub.dispose();
-      saveSub.dispose();
+      gitSub.dispose();
+      visSub.dispose();
       if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
       this.view = undefined;
     });
@@ -1397,7 +1406,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * mid-deploy Cancel now genuinely stops the org-side job.
    */
   private cancelCurrent(): void {
-    if (this.currentCancel) this.currentCancel();
+    // One shot per operation: the panel's Cancel, the notification's Cancel and a
+    // rebuilt webview can all reach here for the same op, and a second kill of an
+    // already-dying process (or a second `deploy cancel`) buys nothing. The
+    // `cancelling` flag rides on every busy post so the panel's Cancel locks
+    // ("Cancelling…") exactly when a handler was consumed — an op with nothing to
+    // cancel (a backup restore's picker) leaves the button a plain no-op.
+    const cancel = this.currentCancel;
+    if (!cancel) return;
+    this.currentCancel = undefined;
+    this.cancelling = true;
+    cancel();
+    this.postBusy();
   }
 
   /** One automatic Fetch Org per session (`fetchOrgOnOpen`, default on), fired
@@ -1867,7 +1887,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Editing a file's BODY cannot add or remove a component, so an onDidChange
         // rescan would walk the whole package tree on every keystroke-save to
         // rebuild the identical list. What a save DOES change — git state — is
-        // already covered by onDidSaveTextDocument → scheduleChangedRefresh.
+        // already covered by the git state watch (watchGitState → scheduleChangedRefresh).
         const watcher = vscode.workspace.createFileSystemWatcher(
           new vscode.RelativePattern(vscode.Uri.file(target.base), target.pattern),
           false,
@@ -1943,6 +1963,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private changedRefreshTimer?: ReturnType<typeof setTimeout>;
+  /** A Changed refresh fell due while the panel was hidden — run it on show. */
+  private changedRefreshHeld = false;
 
   /** Apply a failed unique-root search as a hard local stop. In particular, if a
    *  webview rebuild discovers the failure while automatic Fetch Org is already
@@ -1993,7 +2015,41 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   private scheduleChangedRefresh(): void {
     if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
-    this.changedRefreshTimer = setTimeout(() => { void this.postChangedComponents(); }, 500);
+    this.changedRefreshTimer = setTimeout(() => {
+      // A hidden panel can't show it, and vscode.git runs status on every write
+      // under the repo — a background build would otherwise cost one
+      // `git diff <changedBaseRef>` per pass all day. Held until the panel shows.
+      if (this.view && !this.view.visible) { this.changedRefreshHeld = true; return; }
+      this.changedRefreshHeld = false;
+      void this.postChangedComponents();
+    }, 500);
+  }
+
+  /** Keep the Changed lens live through git itself. vscode.git re-reads status
+   *  after every save, commit, stash, checkout and discard and fires
+   *  `state.onDidChange` once its in-memory state is current — the state
+   *  changedComponentKeys reads. The save listener alone raced that re-read
+   *  (500 ms is often shorter than a `git status`), so a fresh edit only showed
+   *  once the user re-entered the lens, and a commit or discard — no editor
+   *  buffer involved — never refreshed at all. Debounced through
+   *  scheduleChangedRefresh; repositories opened later are hooked as they appear.
+   *  No feedback loop: `state.onDidChange` is vscode.git's onDidRunGitStatus, and
+   *  the `git diff` behind diffWith is a read-only operation that never re-runs
+   *  status — so a `changedBaseRef` refresh can't re-fire the event that caused it.
+   *  Never throws: no git extension just means no live refresh, as before. */
+  private watchGitState(): vscode.Disposable {
+    const subs: vscode.Disposable[] = [];
+    let disposed = false;
+    void (async () => {
+      const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
+      if (!gitExt) return;
+      const api = (gitExt.isActive ? gitExt.exports : await gitExt.activate()).getAPI(1);
+      if (disposed) return;
+      const hook = (repo: GitRepoLite): void => { subs.push(repo.state.onDidChange(() => this.scheduleChangedRefresh())); };
+      api.repositories.forEach(hook);
+      subs.push(api.onDidOpenRepository(hook));
+    })().catch(err => this.output.appendLine(`[changed] git state watch failed: ${err instanceof Error ? err.message : String(err)}`));
+    return { dispose: () => { disposed = true; for (const d of subs.splice(0)) d.dispose(); } };
   }
 
   /** Compute which local components differ, via the built-in vscode.git
@@ -4481,6 +4537,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               activeQueryCancels.delete(q.cancel);
             }
           }
+          // A Cancel that landed while the LAST type's editors were opening has no
+          // further query to bail out of — honour it before the slow retrieve.
+          if (diffCancelled) throw new SfCliCancelledError();
         }
 
         if (slowItems.length > 0) {
@@ -4633,8 +4692,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[org cache] ${org}: ${snap.keys.length} components as of ${new Date(snap.at).toLocaleString()}${hidden ? ` (${hidden} managed hidden)` : ''}`);
     }
     this.postOrgMembership(this.orgs.find(o => o.username === org)?.alias ?? org);
-    const hours = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('orgCacheMaxAgeHours', 24);
-    const maxAgeMs = Math.max(0, Math.min(720, Number.isFinite(hours) ? hours : 24)) * 3_600_000;
+    const hours = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('orgCacheMaxAgeHours', ORG_CACHE_DEFAULT_HOURS);
+    const maxAgeMs = Math.max(0, Math.min(720, Number.isFinite(hours) ? hours : ORG_CACHE_DEFAULT_HOURS)) * 3_600_000;
     return Date.now() - (this.orgMembersAt ?? 0) >= maxAgeMs ? 'stale' : 'fresh';
   }
 
@@ -5016,14 +5075,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** The slot's current state, as the webview's `busy` message. */
   private postBusy(): void {
-    this.post({ type: 'busy', busy: this.busy, action: this.currentAction });
+    this.post({ type: 'busy', busy: this.busy, action: this.currentAction, cancelling: this.cancelling });
   }
 
   private setBusy(b: boolean, action?: string): void {
     this.busy = b;
     this.currentAction = b ? action : undefined;
+    this.cancelling = false;
     if (!b) this.currentProgressText = undefined;
-    this.post({ type: 'busy', busy: b, action: this.currentAction });
+    this.post({ type: 'busy', busy: b, action: this.currentAction, cancelling: false });
     // Drain the next queued deploy/validate once the slot frees (Feature: deploy
     // queue). A microtask — never synchronous inside the caller's `finally` —
     // so the operation that just finished unwinds its OWN cleanup

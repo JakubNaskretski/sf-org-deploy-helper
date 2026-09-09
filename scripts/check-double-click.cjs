@@ -26,6 +26,9 @@
 //   7. source pins: every deploy-family modal goes through awaitConfirm (the
 //      confirmOpen try/finally), the twin check sits at the push, and the
 //      message wiring re-syncs in a finally.
+//   8. cancel ×2 fires the running op's cancel handler ONCE (the webview locks
+//      the button, but the notification's Cancel and a rebuilt webview reach
+//      cancelCurrent too — it consumes the handler).
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
@@ -459,6 +462,46 @@ check('debugTiming on: retrieve/diff/fetchOrgMetadata log a click→post/post→
   const lines = timingLines(p);
   assert.strictEqual(lines.length, 1, `expected exactly one [timing] line, got: ${p.log.join(' | ')}`);
   assert.ok(/^\[timing\] retrieve: click→post \d+ ms · post→host \d+ ms$/.test(lines[0]), lines[0]);
+});
+
+// ------------------------------------------------ 8) cancel is one-shot
+check('cancel ×2: the running op\'s cancel handler fires once, each message still answered', async () => {
+  reset();
+  const p = provider();
+  await running(p);
+  let fired = 0;
+  p.s.currentCancel = () => { fired++; };
+  const before = p.busyPosts().length;
+  p.send({ type: 'cancel' }); p.send({ type: 'cancel' });
+  await ticks();
+  assert.strictEqual(fired, 1, 'a second Cancel re-fired the kill');
+  assert.strictEqual(p.s.currentCancel, undefined, 'the handler is consumed on use');
+  const busyAll = () => p.posted.filter(m => m.type === 'busy');
+  assert.strictEqual(busyAll().length, before + 3, 'consuming the handler posts busy once, then each cancel message is answered');
+  assert.ok(busyAll().slice(before).every(m => m.busy === true && m.cancelling === true), 'the posts say a handler was consumed');
+  assert.ok(busyAll().slice(0, before).every(m => !m.cancelling), 'nothing said so before the cancel');
+  assert.strictEqual(p.s.busy, true, 'the slot is the op\'s to release, not the cancel\'s');
+  p.send({ type: 'cancel' }); // nothing left to cancel — a no-op, not a throw
+  await ticks();
+  assert.strictEqual(fired, 1);
+  p.s.setBusy(false);
+  p.s.postBusy(); // the flag itself must be cleared, not just the transition post
+  const last = busyAll()[busyAll().length - 1];
+  assert.deepStrictEqual([last.busy, !!last.cancelling], [false, false], 'the slot freeing clears the flag');
+  assert.ok(src.includes('const cancel = this.currentCancel;\n    if (!cancel) return;\n    this.currentCancel = undefined;\n    this.cancelling = true;\n    cancel();\n    this.postBusy();'), 'cancelCurrent consumes the handler, flags it, calls it, posts');
+  // With the handler consumed, runDiff's own flag is the only thing left to honour a
+  // Cancel that landed while the last type's editors were opening.
+  assert.ok(src.includes('          if (diffCancelled) throw new SfCliCancelledError();\n        }\n\n        if (slowItems.length > 0) {'), 'runDiff checks diffCancelled before the slow retrieve');
+});
+
+check('cancel with no handler installed (a picker holds the slot): answered with cancelling:false, nothing thrown', async () => {
+  reset();
+  const p = provider({ fields: { busy: true, currentAction: 'Restore backup' } });
+  p.send({ type: 'cancel' });
+  await ticks();
+  const busy = p.posted.filter(m => m.type === 'busy');
+  assert.strictEqual(busy.length, 1);
+  assert.deepStrictEqual([busy[0].busy, busy[0].action, !!busy[0].cancelling], [true, 'Restore backup', false]);
 });
 
 (async () => {

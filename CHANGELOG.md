@@ -3,6 +3,24 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.23.1
+
+- Changed: **The remembered org listing now stays fresh for a week.** `sfOrgDeployWrapper.orgCacheMaxAgeHours`
+  defaults to 168 instead of 24: with the panel opened once a day, the old default re-listed the org in
+  the background every morning. Set it to 24 for the daily refresh, 0 to re-list on every open; Fetch Org
+  still refreshes on demand.
+- Fixed: **The Changed view follows git as it happens.** A saved edit, a commit, a stash, a checkout or a
+  discard now updates the Changed lens and its tab count as soon as VS Code's git extension has noticed
+  it, instead of waiting for the lens to be re-entered. The refresh after a save used to read the git extension's state before it had caught
+  up with the save, and a commit or discard never triggered one at all; the panel now listens to the git
+  extension itself.
+- Fixed: **Cancel is one click.** While an operation runs, the panel's Cancel locks as "Cancelling…" after
+  the first click until the operation actually ends, so it can no longer be clicked repeatedly; a
+  repeated cancel from any route (the notification's Cancel, a rebuilt panel) no longer re-fires the kill;
+  and a Cancel that has nothing to stop (a backup picker holding the slot) stays a plain button instead of
+  pretending. A Cancel landing while a diff's last editors were opening now also stops the retrieve that
+  used to follow.
+
 ## 0.23.0
 
 - Fixed: **Large deploys and retrieves no longer pass one flag per component.** Above 30 components

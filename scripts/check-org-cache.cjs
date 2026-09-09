@@ -70,6 +70,7 @@ const KEY = 'orgMembershipCache';
 const DEV = 'acme-dev-user';
 const UAT = 'acme-uat-user';
 const HOUR = 3_600_000;
+const WEEK = 168 * HOUR; // the orgCacheMaxAgeHours default
 const snap = (org, keys, ageMs, extra = {}) => ({ org, keys, at: Date.now() - ageMs, ...extra });
 const cacheOf = orgs => ({ [KEY]: Object.fromEntries(orgs.map(s => [s.org, s])) });
 
@@ -174,7 +175,7 @@ check('ready on a fresh snapshot: badges posted with asOf, NO listMetadata spawn
 
 // --------------------------------------------- 3) stale snapshot: refresh
 check('a stale snapshot shows first, then the auto-fetch replaces it and the snapshot', async () => {
-  const s = snap(DEV, ['ApexClass:Old'], 25 * HOUR);
+  const s = snap(DEV, ['ApexClass:Old'], WEEK + HOUR);
   const p = boot({ state: cacheOf([s]), script: { ApexClass: [{ fullName: 'New' }] } });
   await p.ready();
   assert.ok(p.calls.length > 0, 'stale → re-listed');
@@ -203,15 +204,15 @@ check('orgCacheMaxAgeHours: 0 always re-lists, 720 keeps a month, out-of-range v
   assert.strictEqual(await run(720, 29 * 24 * HOUR), false, '720 keeps 29 days');
   assert.strictEqual(await run(720, 31 * 24 * HOUR), true, '720 drops 31 days');
   assert.strictEqual(await run(100000, 29 * 24 * HOUR), false, 'above 720 clamps to 720');
-  assert.strictEqual(await run('junk', 23 * HOUR), false, 'a non-number reads as the default 24');
-  assert.strictEqual(await run('junk', 25 * HOUR), true);
+  assert.strictEqual(await run('junk', WEEK - HOUR), false, 'a non-number reads as the default 168');
+  assert.strictEqual(await run('junk', WEEK + HOUR), true);
 });
 
 // ------------------------------------ 5) fetchOrgOnOpen off / no snapshot
 check('fetchOrgOnOpen off: a stale snapshot still shows, nothing is listed', async () => {
   cfg.fetchOrgOnOpen = false;
   try {
-    const s = snap(DEV, ['ApexClass:Old'], 25 * HOUR);
+    const s = snap(DEV, ['ApexClass:Old'], WEEK + HOUR);
     const p = boot({ state: cacheOf([s]), script: { ApexClass: ORDER } });
     await p.ready();
     assert.strictEqual(p.calls.length, 0);
@@ -238,7 +239,7 @@ check('no snapshot is exactly the old behaviour: auto-fetch when on, nothing whe
 // --------------------------------------------------------- 6) org switch
 check('org switch: the new org\'s snapshot shows (a stale one re-lists); none → manual as before', async () => {
   const dev = snap(DEV, ['ApexClass:DevOnly'], HOUR);
-  const uat = snap(UAT, ['ApexClass:UatOld'], 25 * HOUR);
+  const uat = snap(UAT, ['ApexClass:UatOld'], WEEK + HOUR);
   const p = boot({ state: cacheOf([dev, uat]), script: { ApexClass: [{ fullName: 'UatNew' }] } });
   await p.ready();
   assert.strictEqual(p.calls.length, 0);
@@ -409,7 +410,7 @@ check('source: the org-switch resync hydrates; the listing persists only when co
 check('manifest: the setting is declared with its bounds, and this harness is in `check`', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   const s = pkg.contributes.configuration.properties['sfOrgDeployWrapper.orgCacheMaxAgeHours'];
-  assert.deepStrictEqual([s.type, s.default, s.minimum, s.maximum], ['number', 24, 0, 720]);
+  assert.deepStrictEqual([s.type, s.default, s.minimum, s.maximum], ['number', 168, 0, 720]);
   assert.match(s.markdownDescription, /Fetch Org always re-lists/);
   assert.ok(pkg.scripts.check.includes('node ./scripts/check-org-cache.cjs'));
   assert.ok(fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8').includes('`sfOrgDeployWrapper.orgCacheMaxAgeHours`'));
