@@ -534,9 +534,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // state events (watchGitState) — a save listener used to do this and raced
     // vscode.git's status re-read, showing the pre-save answer.
     const gitSub = this.watchGitState();
-    // A refresh held while the panel was hidden (scheduleChangedRefresh) runs
-    // once it shows again.
-    const visSub = view.onDidChangeVisibility(() => { if (view.visible && this.changedRefreshHeld) this.scheduleChangedRefresh(); });
+    // A refresh held while the panel was hidden (scheduleChangedRefresh) lands the
+    // moment it shows again — not after another debounce, the retained DOM is
+    // already stale by then.
+    const visSub = view.onDidChangeVisibility(() => {
+      if (view.visible && this.changedRefreshHeld) { this.changedRefreshHeld = false; void this.postChangedComponents(); }
+    });
     view.onDidDispose(() => {
       editorChangeSub.dispose();
       gitSub.dispose();
@@ -894,7 +897,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       match = inferItemForPath(uri.fsPath, this.ruleSet());
       if (!match) {
         try {
-          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath));
+          // quiet: this runs BEFORE the slot is reserved, so a cancellable toast's
+          // Cancel could only reach whatever other op was running — a polled deploy's
+          // handler, i.e. a real org-side `deploy cancel` from an unrelated click.
+          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath), { quiet: true });
         } catch (err) {
           // CLI failure (timeout, no project, …) — distinct from "not metadata".
           const msg = err instanceof Error ? err.message : String(err);
@@ -4482,6 +4488,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // can't resolve cleanly falls back to the retrieve below.
         const fastItems = items.filter(i => FAST_DIFF_FIELD[i.type]);
         const slowItems = items.filter(i => !FAST_DIFF_FIELD[i.type]);
+        // One flag for the whole diff: a Cancel flips it AND kills whatever sf call
+        // is in flight, and every loop below checks it before its next editor. A
+        // bare `handle.cancel` is a no-op once that handle has settled, so a Cancel
+        // during the editor-opening phase used to lock the button as "Cancelling…"
+        // while every remaining diff still opened.
+        let diffCancelled = false;
         if (fastItems.length > 0) {
           report('querying org (Tooling API)…');
           this.postProgress(`Fetching ${fastItems.length} component${fastItems.length === 1 ? '' : 's'} from ${orgLabel} via Tooling API…`);
@@ -4493,9 +4505,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // A Cancel landing BETWEEN two per-type queries used to be lost: currentCancel
           // then points at the just-settled query handle, so calling it is a no-op and
           // the loop rolls on to the next type. Mirror loadOrgMetadata's fetchCancelled —
-          // the wrapper flips a flag AND kills whatever query is in flight; the loop
-          // checks the flag before each query and bails out honestly.
-          let diffCancelled = false;
+          // the wrapper flips the flag AND kills whatever query is in flight; the loop
+          // checks the flag before each query and each editor and bails out honestly.
           const activeQueryCancels = new Set<() => void>();
           this.currentCancel = () => {
             diffCancelled = true;
@@ -4522,6 +4533,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 const body = rec?.[field];
                 if (recs.length === 0) { missing.push(item); continue; }
                 if (typeof body !== 'string' || body === '(hidden)') { slowItems.push(item); continue; }
+                if (diffCancelled) throw new SfCliCancelledError();
                 const staged = await stageDiffText(body, item);
                 tmpPaths.push(staged.dir);
                 await this.openDiff(item, staged.file, orgLabel, diffColumn());
@@ -4561,7 +4573,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const handle = this.sf.retrieveMetadata(
             slowItems.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs() }
           );
-          this.currentCancel = handle.cancel;
+          this.currentCancel = () => { diffCancelled = true; handle.cancel(); };
           let result: RetrieveResult;
           try {
             const r = await handle.promise;
@@ -4580,6 +4592,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
           report('opening diff editors…');
           for (const item of slowItems) {
+            if (diffCancelled) throw new SfCliCancelledError();
             const isChild = OBJECT_CHILD_TYPES.has(item.type);
             let remoteFile: string | undefined;
             if (item === focused) {

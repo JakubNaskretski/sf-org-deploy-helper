@@ -18,8 +18,12 @@ This file starts at the current release; earlier history predates it.
   the first click until the operation actually ends, so it can no longer be clicked repeatedly; a
   repeated cancel from any route (the notification's Cancel, a rebuilt panel) no longer re-fires the kill;
   and a Cancel that has nothing to stop (a backup picker holding the slot) stays a plain button instead of
-  pretending. A Cancel landing while a diff's last editors were opening now also stops the retrieve that
-  used to follow.
+  pretending. A Cancel while a diff is opening its editors now stops the remaining editors on both the
+  Tooling-API and the retrieve path, instead of locking the button while every window still opened.
+- Fixed: **The "Resolving metadata type" progress no longer offers a Cancel.** That toast ran before the
+  operation slot was taken, so its Cancel could only reach whatever else was running — including a real
+  org-side cancel of an unrelated in-flight deploy. It is now a status-bar spinner like the other
+  background resolutions.
 
 ## 0.23.0
 

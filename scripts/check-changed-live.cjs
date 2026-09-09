@@ -149,15 +149,14 @@ check('a refresh due while the panel is hidden is held, and runs once on show', 
   await settle();
   assert.strictEqual(p.changed().length, 0, 'hidden → nothing posted');
   assert.strictEqual(p.s.changedRefreshHeld, true);
-  // What the onDidChangeVisibility handler does on show:
+  // What the onDidChangeVisibility handler does on show (pinned by source below):
+  // the held payload lands immediately, with no second debounce.
   p.s.view.visible = true;
-  if (p.s.changedRefreshHeld) p.s.scheduleChangedRefresh();
-  await settle();
+  if (p.s.changedRefreshHeld) { p.s.changedRefreshHeld = false; await p.s.postChangedComponents(); }
   assert.deepStrictEqual(p.changed(), [['ApexClass:AcmeA']]);
   assert.strictEqual(p.s.changedRefreshHeld, false);
   // Nothing held → showing again re-runs nothing.
-  if (p.s.changedRefreshHeld) p.s.scheduleChangedRefresh();
-  await settle();
+  if (p.s.changedRefreshHeld) { p.s.changedRefreshHeld = false; await p.s.postChangedComponents(); }
   assert.strictEqual(p.changed().length, 1);
   // No view at all (never resolved) is not "hidden".
   p.s.view = undefined;
@@ -189,7 +188,7 @@ check('a git API that throws is logged, not thrown', async () => {
 // ------------------------------------------------------- 5) source pins
 check('resolveWebviewView wires the watch and the show-again resume, and disposes both with the view', () => {
   assert.ok(src.includes('const gitSub = this.watchGitState();'));
-  assert.ok(src.includes('const visSub = view.onDidChangeVisibility(() => { if (view.visible && this.changedRefreshHeld) this.scheduleChangedRefresh(); });'));
+  assert.ok(src.includes('      if (view.visible && this.changedRefreshHeld) { this.changedRefreshHeld = false; void this.postChangedComponents(); }'), 'show-again posts NOW, not after another debounce');
   assert.ok(src.includes('      gitSub.dispose();\n      visSub.dispose();'));
   assert.ok(!src.includes('onDidSaveTextDocument(() => this.scheduleChangedRefresh())'), 'the save listener is gone — it read git state before vscode.git had caught up');
   assert.ok(src.includes('subs.push(repo.state.onDidChange(() => this.scheduleChangedRefresh()));'), 'the git event goes through the same debounce as a save');

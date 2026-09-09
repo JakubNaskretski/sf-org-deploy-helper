@@ -29,7 +29,10 @@ const ui = { diffs: [], warn: [], info: [] };
 const editorListeners = [];
 // moveEditorToNewWindow's outcome per test — see the floatFirstDiff checks below.
 let moveEditorResult = () => Promise.resolve(undefined);
-const resetUi = () => { ui.diffs.length = 0; ui.warn.length = 0; ui.info.length = 0; editorListeners.length = 0; moveEditorResult = () => Promise.resolve(undefined); };
+// Fires once, as the FIRST diff editor opens — how the cancel checks land a Cancel
+// click in the editor-opening phase (after every sf handle has settled).
+let onFirstDiffOpen = null;
+const resetUi = () => { ui.diffs.length = 0; ui.warn.length = 0; ui.info.length = 0; editorListeners.length = 0; moveEditorResult = () => Promise.resolve(undefined); onFirstDiffOpen = null; };
 
 const vscodeStub = {
   window: {
@@ -42,7 +45,11 @@ const vscodeStub = {
   },
   commands: {
     executeCommand: (id, ...args) => {
-      if (id === 'vscode.diff') { ui.diffs.push({ left: args[0].fsPath, right: args[1].fsPath, title: args[2] }); return Promise.resolve(undefined); }
+      if (id === 'vscode.diff') {
+        ui.diffs.push({ left: args[0].fsPath, right: args[1].fsPath, title: args[2] });
+        if (onFirstDiffOpen) { const fn = onFirstDiffOpen; onFirstDiffOpen = null; fn(); }
+        return Promise.resolve(undefined);
+      }
       if (id === 'workbench.action.moveEditorToNewWindow') return moveEditorResult();
       return Promise.resolve(undefined);
     }
@@ -138,7 +145,8 @@ function diffStub(items) {
   stub.output = { appendLine: (l) => log.push(l) };
   stub.withWindowProgress = (_title, body) => body(() => {});
   stub.sf = {
-    queryTooling: () => ({ promise: Promise.resolve({ records: [] }), cancel: () => {} }),
+    // `records` lets a check script the Tooling fast path (ApexClass bodies).
+    queryTooling: () => ({ promise: Promise.resolve({ records: stub.toolingRecords || [] }), cancel: () => {} }),
     retrieveMetadata: (_keys, _org, proj) => ({
       cancel: () => {},
       promise: (async () => {
@@ -154,6 +162,7 @@ function diffStub(items) {
         await fsp.mkdir(path.join(objDir, 'fields'), { recursive: true });
         await fsp.writeFile(path.join(objDir, 'Widget__c.object-meta.xml'), OBJECT_META, 'utf8');
         await fsp.writeFile(path.join(objDir, 'fields', 'Size__c.field-meta.xml'), '<CustomField>ORG field</CustomField>', 'utf8');
+        await fsp.writeFile(path.join(objDir, 'fields', 'Color__c.field-meta.xml'), '<CustomField>ORG colour</CustomField>', 'utf8');
         return { result: { messages: [] }, cmd: 'sf project retrieve start' };
       })()
     })
@@ -169,6 +178,58 @@ const runDiff = (stub, keys, focusFile) =>
 let failed = 0;
 const queue = [];
 function check(name, fn) { queue.push([name, fn]); }
+
+// ---------------------------------------------------------- Cancel mid-open
+// A bare `handle.cancel` is a no-op once the retrieve/query has settled, so a
+// Cancel during the editor-opening phase used to lock the panel's button as
+// "Cancelling…" (0.23.1's cancelling flag) while every remaining diff still
+// opened and the card read as success. Both paths now share one diffCancelled
+// flag checked before each editor.
+const cancelledCard = (posted) => cards(posted).find(c => /cancelled$/.test(c.title || ''));
+async function fieldItem(field) {
+  const file = path.join(objectDir, 'fields', `${field}.field-meta.xml`);
+  await fsp.writeFile(file, `<CustomField>LOCAL ${field}</CustomField>`, 'utf8');
+  return { type: 'CustomField', name: `Widget__c.${field}`, filePath: file, files: [file] };
+}
+check('retrieve path: Cancel as the first editor opens stops the rest and reports Cancelled', async () => {
+  resetUi();
+  // Two object children: the one slow-path shape that diffs without a focus file
+  // (a CustomObject folder without focus keeps the unsupported verdict).
+  const { stub, posted, retrieves } = diffStub([await fieldItem('Size__c'), await fieldItem('Color__c')]);
+  onFirstDiffOpen = () => stub.cancelCurrent(); // the panel's Cancel, delivered mid-loop
+  await runDiff(stub, ['CustomField:Widget__c.Size__c', 'CustomField:Widget__c.Color__c'], undefined);
+  drainTmpCleanup();
+  assert.strictEqual(retrieves(), 1);
+  assert.strictEqual(ui.diffs.length, 1, `every editor still opened: ${ui.diffs.map(d => d.title).join(' | ')}`);
+  assert.ok(cancelledCard(posted), `no cancelled card: ${cards(posted).map(c => c.title).join(' | ')}`);
+  assert.ok(!cards(posted).some(c => /opened diff/.test((c.lines || []).join('\n'))), 'the run must not also report success');
+  assert.strictEqual(stub.currentCancel, undefined, 'the op releases its handler');
+  assert.ok(posted.some(m => m.type === 'busy' && m.cancelling === true), 'the lock the button trusts was posted');
+});
+
+check('Tooling path: Cancel as the first editor opens stops the rest of that type too', async () => {
+  resetUi();
+  const cls = (name) => ({ type: 'ApexClass', name, filePath: path.join(workspace, 'force-app', 'main', 'default', 'classes', `${name}.cls`), files: [] });
+  const { stub, posted, retrieves } = diffStub([cls('AcmeA'), cls('AcmeB'), cls('AcmeC')]);
+  stub.toolingRecords = ['AcmeA', 'AcmeB', 'AcmeC'].map(Name => ({ Name, NamespacePrefix: null, Body: `ORG ${Name}` }));
+  onFirstDiffOpen = () => stub.cancelCurrent();
+  await runDiff(stub, ['ApexClass:AcmeA', 'ApexClass:AcmeB', 'ApexClass:AcmeC'], undefined);
+  drainTmpCleanup();
+  assert.strictEqual(ui.diffs.length, 1, `every editor still opened: ${ui.diffs.map(d => d.title).join(' | ')}`);
+  assert.ok(cancelledCard(posted), `no cancelled card: ${cards(posted).map(c => c.title).join(' | ')}`);
+  assert.strictEqual(retrieves(), 0, 'no fallback retrieve after a cancel');
+});
+
+check('no Cancel: both paths still open every editor (the guards are inert)', async () => {
+  resetUi();
+  const cls = (name) => ({ type: 'ApexClass', name, filePath: path.join(workspace, 'force-app', 'main', 'default', 'classes', `${name}.cls`), files: [] });
+  const { stub, posted } = diffStub([cls('AcmeA'), cls('AcmeB'), await fieldItem('Size__c')]);
+  stub.toolingRecords = ['AcmeA', 'AcmeB'].map(Name => ({ Name, NamespacePrefix: null, Body: `ORG ${Name}` }));
+  await runDiff(stub, ['ApexClass:AcmeA', 'ApexClass:AcmeB', 'CustomField:Widget__c.Size__c'], undefined);
+  drainTmpCleanup();
+  assert.strictEqual(ui.diffs.length, 3, ui.diffs.map(d => d.title).join(' | '));
+  assert.ok(!cancelledCard(posted));
+});
 
 const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
 check('source: the once-per-session flag is declared, and the toast sits inside floatFirstDiff\'s catch', () => {

@@ -711,12 +711,17 @@ check('source: exactly one call site passes { quiet } — loadOrgMetadata\'s own
     'the quiet flag must reach the Fetch Org progress notification');
 });
 
-check('source: exactly one call site hardcodes { quiet: true } — background type resolution', () => {
+check('source: exactly two call sites hardcode { quiet: true } — the two registry resolutions', () => {
   const count = (providerSrc.match(/, \{ quiet: true \}\);/g) || []).length;
-  assert.strictEqual(count, 1, 'only the background registry resolution may hardcode quiet');
+  assert.strictEqual(count, 2, 'only the two registry resolutions may hardcode quiet');
   const i = providerSrc.indexOf("'Resolving metadata types (sf registry)'");
   assert.ok(i > 0 && providerSrc.slice(i, i + 300).includes('{ quiet: true }'),
     'the ordinary-scan type-resolution progress must be quiet, not a Notification');
+  // The single-file resolution (0.23.1) runs BEFORE the slot is reserved: a
+  // cancellable toast there could only ever cancel whatever OTHER op was running.
+  const j = providerSrc.indexOf("'Resolving metadata type (sf registry)'");
+  assert.ok(j > 0 && providerSrc.slice(j, j + 200).includes('{ quiet: true }'),
+    'the per-file type resolution must be quiet — its Cancel reached an unrelated running op');
 });
 
 check('source: the automatic Fetch Org on open requests quiet; a manual click does not', () => {
