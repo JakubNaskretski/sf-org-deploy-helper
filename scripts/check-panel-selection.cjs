@@ -157,6 +157,13 @@ function panel(persisted) {
   const listeners = {};
   let stored = persisted ? JSON.parse(JSON.stringify(persisted)) : undefined;
   const outbound = [];
+  // sendAction defers renderActions()/renderStatus() via requestAnimationFrame
+  // (debugTiming/click-latency fix) so the click handler returns right after
+  // postMessage — the whole point being that the outbound message exists BEFORE
+  // the render runs. Captured here instead of firing immediately, so a check can
+  // assert exactly that ordering, then call flush() to run the deferred render
+  // and get the old "render already happened" behaviour back.
+  const pendingFrames = [];
 
   const sandbox = {
     console,
@@ -164,7 +171,11 @@ function panel(persisted) {
     // The progress card's elapsed clock is a real setInterval; a panel left busy
     // at the end of a check must not keep this process alive.
     setInterval: (fn, ms) => { const t = setInterval(fn, ms); t.unref(); return t; },
-    requestAnimationFrame: (fn) => setTimeout(fn, 0),
+    requestAnimationFrame: (fn) => { pendingFrames.push(fn); return pendingFrames.length; },
+    // panel.js stamps clickSpan with performance.now() (sendAction, debugTiming) —
+    // Date.now()-based is precise enough for these checks (they only need a
+    // finite, non-negative number, not sub-ms resolution).
+    performance: { now: () => Date.now() },
     acquireVsCodeApi: () => ({
       postMessage: (m) => outbound.push(m),
       getState: () => stored,
@@ -199,7 +210,9 @@ function panel(persisted) {
     /** The LIVE selection, read the way the user reads it (toolbar count). */
     liveCount: () => Number(/^(\d+)/.exec(els.get('selCount').textContent)?.[1] ?? -1),
     el: (id) => els.get(id),
-    outbound
+    outbound,
+    pendingRenders: pendingFrames,
+    flush: () => { while (pendingFrames.length) pendingFrames.shift()(); }
   };
 }
 
@@ -333,6 +346,35 @@ check('replace also re-snapshots the Selected lens instead of stranding old rows
   const rows = [];
   p.el('tree').find(e => { if (e.tagName === 'SPAN' && /Acme/.test(e.textContent)) rows.push(e.textContent); return false; });
   assert.deepStrictEqual(rows, ['AcmeInvoiceService'], `lens still lists: ${rows.join(', ')}`);
+});
+
+// -------------------------------------------------- 3c) B4: transient selectKeys
+// A suggestion accept reveals what it added to its own retry WITHOUT joining the
+// persisted selection — a plain Deploy click right after must not silently pick
+// these up, and the user stays in whatever lens/mode they were already in.
+check('a transient selectKeys never joins the live selection or persisted state', () => {
+  const p = panel(RESTORED);
+  p.deliver(FILES(THREE));
+  const before = p.persisted().selected.slice().sort();
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeInvoiceService')], scroll: true, transient: true });
+  assert.strictEqual(p.liveCount(), 3, 'a transient key must not join the live selection');
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), before, 'a transient key must not be persisted');
+});
+
+check('a transient selectKeys still reveals the row (group auto-expands so it can be scrolled to)', () => {
+  const acmeNames = (p) => { const o = []; p.el('tree').find(e => { if (e.tagName === 'SPAN' && /^Acme/.test(e.textContent)) o.push(e.textContent); return false; }); return o; };
+  const p = panel({ ...RESTORED, selected: [], expandedGroups: [] });
+  p.deliver(FILES(THREE));
+  assert.ok(!acmeNames(p).includes('AcmeInvoiceService'), 'row already visible before the reveal — fixture is broken');
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeInvoiceService')], scroll: true, transient: true });
+  assert.ok(acmeNames(p).includes('AcmeInvoiceService'), 'the transient key never became visible');
+});
+
+check('a transient selectKeys does not force the user out of the Changed lens (replace/plain selectKeys does)', () => {
+  const p = panel({ ...RESTORED, viewMode: 'changed' });
+  p.deliver(FILES(THREE));
+  p.deliver({ type: 'selectKeys', keys: [KEY('AcmeInvoiceService')], scroll: true, transient: true });
+  assert.strictEqual(p.persisted().viewMode, 'changed', 'transient must not switch the lens like a real selection does');
 });
 
 // ------------------------------------------ the Changed lens's bulk selection
@@ -570,6 +612,59 @@ check('⟳ locks on click, ignores repeats, survives an orgs broadcast, unlocks 
   assert.strictEqual(btn.title, 'Refresh org list');
   btn.fire('click'); // and it works again afterwards
   assert.strictEqual(sent(), 2);
+});
+
+check('Cancel locks on click ("Cancelling…"), ignores repeats, holds on a cancelling re-sync, unlocks when the slot frees', () => {
+  const p = panel(undefined);
+  const btn = p.el('cancelBtn');
+  const sent = () => p.outbound.filter(m => m.type === 'cancel').length;
+  p.deliver({ type: 'busy', busy: true, action: 'Fetch Org', cancelling: false });
+  assert.strictEqual(btn.style.display, '');
+  assert.strictEqual(btn.disabled, false);
+  assert.strictEqual(btn.textContent, 'Cancel Fetch Org');
+  btn.fire('click');
+  assert.strictEqual(sent(), 1);
+  assert.strictEqual(btn.disabled, true);
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  btn.fire('click'); btn.fire('click'); // spam — the kill must not re-fire
+  assert.strictEqual(sent(), 1);
+  // The provider answers the cancel message within milliseconds with a busy
+  // re-sync (still busy, same op) that says a handler was consumed — that holds.
+  p.deliver({ type: 'busy', busy: true, action: 'Fetch Org', cancelling: true });
+  assert.strictEqual(btn.disabled, true);
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  btn.fire('click');
+  assert.strictEqual(sent(), 1);
+  p.deliver({ type: 'busy', busy: false, cancelling: false });
+  assert.strictEqual(btn.style.display, 'none');
+  // The next op gets a fresh Cancel.
+  p.deliver({ type: 'busy', busy: true, action: 'Retrieve', cancelling: false });
+  assert.strictEqual(btn.disabled, false);
+  assert.strictEqual(btn.textContent, 'Cancel Retrieve');
+  btn.fire('click');
+  assert.strictEqual(sent(), 2);
+});
+
+check('a Cancel that hit nothing unlocks on the reply; the notification\'s Cancel locks the panel\'s too', () => {
+  const p = panel(undefined);
+  const btn = p.el('cancelBtn');
+  // A picker holding the slot installs no cancel handler: the click locks for
+  // instant feedback, the reply (cancelling:false) says nothing was consumed.
+  p.deliver({ type: 'busy', busy: true, action: 'Restore backup', cancelling: false });
+  btn.fire('click');
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  p.deliver({ type: 'busy', busy: true, action: 'Restore backup', cancelling: false });
+  assert.strictEqual(btn.disabled, false, 'a click that cancelled nothing must not strand the button');
+  assert.strictEqual(btn.textContent, 'Cancel Restore backup');
+  // Cancel pressed on the progress notification instead: the provider posts
+  // cancelling:true unasked, and the panel's button follows.
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy', cancelling: false });
+  assert.strictEqual(btn.disabled, false);
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy', cancelling: true });
+  assert.strictEqual(btn.disabled, true);
+  assert.strictEqual(btn.textContent, 'Cancelling…');
+  btn.fire('click');
+  assert.strictEqual(p.outbound.filter(m => m.type === 'cancel').length, 1, 'locked — nothing sent');
 });
 
 check('the provider replies orgsRefreshed however the listing ends', () => {
@@ -985,6 +1080,7 @@ for (const [id, type] of GUARDED) {
     const b = p.el(id);
     assert.ok(click(b));
     assert.strictEqual(sent(p, type), 1);
+    p.flush(); // renderActions is deferred (sendAction) — flush before reading DOM state
     assert.strictEqual(b.disabled, true);
     assert.strictEqual(b.title, 'Sending…');
     assert.ok(!click(b));
@@ -999,11 +1095,45 @@ for (const [id, type] of GUARDED) {
   });
 }
 
+// ---------------------------------------------- 9) click-to-post ordering
+// The user-visible symptom (several seconds between clicking Deploy and the
+// confirm modal) turned out to be outside the extension-host path — so the fix
+// is to remove the only thing on OUR side that could sit between the click and
+// the postMessage call: rendering. sendAction now posts first and defers
+// renderActions()/renderStatus() to a rAF/setTimeout callback (see check 8's
+// flush() above), and stamps clickedAt/clickSpan for the [timing] log
+// (panelProvider.ts, debugTiming) to measure the rest of the trip.
+check('Deploy click posts before the deferred render runs', () => {
+  const p = armed();
+  const b = p.el('deployBtn');
+  assert.strictEqual(p.pendingRenders.length, 0, 'a render was already pending before the click');
+  assert.ok(click(b));
+  // The message is already in the outbound queue — the deferred render has not
+  // run yet (nothing has flushed it).
+  assert.strictEqual(sent(p, 'deploy'), 1, 'sendAction must post before deferring the render');
+  assert.strictEqual(p.pendingRenders.length, 1, 'renderActions/renderStatus must be deferred, not run inline');
+  assert.strictEqual(b.disabled, false, 'the DOM must not reflect the click yet — the render is still pending');
+  p.flush();
+  assert.strictEqual(b.disabled, true, 'flushing the deferred render must lock the button');
+});
+
+check('every slot-taking action stamps clickedAt/clickSpan as finite, non-negative numbers', () => {
+  const p = armed();
+  assert.ok(click(p.el('deployBtn')));
+  p.flush();
+  const [msg] = p.outbound.filter(m => m.type === 'deploy');
+  assert.strictEqual(typeof msg.clickedAt, 'number');
+  assert.ok(Number.isFinite(msg.clickedAt) && msg.clickedAt > 0, `clickedAt: ${msg.clickedAt}`);
+  assert.strictEqual(typeof msg.clickSpan, 'number');
+  assert.ok(Number.isFinite(msg.clickSpan) && msg.clickSpan >= 0, `clickSpan: ${msg.clickSpan}`);
+});
+
 check('Deploy queues while busy but never sends while its previous click is unanswered', () => {
   const p = armed({ busy: 'Retrieve' });
   const b = p.el('deployBtn');
   assert.ok(click(b));
   assert.strictEqual(sent(p, 'deploy'), 1);
+  p.flush(); // renderActions is deferred (sendAction) — flush before reading DOM state
   assert.strictEqual(b.disabled, true);
   assert.ok(!click(b));
   p.deliver({ type: 'busy', busy: true, action: 'Retrieve' }); // the provider's re-sync: same state
@@ -1029,6 +1159,7 @@ for (const [label, send, expect] of CARD_BTNS) {
     click(findBtn(p, label));
     click(findBtn(p, label)); // re-found: a render replaces the element under the cursor
     assert.strictEqual(sent(p, send.type), expect);
+    p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
     if (expect === 1) {
       assert.strictEqual(findBtn(p, label).disabled, true);
       assert.strictEqual(findBtn(p, label).title, 'Sending…');
@@ -1045,6 +1176,7 @@ check('card Retry queues while busy, not while pending', () => {
   p.deliver(CARD([{ label: 'Retry deploy', send: { type: 'retryDeploy', request: { keys: DC.selected } } }]));
   assert.ok(click(findBtn(p, 'Retry deploy')));
   assert.strictEqual(sent(p, 'retryDeploy'), 1);
+  p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
   assert.ok(!click(findBtn(p, 'Retry deploy')));
   p.deliver({ type: 'busy', busy: true, action: 'Deploy' });
   assert.strictEqual(findBtn(p, 'Retry deploy').title, 'Will queue behind Deploy');
@@ -1101,6 +1233,104 @@ check('the context-menu paths and the provider\'s Rescan reply share the same gu
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
   const shape = /case 'refreshFiles':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.refreshFiles\(\); \} finally \{ this\.post\(\{ type: 'filesRefreshed' \}\); \}\n\s*return;/;
   assert.ok(shape.test(src), "refreshFiles handler must be exactly: try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }");
+});
+
+// ---------------------------------- 10) B1/B8: dependency-suggestion rendering
+// The provider-side contract (liveSuggestions, orgOverride, transient selectKeys,
+// suggestionRestore payload shape) is covered end to end in
+// check-suggestion-flow.cjs against the REAL provider; this section is the
+// webview-only half — panel.js is a browser IIFE with no exports of its own, so
+// it can only be driven the way check-panel-selection.cjs already does, by
+// delivering messages and reading back the DOM/state.
+const suggestCard = (overrides = {}) => ({
+  type: 'status',
+  card: {
+    kind: 'err', title: 'Deploy failed', at: 1,
+    lines: ['ApexClass:MyThing — Invalid type: smth__mdt'],
+    suggest: {
+      id: 'sug-1000-0',
+      candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing', why: 'Invalid type: smth__mdt' }],
+      unresolved: ['Ghost__mdt']
+    },
+    ...overrides
+  }
+});
+const openSuggestBtn = (p) => p.el('status').find(e => e.tagName === 'BUTTON' && /^Try with dependencies/.test(e.textContent));
+const statusLines = (p) => { const o = []; p.el('status').find(e => { if (e.tagName === 'LI') o.push(e.textContent); return false; }); return o; };
+const suggestWhys = (p) => { const o = []; p.el('status').find(e => { if (e.className === 'suggest-why') o.push(e.textContent); return false; }); return o; };
+const suggestRows = (p) => p.el('status').find(e => e.className === 'suggest-rows');
+const suggestUnresolved = (p) => p.el('status').find(e => e.className === 'suggest-unresolved');
+
+check('B11: the "Try with dependencies" button renders even with no other card.buttons', () => {
+  const p = panel(null);
+  p.deliver(suggestCard()); // no `buttons` field at all
+  assert.ok(openSuggestBtn(p), 'the button must not be gated behind card.buttons');
+});
+
+check('B8: opening the suggestion keeps the org error lines visible above the checkbox rows', () => {
+  const p = panel(null);
+  p.deliver(suggestCard());
+  openSuggestBtn(p).fire('click');
+  assert.ok(suggestRows(p), 'checkbox rows did not render');
+  assert.ok(statusLines(p).some(l => l.includes('smth__mdt')), `expected the org error line to stay visible: ${JSON.stringify(statusLines(p))}`);
+});
+
+check('B8: the "why" reason renders under its checkbox', () => {
+  const p = panel(null);
+  p.deliver(suggestCard());
+  openSuggestBtn(p).fire('click');
+  assert.deepStrictEqual(suggestWhys(p), ['Invalid type: smth__mdt']);
+});
+
+check('B8: a candidate with no why renders no suggest-why row (field is optional)', () => {
+  const p = panel(null);
+  p.deliver(suggestCard({ suggest: { id: 'sug-1000-1', candidates: [{ key: 'CustomObject:smth__mdt' }], unresolved: [] } }));
+  openSuggestBtn(p).fire('click');
+  assert.deepStrictEqual(suggestWhys(p), []);
+});
+
+check('B11: the unresolved wording says "Not found in your workspace (retrieve it, or its type is not scanned)"', () => {
+  const p = panel(null);
+  p.deliver(suggestCard());
+  openSuggestBtn(p).fire('click');
+  const el = suggestUnresolved(p);
+  assert.ok(el, 'no suggest-unresolved element');
+  assert.ok(el.textContent.startsWith('Not found in your workspace (retrieve it, or its type is not scanned): '), el.textContent);
+  assert.ok(el.textContent.includes('Ghost__mdt'), el.textContent);
+});
+
+check('B1: suggestionRestore merges the payload into the matching history card by suggestId, and the button reappears', () => {
+  const p = panel(null);
+  // What a webview rebuild actually receives: the STRIPPED persisted copy —
+  // `suggest` is gone, `suggestId` is what correlates a later restore.
+  p.deliver({
+    type: 'statusHistory',
+    cards: [{
+      kind: 'err', title: 'Deploy failed', at: 1, suggestId: 'sug-2000-0',
+      lines: ['Missing but available locally: CustomObject:smth__mdt — add them to the deploy by hand.', 'ApexClass:MyThing — Invalid type: smth__mdt']
+    }]
+  });
+  assert.ok(!openSuggestBtn(p), 'a stripped history card must not show the button before restore');
+  p.deliver({ type: 'suggestionRestore', id: 'sug-2000-0', candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing' }], unresolved: [] });
+  const btn = openSuggestBtn(p);
+  assert.ok(btn, 'suggestionRestore did not bring the button back');
+  assert.strictEqual(btn.textContent, 'Try with dependencies (1)');
+  // And it is fully live — opening it works exactly like a fresh suggestion.
+  btn.fire('click');
+  assert.ok(suggestRows(p), 'the restored suggestion cannot be opened');
+});
+
+check('B1: suggestionRestore for an id with no matching card, or already carrying a live suggest, is a no-op', () => {
+  const p = panel(null);
+  p.deliver({ type: 'statusHistory', cards: [{ kind: 'err', title: 'X', at: 1, suggestId: 'sug-3000-0', lines: [] }] });
+  p.deliver({ type: 'suggestionRestore', id: 'sug-nonexistent', candidates: [{ key: 'CustomObject:X' }], unresolved: [] });
+  assert.ok(!openSuggestBtn(p), 'restore attached to the wrong card');
+  // A card that already has a live suggest (e.g. the session's own posted card,
+  // never stripped) must not be clobbered by a stale restore for the same id.
+  const q = panel(null);
+  q.deliver(suggestCard({ suggestId: 'sug-1000-0' }));
+  q.deliver({ type: 'suggestionRestore', id: 'sug-1000-0', candidates: [{ key: 'CustomObject:different' }], unresolved: [] });
+  assert.strictEqual(openSuggestBtn(q).textContent, 'Try with dependencies (1)', 'a live suggest was overwritten by a restore');
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

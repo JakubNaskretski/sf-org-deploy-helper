@@ -33,6 +33,21 @@ are hidden unless `sfOrgDeployWrapper.fetchIncludeManaged` is on (the card says 
 type). DataPack exports (`vlocity/`, `*_DataPack.json`) are data, not Metadata API source: the
 scan flags them but cannot list them.
 
+## Deploy File + Dependencies
+
+Right-click an Apex class/trigger, an LWC or Aura bundle, or a Visualforce page/component
+(also on the command palette, and on an explorer multi-selection of up to 20 files) for
+**SF Deploy: Deploy File + Dependencies**. It reads the file's own source for references to
+other workspace components — Apex classes it calls, custom objects/fields it touches, child
+LWC/Aura bundles, message channels, static resources, Visualforce controllers/extensions —
+and deploys the whole local closure as ONE deploy, instead of failing layer by layer and
+being patched one failure card at a time. Best-effort, not a parser: a false positive just
+deploys an unchanged copy of an unrelated component (harmless), and a miss falls back to the
+usual failure card. The confirm modal names how many components were auto-included on top of
+what you picked (and why, for the first few); the result card lists every one of them with
+the component whose source pulled it in. `sfOrgDeployWrapper.dependencyMaxDepth` and
+`sfOrgDeployWrapper.dependencyMaxComponents` bound how far and how wide the scan goes.
+
 ## Requirements
 
 - Salesforce CLI (`sf`) installed and on `PATH`.
@@ -48,10 +63,13 @@ scan flags them but cannot list them.
 - `sfOrgDeployWrapper.fetchIncludeManaged` — include managed-package components when fetching org metadata (default off — they're read-only and add thousands of entries to the browse tree).
 - `sfOrgDeployWrapper.fetchOrgOnOpen` — run Fetch Org automatically when the panel first opens (default on). A remembered listing is shown instantly and re-listed in the background only when stale — also after switching to an org whose remembered listing is stale; otherwise later refreshes stay manual via the Fetch Org button.
 - `sfOrgDeployWrapper.fetchConcurrency` — how many metadata types Fetch Org lists in parallel (default 5, 1–12). Machine-scoped: lower it on a weaker machine, raise it on a capable one.
-- `sfOrgDeployWrapper.orgCacheMaxAgeHours` — how long (hours, default 24) the remembered per-org listing counts as fresh: the panel opens on it instantly ("org as of HH:MM"), only an older one is re-fetched in the background, and Fetch Org always re-lists.
+- `sfOrgDeployWrapper.orgCacheMaxAgeHours` — how long (hours, default 168 — a week) the remembered per-org listing counts as fresh: the panel opens on it instantly ("org as of HH:MM"), only an older one is re-fetched in the background, and Fetch Org always re-lists.
 - `sfOrgDeployWrapper.typeCacheDays` — how many days (default 7) to cache metadata-type rules learned from the `sf` CLI registry, and how long a folder that failed resolution is remembered as a lost cause. 0 disables both caches.
 - `sfOrgDeployWrapper.changedBaseRef` — when set (e.g. `main` or `origin/main`), the **Changed** view also shows components that differ from that git ref, not just uncommitted edits. Empty by default (uncommitted changes only).
 - `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
 - `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
 - `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org).
+- `sfOrgDeployWrapper.debugTiming` — log click-to-modal timing to the **SF Deploy** Output channel, to diagnose a slow confirmation dialog (default off).
+- `sfOrgDeployWrapper.dependencyMaxDepth` — how many reference layers **Deploy File + Dependencies** follows below the file(s) you picked (default 2, 1–3).
+- `sfOrgDeployWrapper.dependencyMaxComponents` — cap on how many components **Deploy File + Dependencies** may auto-include (default 40, 5–200).

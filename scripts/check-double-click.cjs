@@ -26,6 +26,9 @@
 //   7. source pins: every deploy-family modal goes through awaitConfirm (the
 //      confirmOpen try/finally), the twin check sits at the push, and the
 //      message wiring re-syncs in a finally.
+//   8. cancel ×2 fires the running op's cancel handler ONCE (the webview locks
+//      the button, but the notification's Cancel and a rebuilt webview reach
+//      cancelCurrent too — it consumes the handler).
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
@@ -39,6 +42,10 @@ const picks = [];      // { items, options, resolve }
 const toasts = [];     // showInformationMessage / showErrorMessage
 const statusBar = [];
 let modalThrows = false; // next modal rejects (window closed) — see check 2
+// debugTiming (sfOrgDeployWrapper.debugTiming): the only setting these checks need
+// to flip live — everything else in this file is happy with getConfiguration's
+// plain default fallback.
+let debugTimingOn = false;
 const vscodeStub = {
   window: {
     showWarningMessage: (message, options, ...items) => {
@@ -55,7 +62,12 @@ const vscodeStub = {
     setStatusBarMessage: (m) => { statusBar.push(m); return { dispose() {} }; },
     withProgress: (_o, body) => body({ report() {} }, { onCancellationRequested: () => ({ dispose() {} }) })
   },
-  workspace: { getConfiguration: () => ({ get: (_k, d) => d, update: async () => {} }) },
+  workspace: {
+    getConfiguration: () => ({
+      get: (k, d) => (k === 'debugTiming' ? debugTimingOn : d),
+      update: async () => {}
+    })
+  },
   commands: { executeCommand: async () => {} },
   Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
@@ -74,7 +86,7 @@ const queue = [];
 const check = (name, fn) => queue.push([name, fn]);
 const tick = () => new Promise(r => setImmediate(r));
 const ticks = async (n = 3) => { for (let i = 0; i < n; i++) await tick(); };
-function reset() { modals.length = 0; picks.length = 0; toasts.length = 0; statusBar.length = 0; modalThrows = false; }
+function reset() { modals.length = 0; picks.length = 0; toasts.length = 0; statusBar.length = 0; modalThrows = false; debugTimingOn = false; }
 
 // ---------------------------------------------------------------- provider
 const cls = (name) => ({ type: 'ApexClass', name, filePath: `/ws/force-app/classes/${name}.cls`, files: [`/ws/force-app/classes/${name}.cls`] });
@@ -373,9 +385,12 @@ check('every deploy-family modal goes through awaitConfirm, whose try/finally ow
 });
 
 check('runDeploy refuses the twin BEFORE enqueueing, and the twin check sits at the push', () => {
-  const guard = /if \(this\.busy && !opts\.preConfirmed\) \{(?:\n\s*\/\/[^\n]*)*\n\s*if \(this\.confirmOpen\) \{\n\s*vscode\.window\.setStatusBarMessage\('[^']*answer the open confirmation first'[^\n]*\n\s*return ABORTED;\n\s*\}\n\s*await this\.enqueueDeploy\(keys, opts\);/;
+  // A5: enqueueDeploy now RETURNS whether it actually queued the entry, so
+  // runDeploy can tell a genuine queue from a dismissed/capped/twin request —
+  // the call itself may now be captured into a variable.
+  const guard = /if \(this\.busy && !opts\.preConfirmed\) \{(?:\n\s*\/\/[^\n]*)*\n\s*if \(this\.confirmOpen\) \{\n\s*vscode\.window\.setStatusBarMessage\('[^']*answer the open confirmation first'[^\n]*\n\s*return ABORTED;\n\s*\}\n\s*(?:const \w+ = )?await this\.enqueueDeploy\(keys, opts\);/;
   assert.ok(guard.test(src), 'the confirmOpen refusal must precede enqueueDeploy inside the busy branch');
-  const push = /if \(this\.twinQueued\(org, entryKeys, validateOnly\)\) \{ this\.notifyAlreadyQueued\(noun, orgLabel, validateOnly\); return; \}\n\s*this\.deployQueue\.push\(\{/;
+  const push = /if \(this\.twinQueued\(org, entryKeys, validateOnly\)\) \{ this\.notifyAlreadyQueued\(noun, orgLabel, validateOnly\); return false; \}\n\s*this\.deployQueue\.push\(\{/;
   assert.ok(push.test(src), 'twinQueued must be re-checked immediately before deployQueue.push');
 });
 
@@ -384,6 +399,109 @@ check('the message wiring re-syncs busy in a finally, thrown or not', () => {
   assert.ok(wiring.test(src), "onDidReceiveMessage must be: handleMessage(m).catch(reportError).finally(() => this.postBusy())");
   const rescan = /case 'refreshFiles':(?:\n\s*\/\/[^\n]*)*\n\s*try \{ await this\.refreshFiles\(\); \} finally \{ this\.post\(\{ type: 'filesRefreshed' \}\); \}\n\s*return;/;
   assert.ok(rescan.test(src), "refreshFiles handler must be exactly: try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }");
+});
+
+// ------------------------------------------------------------ 8) debugTiming
+// The user-visible symptom was a several-second gap between clicking Deploy
+// and the confirm modal, with nothing else running — so debugTiming logs a
+// click-to-modal breakdown to the Output channel, off by default and inert
+// unless the setting is on.
+const TIMING_LINE = /^\[timing\] deploy: click→post (\d+ ms|n\/a) · post→host (\d+ ms|n\/a) · host→busy \d+ ms · busy→modal \d+ ms$/;
+const timingLines = (p) => p.log.filter(l => l.startsWith('[timing]'));
+
+check('debugTiming on: a deploy click produces one [timing] line with the four spans', async () => {
+  reset();
+  debugTimingOn = true;
+  const p = provider();
+  p.send({ type: 'deploy', keys: KEYS, clickedAt: Date.now() - 5, clickSpan: 1.5 });
+  await ticks();
+  assert.strictEqual(modals.length, 1);
+  modals[0].resolve(confirmOf(modals[0]));
+  await ticks();
+  const lines = timingLines(p);
+  assert.strictEqual(lines.length, 1, `expected exactly one [timing] line, got: ${p.log.join(' | ')}`);
+  assert.ok(TIMING_LINE.test(lines[0]), lines[0]);
+});
+
+check('debugTiming off: no [timing] line for a deploy click, however it resolves', async () => {
+  reset();
+  // debugTimingOn stays false (reset's default) — the message still carries
+  // clickedAt/clickSpan, but the host must ignore them entirely.
+  const p = provider();
+  p.send({ type: 'deploy', keys: KEYS, clickedAt: Date.now(), clickSpan: 2 });
+  await ticks();
+  modals[0].resolve(confirmOf(modals[0]));
+  await ticks();
+  assert.strictEqual(timingLines(p).length, 0, `unexpected timing log: ${p.log.join(' | ')}`);
+});
+
+check('debugTiming on: garbage clickedAt/clickSpan are omitted, never NaN in the log', async () => {
+  reset();
+  debugTimingOn = true;
+  const p = provider();
+  // A stale or hostile webview could send anything — a string, a negative
+  // number, Infinity — none of it may reach the Output channel as NaN.
+  p.send({ type: 'deploy', keys: KEYS, clickedAt: 'not-a-number', clickSpan: -5 });
+  await ticks();
+  modals[0].resolve(confirmOf(modals[0]));
+  await ticks();
+  const lines = timingLines(p);
+  assert.strictEqual(lines.length, 1);
+  assert.ok(!/NaN/.test(lines[0]), lines[0]);
+  assert.ok(TIMING_LINE.test(lines[0]), lines[0]);
+  assert.ok(lines[0].includes('click→post n/a'), lines[0]);
+  assert.ok(lines[0].includes('post→host n/a'), lines[0]);
+});
+
+check('debugTiming on: retrieve/diff/fetchOrgMetadata log a click→post/post→host receive stamp', async () => {
+  reset();
+  debugTimingOn = true;
+  const p = provider();
+  p.send({ type: 'retrieve', keys: KEYS, clickedAt: Date.now() - 3, clickSpan: 0.4 });
+  await ticks();
+  const lines = timingLines(p);
+  assert.strictEqual(lines.length, 1, `expected exactly one [timing] line, got: ${p.log.join(' | ')}`);
+  assert.ok(/^\[timing\] retrieve: click→post \d+ ms · post→host \d+ ms$/.test(lines[0]), lines[0]);
+});
+
+// ------------------------------------------------ 8) cancel is one-shot
+check('cancel ×2: the running op\'s cancel handler fires once, each message still answered', async () => {
+  reset();
+  const p = provider();
+  await running(p);
+  let fired = 0;
+  p.s.currentCancel = () => { fired++; };
+  const before = p.busyPosts().length;
+  p.send({ type: 'cancel' }); p.send({ type: 'cancel' });
+  await ticks();
+  assert.strictEqual(fired, 1, 'a second Cancel re-fired the kill');
+  assert.strictEqual(p.s.currentCancel, undefined, 'the handler is consumed on use');
+  const busyAll = () => p.posted.filter(m => m.type === 'busy');
+  assert.strictEqual(busyAll().length, before + 3, 'consuming the handler posts busy once, then each cancel message is answered');
+  assert.ok(busyAll().slice(before).every(m => m.busy === true && m.cancelling === true), 'the posts say a handler was consumed');
+  assert.ok(busyAll().slice(0, before).every(m => !m.cancelling), 'nothing said so before the cancel');
+  assert.strictEqual(p.s.busy, true, 'the slot is the op\'s to release, not the cancel\'s');
+  p.send({ type: 'cancel' }); // nothing left to cancel — a no-op, not a throw
+  await ticks();
+  assert.strictEqual(fired, 1);
+  p.s.setBusy(false);
+  p.s.postBusy(); // the flag itself must be cleared, not just the transition post
+  const last = busyAll()[busyAll().length - 1];
+  assert.deepStrictEqual([last.busy, !!last.cancelling], [false, false], 'the slot freeing clears the flag');
+  assert.ok(src.includes('const cancel = this.currentCancel;\n    if (!cancel) return;\n    this.currentCancel = undefined;\n    this.cancelling = true;\n    cancel();\n    this.postBusy();'), 'cancelCurrent consumes the handler, flags it, calls it, posts');
+  // With the handler consumed, runDiff's own flag is the only thing left to honour a
+  // Cancel that landed while the last type's editors were opening.
+  assert.ok(src.includes('          if (diffCancelled) throw new SfCliCancelledError();\n        }\n\n        if (slowItems.length > 0) {'), 'runDiff checks diffCancelled before the slow retrieve');
+});
+
+check('cancel with no handler installed (a picker holds the slot): answered with cancelling:false, nothing thrown', async () => {
+  reset();
+  const p = provider({ fields: { busy: true, currentAction: 'Restore backup' } });
+  p.send({ type: 'cancel' });
+  await ticks();
+  const busy = p.posted.filter(m => m.type === 'busy');
+  assert.strictEqual(busy.length, 1);
+  assert.deepStrictEqual([busy[0].busy, busy[0].action, !!busy[0].cancelling], [true, 'Restore backup', false]);
 });
 
 (async () => {

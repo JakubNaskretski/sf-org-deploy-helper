@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { stripAnsi } from './kit/sfCli';
 
 export interface MetadataItem {
   /** Salesforce metadata type, e.g. ApexClass */
@@ -161,6 +162,51 @@ export async function resolvePackageDirs(root: string): Promise<string[]> {
     // ignore
   }
   return ['force-app'];
+}
+
+/** Fallback `<version>` for a generated manifest (large-selection deploy/retrieve,
+ *  see MANIFEST_THRESHOLD in panelProvider.ts) when the project names none — a
+ *  recent, still-supported API version beats failing the whole run over one field. */
+const DEFAULT_MANIFEST_API_VERSION = '62.0';
+
+/** Read `sourceApiVersion` from sfdx-project.json (the same field the CLI itself
+ *  defaults deploys to) for a generated manifest's `<version>`. Same read-and-
+ *  fall-back shape as resolvePackageDirs. */
+export async function resolveApiVersion(root: string): Promise<string> {
+  try {
+    const cfg = await fs.readFile(path.join(root, 'sfdx-project.json'), 'utf8');
+    const parsed = JSON.parse(cfg) as { sourceApiVersion?: string };
+    if (typeof parsed.sourceApiVersion === 'string' && /^\d+\.\d+$/.test(parsed.sourceApiVersion)) return parsed.sourceApiVersion;
+  } catch {
+    // ignore
+  }
+  return DEFAULT_MANIFEST_API_VERSION;
+}
+
+/** Build a package.xml for a component set, types and members both sorted and
+ *  XML-escaped, for deterministic output. Used above MANIFEST_THRESHOLD so a
+ *  deploy/validate/retrieve sends `--manifest <file>` instead of one
+ *  `--metadata Type:Name` argv token per component — the real failure mode is
+ *  Windows' ~32 KB command-line limit, hit around 500 components. Pure (no I/O),
+ *  so it's directly unit-testable. */
+export function buildManifestXml(items: Array<{ type: string; name: string }>, apiVersion: string): string {
+  const byType = new Map<string, Set<string>>();
+  for (const { type, name } of items) {
+    let names = byType.get(type);
+    if (!names) { names = new Set(); byType.set(type, names); }
+    names.add(name);
+  }
+  const escape = (s: string): string => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+  const typeBlocks = [...byType.keys()].sort().map(type => {
+    const members = [...byType.get(type)!].sort().map(n => `    <members>${escape(n)}</members>`).join('\n');
+    return `  <types>\n${members}\n    <name>${escape(type)}</name>\n  </types>`;
+  }).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n${typeBlocks}\n  <version>${escape(apiVersion)}</version>\n</Package>\n`;
 }
 
 /**
@@ -793,17 +839,25 @@ function sanitizeUnresolved(text: string): string {
  * failed for some OTHER reason, they're not "missing") are excluded from both
  * lists. Both lists are deduped, first-seen order preserved.
  */
-export function detectMissingDependencies(
-  problems: string[],
-  items: MetadataItem[],
-  deployedKeys: Set<string>
-): MissingDependencies {
+/** Lookup maps detectMissingDependencies resolves candidates against. */
+export interface MissingDependencyIndex {
+  byExact: Map<string, MetadataItem>;
+  byCiName: Map<string, MetadataItem>;
+  byBareName: Map<string, MetadataItem[]>;
+}
+
+/** Build the index once for a given `items` list. Exposed so a caller resolving
+ *  MANY problem batches against the SAME item list (buildSuggestionCandidates —
+ *  one detectMissingDependencies call per failed row) builds it ONCE instead of
+ *  once per row: rebuilding per row was O(rows x items) and measured at ~1.5s of
+ *  synchronous extension-host block for 200 rows over a 20k-component workspace. */
+export function buildMissingDependencyIndex(items: MetadataItem[]): MissingDependencyIndex {
   const byExact = new Map<string, MetadataItem>();
   const byCiName = new Map<string, MetadataItem>(); // `${type}:${name.toLowerCase()}` -> item
-  // Bare-name index for the "Variable does not exist" branch. Built ONCE: filtering
-  // `items` per candidate was O(candidates x items) and measured at ~32s of
-  // synchronous extension-host block on a failure message naming ~190 bare names
-  // in a 20k-component workspace.
+  // Bare-name index for the "Variable does not exist" branch. Filtering `items`
+  // per candidate was O(candidates x items) and measured at ~32s of synchronous
+  // extension-host block on a failure message naming ~190 bare names in a 20k-
+  // component workspace.
   const byBareName = new Map<string, MetadataItem[]>();
   const pushBare = (name: string, it: MetadataItem): void => {
     const list = byBareName.get(name);
@@ -816,6 +870,29 @@ export function detectMissingDependencies(
     if (it.type === 'CustomField') pushBare((it.name.split('.').pop() ?? '').toLowerCase(), it);
     else if (it.type === 'ApexClass') pushBare(it.name.toLowerCase(), it);
   }
+  return { byExact, byCiName, byBareName };
+}
+
+export interface DetectMissingDependenciesOptions {
+  /** Pre-built lookup maps (buildMissingDependencyIndex) — see its doc comment.
+   *  Omitted (the common single-call case) builds one from `items`. */
+  index?: MissingDependencyIndex;
+  /** True when `key` (`Type:Name`) is confirmed NOT present on the target org —
+   *  i.e. local-only per the org membership snapshot. Used only by the "No such
+   *  column" rule: when a missing field's PARENT object is itself local-only, the
+   *  object needs deploying too, so it's offered alongside the field instead of
+   *  costing the user a second failed round. Undefined (no snapshot for this org)
+   *  never adds it — same as before this existed. */
+  isLocalOnly?: (key: string) => boolean;
+}
+
+export function detectMissingDependencies(
+  problems: string[],
+  items: MetadataItem[],
+  deployedKeys: Set<string>,
+  opts: DetectMissingDependenciesOptions = {}
+): MissingDependencies {
+  const { byExact, byCiName, byBareName } = opts.index ?? buildMissingDependencyIndex(items);
 
   const candidates: Candidate[] = [];
   for (const problem of problems) {
@@ -856,6 +933,14 @@ export function detectMissingDependencies(
     // there is no ambiguity: "No such column 'Status__c' on entity 'Account'".
     for (const m of problem.matchAll(/No such column '([A-Za-z0-9_]+)' on entity '([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)'/g)) {
       candidates.push({ display: `${m[2]}.${m[1]}`, tries: [{ type: 'CustomField', name: `${m[2]}.${m[1]}` }] });
+      // The object itself can ALSO be missing on the org — offering the field
+      // alone then costs a second failed round once the object deploy is needed
+      // too. Only when the caller can vouch it's local-only (org membership
+      // fetched for this org and the object isn't in it) — with no snapshot we
+      // can't tell, so this stays a no-op, same as before it existed.
+      if (opts.isLocalOnly?.(`CustomObject:${m[2]}`)) {
+        candidates.push({ display: m[2], tries: [{ type: 'CustomObject', name: m[2] }] });
+      }
     }
     // Same shape from the other Salesforce phrasing:
     // "Invalid field Status__c for SObject Account".
@@ -876,6 +961,17 @@ export function detectMissingDependencies(
     // parent, so a bare name can match Account.Status__c and Case.Status__c
     // equally. Resolved unique-match-only (see below) — never guessed.
     for (const m of problem.matchAll(/Variable does not exist:\s*([A-Za-z_]\w*)/g)) {
+      candidates.push({ display: m[1], bareName: m[1] });
+    }
+    // Two more bare-field wordings, same shape as "Variable does not exist" — no
+    // reliable parent object in the text, so both resolve unique-match-only:
+    // "Field Rating__c does not exist. Check spelling." (layout/report/list-view)
+    // "Unknown field 'Rating__c' in Opportunity" (SOQL/describe) — the object
+    // named here is NOT trusted as the parent; a bare-name lookup is exact.
+    for (const m of problem.matchAll(/Field ([A-Za-z0-9_]{1,80}) does not exist\.\s*Check spelling\./g)) {
+      candidates.push({ display: m[1], bareName: m[1] });
+    }
+    for (const m of problem.matchAll(/Unknown field '([A-Za-z0-9_]{1,80})' in [A-Za-z0-9_]{1,80}/g)) {
       candidates.push({ display: m[1], bareName: m[1] });
     }
     // A FlexiPage referencing a field the org doesn't have (org-verified via a
@@ -919,13 +1015,20 @@ export function detectMissingDependencies(
     // An LWC's static @salesforce import the org can't satisfy:
     // "Invalid reference c.My_Label of type label in file cmp.js"
     // "Invalid reference myResource of type resourceUrl in file cmp.js"
-    // The `c.` belongs to the IMPORT syntax, not to the label's fullName, so it is
-    // stripped (the resourceUrl form carries no prefix at all). Only these two
-    // verified `of type` values are handled — other values are left alone rather
-    // than mapped to a guessed metadata type.
-    for (const m of problem.matchAll(/Invalid reference (?:c\.)?([A-Za-z0-9_]{1,80}) of type (label|resourceUrl)\b/gi)) {
-      const type = m[2].toLowerCase() === 'label' ? 'CustomLabel' : 'StaticResource';
-      candidates.push({ display: `${type}:${m[1]}`, tries: [{ type, name: m[1] }] });
+    // "Invalid reference c/myChannel of type messageChannel in file cmp.js"
+    // The `c.`/`c/` belongs to the IMPORT syntax, not to the referent's fullName,
+    // so it's stripped (the resourceUrl form carries no prefix at all). Three
+    // verified `of type` values map to a metadata type; any OTHER value is still
+    // named back to the user as unresolved (never a guessed type, never silent —
+    // the org named something real that this workspace can't help with).
+    for (const m of problem.matchAll(/Invalid reference (?:c[./])?([A-Za-z0-9_]{1,80}) of type ([A-Za-z0-9_]{1,40})\b/gi)) {
+      const raw = m[2].toLowerCase();
+      const type = raw === 'label' ? 'CustomLabel'
+        : raw === 'resourceurl' ? 'StaticResource'
+        : raw === 'messagechannel' ? 'LightningMessageChannel'
+        : undefined;
+      if (type) candidates.push({ display: `${type}:${m[1]}`, tries: [{ type, name: m[1] }] });
+      else candidates.push({ display: `${m[1]} (of type ${m[2]})` }); // neither tries nor bareName — display only
     }
     // Aura/LWC markup naming a definition the org doesn't have. Three renderings
     // are verified — "found : [" (v61), the older "found: [", and a bare "found" —
@@ -1083,6 +1186,19 @@ export function detectMissingDependencies(
 export interface SuggestionCandidateInfo {
   key: string;
   from?: string;
+  /** The org's own sentence that produced this candidate — shown under its
+   *  checkbox so the user can judge the suggestion without hunting back through
+   *  the error list. Bounded like every other org-controlled display string. */
+  why?: string;
+}
+
+const WHY_MAX_LEN = 160;
+/** Bound the org sentence behind a suggestion checkbox (SuggestionCandidateInfo
+ *  .why) — ANSI-stripped like the CLI text that reaches every other card, then
+ *  flattened and length-capped the same way sanitizeUnresolved is. */
+function sanitizeWhy(text: string): string {
+  const flat = stripAnsi(text).replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return flat.length > WHY_MAX_LEN ? `${flat.slice(0, WHY_MAX_LEN - 1)}…` : flat;
 }
 
 /**
@@ -1098,13 +1214,17 @@ export const SUGGESTION_CANDIDATES_MAX = 20;
 export function buildSuggestionCandidates(
   failures: Array<{ from?: string; problem?: string }>,
   items: MetadataItem[],
-  deployedKeys: Set<string>
+  deployedKeys: Set<string>,
+  opts: DetectMissingDependenciesOptions = {}
 ): SuggestionCandidateInfo[] {
+  // Built ONCE for every row below, not once per detectMissingDependencies call —
+  // see buildMissingDependencyIndex's doc comment for the perf history.
+  const index = opts.index ?? buildMissingDependencyIndex(items);
   const seen = new Set<string>();
   const out: SuggestionCandidateInfo[] = [];
   for (const f of failures) {
     if (!f.problem) continue;
-    const deps = detectMissingDependencies([f.problem], items, deployedKeys);
+    const deps = detectMissingDependencies([f.problem], items, deployedKeys, { index, isLocalOnly: opts.isLocalOnly });
     for (const key of deps.keys) {
       if (seen.has(key)) continue;
       seen.add(key);
@@ -1112,7 +1232,8 @@ export function buildSuggestionCandidates(
       // org-controlled field the suggestion path persists. Same bounds as the
       // unresolved report: control characters flattened, length capped.
       const from = f.from ? sanitizeUnresolved(f.from) : undefined;
-      out.push({ key, ...(from ? { from } : {}) });
+      const why = sanitizeWhy(f.problem);
+      out.push({ key, ...(from ? { from } : {}), ...(why ? { why } : {}) });
       if (out.length >= SUGGESTION_CANDIDATES_MAX) return out;
     }
   }

@@ -55,6 +55,11 @@
     seenTypesBaseline: Array.isArray(persisted.seenTypes) && persisted.seenTypes.length > 0,
     busy: false,
     busyAction: null,
+    // The running operation is being cancelled: the button reads "Cancelling…"
+    // and ignores repeats. Set on click for instant feedback, then owned by the
+    // provider's `busy` posts (`cancelling`), which say whether the click actually
+    // consumed a cancel handler — see the click handler and the busy case.
+    cancelRequested: false,
     progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
@@ -140,6 +145,13 @@
 
   function send(type, payload) { vscode.postMessage({ type, ...(payload || {}) }); }
 
+  // debugTiming (sfOrgDeployWrapper.debugTiming): host tells us on 'ready'/config
+  // change (see the 'debugTiming' case below) whether to stamp and log. Off by
+  // default — every sendAction still stamps clickedAt/clickSpan on the message
+  // (cheap, and the host ignores them when its own copy of the setting is off),
+  // but only logs to console when this is true.
+  let debugTiming = false;
+
   // The funnel for every click that takes (or asks for) the operation slot —
   // toolbar, context menu and card buttons alike. The provider answers EVERY
   // message with a `busy` post once its handler is done (reserved, refused,
@@ -148,12 +160,24 @@
   // a duplicate queue entry, or a misleading "already running" toast.
   // Deploy/Validate/Retry stay clickable while BUSY (they queue), never while
   // PENDING. Returns false when the previous click is still unanswered.
+  //
+  // debugTiming: stamped here (clickedAt/clickSpan) so a slow confirmation can be
+  // measured end to end (see panelProvider.ts's [timing] log). `send()` — the
+  // postMessage call — fires BEFORE renderActions()/renderStatus(): those are
+  // pure DOM work with no bearing on whether the message went out, and used to
+  // run first, on the critical path between the click and the host receiving it.
+  // Deferring them (rAF, falling back to setTimeout(0) if unavailable) lets the
+  // click handler return right after postMessage.
+  const deferRender = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
   function sendAction(type, payload) {
+    const t0 = performance.now();
     if (state.pendingAction) return false;
     state.pendingAction = type;
-    send(type, payload);
-    renderActions();
-    renderStatus(); // card buttons lock too
+    const clickSpan = performance.now() - t0;
+    const clickedAt = Date.now();
+    send(type, { ...(payload || {}), clickedAt, clickSpan });
+    if (debugTiming) console.log(`[timing] ${type}: clickedAt=${clickedAt} clickSpan=${clickSpan.toFixed(2)}ms`);
+    deferRender(() => { renderActions(); renderStatus(); });
     return true;
   }
 
@@ -246,7 +270,17 @@
   $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
   $('diffBtn').addEventListener('click', () => action('diff'));
-  $('cancelBtn').addEventListener('click', () => send('cancel'));
+  // One Cancel per operation. sendAction's pending lock is the wrong shape here:
+  // the provider answers the message in milliseconds while the cancel itself
+  // takes seconds. The lock set here holds until a `busy` post says otherwise —
+  // `cancelling: true` keeps it until the op ends; `false` (nothing to cancel,
+  // e.g. a picker holding the slot) releases it at once.
+  $('cancelBtn').addEventListener('click', () => {
+    if (state.cancelRequested) return;
+    state.cancelRequested = true;
+    send('cancel');
+    renderActions();
+  });
   $('useActive').addEventListener('click', () => send('useActiveFile'));
   $('useOpenTabs').addEventListener('click', () => send('useOpenTabs'));
   $('clearSel').addEventListener('click', () => {
@@ -500,6 +534,16 @@
         // single-key activeFile select: visible lens, expanded paths, scroll to first.
         const keys = msg.keys || [];
         if (!keys.length) return;
+        // `transient` (a suggestion accept, before its own retry deploy settles):
+        // reveal what was added WITHOUT joining the persisted selection — a plain
+        // Deploy click right after must not silently pick these up, and the user
+        // stays in whatever lens they were already looking at.
+        if (msg.transient) {
+          for (const k of keys) expandPathForKey(k);
+          renderTree();
+          if (msg.scroll) scrollKeyIntoView(keys[0]);
+          return;
+        }
         // `replace` (a success card's "Select these N") means the selection BECOMES
         // that run instead of growing by it — the button names a count, and diffing
         // or retrieving "what just went up" is wrong against a union with whatever
@@ -522,6 +566,9 @@
       case 'ignoreDeployConflicts':
         state.ignoreDeployConflicts = msg.enabled === true;
         renderIgnoreDeployConflicts();
+        return;
+      case 'debugTiming':
+        debugTiming = msg.enabled === true;
         return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
@@ -556,6 +603,20 @@
         renderStatus();
         return;
       }
+      case 'suggestionRestore': {
+        // Sent on 'ready' for every suggestion still alive server-side: the
+        // persisted history copy this card came back as dropped the live payload
+        // (provider's stripSuggestForHistory) and carries only `suggestId` — merge
+        // the payload back in so the "Try with dependencies" button reappears.
+        if (typeof msg.id !== 'string') return;
+        for (const c of state.statusCards) {
+          if (c.suggestId === msg.id && !c.suggest) {
+            c.suggest = { id: msg.id, candidates: msg.candidates || [], unresolved: msg.unresolved || [] };
+          }
+        }
+        renderStatus();
+        return;
+      }
       case 'busy': {
         // Every `busy` post answers an outstanding click (sendAction): the
         // provider re-syncs after each handled message, so this is where the
@@ -567,8 +628,15 @@
         const busy = !!msg.busy;
         const busyAction = msg.action || null;
         const changed = busy !== state.busy || busyAction !== state.busyAction;
+        // The provider's word on the Cancel lock (see the cancelBtn click handler):
+        // a re-sync that consumed no handler unlocks a click that hit nothing, the
+        // notification's Cancel locks the panel's button too, and the op ending
+        // (setBusy always posts cancelling:false) releases it.
+        const cancelling = !!msg.cancelling;
+        const lockChanged = cancelling !== state.cancelRequested;
         state.busy = busy;
         state.busyAction = busyAction;
+        state.cancelRequested = cancelling;
         if (changed) {
           if (busy) {
             state.progress = { text: busyAction ? `${busyAction} running…` : 'Working…', startedAt: Date.now() };
@@ -578,7 +646,7 @@
             stopProgressTimer();
           }
         }
-        if (changed || hadPending) {
+        if (changed || hadPending || lockChanged) {
           renderActions();
           renderStatus();
         }
@@ -1414,7 +1482,8 @@
       if (testLevel) testLevel.style.display = 'none';
       clearSel.style.display = 'none';
       cancelBtn.style.display = '';
-      cancelBtn.textContent = state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel';
+      cancelBtn.disabled = state.cancelRequested;
+      cancelBtn.textContent = state.cancelRequested ? 'Cancelling…' : (state.busyAction ? `Cancel ${state.busyAction}` : 'Cancel');
     } else {
       retrieveBtn.style.display = '';
       diffBtn.style.display = '';
@@ -1532,6 +1601,44 @@
       : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hm}`;
   }
 
+  /** A card's `lines` list (capped at MAX_CARD_LINES with a "Show all" button) —
+   *  shared by the normal card body and renderSuggestOpen (state B), so the org's
+   *  own error text stays visible while the user is deciding on the suggestion
+   *  instead of being replaced wholesale by the checkbox list. */
+  function renderCardLines(card, el) {
+    if (!card.lines || !card.lines.length) return;
+    const ul = document.createElement('ul');
+    const visible = card.expanded ? card.lines : card.lines.slice(0, MAX_CARD_LINES);
+    for (const line of visible) {
+      const li = document.createElement('li');
+      // Lines are plain strings, or {text, key, line?, column?} — the object
+      // form is clickable and opens the source at the error position.
+      if (line && typeof line === 'object') {
+        li.textContent = line.text || '';
+        // A CLI failure can name org/package-level metadata that has no local
+        // source file. Only advertise navigation when the current workspace
+        // scan says the key is local; older persisted cards may still carry
+        // keys created before the provider began filtering them.
+        if (line.key && state.localKeys.has(line.key)) {
+          li.classList.add('nav');
+          li.title = `Open ${line.key}${line.line ? ` at line ${line.line}` : ''}`;
+          li.addEventListener('click', () => send('openFile', { key: line.key, line: line.line, column: line.column }));
+        }
+      } else {
+        li.textContent = line;
+      }
+      ul.appendChild(li);
+    }
+    el.appendChild(ul);
+    if (card.lines.length > MAX_CARD_LINES && !card.expanded) {
+      const btn = document.createElement('button');
+      btn.className = 'show-more';
+      btn.textContent = `Show all ${card.lines.length} lines`;
+      btn.addEventListener('click', () => { card.expanded = true; renderStatus(); });
+      el.appendChild(btn);
+    }
+  }
+
   function renderStatus() {
     const st = $('status');
     st.innerHTML = '';
@@ -1568,9 +1675,9 @@
     for (const card of state.statusCards) {
       const el = document.createElement('div');
       el.className = `status-card ${card.kind || 'ok'}`;
-      // Suggestion view (state B): the card swaps its error list for the
-      // checkbox rows — everything else hides so a 40-failure card doesn't
-      // drown the choices. Plain local state, same pattern as card.expanded.
+      // Suggestion view (state B): the card keeps its error list (so the
+      // decision has evidence) and swaps its buttons for checkbox rows. Plain
+      // local state, same pattern as card.expanded.
       if (card.suggest && card.suggestOpen && !card.suggestDone) {
         renderSuggestOpen(card, el);
         st.appendChild(el);
@@ -1599,38 +1706,7 @@
         m.textContent = card.meta;
         el.appendChild(m);
       }
-      if (card.lines && card.lines.length) {
-        const ul = document.createElement('ul');
-        const visible = card.expanded ? card.lines : card.lines.slice(0, MAX_CARD_LINES);
-        for (const line of visible) {
-          const li = document.createElement('li');
-          // Lines are plain strings, or {text, key, line?, column?} — the object
-          // form is clickable and opens the source at the error position.
-          if (line && typeof line === 'object') {
-            li.textContent = line.text || '';
-            // A CLI failure can name org/package-level metadata that has no local
-            // source file. Only advertise navigation when the current workspace
-            // scan says the key is local; older persisted cards may still carry
-            // keys created before the provider began filtering them.
-            if (line.key && state.localKeys.has(line.key)) {
-              li.classList.add('nav');
-              li.title = `Open ${line.key}${line.line ? ` at line ${line.line}` : ''}`;
-              li.addEventListener('click', () => send('openFile', { key: line.key, line: line.line, column: line.column }));
-            }
-          } else {
-            li.textContent = line;
-          }
-          ul.appendChild(li);
-        }
-        el.appendChild(ul);
-        if (card.lines.length > MAX_CARD_LINES && !card.expanded) {
-          const btn = document.createElement('button');
-          btn.className = 'show-more';
-          btn.textContent = `Show all ${card.lines.length} lines`;
-          btn.addEventListener('click', () => { card.expanded = true; renderStatus(); });
-          el.appendChild(btn);
-        }
-      }
+      renderCardLines(card, el);
       if (card.errText) {
         const e = document.createElement('div');
         e.className = 'err-text';
@@ -1694,10 +1770,15 @@
       // retrieve result) — each posts its own `send` payload verbatim, spread
       // through the same send() every toolbar/tree control uses. Disabled while
       // busy, like the toolbar, so a click can't race a running operation.
-      if (card.buttons && card.buttons.length) {
+      // The suggestion's "Try with dependencies" entry point is independent of
+      // card.buttons — a card can carry a suggestion with no other buttons at
+      // all (an envelope-level failure with no retry key list to extend still
+      // offers one when it resolved locally), so the wrap can't be gated on
+      // card.buttons alone.
+      if ((card.buttons && card.buttons.length) || (card.suggest && !card.suggestDone)) {
         const bwrap = document.createElement('div');
         bwrap.className = 'card-buttons';
-        for (const b of card.buttons) {
+        for (const b of card.buttons || []) {
           const cb = document.createElement('button');
           cb.className = 'card-btn';
           cb.textContent = b.label || '';
@@ -1769,9 +1850,10 @@
     }
   }
 
-  /** State B of a failure card: checkbox rows for the suggested components,
-   *  everything else hidden. Selection state lives on the card object
-   *  (card.suggestSel), surviving re-renders exactly like card.expanded. */
+  /** State B of a failure card: the org's error lines stay up (renderCardLines),
+   *  with checkbox rows for the suggested components below them, replacing the
+   *  buttons. Selection state lives on the card object (card.suggestSel),
+   *  surviving re-renders exactly like card.expanded. */
   function renderSuggestOpen(card, el) {
     card.suggestSel = card.suggestSel || {};
     for (const c of card.suggest.candidates) {
@@ -1791,6 +1873,10 @@
     m.className = 'meta';
     m.textContent = 'Referenced by the failed components and present in your workspace — untick any you don\u2019t want.';
     el.appendChild(m);
+    // The org's own error lines stay visible while deciding — swapping the whole
+    // card body for the checkbox list hid exactly the evidence the decision
+    // needs. Same list, same cap, as the normal card body (state A).
+    renderCardLines(card, el);
 
     const ul = document.createElement('ul');
     ul.className = 'suggest-rows';
@@ -1807,6 +1893,14 @@
       txt.textContent = `${c.from ? c.from + '  \u2192  ' : ''}add ${c.key}`;
       lbl.appendChild(txt);
       li.appendChild(lbl);
+      // The org sentence that produced this candidate — the "why", so a
+      // pre-checked box doesn't have to be taken purely on faith.
+      if (c.why) {
+        const why = document.createElement('div');
+        why.className = 'suggest-why';
+        why.textContent = c.why;
+        li.appendChild(why);
+      }
       ul.appendChild(li);
     }
     el.appendChild(ul);
@@ -1814,7 +1908,7 @@
     if (card.suggest.unresolved && card.suggest.unresolved.length) {
       const u = document.createElement('div');
       u.className = 'suggest-unresolved';
-      u.textContent = `Not in your workspace (retrieve or fix by hand): ${card.suggest.unresolved.join(', ')}`;
+      u.textContent = `Not found in your workspace (retrieve it, or its type is not scanned): ${card.suggest.unresolved.join(', ')}`;
       el.appendChild(u);
     }
 

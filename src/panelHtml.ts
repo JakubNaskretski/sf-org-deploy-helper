@@ -396,11 +396,12 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .status-card .card-btn:hover:not(:disabled) { background: var(--row-hover); }
 .status-card .card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-/* Failure-card dependency suggestions (state B swaps the error list for these). */
+/* Failure-card dependency suggestions (state B adds these below the error list). */
 .status-card .suggest-rows { list-style: none; margin: 6px 0 0; padding: 0; }
 .status-card .suggest-rows li { padding: 2px 0; }
 .status-card .suggest-rows label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .status-card .suggest-rows input[type="checkbox"] { margin: 0; }
+.status-card .suggest-why { margin: 0 0 0 22px; opacity: 0.65; font-size: 11px; }
 .status-card .suggest-unresolved { margin-top: 6px; opacity: 0.65; font-size: 11px; }
 .status-card .suggest-summary { margin-top: 6px; opacity: 0.8; font-style: italic; }
 .status-card .suggest-feedback { margin-top: 6px; display: flex; align-items: center; gap: 6px; opacity: 0.9; }

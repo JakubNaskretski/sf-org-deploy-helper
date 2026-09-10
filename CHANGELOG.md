@@ -3,6 +3,70 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.23.1
+
+- Changed: **The remembered org listing now stays fresh for a week.** `sfOrgDeployWrapper.orgCacheMaxAgeHours`
+  defaults to 168 instead of 24: with the panel opened once a day, the old default re-listed the org in
+  the background every morning. Set it to 24 for the daily refresh, 0 to re-list on every open; Fetch Org
+  still refreshes on demand.
+- Fixed: **The Changed view follows git as it happens.** A saved edit, a commit, a stash, a checkout or a
+  discard now updates the Changed lens and its tab count as soon as VS Code's git extension has noticed
+  it, instead of waiting for the lens to be re-entered. The refresh after a save used to read the git extension's state before it had caught
+  up with the save, and a commit or discard never triggered one at all; the panel now listens to the git
+  extension itself.
+- Fixed: **Cancel is one click.** While an operation runs, the panel's Cancel locks as "Cancelling…" after
+  the first click until the operation actually ends, so it can no longer be clicked repeatedly; a
+  repeated cancel from any route (the notification's Cancel, a rebuilt panel) no longer re-fires the kill;
+  and a Cancel that has nothing to stop (a backup picker holding the slot) stays a plain button instead of
+  pretending. A Cancel while a diff is opening its editors now stops the remaining editors on both the
+  Tooling-API and the retrieve path, instead of locking the button while every window still opened.
+- Fixed: **The "Resolving metadata type" progress no longer offers a Cancel.** That toast ran before the
+  operation slot was taken, so its Cancel could only reach whatever else was running — including a real
+  org-side cancel of an unrelated in-flight deploy. It is now a status-bar spinner like the other
+  background resolutions.
+
+## 0.23.0
+
+- Fixed: **Large deploys and retrieves no longer pass one flag per component.** Above 30 components
+  the plugin writes a package.xml and hands the CLI that instead, so a deploy of thousands of
+  components launches (the old command line could exceed the OS limit, notably on Windows), the
+  command log shows one short line, and result cards list at most 100 components with the full list
+  in the Output channel.
+- Fixed: **The confirmation for a dependency deploy names what it adds.** "Deploy File +
+  Dependencies" now lists the auto-included components and what referenced them before you confirm,
+  says when the scan hit its limits and how many references it did not follow, and posts its
+  explanation card even when the deploy is refused by the org's conflict check or queued. The depth
+  and size limits are settings now (`dependencyMaxDepth`, `dependencyMaxComponents`).
+- Fixed: **Dependency scanning is more accurate.** Apex references must match a component's exact
+  name, so a variable or parameter spelled like a class no longer drags that class in. A bare
+  object mention no longer pulls the whole object when a field on it was already found. Relationship
+  fields (`Obj.Rel__r.Field`), Visualforce pages and their controllers, `Page.X`, Aura `$Resource`,
+  and object names inside SOQL strings are recognized. Selecting several files and choosing the
+  command scans all of them; the command only appears on file types it can scan.
+- Fixed: **"Try with dependencies" survives a panel reload and a hidden panel.** The button and the
+  "missing but available locally" line were lost when the deploy came from the right-click menu or
+  after the sidebar was rebuilt. An expired suggestion no longer leaves the card stuck on
+  "Retrying…". Accepting a suggestion no longer adds components to your ticked selection behind your
+  back, and the retry goes to the org the card names, not whatever the dropdown says now.
+- Changed: **Suggestions explain themselves.** Each suggested component shows the org error that
+  produced it, the error list stays visible while you decide, the confirmation says how many were
+  added, and more org wordings are recognized (unknown field, "check spelling", flow field references,
+  message channels, failures reported inside a test). Building suggestions for a large failure no
+  longer freezes the extension for a second.
+
+## 0.22.2
+
+- Fixed: **Far fewer notifications, and readable ones.** When the panel is visible, failures and
+  warnings go to the card that is already on screen and to a short status-bar line, not to a
+  pop-up; pop-ups only appear when the panel is hidden. Every pop-up is one line (the first line
+  of the message, capped), the same notice is not repeated within a minute, and a burst collapses
+  into a single "N more notices — see Output". The automatic org listing on panel open and the
+  metadata-type resolution now show a quiet status-bar spinner instead of a notification.
+- Changed: **The time from clicking Deploy to the confirmation is now measurable.** Turn on
+  `sfOrgDeployWrapper.debugTiming` and the Output channel logs each step, from the click in the
+  panel to the moment the confirmation is requested, with milliseconds. The panel also sends the
+  click before it repaints anything, so nothing in the sidebar can delay it.
+
 ## 0.22.1
 
 - Fixed: **"No Salesforce DX project found" right after startup no longer sticks.** The first

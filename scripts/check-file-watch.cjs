@@ -96,11 +96,13 @@ check('source: the once-per-session flag is declared, and the toast sits inside 
   assert.ok(/private watchFailureWarned = false;/.test(providerSrc), 'watchFailureWarned field not found');
   const catchBlock = providerSrc.slice(
     providerSrc.indexOf('could not watch the package directories'),
-    providerSrc.indexOf('could not watch the package directories') + 600
+    providerSrc.indexOf('could not watch the package directories') + 1100 // room for the card posted before the toast (0.22.2)
   );
   assert.ok(/if \(!this\.watchFailureWarned\) \{/.test(catchBlock), 'toast must be gated on the flag');
   assert.ok(/this\.watchFailureWarned = true;/.test(catchBlock), 'the flag must be set before/inside the toast, not after');
-  assert.ok(/vscode\.window\.showWarningMessage\(/.test(catchBlock), 'the toast call itself must be inside the catch');
+  // The toast itself now goes through the shared notify() gate (flood fix) rather
+  // than calling vscode.window.showWarningMessage directly.
+  assert.ok(/this\.notify\('warn', /.test(catchBlock), 'the toast call itself must be inside the catch');
 });
 const p = (...s) => path.join(...s);
 const flush = () => new Promise(r => setImmediate(r));
@@ -427,6 +429,11 @@ const provider = (over = {}) => Object.assign(Object.create(DeployPanelProvider.
   items: [],
   output: { appendLine: () => {} },
   rescanScheduler: { scheduled: 0, schedule() { this.scheduled++; } },
+  // The once-per-session warning also posts a card (0.22.2): a visible panel
+  // only gets an 8-second status-bar line from notify(), so the card is the
+  // lasting record.
+  posted: [],
+  post(m) { this.posted.push(m); },
   ...over
 });
 const sync = (prov, root) => DeployPanelProvider.prototype.syncFileWatchers.call(prov, root);
@@ -537,9 +544,15 @@ check('a watcher failure toasts ONCE per session; every failure still logs, a se
     assert.match(ui.warn[0].message, /live file watching is off/i);
     assert.match(ui.warn[0].message, /Refresh Metadata Files/);
     assert.strictEqual(prov.watchFailureWarned, true);
+    const cards = prov.posted.filter(m => m.type === 'status').map(m => m.card);
+    assert.strictEqual(cards.length, 1, 'the first failure also posts a card — the lasting record');
+    assert.strictEqual(cards[0].kind, 'warn');
+    assert.strictEqual(cards[0].title, 'Live file watching is off');
+    assert.match(cards[0].lines[0], /watcher refused/);
 
     await sync(prov, projB); // a second, distinct failure this session
     assert.strictEqual(ui.warn.length, 1, 'a second failure must not toast again — logging alone covers it');
+    assert.strictEqual(prov.posted.filter(m => m.type === 'status').length, 1, 'and no second card either');
   } finally {
     vscodeStub.workspace.createFileSystemWatcher = orig;
   }

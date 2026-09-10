@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
@@ -20,19 +20,23 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'refreshOrgs' }
   | { type: 'refreshFiles' }
-  | { type: 'fetchOrgMetadata'; username?: string }
+  // clickedAt/clickSpan (debugTiming): the webview's Date.now()/performance.now()
+  // stamps from sendAction, present on every slot-taking action it sends. Read
+  // only when the setting is on, and only as untrusted numbers (see safeMs) —
+  // never trusted for anything but a diagnostic log line.
+  | { type: 'fetchOrgMetadata'; username?: string; clickedAt?: number; clickSpan?: number }
   | { type: 'selectOrg'; username: string }
   | { type: 'useActiveFile' }
   | { type: 'useOpenTabs' }
-  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[] }
+  | { type: 'deploy'; keys: string[]; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; clickedAt?: number; clickSpan?: number }
   | { type: 'setTestLevel'; testLevel?: TestLevel; runTests?: string[] }
   | { type: 'setIgnoreDeployConflicts'; enabled: boolean }
   | { type: 'resumeDeploy'; jobId?: string }
   | { type: 'quickDeploy'; jobId: string }
-  | { type: 'retrieve'; keys: string[] }
+  | { type: 'retrieve'; keys: string[]; clickedAt?: number; clickSpan?: number }
   | { type: 'deleteFromOrg'; keys: string[] }
   | { type: 'loginOrg' }
-  | { type: 'diff'; keys: string[] }
+  | { type: 'diff'; keys: string[]; clickedAt?: number; clickSpan?: number }
   | { type: 'openFile'; key: string; line?: number; column?: number }
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
@@ -77,10 +81,10 @@ type Inbound =
 // in workingTreeChanges/indexChanges). Rejects for an unknown ref.
 interface GitChangeLite { uri?: vscode.Uri }
 interface GitRepoLite {
-  state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[] };
+  state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[]; onDidChange: vscode.Event<void> };
   diffWith(ref: string): Promise<GitChangeLite[]>;
 }
-interface GitApiLite { repositories: GitRepoLite[] }
+interface GitApiLite { repositories: GitRepoLite[]; onDidOpenRepository: vscode.Event<GitRepoLite> }
 interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
@@ -148,6 +152,9 @@ const ACTIVE_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  *  entries — the panel opens on the last listing instead of ~90 `sf` spawns. */
 const ORG_CACHE_KEY = 'orgMembershipCache';
 const ORG_CACHE_MAX_ORGS = 5;
+/** Default `orgCacheMaxAgeHours`: a week. A day meant one background re-listing per
+ *  working day for anyone who opens VS Code each morning. */
+const ORG_CACHE_DEFAULT_HOURS = 168;
 /** Largest key list persisted — a bigger org is listed fresh each session rather
  *  than ballooning the state DB. */
 const ORG_CACHE_MAX_KEYS = 50_000;
@@ -206,16 +213,46 @@ interface RetryRequest {
   ignoreConflicts?: boolean;
 }
 
-/** What a runDeploy call did. `aborted` covers every path that never reached the
- *  org (queued, busy slot refused, no root/org, user dismissed the confirm) —
- *  an auto-resolve loop must stop on it rather than spin. */
+/** What a runDeploy call did. `aborted` covers every path that never reached a
+ *  terminal org result (queued, busy slot refused, no root/org, user dismissed
+ *  the confirm, submit itself threw, org-side cancel) — a caller reacting to the
+ *  result (a suggestion retry, deployFileWithDeps) must treat it as "nothing
+ *  landed", never as a failure.
+ *
+ *  `confirmed` (A5) narrows that further: true once the user affirmatively said
+ *  yes to a confirm modal for THIS request — the immediate modal, a drained
+ *  pre-confirmed queue entry, or an enqueue's own "Queue: " modal that actually
+ *  queued it — even though nothing reached the org yet (queued) or the org
+ *  submission itself threw (a conflict). False covers every path where nothing
+ *  was confirmed at all: a dismissed modal, no root/org, a refused busy slot, an
+ *  already-queued twin. A caller that explains WHAT was about to deploy
+ *  (deployFileWithDeps' attribution card) keys off `confirmed`, not `status`,
+ *  because `status: 'aborted'` alone conflates "the user said yes but it hasn't
+ *  landed" with "nothing happened". */
 interface DeployOutcome {
   status: 'ok' | 'failed' | 'aborted';
-  missing: string[];
-  unresolved: string[];
+  confirmed?: boolean;
 }
 
-const ABORTED: DeployOutcome = { status: 'aborted', missing: [], unresolved: [] };
+/** Modal/card explanation for "Deploy File + Dependencies" and the suggestion
+ *  accept path (A1): how many components were added beyond what the user
+ *  picked, and — for the dependency scan specifically — per-key attribution and
+ *  whether/how much the scan's own caps cut. `refs`/`truncated`/`dropped`/
+ *  `maxDepth`/`maxComponents` are absent on the suggestion path (it has no
+ *  depth/count caps of its own); autoIncludedNotice renders sensibly either
+ *  way — see its own doc comment. */
+interface AutoIncludedInfo {
+  count: number;
+  entryKey: string;
+  truncated?: boolean;
+  dropped?: number;
+  refs?: Array<{ key: string; from: string }>;
+  maxDepth?: number;
+  maxComponents?: number;
+}
+
+const ABORTED: DeployOutcome = { status: 'aborted' };
+const ABORTED_CONFIRMED: DeployOutcome = { status: 'aborted', confirmed: true };
 
 /** Cap on how many changed components one "Retry + changed vs branch" click may
  *  add. A branch that many components ahead of the failed deploy is a release
@@ -224,6 +261,36 @@ const ABORTED: DeployOutcome = { status: 'aborted', missing: [], unresolved: [] 
  *  names a COUNT, so past this size "deploy N components?" stops being an
  *  informed yes. */
 const CHANGED_RETRY_MAX_ADDED = 100;
+
+/** Above this many components, deploy/validate/retrieve switch from one
+ *  `--metadata Type:Name` argv token per component to a generated package.xml
+ *  passed via `--manifest` — real argv, so ~500 components already blows
+ *  Windows' ~32 KB command-line limit, and the CLI is slower building/parsing
+ *  thousands of flags than reading one file. Only the argv shape changes: the
+ *  component set, keys, retry request and result mapping are all unaffected. */
+const MANIFEST_THRESHOLD = 30;
+
+/** Cap the ECHOED `--metadata` list at this many tokens ("… (+N more)") — the
+ *  command-log text shown the instant a deploy/retrieve/delete starts, before
+ *  the CLI has even been asked to run. Display only: the REAL argv (the exact
+ *  text sfCliService's formatCmd echoes once the command actually runs) is
+ *  never capped, and beginCmd's text is replaced with that real echo by the
+ *  time the run finishes. */
+const ECHO_METADATA_CAP = 20;
+
+/** Cap on a status card's `lines` — a deploy/retrieve over a few thousand
+ *  components would otherwise render (and persist) every single one. Shared
+ *  with pushCardHistory's own bound below, so a card capLines already trimmed
+ *  to CARD_LINE_CAP+1 (the summary tail counts as one line) isn't re-truncated
+ *  a second time on the way into history. */
+const CARD_LINE_CAP = 100;
+
+/** Cap on how many explorer-selected files "Deploy File + Dependencies" (A11)
+ *  scans as entries in one go — each is its own BFS root, so an unbounded
+ *  multi-select would multiply the scan (and the eventual deploy set) by
+ *  however many files got selected. Twenty covers a deliberate "these classes
+ *  belong together" pick; a bigger release belongs in a manifest. */
+const DEPLOY_DEPS_MAX_FILES = 20;
 
 /** Pre-retrieve backup limits. A retrieve that would overwrite more than
  *  BACKUP_MAX_FILES local files skips the backup (a copy that large is almost
@@ -259,6 +326,16 @@ const WATCH_DEBOUNCE_MS = 600;
  *  progress notification from the Notification Center entirely). */
 const NOTICE_AUTO_DISMISS_MS = 20_000;
 
+/** notify()'s tuning: a toast headline is capped so one line of a multi-line CLI
+ *  message can never read as the whole message; an identical headline within
+ *  NOTIFY_DEDUPE_MS is noise, not news; and more than NOTIFY_RATE_LIMIT toasts
+ *  within NOTIFY_RATE_WINDOW_MS is the flood itself — the rest of that window
+ *  collapses into one summary. */
+const NOTIFY_HEADLINE_MAX = 140;
+const NOTIFY_DEDUPE_MS = 60_000;
+const NOTIFY_RATE_WINDOW_MS = 10_000;
+const NOTIFY_RATE_LIMIT = 3;
+
 interface BackupManifest { at: number; org: string; fileCount: number; workspaceRoot: string }
 /** One backup offered for restore: its on-disk dir plus the manifest fields. */
 interface BackupEntry { dir: string; at: number; org: string; fileCount: number }
@@ -275,6 +352,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private projectDiscoveryError?: string;
   private busy = false;
   private currentCancel?: () => void;
+  /** A cancel handler was consumed for the running op (see cancelCurrent). */
+  private cancelling = false;
   private currentAction?: string;
   private currentProgressText?: string;
   /** A deploy-family confirm modal is up (runDeploy's, enqueueDeploy's "Queue:"
@@ -356,6 +435,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  toast once per session (see runDiff); every failure after the first still
    *  logs. Diffs still open fine as tabs either way. */
   private diffFloatWarned = false;
+  /** notify()'s bookkeeping — the last headline shown/suppressed (60s de-dup)
+   *  and the timestamps of toasts actually shown (10s flood rate-limit), plus
+   *  the current overflow-summary window. Lazily created, like
+   *  noticeDismissers, so a bare test stub never needs to seed them. */
+  private notifyDedupe?: { headline: string; at: number; count: number };
+  private notifyToastTimes?: number[];
+  private notifyOverflow?: { windowStart: number; count: number };
   /** Collapses watcher notifications into one debounced, silent rescan. */
   private readonly rescanScheduler: RescanScheduler;
 
@@ -400,6 +486,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('sfOrgDeployWrapper.changedBaseRef')) void this.postChangedComponents();
       if (e.affectsConfiguration('sfOrgDeployWrapper.ignoreDeployConflicts')) this.postIgnoreDeployConflicts();
+      if (e.affectsConfiguration('sfOrgDeployWrapper.debugTiming')) this.postDebugTiming();
     }));
     // Files created or deleted OUTSIDE the panel's own operations (a new Apex
     // class, a branch switch, a deleted component) used to be invisible until a
@@ -443,13 +530,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         .finally(() => this.postBusy());
     });
     const editorChangeSub = vscode.window.onDidChangeActiveTextEditor(() => this.sendActiveFile());
-    // Keep the "Changed" lens and its tab badge live through the edit→deploy loop:
-    // saving a file is the moment git-dirty state actually changes. Debounced —
-    // and cheap anyway (reads the git extension's in-memory state, no spawn).
-    const saveSub = vscode.workspace.onDidSaveTextDocument(() => this.scheduleChangedRefresh());
+    // Keep the "Changed" lens and its tab badge live: the git extension's own
+    // state events (watchGitState) — a save listener used to do this and raced
+    // vscode.git's status re-read, showing the pre-save answer.
+    const gitSub = this.watchGitState();
+    // A refresh held while the panel was hidden (scheduleChangedRefresh) lands the
+    // moment it shows again — not after another debounce, the retained DOM is
+    // already stale by then.
+    const visSub = view.onDidChangeVisibility(() => {
+      if (view.visible && this.changedRefreshHeld) { this.changedRefreshHeld = false; void this.postChangedComponents(); }
+    });
     view.onDidDispose(() => {
       editorChangeSub.dispose();
-      saveSub.dispose();
+      gitSub.dispose();
+      visSub.dispose();
       if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
       this.view = undefined;
     });
@@ -541,17 +635,25 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   async loginOrg(): Promise<void> { return this.runLogin(); }
 
   /**
-   * "Deploy File + Dependencies" (context menu / palette): resolve the file's
-   * LOCAL dependency closure up front (depGraph — Apex tokens plus LWC/Aura
-   * declared references, best-effort) and deploy entry + dependencies as ONE
-   * set, instead of reacting to org errors
-   * layer by layer the way the failure-card suggestions do. Every dependency key comes
-   * from a scanned MetadataItem, so this path upholds the same invariant as the
-   * error-driven one: file text can never mint a `--metadata` key that isn't a
-   * real workspace component. runDeploy's confirm modal names the full count
-   * before anything reaches the org.
+   * "Deploy File + Dependencies" (context menu / palette): resolve the
+   * selected file(s)' LOCAL dependency closure up front (depGraph — Apex
+   * tokens, LWC/Aura/Visualforce declared references, best-effort) and deploy
+   * entry + dependencies as ONE set, instead of reacting to org errors layer
+   * by layer the way the failure-card suggestions do. Every dependency key
+   * comes from a scanned MetadataItem, so this path upholds the same
+   * invariant as the error-driven one: file text can never mint a
+   * `--metadata` key that isn't a real workspace component. runDeploy's
+   * confirm modal names the full count before anything reaches the org.
+   *
+   * `uris` (A11) is the full explorer multi-selection when the command was
+   * invoked that way — `uri` is just the clicked item, already included in it.
+   * Capped and deduped so a "select everything, deploy deps" click can't kick
+   * off an unbounded scan; every selected file becomes its OWN BFS entry (the
+   * resolver already accepts an array — see resolveLocalDependencies), so two
+   * selected files that reference each other never double up (each is
+   * pre-seeded into the seen-set as an entry, never reported as a dependency).
    */
-  async deployFileWithDeps(uri: vscode.Uri): Promise<void> {
+  async deployFileWithDeps(uri: vscode.Uri, uris?: vscode.Uri[]): Promise<void> {
     if (!uri || !uri.fsPath) {
       vscode.window.showInformationMessage('No file selected.');
       return;
@@ -560,59 +662,103 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Orgs load for the same reason as runByUri: the production guard must be
     // able to classify the target even when the panel never opened.
     if (this.orgs.length === 0) await this.loadOrgs();
-    const match = findItemForPath(this.items, uri.fsPath);
-    if (!match) {
+
+    const paths = uris && uris.length > 1
+      ? [...new Set(uris.map(u => u.fsPath))].slice(0, DEPLOY_DEPS_MAX_FILES)
+      : [uri.fsPath];
+    const matched: MetadataItem[] = [];
+    let unscannedCount = 0;
+    for (const p of paths) {
+      const m = findItemForPath(this.items, p);
+      if (m) matched.push(m); else unscannedCount++;
+    }
+    if (matched.length === 0) {
       // No infer/CLI fallback here, unlike runByUri: an inferred (out-of-package)
       // item deploys via --source-dir, which beats --metadata in the CLI argv
       // (sfCliService.deployMetadata) and would silently discard every dependency
       // key — the one thing this command exists to add. Plain "Deploy to Org"
       // still handles such files.
-      vscode.window.showInformationMessage(
-        'Not a scanned Salesforce metadata file — dependency resolution needs a file inside the project\'s package directories. Use "SF Deploy: Deploy to Org" for this one.'
-      );
+      this.notify('info', 'Not a scanned Salesforce metadata file — dependency resolution needs a file inside the project\'s package directories. Use "SF Deploy: Deploy to Org" for this one.');
       return;
     }
-    const key = `${match.type}:${match.name}`;
-    if (!canScanDependencies(match.type)) {
+    if (unscannedCount > 0) {
+      this.output.appendLine(`[deployFileWithDeps] ${unscannedCount} selected file(s) are not scanned workspace components — skipped.`);
+    }
+    // Two different selected paths (e.g. a .cls and its .cls-meta.xml sidecar)
+    // can resolve to the SAME component — one entry, not two.
+    const seenEntryKeys = new Set<string>();
+    const entries: MetadataItem[] = [];
+    for (const m of matched) {
+      const k = `${m.type}:${m.name}`;
+      if (seenEntryKeys.has(k)) continue;
+      seenEntryKeys.add(k);
+      entries.push(m);
+    }
+    const entryKeys = entries.map(e => `${e.type}:${e.name}`);
+    const label = entries.length === 1 ? entryKeys[0] : `${entries.length} selected files`;
+
+    if (!entries.some(e => canScanDependencies(e.type))) {
       // Still a useful deploy — just be honest that no scan happened, so the
       // user doesn't assume referenced components were included.
-      vscode.window.showInformationMessage(
-        `Dependency scanning follows Apex, LWC and Aura source — deploying ${key} on its own.`
-      );
-      await this.runDeploy([key]);
+      this.notify('info', `Dependency scanning follows Apex, LWC and Aura source (plus Visualforce pages/components) — deploying ${label} on its own.`);
+      await this.runDeploy(entryKeys);
       return;
     }
-    const deps = await resolveLocalDependencies([match], this.items, async p => {
+    const maxDepth = this.dependencyMaxDepth();
+    const maxComponents = this.dependencyMaxComponents();
+    const deps = await resolveLocalDependencies(entries, this.items, async p => {
       try { return await fs.readFile(p, 'utf8'); } catch { return undefined; }
-    });
+    }, { maxDepth, maxDeps: maxComponents });
+
+    // A10: an unreadable ENTRY file must never look identical to "genuinely
+    // has no dependencies" — logged unconditionally (Output), regardless of
+    // what the user does with the confirm modal below.
+    const byKey = new Map(entries.map(e => [`${e.type}:${e.name}`, e]));
+    for (const k of deps.unreadableEntries) {
+      this.output.appendLine(`[deployFileWithDeps] could not read ${byKey.get(k)?.filePath ?? k} — deploying it without a dependency scan.`);
+    }
+    const hasUnreadable = deps.unreadableEntries.length > 0;
+
     // The confirm modal is the LAST point where this set can be refused, and it
     // otherwise names only a total — a number the user cannot check, because they
-    // picked one file and the rest was chosen for them. autoIncluded makes the
+    // picked the file(s) and the rest was chosen for them. autoIncluded makes the
     // split explicit there (see deployConfirmModal); the attribution card below
     // then answers "which, and referenced by what".
-    const outcome = await this.runDeploy([key, ...deps.keys], {
-      autoIncluded: deps.keys.length ? { count: deps.keys.length, entryKey: key } : undefined
-    });
+    const autoIncluded: AutoIncludedInfo | undefined = deps.keys.length ? {
+      count: deps.keys.length,
+      entryKey: label,
+      truncated: deps.truncated,
+      dropped: deps.dropped,
+      refs: deps.refs.map(r => ({ key: r.key, from: r.from })),
+      maxDepth,
+      maxComponents
+    } : undefined;
+    const outcome = await this.runDeploy([...entryKeys, ...deps.keys], { autoIncluded });
     // Post-hoc visibility: the result card lists every key but doesn't say which
     // were auto-included or WHY — this card does, so a surprising extra component
     // is traceable to the reference that pulled it in rather than looking like
     // panel state gone wrong.
-    // An aborted outcome posts nothing: either no deploy happened (dismissed
-    // modal, no org) or it was queued — and a queued run's confirm already named
-    // the full count, with the eventual result card listing every key.
-    if (deps.keys.length === 0 || outcome.status === 'aborted') return;
+    // A5: post it whenever the user actually confirmed something — the
+    // immediate modal, a queued run's own "Queue: " modal, or a submit that
+    // threw AFTER confirm (a conflict) — never for a dismissed modal or a
+    // request that never reached a confirm at all (no org, busy-slot twin…).
+    if (deps.keys.length === 0 && !hasUnreadable) return;
+    if (outcome.status === 'aborted' && !outcome.confirmed) return;
     this.post({
       type: 'status',
       card: {
-        kind: outcome.status === 'ok' && !deps.truncated ? 'ok' : 'warn',
-        title: `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${key}`,
+        kind: outcome.status === 'ok' && !deps.truncated && !hasUnreadable ? 'ok' : 'warn',
+        title: deps.keys.length > 0
+          ? `Auto-included ${deps.keys.length} local dependenc${deps.keys.length === 1 ? 'y' : 'ies'} of ${label}`
+          : `Dependency scan incomplete for ${label}`,
         meta: 'Each line names the component whose source referenced it.',
-        lines: [
+        lines: capLines([
+          ...deps.unreadableEntries.map(k => `could not read ${byKey.get(k)?.filePath ?? k}`),
           ...(deps.truncated
-            ? [`Dependency scan stopped at its caps (depth ${DEFAULT_MAX_DEPTH}, ${DEFAULT_MAX_DEPS} components, ${DEFAULT_MAX_BUNDLE_FILES} files per bundle) — the included set may be incomplete.`]
+            ? [`Dependency scan stopped at its caps (depth ${maxDepth}, ${maxComponents} components, ${DEFAULT_MAX_BUNDLE_FILES} files per bundle) — at least ${deps.dropped} more reference${deps.dropped === 1 ? '' : 's'} ${deps.dropped === 1 ? 'was' : 'were'} not followed.`]
             : []),
           ...formatDependencyAttribution(deps.refs)
-        ]
+        ], CARD_LINE_CAP)
       }
     });
   }
@@ -751,7 +897,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       match = inferItemForPath(uri.fsPath, this.ruleSet());
       if (!match) {
         try {
-          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath));
+          // quiet: this runs BEFORE the slot is reserved, so a cancellable toast's
+          // Cancel could only reach whatever other op was running — a polled deploy's
+          // handler, i.e. a real org-side `deploy cancel` from an unrelated click.
+          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath), { quiet: true });
         } catch (err) {
           // CLI failure (timeout, no project, …) — distinct from "not metadata".
           const msg = err instanceof Error ? err.message : String(err);
@@ -815,9 +964,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // the authoritative value on every rebuild so the visible warning toggle
         // always matches what deploys (including context-menu deploys) will do.
         this.postIgnoreDeployConflicts();
+        // Tell the webview whether to stamp/log click timings — see debugTiming.
+        this.postDebugTiming();
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        // Re-attach the "Try with dependencies" button for any suggestion still
+        // alive server-side: the persisted copy above dropped the live payload
+        // (stripSuggestForHistory), so a webview rebuilt after that — sidebar
+        // collapsed/reopened, window reload — would otherwise show only the
+        // folded-back guidance text with no way to act on it. The webview merges
+        // each payload into the history card carrying the matching `suggestId`.
+        for (const [id, live] of this.liveSuggestions) {
+          this.post({ type: 'suggestionRestore', id, candidates: live.candidates, unresolved: live.unresolved });
+        }
         // Re-sync the deploy-queue strip too — a webview rebuilt mid-session (e.g.
         // sidebar collapsed/reopened) must not show an empty strip while the
         // provider's in-memory queue still has items waiting.
@@ -870,6 +1030,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         try { await this.refreshFiles(); } finally { this.post({ type: 'filesRefreshed' }); }
         return;
       case 'fetchOrgMetadata':
+        this.logReceiveTiming('fetchOrg', msg.clickedAt, msg.clickSpan);
         // Trust the org the webview has selected, applied before we read it back —
         // otherwise a fetch fired right after first-launch auto-selection could race
         // the persisted selection and fetch the default org instead of the picked one.
@@ -912,15 +1073,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         );
         return;
       }
-      case 'deploy':
+      case 'deploy': {
+        // debugTiming: the receive stamp the confirm-modal breakdown (runDeploy)
+        // measures host→busy/busy→modal from — captured HERE, at the top of the
+        // handler, so it also covers the (negligible, synchronous) hop into runDeploy.
+        const receivedAt = Date.now();
         // Fields built explicitly, one by one — NEVER spread `msg` into runDeploy's
         // opts. runDeploy's opts type also carries internal-only `orgOverride` /
         // `preConfirmed` fields that drainQueue uses to replay a queued deploy
         // without a second confirm; spreading the raw webview message would let a
         // compromised webview forge those and skip the confirm modal / retarget
         // the org.
-        await this.runDeploy(msg.keys, { validateOnly: msg.validateOnly, testLevel: msg.testLevel, runTests: msg.runTests });
+        await this.runDeploy(msg.keys, {
+          validateOnly: msg.validateOnly, testLevel: msg.testLevel, runTests: msg.runTests,
+          clickedAt: msg.clickedAt, clickSpan: msg.clickSpan, receivedAt
+        });
         return;
+      }
       case 'quickDeploy':
         await this.runQuickDeploy(msg.jobId);
         return;
@@ -928,6 +1097,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.resumeDeployMonitoring(msg.jobId);
         return;
       case 'retrieve':
+        this.logReceiveTiming('retrieve', msg.clickedAt, msg.clickSpan);
         await this.runRetrieve(msg.keys);
         return;
       case 'deleteFromOrg':
@@ -937,6 +1107,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await this.runLogin();
         return;
       case 'diff':
+        this.logReceiveTiming('diff', msg.clickedAt, msg.clickSpan);
         await this.runDiff(msg.keys);
         return;
       case 'openFile': {
@@ -1080,7 +1251,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (typeof msg.id !== 'string') return;
         const live = this.liveSuggestions.get(msg.id);
         if (!live) {
-          vscode.window.showInformationMessage('This suggestion has expired — use Retry deploy instead.');
+          // Un-fold the card too: without this the button click left it stuck
+          // showing "Retrying…" forever (panel.js only clears that on a reset).
+          this.notify('info', 'This suggestion has expired — use Retry deploy instead.');
+          this.post({ type: 'suggestionReset', id: msg.id });
           return;
         }
         // Selection: intersect the webview's picks with the server-side candidate
@@ -1091,14 +1265,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           ? [...new Set(msg.keys.filter(k => typeof k === 'string' && offered.has(k)))]
           : [];
         if (picked.length === 0) {
-          vscode.window.showInformationMessage('No suggested components selected.');
+          this.notify('info', 'No suggested components selected.');
+          this.post({ type: 'suggestionReset', id: msg.id });
           return;
         }
         // A running operation would QUEUE this deploy, and the log would then
         // record 'retry not run' for a retry that actually runs later. Refuse
         // up front — nothing is consumed or logged, the card stays actionable.
         if (this.busy) {
-          vscode.window.showInformationMessage('A deployment is already running — retry the suggestion when it finishes.');
+          this.notify('info', 'A deployment is already running — retry the suggestion when it finishes.');
           this.post({ type: 'suggestionReset', id: msg.id });
           return;
         }
@@ -1112,14 +1287,37 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           accepted: picked, declined: declined.length ? declined : undefined,
           verdict: undefined, outcome: undefined
         });
+        // writeSuggestionEntry awaited a workspaceState write — busy can have
+        // changed in that window (another op grabbed the slot). Re-check rather
+        // than fall through to enqueueDeploy: the log above already says "not
+        // run", and silently queuing the retry would contradict it.
+        if (this.busy) {
+          await this.writeSuggestionEntry(msg.id, { outcome: 'aborted' });
+          this.post({ type: 'suggestionReset', id: msg.id });
+          return;
+        }
         // Reflect the acceptance in the component tree IMMEDIATELY (before the
-        // deploy settles): the added components join the selection and scroll
-        // into view, so the retry's contents are visible, not just implied.
-        this.post({ type: 'selectKeys', keys: picked, scroll: true });
+        // deploy settles): the added rows scroll into view so the retry's
+        // contents are visible — transient, so they never join the PERSISTED
+        // selection (a plain Deploy click right after must not silently pick up
+        // components the user never ticked themselves).
+        this.post({ type: 'selectKeys', keys: picked, scroll: true, transient: true });
+        // entryKey names ONE failing component for the confirm modal's "auto-
+        // included as local dependencies of X" line — prefer the accepted
+        // candidate's own attribution, falling back to the retry's first key for
+        // an envelope-level failure that named no per-component `from`.
+        const entryKey = live.candidates.find(c => picked.includes(c.key))?.from ?? baseKeys[0] ?? picked[0];
         // Server-side truth (liveSuggestions), so these are the ORIGINAL run's own
         // modes: a suggestion accepted from a validation failure re-validates, it
-        // does not deploy.
-        const outcome = await this.runDeploy([...new Set([...baseKeys, ...picked])], deployOptsFromRetry(live.retry));
+        // does not deploy. orgOverride pins the retry to the org the FAILURE
+        // happened on, not wherever the panel's org selector has since moved —
+        // and now that the deploy actually goes there, the `org: live.orgLabel`
+        // written into the log above is finally the org that ran, not just the
+        // org that was named.
+        const outcome = await this.runDeploy(
+          [...new Set([...baseKeys, ...picked])],
+          { ...deployOptsFromRetry(live.retry), orgOverride: live.org, autoIncluded: { count: picked.length, entryKey } }
+        );
         if (outcome.status === 'aborted') {
           // Dismissed confirm / no org / refused slot: nothing reached the org.
           // Keep the suggestion alive and un-fold the card so the user can go
@@ -1214,7 +1412,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * mid-deploy Cancel now genuinely stops the org-side job.
    */
   private cancelCurrent(): void {
-    if (this.currentCancel) this.currentCancel();
+    // One shot per operation: the panel's Cancel, the notification's Cancel and a
+    // rebuilt webview can all reach here for the same op, and a second kill of an
+    // already-dying process (or a second `deploy cancel`) buys nothing. The
+    // `cancelling` flag rides on every busy post so the panel's Cancel locks
+    // ("Cancelling…") exactly when a handler was consumed — an op with nothing to
+    // cancel (a backup restore's picker) leaves the button a plain no-op.
+    const cancel = this.currentCancel;
+    if (!cancel) return;
+    this.currentCancel = undefined;
+    this.cancelling = true;
+    cancel();
+    this.postBusy();
   }
 
   /** One automatic Fetch Org per session (`fetchOrgOnOpen`, default on), fired
@@ -1237,7 +1446,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('fetchOrgOnOpen', true)) return;
     if (this.busy) return;
     this.autoFetchDone = true;
-    void this.loadOrgMetadata().catch(err =>
+    // Quiet: nobody clicked this — a Notification (with its own Cancel button)
+    // firing unasked at panel open is the flood being fixed here. The panel's own
+    // Cancel still reaches it (cancelCurrent is wired before withWindowProgress
+    // starts, independent of which progress UI is showing).
+    void this.loadOrgMetadata(true).catch(err =>
       this.output.appendLine(`[Fetch Org] auto-fetch failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
@@ -1280,7 +1493,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (this.orgMembersOrg && this.orgStore.get() !== this.orgMembersOrg) this.resetOrgMetadata();
     this.postOrgs();
     if (notify && this.orgs.length === 0) {
-      vscode.window.showWarningMessage('No authenticated Salesforce orgs found.');
+      this.notify('warn', 'No authenticated Salesforce orgs found.');
     } else if (notify) {
       // An unchanged list re-renders identically — say it finished.
       vscode.window.setStatusBarMessage(`$(check) SF Deploy: org list refreshed — ${this.orgs.length} org${this.orgs.length === 1 ? '' : 's'}`, 4000);
@@ -1609,7 +1822,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const scanRoot = scan.root;
       // Under window progress — this spawns `sf` (30s timeout per folder) and
       // would otherwise stall the tree with zero feedback on panel open/refresh.
-      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot));
+      // Quiet: this fires on an ordinary panel open/refresh, not a deliberate
+      // "resolve types" click, so a Notification here is exactly the flood a
+      // status-bar spinner exists to replace.
+      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot), { quiet: true });
       // Fresh rules are passed directly (not just via the cache) so the rescan
       // sees them even with typeCacheDays 0.
       if (fresh.length) scan = await scanWorkspace([...this.ruleSet(), ...fresh]);
@@ -1677,7 +1893,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Editing a file's BODY cannot add or remove a component, so an onDidChange
         // rescan would walk the whole package tree on every keystroke-save to
         // rebuild the identical list. What a save DOES change — git state — is
-        // already covered by onDidSaveTextDocument → scheduleChangedRefresh.
+        // already covered by the git state watch (watchGitState → scheduleChangedRefresh).
         const watcher = vscode.workspace.createFileSystemWatcher(
           new vscode.RelativePattern(vscode.Uri.file(target.base), target.pattern),
           false,
@@ -1715,7 +1931,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // noticing before that. Every subsequent failure this session still logs above.
       if (!this.watchFailureWarned) {
         this.watchFailureWarned = true;
-        void vscode.window.showWarningMessage("SF Deploy: live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
+        // A card too: with the panel visible notify() only writes an 8-second
+        // status-bar line, and this once-per-session notice needs a lasting record.
+        this.post({
+          type: 'status',
+          card: { kind: 'warn', title: 'Live file watching is off', meta: "New or deleted files won't appear until you run SF Deploy: Refresh Metadata Files.", lines: [stripAnsi(err instanceof Error ? err.message : String(err))] }
+        });
+        this.notify('warn', "live file watching is off — use 'SF Deploy: Refresh Metadata Files' to rescan.");
       }
     }
   }
@@ -1747,6 +1969,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private changedRefreshTimer?: ReturnType<typeof setTimeout>;
+  /** A Changed refresh fell due while the panel was hidden — run it on show. */
+  private changedRefreshHeld = false;
 
   /** Apply a failed unique-root search as a hard local stop. In particular, if a
    *  webview rebuild discovers the failure while automatic Fetch Org is already
@@ -1768,7 +1992,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Root ambiguity is a hard blocker, not the dismissible scan notice used for
     // individual metadata folders the registry could not classify.
     this.post({ type: 'banner', message });
-    if (isNew) vscode.window.showErrorMessage(`SF Deploy: ${message}`);
+    if (isNew) this.notify('error', message);
   }
 
   private clearProjectDiscoveryError(): void {
@@ -1797,7 +2021,41 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   private scheduleChangedRefresh(): void {
     if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
-    this.changedRefreshTimer = setTimeout(() => { void this.postChangedComponents(); }, 500);
+    this.changedRefreshTimer = setTimeout(() => {
+      // A hidden panel can't show it, and vscode.git runs status on every write
+      // under the repo — a background build would otherwise cost one
+      // `git diff <changedBaseRef>` per pass all day. Held until the panel shows.
+      if (this.view && !this.view.visible) { this.changedRefreshHeld = true; return; }
+      this.changedRefreshHeld = false;
+      void this.postChangedComponents();
+    }, 500);
+  }
+
+  /** Keep the Changed lens live through git itself. vscode.git re-reads status
+   *  after every save, commit, stash, checkout and discard and fires
+   *  `state.onDidChange` once its in-memory state is current — the state
+   *  changedComponentKeys reads. The save listener alone raced that re-read
+   *  (500 ms is often shorter than a `git status`), so a fresh edit only showed
+   *  once the user re-entered the lens, and a commit or discard — no editor
+   *  buffer involved — never refreshed at all. Debounced through
+   *  scheduleChangedRefresh; repositories opened later are hooked as they appear.
+   *  No feedback loop: `state.onDidChange` is vscode.git's onDidRunGitStatus, and
+   *  the `git diff` behind diffWith is a read-only operation that never re-runs
+   *  status — so a `changedBaseRef` refresh can't re-fire the event that caused it.
+   *  Never throws: no git extension just means no live refresh, as before. */
+  private watchGitState(): vscode.Disposable {
+    const subs: vscode.Disposable[] = [];
+    let disposed = false;
+    void (async () => {
+      const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
+      if (!gitExt) return;
+      const api = (gitExt.isActive ? gitExt.exports : await gitExt.activate()).getAPI(1);
+      if (disposed) return;
+      const hook = (repo: GitRepoLite): void => { subs.push(repo.state.onDidChange(() => this.scheduleChangedRefresh())); };
+      api.repositories.forEach(hook);
+      subs.push(api.onDidOpenRepository(hook));
+    })().catch(err => this.output.appendLine(`[changed] git state watch failed: ${err instanceof Error ? err.message : String(err)}`));
+    return { dispose: () => { disposed = true; for (const d of subs.splice(0)) d.dispose(); } };
   }
 
   /** Compute which local components differ, via the built-in vscode.git
@@ -1986,26 +2244,85 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'ignoreDeployConflicts', enabled: this.ignoreDeployConflicts() });
   }
 
+  /** Diagnosing a slow confirmation (see the click-timing log below) needs the
+   *  webview to know whether to bother stamping/logging at all — read fresh
+   *  each time since, unlike ignoreDeployConflicts, this isn't machine-scoped. */
+  private debugTiming(): boolean {
+    return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('debugTiming', false);
+  }
+
+  private postDebugTiming(): void {
+    this.post({ type: 'debugTiming', enabled: this.debugTiming() });
+  }
+
+  /** "Deploy File + Dependencies" caps (A13) — clamped the same way
+   *  fetchConcurrency is: VS Code's settings UI enforces the schema's min/max,
+   *  but a hand-edited settings.json does not, so the extension clamps too. */
+  private dependencyMaxDepth(): number {
+    return Math.max(1, Math.min(3,
+      vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('dependencyMaxDepth', DEFAULT_MAX_DEPTH)));
+  }
+
+  private dependencyMaxComponents(): number {
+    return Math.max(5, Math.min(200,
+      vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('dependencyMaxComponents', DEFAULT_MAX_DEPS)));
+  }
+
+  /** debugTiming: click→post/post→host receive stamp for the actions that don't
+   *  have a busy/modal breakdown worth logging (retrieve/diff/Fetch Org just
+   *  need to show whether the delay is on our side of the postMessage hop at
+   *  all). No-op when the setting is off — the message's timing fields are
+   *  otherwise ignored entirely. */
+  private logReceiveTiming(action: string, clickedAt: unknown, clickSpan: unknown): void {
+    if (!this.debugTiming()) return;
+    const receivedAt = Date.now();
+    const clickedAtMs = safeMs(clickedAt);
+    const postToHost = clickedAtMs === undefined ? undefined : receivedAt - clickedAtMs;
+    this.output.appendLine(`[timing] ${action}: click→post ${fmtSpan(safeMs(clickSpan))} · post→host ${fmtSpan(postToHost)}`);
+  }
+
+  /** debugTiming: click-to-modal breakdown for a deploy/validate confirm,
+   *  logged once the modal is answered so writing to the Output channel can't
+   *  itself skew when the modal appears. clickedAt/clickSpan are the webview's —
+   *  untrusted (see safeMs). No-op for a run that didn't originate from a
+   *  webview click (context-menu deploy, retry, a drained queue entry) —
+   *  receivedAt is only set by the 'deploy' message handler. */
+  private logDeployTiming(
+    verb: DeployVerb, clickedAt: unknown, clickSpan: unknown,
+    receivedAt: number | undefined, busyAt: number, modalAt: number
+  ): void {
+    if (receivedAt === undefined) return;
+    const clickedAtMs = safeMs(clickedAt);
+    const postToHost = clickedAtMs === undefined ? undefined : receivedAt - clickedAtMs;
+    this.output.appendLine(
+      `[timing] ${verb.toLowerCase()}: click→post ${fmtSpan(safeMs(clickSpan))} · post→host ${fmtSpan(postToHost)} · `
+      + `host→busy ${fmtSpan(busyAt - receivedAt)} · busy→modal ${fmtSpan(modalAt - busyAt)}`
+    );
+  }
+
   // ---- Operations ----
   private async runDeploy(
     keys: string[],
     opts: {
       sourceDir?: string; validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[];
-      /** Internal only — set by drainQueue to run a previously-queued deploy
-       *  against the org PINNED at enqueue time, bypassing the currently-selected
-       *  org. The 'deploy' Inbound handler builds its opts explicitly (see the
-       *  comment there) and never spreads the raw webview message, so a
-       *  compromised webview can never set this itself. */
+      /** Internal only — set by drainQueue (a previously-queued deploy, pinned to
+       *  the org selected at enqueue time) and by the suggestionDeploy handler (a
+       *  suggestion retry, pinned to the org the ORIGINAL failure happened on,
+       *  which the panel's live selector may have since moved past). The 'deploy'
+       *  Inbound handler builds its opts explicitly (see the comment there) and
+       *  never spreads the raw webview message, so a compromised webview can
+       *  never set this itself. */
       orgOverride?: string;
       /** Internal only — set by drainQueue to skip the confirm modal for a
        *  deploy the user already confirmed at enqueue time. Same invariant as
        *  orgOverride: only drainQueue sets it. */
       preConfirmed?: boolean;
-      /** Internal only — set by deployFileWithDeps so the confirm modal can say
-       *  how much of the count the user did NOT pick. Display only: it changes
-       *  one line of modal text and nothing about what deploys, so unlike
-       *  orgOverride/preConfirmed a forged value could not widen anything. */
-      autoIncluded?: { count: number; entryKey: string };
+      /** Internal only — set by deployFileWithDeps and by the suggestionDeploy
+       *  handler so the confirm modal can say how much of the count the user did
+       *  NOT explicitly pick. Display only: it changes one line of modal text and
+       *  nothing about what deploys, so unlike orgOverride/preConfirmed a forged
+       *  value could not widen anything. */
+      autoIncluded?: AutoIncludedInfo;
       /** One-off override of the machine-scoped ignoreDeployConflicts setting,
        *  for exactly this run. Set only via a "Retry + overwrite" card button
        *  (deployOptsFromRetry reading RetryRequest.ignoreConflicts) — every other
@@ -2013,6 +2330,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  existed. Never sticky: buildRetryRequest does not carry it forward into
        *  the NEXT card's plain Retry request. */
       ignoreConflictsOverride?: boolean;
+      /** debugTiming diagnostics — the webview's click stamps and this handler's
+       *  own receive stamp (case 'deploy'), threaded through so the confirm-modal
+       *  breakdown below can log host→busy/busy→modal. Untrusted (safeMs
+       *  validates); receivedAt undefined means this run didn't originate from a
+       *  webview click (context-menu deploy, retry, a drained queue entry), and
+       *  logDeployTiming no-ops on that. */
+      clickedAt?: number;
+      clickSpan?: number;
+      receivedAt?: number;
     } = {}
   ): Promise<DeployOutcome> {
     // The single busy slot stays THE invariant (see setBusy/reserveBusy) — but a
@@ -2031,8 +2357,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         vscode.window.setStatusBarMessage('$(warning) SF Deploy: answer the open confirmation first', 4000);
         return ABORTED;
       }
-      await this.enqueueDeploy(keys, opts);
-      return ABORTED;
+      const queued = await this.enqueueDeploy(keys, opts);
+      // queued names whether enqueueDeploy ITSELF actually queued the entry
+      // (its "Queue: " modal was confirmed) or not (dismissed / cap full / an
+      // already-queued twin) — that, not this call's own status, is what
+      // `confirmed` must reflect (A5).
+      return queued ? ABORTED_CONFIRMED : ABORTED;
     }
     // Reserve the busy slot synchronously, before the first await (the confirm
     // modal): otherwise a second deploy/retrieve/diff fired during the modal
@@ -2040,14 +2370,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // re-enabling the UI mid-op (busy-flag TOCTOU). Release on any early
     // return with `releaseBusy()`.
     if (!this.reserveBusy(verb)) return ABORTED;
+    const busyAt = Date.now(); // debugTiming: host→busy span (logDeployTiming below)
     let reserved = true;
     const releaseBusy = (): void => { if (reserved) { reserved = false; this.setBusy(false); } };
-    // Set by the terminal result callback; drives the auto-resolve loop in the
-    // retryDeploy handler. Declared out here so the outcome survives the try/
-    // finally that owns the busy slot. `sawTerminal` distinguishes a real
-    // success from a run that never produced a terminal result at all
-    // (exception, cancelled submit, lost contact) — both leave `detection`
-    // undefined, but only the first is an 'ok' the caller may act on.
+    // Set by the terminal result callback; a truthy value is what turns the
+    // outcome below into 'failed' rather than 'ok'. Declared out here so it
+    // survives the try/finally that owns the busy slot. `sawTerminal`
+    // distinguishes a real success from a run that never produced a terminal
+    // result at all (exception, cancelled submit, lost contact) — both leave
+    // `detection` undefined, but only the first is an 'ok' the caller may act on.
     let detection: MissingDependencies | undefined;
     let sawTerminal = false;
     try {
@@ -2071,6 +2402,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const isProd = isLikelyProduction(orgInfo);
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
+      // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
+      // ~32 KB command-line limit well under 1,000 components — switch to a
+      // generated package.xml. A sourceDir-pinned deploy (one picked file/dir)
+      // is never this big and keeps its own target.
+      const useManifest = !opts.sourceDir && n > MANIFEST_THRESHOLD;
 
       // RunSpecifiedTests needs an actual class list — resolved now (before the
       // confirm modal) so an empty list can refuse the deploy outright instead of
@@ -2098,11 +2434,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const modal = this.deployConfirmModal(
           {
             noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
-            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded
+            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, useManifest
           },
           false
         );
+        const modalAt = Date.now(); // debugTiming: busy→modal span
         const confirm = await this.awaitConfirm(modal);
+        // Logged AFTER the modal is answered so writing to the Output channel
+        // can't itself delay the modal's appearance.
+        if (this.debugTiming()) this.logDeployTiming(verb, opts.clickedAt, opts.clickSpan, opts.receivedAt, busyAt, modalAt);
         if (!confirm) return ABORTED;
       }
 
@@ -2121,7 +2461,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (buildRetryRequest inlined at the report call, below) would build.
       const retry = buildRetryRequest(opts, items, testLevel, runTests);
 
-      const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
+      // useManifest: write the temp package.xml now that the run is confirmed —
+      // its path feeds both the echoed command below and the real deploy call.
+      // Keys/retry/reattach/badge-flip all still key on Type:Name (unchanged
+      // above); only the argv target changes.
+      let manifest: { path: string; dir: string } | undefined;
+      if (useManifest) {
+        try {
+          manifest = await this.writeTempManifest(items);
+        } catch (err) {
+          this.reportError(`${verb} ${orgPrep(verb)} ${orgLabel}`, err, retry);
+          // Past the confirm gate above — the user already said yes (A5).
+          return ABORTED_CONFIRMED;
+        }
+      }
+
+      const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
       // owns releasing it, so stop the early-return releaser from double-firing.
       reserved = false;
@@ -2137,6 +2492,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // Submit ASYNC: the CLI enqueues the deploy (client-side conflict check
           // still runs here) and returns a job id in seconds. Cancel during this
           // brief window kills the submit before any job exists.
+          // The metadata list is passed as usual even when useManifest is set —
+          // deployMetadata's own precedence (manifest wins) ignores it in that
+          // case, same as every other caller of this method.
           const handle = this.sf.deployMetadata(
             items.map(i => `${i.type}:${i.name}`),
             org,
@@ -2145,6 +2503,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               ignoreConflicts,
               timeoutMs: this.timeoutMs(),
               sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined,
+              manifest: manifest?.path,
               validateOnly: opts.validateOnly,
               testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
               runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined,
@@ -2201,15 +2560,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.currentDeployJobId = undefined;
         this.currentDeployOrg = undefined;
         this.setBusy(false);
+        // A reattach only re-polls the existing job id — it never resubmits — so
+        // the manifest file is never needed again after this point either way.
+        await this.cleanupTempManifest(manifest?.dir);
       }
     } finally {
       releaseBusy();
     }
-    if (detection) return { status: 'failed', missing: detection.keys, unresolved: detection.unresolved };
-    // A run that never reached a terminal result (or was cancelled org-side,
-    // which reportPolledDeploy already carded) is NOT a success — an
-    // auto-resolve loop must stop without claiming the deploy landed.
-    return sawTerminal ? { status: 'ok', missing: [], unresolved: [] } : ABORTED;
+    if (detection) return { status: 'failed' };
+    // A run that never reached a terminal result (a submit-time throw/timeout —
+    // reportError/reportDeployTimeout already carded it — or an org-side
+    // cancel, which reportPolledDeploy already carded) is NOT a success — the
+    // caller must not report the deploy as landed. Every path down here is past
+    // the confirm gate above (A5), so it is always `confirmed`.
+    return sawTerminal ? { status: 'ok' } : ABORTED_CONFIRMED;
   }
 
   // ---- Dependency suggestions (failure-card "Try with dependencies") ----
@@ -2218,10 +2582,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  The webview only ever echoes an id and a SELECTION; every key it picks is
    *  validated against this map, so a forged message can neither mint a deploy
    *  key nor resurrect an expired suggestion. Bounded: oldest evicted. */
-  private liveSuggestions = new Map<string, { candidates: SuggestionCandidateInfo[]; retry: RetryRequest; orgLabel: string }>();
+  private liveSuggestions = new Map<string, { candidates: SuggestionCandidateInfo[]; unresolved: string[]; retry: RetryRequest; orgLabel: string; org: string }>();
   private suggestionSeq = 0;
 
-  private rememberSuggestion(id: string, data: { candidates: SuggestionCandidateInfo[]; retry: RetryRequest; orgLabel: string }): void {
+  private rememberSuggestion(id: string, data: { candidates: SuggestionCandidateInfo[]; unresolved: string[]; retry: RetryRequest; orgLabel: string; org: string }): void {
     this.liveSuggestions.set(id, data);
     // A handful of live cards is plenty — suggestions are meant to be acted on
     // right after the failure, and stale ones render inert after a reload anyway.
@@ -2352,26 +2716,28 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private deployConfirmModal(
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
-      instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: { count: number; entryKey: string };
+      instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: AutoIncludedInfo;
+      useManifest?: boolean;
     },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
     const overwriteLine = overwriteNotice(ignoreConflicts, validateOnly, queued);
     const autoLine = autoIncludedNotice(autoIncluded);
+    const manifestLine = manifestNotice(useManifest);
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
-        options: { modal: true, detail: [instanceUrl ?? '', autoLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
+        options: { modal: true, detail: [instanceUrl ?? '', autoLine, manifestLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
     }
     // Below prod: keep the pre-existing shape — with no lines to show at all the
     // `detail` key stays absent rather than becoming an empty string.
-    const rest = [autoLine, overwriteLine, queueNote].filter(Boolean);
+    const rest = [autoLine, manifestLine, overwriteLine, queueNote].filter(Boolean);
     const detail = isProd
       ? [instanceUrl ?? '', ...rest].filter(Boolean).join('\n')
       : (rest.length > 0 ? rest.join('\n') : undefined);
@@ -2394,7 +2760,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  deployConfirmModal — just prefixed "Queue: " with a note that it waits for
    *  the current operation. The target org is PINNED right now (named in the
    *  modal, and used again by drainQueue) — a later org switch in the panel
-   *  can't retarget an already-queued deploy. */
+   *  can't retarget an already-queued deploy. Returns whether the entry was
+   *  actually pushed onto the queue (A5) — false for every path that answers
+   *  the request WITHOUT queuing it (dismissed modal, no root/org, queue full,
+   *  an already-queued twin) — so runDeploy can tell a genuine "queued" outcome
+   *  from a request that landed nowhere. */
   private async enqueueDeploy(
     keys: string[],
     opts: {
@@ -2403,22 +2773,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  that lands on a busy slot discloses the same split at confirm time; it is
        *  deliberately NOT stored on the queue entry, because drainQueue re-enters
        *  runDeploy preConfirmed and shows no second modal. */
-      autoIncluded?: { count: number; entryKey: string };
+      autoIncluded?: AutoIncludedInfo;
       /** See runDeploy — unlike the machine-scoped setting (re-read fresh when the
        *  queue drains, below), this one-off flag IS stored on the queue entry and
        *  carried through unchanged: it names a single click, not something that
        *  could legitimately change while the deploy waits its turn. */
       ignoreConflictsOverride?: boolean;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
     const root = this.requireRoot();
-    if (!root) return;
+    if (!root) return false;
     const org = this.requireOrg();
-    if (!org) return;
+    if (!org) return false;
     const items = this.resolveKeys(keys).filter(i => !!i.filePath);
     if (items.length === 0) {
       vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
-      return;
+      return false;
     }
 
     const orgInfo = this.orgs.find(o => o.username === org);
@@ -2426,9 +2796,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const isProd = isLikelyProduction(orgInfo);
     const n = items.length;
     const noun = `${n} component${n === 1 ? '' : 's'}`;
+    // Display only here — see runDeploy, which computes the same thing again
+    // when the queued entry actually runs and generates the manifest there.
+    const useManifest = !opts.sourceDir && n > MANIFEST_THRESHOLD;
 
     const plan = this.resolveTestPlan(opts, isProd);
-    if (!plan) return;
+    if (!plan) return false;
     const { testLevel, runTests, testNote } = plan;
     const entryKeys = items.map(i => `${i.type}:${i.name}`);
     const validateOnly = !!opts.validateOnly;
@@ -2437,7 +2810,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // twice (a different set still queues). Before the modal so the user isn't
     // asked to confirm a request that can't be honoured; again at the push
     // because the modal await is a TOCTOU window (same shape as the cap).
-    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
+    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return false; }
 
     // The SETTING is machine-scoped and re-read by runDeploy when the queue
     // drains, so what's true NOW is only a snapshot — the queued variant of the
@@ -2450,7 +2823,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       {
         noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
         instanceUrl: orgInfo?.instanceUrl, ignoreConflicts,
-        autoIncluded: opts.autoIncluded
+        autoIncluded: opts.autoIncluded, useManifest
       },
       true
     );
@@ -2458,18 +2831,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // wastes the user's read of a modal that could never be honored.
     if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
       vscode.window.showInformationMessage(`SF Deploy: queue full (${DEPLOY_QUEUE_MAX} max) — wait for a queued operation to run before adding another.`);
-      return;
+      return false;
     }
     const confirm = await this.awaitConfirm(modal);
-    if (!confirm) return;
+    if (!confirm) return false;
     // Re-check at the push: the early check avoids showing a doomed modal, but
     // the await above is a TOCTOU window — concurrent enqueues could all pass
     // the early check and overshoot the cap (safety gate finding, probe-proven).
     if (this.deployQueue.length >= DEPLOY_QUEUE_MAX) {
       vscode.window.showInformationMessage(`SF Deploy: the queue filled up while the confirmation was open (${DEPLOY_QUEUE_MAX} max) — this deploy was NOT queued.`);
-      return;
+      return false;
     }
-    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return; }
+    if (this.twinQueued(org, entryKeys, validateOnly)) { this.notifyAlreadyQueued(noun, orgLabel, validateOnly); return false; }
     this.deployQueue.push({
       id: crypto.randomBytes(8).toString('hex'),
       keys: entryKeys,
@@ -2488,6 +2861,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // ever run this item (post-release review, MED). If the slot is already
     // free, kick the drain ourselves.
     if (!this.busy) queueMicrotask(() => this.drainQueue());
+    return true;
   }
 
   /** Is an identical entry — same pinned org, same key set, same mode — already
@@ -2550,10 +2924,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** Render the status card for a completed deploy/validate, including Apex test
    *  failures (surfaced when a test-level ran) and a Quick Deploy affordance for a
-   *  successful validation. */
-  /** Posts the deploy/validate result card. Returns the dependency detection for
-   *  a FAILED deploy (undefined on success) so an auto-resolving retry can decide
-   *  whether another round would add anything. */
+   *  successful validation. Returns the dependency detection for a FAILED deploy
+   *  (undefined on success) so runDeploy's caller can report 'failed' vs 'ok'. */
   private reportDeployResult(
     result: DeployResult,
     ctx: {
@@ -2606,7 +2978,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
             : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
           meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
-          lines: [...lines, ...skipLines],
+          lines: this.capForCard(`Deployed to ${orgLabel} — full component list`, [...lines, ...skipLines]),
           // Built from the ITEMS, not from the display lines: a manifest deploy
           // synthesizes its items straight from <members> (wildcards and all) and
           // a reattached job synthesizes them from the org's own report, so those
@@ -2682,10 +3054,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         problem: fileProblem(f) ?? ''
       }));
       if (envProblem) problemRows.push({ problem: envProblem });
+      // A test-only failure (the deploy itself succeeded, but a test assertion
+      // named a missing dependency — "System.NullPointerException" from a class
+      // referencing a __mdt record the org doesn't have, say) used to never reach
+      // the detector at all: testFailures never joined problemRows.
+      for (const t of testFailures) {
+        if (t.message) problemRows.push({ from: t.name ? `ApexClass:${t.name}` : undefined, problem: t.message });
+      }
+      // Vouches for a missing field's parent object too (detectMissingDependencies'
+      // "No such column" rule) — only when THIS org's membership was actually
+      // fetched; otherwise isLocalOnly stays undefined and the rule no-ops exactly
+      // as it did before it existed.
+      const isLocalOnly = this.orgMembersOrg === org ? (key: string): boolean => !this.orgMembers.has(key) : undefined;
       const deps = detectMissingDependencies(
         problemRows.map(row => row.problem),
         this.items,
-        new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`))
+        new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`)),
+        { isLocalOnly }
       );
       // "Retry + changed vs branch" was offered here in 0.15.0 and removed on user
       // feedback — the Changed lens already owns that workflow. The
@@ -2705,12 +3090,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // keeps the authority: liveSuggestions holds the server-side truth the
       // webview's clicks are validated against.
       const suggest = retryKeys && !ctx.retry?.sourceDir
-        ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys))
+        ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys), { isLocalOnly })
         : [];
       let suggestPayload: { id: string; candidates: SuggestionCandidateInfo[]; unresolved: string[] } | undefined;
       if (suggest.length && ctx.retry) {
         const id = `sug-${Date.now()}-${this.suggestionSeq++}`;
-        this.rememberSuggestion(id, { candidates: suggest, retry: ctx.retry, orgLabel });
+        // `org` (the username, not the alias) rides along so an accepted retry
+        // can be PINNED to it — the panel's org selector may have moved on by the
+        // time the user acts on the suggestion.
+        this.rememberSuggestion(id, { candidates: suggest, unresolved: deps.unresolved, retry: ctx.retry, orgLabel, org });
         suggestPayload = { id, candidates: suggest, unresolved: deps.unresolved };
       }
       // The unresolved diagnosis still renders as a guidance line when there is
@@ -2733,19 +3121,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           kind: 'err',
           title: validateOnly ? `Validation failed against ${orgLabel}` : `Deploy failed against ${orgLabel}`,
           meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}, ${successes.length} success${testFailures.length ? ` · ${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}` : ''}`,
-          lines: [
+          lines: this.capForCard(`Deploy failed against ${orgLabel} — full detail list`, [
             ...guidanceLines,
             ...errLines,
             ...testLines,
             ...skipLines
-          ],
+          ]),
           ...(buttons ? { buttons } : {}),
           ...(suggestPayload ? { suggest: suggestPayload } : {})
         }
       });
-      // An auto-resolving retry round that is about to run again suppresses its
-      // own toast — otherwise one logical "resolve the dependencies" action
-      // fires a failure toast per round. The final round always reports.
       const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
       // Details also mirror into the output channel so "Show Output" opens a log
       // that actually mentions the failure.
@@ -3206,6 +3591,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (items.length === 0) return;
       const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
       const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
+      // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
+      // ~32 KB command-line limit well under 1,000 components — see runDeploy.
+      const useManifest = !opts.sourceDir && items.length > MANIFEST_THRESHOLD;
 
       const orgOnlyCount = items.filter(i => !i.filePath).length;
       const localCount = items.length - orgOnlyCount;
@@ -3216,7 +3604,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           : 'This will overwrite your local files.';
       const confirm = await vscode.window.showWarningMessage(
         `Retrieve ${noun} from ${orgLabel}?`,
-        { modal: true, detail },
+        { modal: true, detail: [detail, manifestNotice(useManifest)].filter(Boolean).join('\n') },
         'Retrieve'
       );
       if (confirm !== 'Retrieve') return;
@@ -3245,13 +3633,27 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // check stays as the last safety net. Deploy keeps its opt-in toggle — there
       // the overwrite hits the org, not a backed-up file.
       const ignoreConflicts = backupDir !== undefined;
-      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
+      // useManifest: same temp package.xml approach as runDeploy — Type:Name keys
+      // and the result mapping below are unaffected, only the argv target changes.
+      let manifest: { path: string; dir: string } | undefined;
+      if (useManifest) {
+        try {
+          manifest = await this.writeTempManifest(items);
+        } catch (err) {
+          this.reportError(`Retrieve from ${orgLabel}`, err);
+          return; // releaseBusy() in the outer finally frees the slot
+        }
+      }
+      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
       reserved = false;
       const start = Date.now();
       try {
         await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
         this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
-        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, ignoreConflicts });
+        // The metadata list is passed as usual even when useManifest is set —
+        // retrieveMetadata's own precedence (manifest wins) ignores it, same as
+        // the manifest-file retrieve feature below (runManifestRetrieve).
+        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, manifest: manifest?.path, ignoreConflicts });
         this.currentCancel = handle.cancel;
         const { result, cmd } = await handle.promise;
         this.updateCmd(cmdId, cmd);
@@ -3275,7 +3677,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: 'ok',
               title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
               ...(backupNote ? { meta: backupNote } : {}),
-              lines: ok.map(f => `${f.type}:${f.fullName}`),
+              lines: this.capForCard(`Retrieved from ${orgLabel} — full component list`, ok.map(f => `${f.type}:${f.fullName}`)),
               ...this.backupCardButtons(backupDir)
             }
           });
@@ -3292,9 +3694,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           });
           this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
         } else {
+          // Failures FIRST: capForCard cuts off the TAIL, and a failure must
+          // never be the thing that gets cut just because there were more
+          // successes ahead of it in the list.
           const lines: string[] = [];
-          for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
           for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`);
+          for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
           for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
           lines.push(...msgLines);
           this.post({
@@ -3303,7 +3708,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               kind: failed.length > 0 ? 'err' : 'warn',
               title: `Retrieve from ${orgLabel} completed with issues`,
               meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing${backupNote ? ` · ${backupNote}` : ''}`,
-              lines,
+              lines: this.capForCard(`Retrieve from ${orgLabel} — full detail list`, lines),
               ...this.backupCardButtons(backupDir)
             }
           });
@@ -3323,6 +3728,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       } finally {
         this.currentCancel = undefined;
         this.setBusy(false);
+        await this.cleanupTempManifest(manifest?.dir);
       }
     } finally {
       releaseBusy();
@@ -4066,7 +4472,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             // one toast so the setting doesn't look broken with no explanation.
             if (!this.diffFloatWarned) {
               this.diffFloatWarned = true;
-              void vscode.window.showInformationMessage("SF Deploy: couldn't open the diff in its own window — it stayed as a tab.");
+              // Same as the watcher notice: a card so the explanation outlives
+              // the status-bar line when the panel is visible.
+              this.post({
+                type: 'status',
+                card: { kind: 'warn', title: 'Diff stayed as a tab', meta: 'This window could not float the diff into its own window (sfOrgDeployWrapper.openDiffInFloatingWindow).', lines: [String(e)] }
+              });
+              this.notify('info', "couldn't open the diff in its own window — it stayed as a tab.");
             }
           });
         };
@@ -4076,6 +4488,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // can't resolve cleanly falls back to the retrieve below.
         const fastItems = items.filter(i => FAST_DIFF_FIELD[i.type]);
         const slowItems = items.filter(i => !FAST_DIFF_FIELD[i.type]);
+        // One flag for the whole diff: a Cancel flips it AND kills whatever sf call
+        // is in flight, and every loop below checks it before its next editor. A
+        // bare `handle.cancel` is a no-op once that handle has settled, so a Cancel
+        // during the editor-opening phase used to lock the button as "Cancelling…"
+        // while every remaining diff still opened.
+        let diffCancelled = false;
         if (fastItems.length > 0) {
           report('querying org (Tooling API)…');
           this.postProgress(`Fetching ${fastItems.length} component${fastItems.length === 1 ? '' : 's'} from ${orgLabel} via Tooling API…`);
@@ -4087,9 +4505,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // A Cancel landing BETWEEN two per-type queries used to be lost: currentCancel
           // then points at the just-settled query handle, so calling it is a no-op and
           // the loop rolls on to the next type. Mirror loadOrgMetadata's fetchCancelled —
-          // the wrapper flips a flag AND kills whatever query is in flight; the loop
-          // checks the flag before each query and bails out honestly.
-          let diffCancelled = false;
+          // the wrapper flips the flag AND kills whatever query is in flight; the loop
+          // checks the flag before each query and each editor and bails out honestly.
           const activeQueryCancels = new Set<() => void>();
           this.currentCancel = () => {
             diffCancelled = true;
@@ -4116,6 +4533,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 const body = rec?.[field];
                 if (recs.length === 0) { missing.push(item); continue; }
                 if (typeof body !== 'string' || body === '(hidden)') { slowItems.push(item); continue; }
+                if (diffCancelled) throw new SfCliCancelledError();
                 const staged = await stageDiffText(body, item);
                 tmpPaths.push(staged.dir);
                 await this.openDiff(item, staged.file, orgLabel, diffColumn());
@@ -4131,6 +4549,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               activeQueryCancels.delete(q.cancel);
             }
           }
+          // A Cancel that landed while the LAST type's editors were opening has no
+          // further query to bail out of — honour it before the slow retrieve.
+          if (diffCancelled) throw new SfCliCancelledError();
         }
 
         if (slowItems.length > 0) {
@@ -4152,7 +4573,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const handle = this.sf.retrieveMetadata(
             slowItems.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs() }
           );
-          this.currentCancel = handle.cancel;
+          this.currentCancel = () => { diffCancelled = true; handle.cancel(); };
           let result: RetrieveResult;
           try {
             const r = await handle.promise;
@@ -4171,6 +4592,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
           report('opening diff editors…');
           for (const item of slowItems) {
+            if (diffCancelled) throw new SfCliCancelledError();
             const isChild = OBJECT_CHILD_TYPES.has(item.type);
             let remoteFile: string | undefined;
             if (item === focused) {
@@ -4283,8 +4705,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[org cache] ${org}: ${snap.keys.length} components as of ${new Date(snap.at).toLocaleString()}${hidden ? ` (${hidden} managed hidden)` : ''}`);
     }
     this.postOrgMembership(this.orgs.find(o => o.username === org)?.alias ?? org);
-    const hours = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('orgCacheMaxAgeHours', 24);
-    const maxAgeMs = Math.max(0, Math.min(720, Number.isFinite(hours) ? hours : 24)) * 3_600_000;
+    const hours = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('orgCacheMaxAgeHours', ORG_CACHE_DEFAULT_HOURS);
+    const maxAgeMs = Math.max(0, Math.min(720, Number.isFinite(hours) ? hours : ORG_CACHE_DEFAULT_HOURS)) * 3_600_000;
     return Date.now() - (this.orgMembersAt ?? 0) >= maxAgeMs ? 'stale' : 'fresh';
   }
 
@@ -4341,7 +4763,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.postOrgs();
   }
 
-  private async loadOrgMetadata(): Promise<void> {
+  /** `quiet` is set by the automatic Fetch Org on open (maybeAutoFetchOrg) — see
+   *  its own call site. A manual click ('fetchOrgMetadata' from the webview)
+   *  leaves it false and keeps the full cancellable Notification. */
+  private async loadOrgMetadata(quiet = false): Promise<void> {
     // No await between this check and setBusy below (requireRoot/Org and config
     // reads are synchronous), so reserving here is race-free. reserveBusy keeps the
     // "already running" messaging consistent with the other ops.
@@ -4449,7 +4874,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         };
         await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
         if (fetchCancelled) throw new SfCliCancelledError();
-      });
+      }, { quiet });
 
       // If the user switched the target org while this fetch was in flight, the
       // result describes the wrong org — discard it rather than badge org B's tree
@@ -4608,15 +5033,49 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return byPath ? `${byPath.type}:${byPath.name}` : undefined;
   }
 
+  /** Echoed `--metadata` list, capped at ECHO_METADATA_CAP tokens — display only,
+   *  see its doc comment. */
   private metadataArgs(items: MetadataItem[]): string {
-    return items.map(i => `--metadata ${i.type}:${i.name}`).join(' ');
+    const shown = items.slice(0, ECHO_METADATA_CAP).map(i => `--metadata ${i.type}:${i.name}`).join(' ');
+    const more = items.length - ECHO_METADATA_CAP;
+    return more > 0 ? `${shown} … (+${more} more)` : shown;
   }
 
-  /** Echoed-command target: an explicit `--source-dir <path>` when deploying/retrieving
-   *  a pointed-at file, else the per-component `--metadata` list. */
-  private targetArg(sourceDir: string | undefined, items: MetadataItem[]): string {
-    if (!sourceDir) return this.metadataArgs(items);
-    return `--source-dir ${/\s/.test(sourceDir) ? `"${sourceDir}"` : sourceDir}`;
+  /** Echoed-command target, in the same precedence sfCliService's deployMetadata/
+   *  retrieveMetadata apply: an explicit manifest path (MANIFEST_THRESHOLD) wins,
+   *  then `--source-dir <path>` for a pointed-at file, else the per-component
+   *  `--metadata` list. */
+  private targetArg(sourceDir: string | undefined, items: MetadataItem[], manifestPath?: string): string {
+    if (manifestPath) {
+      const quoted = /\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath;
+      return `--manifest ${quoted} (${items.length} component${items.length === 1 ? '' : 's'})`;
+    }
+    if (sourceDir) return `--source-dir ${/\s/.test(sourceDir) ? `"${sourceDir}"` : sourceDir}`;
+    return this.metadataArgs(items);
+  }
+
+  /** Write a component set to a per-run temp package.xml for the manifest deploy/
+   *  retrieve path (MANIFEST_THRESHOLD) — a fresh mkdtemp dir per run, so
+   *  concurrent queued runs can never collide. The caller removes it via
+   *  cleanupTempManifest once the run is done. */
+  private async writeTempManifest(items: MetadataItem[]): Promise<{ path: string; dir: string }> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-manifest-'));
+    const apiVersion = await resolveApiVersion(this.workspaceRoot ?? process.cwd());
+    const file = path.join(dir, 'package.xml');
+    await fs.writeFile(file, buildManifestXml(items.map(i => ({ type: i.type, name: i.name })), apiVersion), 'utf8');
+    return { path: file, dir };
+  }
+
+  /** Best-effort cleanup for writeTempManifest's dir. The deploy/retrieve already
+   *  ran either way, so a failure here is not the user's problem — log the path
+   *  once (it's a single attempt, not a loop) instead of surfacing an error. */
+  private async cleanupTempManifest(dir: string | undefined): Promise<void> {
+    if (!dir) return;
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch (err) {
+      this.output.appendLine(`[manifest] couldn't remove temp manifest dir ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private timeoutMs(): number {
@@ -4629,14 +5088,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** The slot's current state, as the webview's `busy` message. */
   private postBusy(): void {
-    this.post({ type: 'busy', busy: this.busy, action: this.currentAction });
+    this.post({ type: 'busy', busy: this.busy, action: this.currentAction, cancelling: this.cancelling });
   }
 
   private setBusy(b: boolean, action?: string): void {
     this.busy = b;
     this.currentAction = b ? action : undefined;
+    this.cancelling = false;
     if (!b) this.currentProgressText = undefined;
-    this.post({ type: 'busy', busy: b, action: this.currentAction });
+    this.post({ type: 'busy', busy: b, action: this.currentAction, cancelling: false });
     // Drain the next queued deploy/validate once the slot frees (Feature: deploy
     // queue). A microtask — never synchronous inside the caller's `finally` —
     // so the operation that just finished unwinds its OWN cleanup
@@ -4665,6 +5125,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The "already running" info-message, shared by reserveBusy and the palette-only
    *  commands (refreshFiles/pickOrg) that must refuse mid-op WITHOUT taking the slot. */
   private notifyBusy(): void {
+    // NOT routed through notify(): this is the direct, synchronous answer to a
+    // click the user just made (not a background event), so it must always be
+    // visible regardless of the panel-visible rule — check-double-click.cjs
+    // pins this feedback on every refused click.
     vscode.window.showInformationMessage(this.currentAction
       ? `${this.currentAction} is already running — cancel it from the panel or wait for it to finish.`
       : 'Another operation is already running.');
@@ -4672,10 +5136,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** Run `body` under a cancellable VS Code progress notification so operations
    *  give feedback even when the panel is hidden (context-menu flows). The
-   *  notification's Cancel button maps onto the currently running sf command. */
-  private withWindowProgress<T>(title: string, body: (report: (message: string) => void) => Promise<T>): Promise<T> {
+   *  notification's Cancel button maps onto the currently running sf command.
+   *
+   *  `quiet` swaps that for a status-bar spinner (ProgressLocation.Window) — no
+   *  toast, no Cancel button of its own — for background work nobody clicked:
+   *  the automatic Fetch Org on open and background type resolution. The
+   *  panel's own Cancel button still reaches the running command either way,
+   *  since cancelCurrent is wired independently of which progress UI is up. */
+  private withWindowProgress<T>(
+    title: string,
+    body: (report: (message: string) => void) => Promise<T>,
+    opts: { quiet?: boolean } = {}
+  ): Promise<T> {
     return Promise.resolve(vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `SF Deploy: ${title}`, cancellable: true },
+      {
+        location: opts.quiet ? vscode.ProgressLocation.Window : vscode.ProgressLocation.Notification,
+        title: `SF Deploy: ${title}`,
+        cancellable: !opts.quiet
+      },
       (progress, token) => {
         const sub = token.onCancellationRequested(() => this.cancelCurrent());
         return body(message => progress.report({ message })).finally(() => sub.dispose());
@@ -4803,6 +5281,35 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'orgs', orgs: payload, selected: this.orgStore.get() ?? null });
   }
 
+  /** The persisted-history copy of a card carrying a live suggestion payload.
+   *  The payload itself never survives into storage (see the comment at the call
+   *  site), but without it a card restored after a reload used to say NOTHING
+   *  about what was found — silently dropping guidance the live card had shown.
+   *  This folds that guidance back in as plain `lines` text (the same wording
+   *  reportDeployResult's guidanceLines would have used had there been no
+   *  suggestion UI to carry it), and keeps the suggestion's id under a separate
+   *  `suggestId` field — inert on its own, but a later 'ready' can match it
+   *  against `liveSuggestions` and re-attach the button (see the 'ready' handler)
+   *  if the suggestion is still alive when the webview rebuilds. */
+  private stripSuggestForHistory(card: Record<string, unknown>): Record<string, unknown> {
+    const suggest = card.suggest as { id?: string; candidates?: SuggestionCandidateInfo[]; unresolved?: string[] };
+    const candidates = suggest.candidates ?? [];
+    const unresolved = suggest.unresolved ?? [];
+    const guidanceLines = [
+      ...(candidates.length ? [`Missing but available locally: ${candidates.map(c => c.key).join(', ')} — add them to the deploy by hand.`] : []),
+      ...(unresolved.length
+        ? [`Referenced but not found in your workspace: ${unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
+        : [])
+    ];
+    const existingLines = Array.isArray(card.lines) ? card.lines : [];
+    return {
+      ...card,
+      suggest: undefined,
+      ...(typeof suggest.id === 'string' ? { suggestId: suggest.id } : {}),
+      lines: [...guidanceLines, ...existingLines]
+    };
+  }
+
   private post(msg: unknown): void {
     const m = msg as { type?: string; card?: Record<string, unknown> } | null;
     if (m?.type === 'status' && m.card) {
@@ -4813,7 +5320,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // The suggestion UI is live-only: a card restored after a reload renders
       // without it (inert), so stale checkboxes can't deploy through an expired
       // liveSuggestions entry. History gets a copy WITHOUT the payload.
-      this.pushCardHistory(m.card.suggest ? { ...m.card, suggest: undefined } : m.card);
+      this.pushCardHistory(m.card.suggest ? this.stripSuggestForHistory(m.card) : m.card);
     }
     this.view?.webview.postMessage(msg);
   }
@@ -4854,8 +5361,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (typeof persistable.errText === 'string' && persistable.errText.length > 8_000) {
       persistable.errText = `${persistable.errText.slice(0, 8_000)}\n… (truncated in history)`;
     }
-    if (Array.isArray(persistable.lines) && persistable.lines.length > 100) {
-      persistable.lines = [...persistable.lines.slice(0, 100), `… ${persistable.lines.length - 100} more (truncated in history)`];
+    // > CARD_LINE_CAP + 1, not just > CARD_LINE_CAP: capForCard/capLines already
+    // trims a live card to at most CARD_LINE_CAP real lines plus its own summary
+    // tail (one extra line) — re-slicing at the plain cap would chop that tail
+    // off and replace it with this less useful generic note.
+    if (Array.isArray(persistable.lines) && persistable.lines.length > CARD_LINE_CAP + 1) {
+      persistable.lines = [...persistable.lines.slice(0, CARD_LINE_CAP), `… ${persistable.lines.length - CARD_LINE_CAP} more (truncated in history)`];
     }
     // Same bloat bound for a button that carries a key list ("Select these N"):
     // 50 cards × an unbounded deploy set is state-DB weight nobody asked for.
@@ -4915,8 +5426,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  covers the "command succeeded, deployment failed" outcomes. The status card
    *  in the panel stays the durable, detailed record. */
   /** Mirror a result and its detail lines into the output channel. Split out of
-   *  failureToast so a QUIET auto-resolve round still records why it failed —
-   *  suppressing the toast must never suppress the diagnostics. */
+   *  failureToast so the diagnostics are recorded independently of the toast. */
   private logResultLines(message: string, lines: Array<string | { text: string }> = []): void {
     try {
       this.output.appendLine(`[result] ${message}`);
@@ -4931,6 +5441,101 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
+   *  list into the Output channel first when it's about to be cut — a deploy/
+   *  retrieve over a few thousand components is inconvenient to scroll in a
+   *  card, but the full list must never simply be gone. */
+  private capForCard(header: string, lines: Array<string | { text: string }>): Array<string | { text: string }> {
+    if (lines.length > CARD_LINE_CAP) this.logResultLines(header, lines);
+    return capLines(lines);
+  }
+
+  /** Injection point for notify()'s de-dup/rate-limit clock — real time in
+   *  production; a test stub overrides it to drive the windows deterministically
+   *  instead of sleeping real seconds. */
+  private now(): number { return Date.now(); }
+
+  /**
+   * The single gate every background "something happened" toast goes through —
+   * failureToast, reportError, reportDeployTimeout, applyProjectDiscoveryFailure,
+   * the org-list warning, the watcher warning, the diff-float notice, and
+   * notifyBusy. Confirm modals, QuickPicks and notifyIfPanelHidden's own paths
+   * (a different rule for verdicts — see its own doc comment) do NOT go through
+   * here.
+   *
+   * The reported bug: several of the above can fire within the same few seconds
+   * of a panel opening, stacking unreadably in VS Code's non-scrollable
+   * notification area. Three rules address that:
+   *  - a VISIBLE panel already carries the detail on a card — a toast on top of
+   *    it is pure noise, so only the status bar gets a line (unless `force`,
+   *    unused today but kept as a hook);
+   *  - an identical headline within a minute is a repeat, not news — counted
+   *    and logged instead of shown again;
+   *  - more than a few toasts within ten seconds IS the flood — the rest of
+   *    that window collapses into one pointer at the Output channel, since VS
+   *    Code has no way to update a toast already on screen.
+   * The headline itself is the first non-empty line only, so a multi-line CLI
+   * message can never render as an unreadable wall of text in the toast — the
+   * full message always stays on the card / in the Output channel.
+   */
+  private notify(
+    kind: 'error' | 'warn' | 'info',
+    message: string,
+    opts: { buttons?: Array<'Show Panel' | 'Show Output'>; force?: boolean } = {}
+  ): void {
+    const headline = notifyHeadline(message);
+    const now = this.now();
+
+    const icon = kind === 'error' ? '$(error)' : kind === 'warn' ? '$(warning)' : '$(info)';
+    if (this.view?.visible && !opts.force) {
+      // The card is already on screen — see notifyIfPanelHidden's own doc for
+      // why the same rule applies here. Checked BEFORE the dedupe: a status-bar
+      // line replaces the previous one rather than stacking, so there is nothing
+      // to throttle, and a second failure with the same first line must still
+      // register live (the card differs; the headline may not).
+      vscode.window.setStatusBarMessage(`${icon} SF Deploy: ${headline}`, 8000);
+      return;
+    }
+
+    const dup = this.notifyDedupe;
+    if (dup && dup.headline === headline && now - dup.at < NOTIFY_DEDUPE_MS) {
+      dup.count++;
+      dup.at = now;
+      this.output.appendLine(`[notify] suppressed duplicate ×${dup.count}: ${headline}`);
+      return;
+    }
+    this.notifyDedupe = { headline, at: now, count: 1 };
+
+    const times = (this.notifyToastTimes ??= []).filter(t => now - t < NOTIFY_RATE_WINDOW_MS);
+    this.notifyToastTimes = times;
+    if (times.length >= NOTIFY_RATE_LIMIT) {
+      const overflow = this.notifyOverflow && now - this.notifyOverflow.windowStart < NOTIFY_RATE_WINDOW_MS
+        ? this.notifyOverflow
+        : (this.notifyOverflow = { windowStart: now, count: 0 });
+      overflow.count++;
+      this.output.appendLine(`[notify] rate-limited ×${overflow.count} this window: ${headline}`);
+      // VS Code cannot update a toast already on screen, so only the FIRST
+      // overflow in a window shows one — later ones just bump the Output count.
+      if (overflow.count === 1) {
+        void Promise.resolve(
+          vscode.window.showWarningMessage(`SF Deploy: ${overflow.count} more notice${overflow.count === 1 ? '' : 's'} — see Output`, 'Show Output')
+        ).then(choice => { if (choice === 'Show Output') this.output.show(true); }, () => undefined);
+      }
+      return;
+    }
+    times.push(now);
+
+    const text = `SF Deploy: ${headline}`;
+    const buttons = opts.buttons ?? [];
+    const promise = kind === 'error' ? vscode.window.showErrorMessage(text, ...buttons)
+      : kind === 'warn' ? vscode.window.showWarningMessage(text, ...buttons)
+      : vscode.window.showInformationMessage(text, ...buttons);
+    void Promise.resolve(promise).then(choice => {
+      if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
+      if (choice === 'Show Output') this.output.show(true);
+    }, () => undefined);
+  }
+
   private failureToast(message: string, lines: Array<string | { text: string }> = []): void {
     // Belt: this is a reporting path, so a synchronous throw from post()/output must
     // not cascade into the caller's catch and mask the real failure. Fall back to the
@@ -4940,10 +5545,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // first; the details are ALSO mirrored into the output channel so
       // "Show Output" opens a log that actually mentions the failure.
       this.logResultLines(message, lines);
-      void vscode.window.showErrorMessage(`SF Deploy: ${message}`, 'Show Panel', 'Show Output').then(choice => {
-        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-        if (choice === 'Show Output') this.output.show(true);
-      }, () => undefined);
+      this.notify('error', message, { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[failureToast] failed to report "${message}": ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -4977,10 +5579,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           buttons: deployFailureButtons(retry, isConflictFailure(err))
         }
       });
-      void vscode.window.showErrorMessage(`SF Deploy: ${action} failed. ${message}`, 'Show Panel', 'Show Output').then(choice => {
-        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-        if (choice === 'Show Output') this.output.show(true);
-      }, () => undefined);
+      this.notify('error', `${action} failed. ${message}`, { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[reportError] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -5006,13 +5605,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large deployments.`
         }
       });
-      void vscode.window.showWarningMessage(
-        `SF Deploy: ${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
-        'Show Panel', 'Show Output'
-      ).then(choice => {
-        if (choice === 'Show Panel') void vscode.commands.executeCommand('sfOrgDeployWrapper.panel.focus');
-        if (choice === 'Show Output') this.output.show(true);
-      }, () => undefined);
+      this.notify('warn', `${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
+        { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[reportDeployTimeout] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -5495,6 +6089,18 @@ function sameKeySet(a: readonly string[], b: readonly string[]): boolean {
   return b.every(k => set.has(k));
 }
 
+/** debugTiming: a webview click-timing field is untrusted (postMessage from a
+ *  possibly-stale or compromised webview) — accepted only if finite and
+ *  non-negative, else the span is omitted rather than printing NaN. */
+function safeMs(n: unknown): number | undefined {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/** Renders one debugTiming span; 'n/a' for a missing/garbage value. */
+function fmtSpan(ms: number | undefined): string {
+  return ms === undefined ? 'n/a' : `${Math.round(ms)} ms`;
+}
+
 function isUnder(root: string, abs: string): boolean {
   const r = foldPathKey(root);
   const a = foldPathKey(abs);
@@ -5591,6 +6197,17 @@ interface ToolingCodeRecord {
   Name?: string;
   NamespacePrefix?: string | null;
   [field: string]: unknown;
+}
+
+/** notify()'s toast text: the first non-empty line of `message`, ANSI-stripped,
+ *  whitespace-collapsed, and capped so a multi-line CLI error can never render
+ *  as an unreadable wall of text in a toast — the full message stays on the
+ *  card and in the Output channel. Pure, and exported so the cap and the
+ *  first-line rule are assertable on their own. */
+export function notifyHeadline(message: string): string {
+  const firstLine = stripAnsi(message).split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '';
+  const collapsed = firstLine.replace(/\s+/g, ' ').trim();
+  return collapsed.length > NOTIFY_HEADLINE_MAX ? `${collapsed.slice(0, NOTIFY_HEADLINE_MAX - 1)}…` : collapsed;
 }
 
 /**
@@ -5748,18 +6365,69 @@ function overwriteNotice(ignoreConflicts: boolean, validateOnly: boolean, queued
   return queued ? `${body} The setting is re-read when this queued run starts.` : body;
 }
 
+/** Modal detail line for a run above MANIFEST_THRESHOLD: names why the command
+ *  log will show `--manifest <path>` instead of one `--metadata` flag per
+ *  component, so the changed shape doesn't read as a bug. */
+function manifestNotice(useManifest: boolean | undefined): string | undefined {
+  return useManifest ? 'Large selection — sent via a generated package.xml manifest, not one --metadata flag per component.' : undefined;
+}
+
+/** Cap on the per-key attribution lines autoIncludedNotice renders in the
+ *  MODAL — a confirm dialog (unlike the post-deploy card) has to stay readable
+ *  on a PROD warning too, so this is far tighter than CARD_LINE_CAP; the
+ *  full list always lives on the result card (A1). */
+const AUTO_NOTICE_LINE_CAP = 8;
+
 /**
- * Modal detail line for "Deploy File + Dependencies": the one deploy path where
- * the confirmed set is mostly NOT what the user selected. The count alone
- * ("Deploy 26 components to …") reads as panel state gone wrong when the user
- * right-clicked a single file, so name the split — the file they picked, plus how
- * many the dependency scan added — while the deploy can still be refused.
- * Undefined for every other path, which keeps their modals byte-for-byte as they
- * were, and for a scan that added nothing (the count is then simply the truth).
+ * Modal detail block for "Deploy File + Dependencies" (and the suggestion
+ * accept path): the one confirm where the set is mostly NOT what the user
+ * picked. The count alone ("Deploy 26 components to …") reads as panel state
+ * gone wrong when the user right-clicked a single file, so this names the
+ * split AND — when per-key attribution is available (`refs`) — the first few
+ * additions and why, capped so a PROD warning modal stays readable, plus an
+ * honest note when the scan itself hit its caps (A1/A13: `dropped` is a floor,
+ * "at least N", never a guess pretending to be exact).
+ *
+ * `refs` is absent on the suggestion path (no dependency scan runs there) —
+ * that falls back to the original one-line summary pointing at the result
+ * card, so an existing caller that never passed `refs` keeps working exactly
+ * as before. Undefined for every other deploy path (auto.count <= 0), which
+ * keeps their modals byte-for-byte as they were.
  */
-export function autoIncludedNotice(auto: { count: number; entryKey: string } | undefined): string | undefined {
+export function autoIncludedNotice(auto: AutoIncludedInfo | undefined): string | undefined {
   if (!auto || auto.count <= 0) return undefined;
-  return `Includes ${auto.count} component${auto.count === 1 ? '' : 's'} auto-included as local dependencies of ${auto.entryKey} — the result card lists each one and what referenced it.`;
+  const noun = `component${auto.count === 1 ? '' : 's'}`;
+  const refs = auto.refs ?? [];
+  if (refs.length === 0) {
+    return `Includes ${auto.count} ${noun} auto-included as local dependencies of ${auto.entryKey} — the result card lists each one and what referenced it.`;
+  }
+  const lines = [
+    `Includes ${auto.count} ${noun} auto-included as local dependencies of ${auto.entryKey}:`,
+    ...capLines(refs.map(r => `${r.key} — via ${r.from}`), AUTO_NOTICE_LINE_CAP)
+  ];
+  if (auto.truncated) {
+    const depth = auto.maxDepth ?? DEFAULT_MAX_DEPTH;
+    const cap = auto.maxComponents ?? DEFAULT_MAX_DEPS;
+    const dropped = Math.max(auto.dropped ?? 0, 0);
+    lines.push(
+      `The scan hit its limits (depth ${depth}, ${cap} components) — at least ${dropped} more reference${dropped === 1 ? '' : 's'} ${dropped === 1 ? 'was' : 'were'} not followed.`
+    );
+  }
+  return lines.join('\n');
+}
+
+/** Bound a status card's `lines` at `max`, appending one summary line instead of
+ *  rendering (and persisting) every entry — a deploy/retrieve over a few
+ *  thousand components would otherwise do exactly that. Pure and order-
+ *  preserving: callers that need failures to survive the cut put those lines
+ *  first. */
+export function capLines<T extends string | { text: string }>(
+  lines: T[],
+  max: number = CARD_LINE_CAP,
+  more: (n: number) => string = n => `… and ${n} more — full list in the Output channel`
+): Array<T | string> {
+  if (lines.length <= max) return lines;
+  return [...lines.slice(0, max), more(lines.length - max)];
 }
 
 /** Preposition for a verb in card / progress / toast text: a check-only run
