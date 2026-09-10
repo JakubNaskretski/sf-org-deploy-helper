@@ -6,7 +6,8 @@
 // restored on rebuild. That makes three quiet behaviours worth pinning, none of
 // which any provider-side suite can see:
 //   1) the round trip — a change persists, and a scan that FINDS something prunes
-//      keys that no longer exist and writes the prune back;
+//      keys that no longer exist and writes the prune back, once org membership
+//      has had its say (a rebuild's first scan arrives before it);
 //   2) authority — an EMPTY scan (project discovery failed, or the scan hasn't
 //      really run) must NOT be treated as proof the components are gone, or one
 //      workspace hiccup destroys the selection permanently;
@@ -36,7 +37,14 @@
 //      slot-taking ones) synchronously until the provider's `busy` reply —
 //      Deploy/Validate/Retry queue while busy but never send while pending —
 //      Rescan locks until `filesRefreshed`, and a repeated `busy` post is a
-//      no-op for the progress card and the Status pane.
+//      no-op for the progress card and the Status pane;
+//   9) selection vs the filters: a selection made FOR the user (Use active file,
+//      Use open tabs, a card's "Select these N") clears whatever filter would
+//      hide it — it used to bump the count and change nothing else — the Selected
+//      lens ignores the type and source filters (they are for FINDING components
+//      in All) so it can account for the count above it, a group checkbox ticks
+//      only rows with a source to deploy, and a real scan is the one thing that
+//      takes stale keys back out of the persisted expandedGroups set.
 //
 // panel.js is a browser-only IIFE with no exports, so it is run inside a minimal
 // DOM/vscode-API shim and driven the way the provider drives it: by delivering
@@ -231,11 +239,23 @@ check('a restored selection is live after the scan lands', () => {
   assert.deepStrictEqual(p.persisted().selected.slice().sort(), THREE.map(KEY).sort());
 });
 
-check('a key deleted between sessions is pruned by a real scan, and the prune persists', () => {
+check('a key deleted between sessions is pruned once the scan can be trusted, and the prune persists', () => {
+  // Updated in 0.23.2: the FIRST scan of a rebuilt webview lands before org
+  // membership does, so it is not yet proof a key is gone — pruning there took
+  // every org-only key with it (see "an org-only key survives the rebuild scan"
+  // below). Membership completes the picture, and so does the next explicit scan.
   const p = panel(RESTORED);
   p.deliver(FILES(['AcmeOrderService', 'AcmeOrderServiceTest'])); // AcmeInvoiceService is gone
+  assert.strictEqual(p.liveCount(), 3, 'nothing can vouch for an org-only key yet');
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [] });
   assert.strictEqual(p.liveCount(), 2);
   assert.deepStrictEqual(p.persisted().selected.slice().sort(), [KEY('AcmeOrderService'), KEY('AcmeOrderServiceTest')].sort());
+  // No org fetch at all: the next explicit scan prunes on its own.
+  const q = panel(RESTORED);
+  q.deliver(FILES(['AcmeOrderService', 'AcmeOrderServiceTest']));
+  q.deliver(FILES(['AcmeOrderService', 'AcmeOrderServiceTest']));
+  assert.strictEqual(q.liveCount(), 2);
+  assert.deepStrictEqual(q.persisted().selected.slice().sort(), [KEY('AcmeOrderService'), KEY('AcmeOrderServiceTest')].sort());
 });
 
 check('a selection change is written back immediately', () => {
@@ -288,6 +308,36 @@ check('an org switch still drops org-only keys once a scan exists', () => {
   assert.strictEqual(p.liveCount(), 2);
   p.deliver({ type: 'orgMetadataReset' });
   assert.deepStrictEqual(p.persisted().selected, [KEY('AcmeOrderService')]);
+});
+
+check('an org-only key survives the rebuild scan, and membership does the prune it could not', () => {
+  // A rebuild replays `files` BEFORE `orgMetadata`: at the first scan orgKeys is
+  // still empty, so pruning against it deleted every key ticked from the Org lens
+  // to retrieve — and persisted the deletion seconds before membership arrived.
+  const ORG_ONLY = KEY('AcmeOrgOnlyService');
+  const GHOST = KEY('AcmeGhostService'); // exists nowhere: local, org, or otherwise
+  const p = panel({ ...RESTORED, selected: [KEY('AcmeOrderService'), ORG_ONLY, GHOST] });
+  p.deliver(FILES(['AcmeOrderService']));
+  assert.strictEqual(p.liveCount(), 3, 'the first scan pruned keys nothing had been asked about yet');
+  assert.ok(p.persisted().selected.includes(ORG_ONLY), 'and persisted the loss');
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnlyService' }] });
+  assert.deepStrictEqual(
+    p.persisted().selected.slice().sort(), [KEY('AcmeOrderService'), ORG_ONLY].sort(),
+    'membership is what the ghost key had to be pruned against'
+  );
+  assert.strictEqual(p.liveCount(), 2);
+  // And every later scan prunes exactly as it always did.
+  p.deliver(FILES(['AcmeInvoiceService'])); // AcmeOrderService deleted since
+  assert.deepStrictEqual(p.persisted().selected, [ORG_ONLY]);
+  assert.strictEqual(p.liveCount(), 1);
+  // The membership prune answers to the same authority rule as the scan one:
+  // after a discovery failure there is no local list, and org membership alone is
+  // no proof a local component is gone.
+  const q = panel(RESTORED);
+  q.deliver({ type: 'files', objectChildTypes: [], items: [] });
+  q.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnlyService' }] });
+  assert.strictEqual(q.liveCount(), 3, 'an empty scan plus org membership is still not evidence');
+  assert.deepStrictEqual(q.persisted().selected.slice().sort(), THREE.map(KEY).sort());
 });
 
 check('an empty scan does not wipe the type filter either', () => {
@@ -726,8 +776,8 @@ const onlyBtn = (p, type) => p.el('typeFilterList').find(e => e.tagName === 'BUT
 const rowLabel = (p, type) => { const b = onlyBtn(p, type); return b && b.parentNode.children[0]; };
 const tab = (p, mode) => p.el('viewModes').children.find(b => b.dataset.mode === mode).textContent;
 
-// ---- 9. lens tab counts honour the type filter (0.22.0) ----
-check('Selected / Changed tab counts follow the type filter, like the rows do', () => {
+// ---- 9. lens tab counts match the rows their lens draws (0.22.0; Selected 0.23.2) ----
+check('the Changed tab count follows the type filter; Selected counts the whole selection', () => {
   const p = panel();
   p.deliver({ type: 'files', objectChildTypes: [], items: [item('ApexClass', 'A1'), item('ApexClass', 'A2'), item('Flow', 'F1')] });
   p.deliver({ type: 'selectKeys', keys: ['ApexClass:A1', 'ApexClass:A2', 'Flow:F1'], replace: true });
@@ -735,11 +785,12 @@ check('Selected / Changed tab counts follow the type filter, like the rows do', 
   assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
   assert.strictEqual(tab(p, 'changed'), 'Changed (2)');
   onlyBtn(p, 'Flow').fire('click');
-  assert.strictEqual(tab(p, 'selected'), 'Selected (1)', 'only Flow → one selected row visible');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)', 'the Selected lens ignores the type filter, so its count must too');
   assert.strictEqual(tab(p, 'changed'), 'Changed (1)');
   assert.strictEqual(p.liveCount(), 3, 'the live selection itself is untouched by the filter');
   p.el('typeFilterNone').fire('click');
-  assert.strictEqual(tab(p, 'selected'), 'Selected', 'nothing visible → bare label');
+  assert.strictEqual(tab(p, 'changed'), 'Changed', 'nothing visible → bare label');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
   p.el('typeFilterAll').fire('click');
   assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
   assert.strictEqual(tab(p, 'all'), 'All');
@@ -970,6 +1021,78 @@ check('aliased types are labelled "Type (Alias)" on group headers and filter row
   assert.deepStrictEqual(p.persisted().typeFilter, ['OmniUiCard']);
 });
 
+// ------------------------- 6d) selection vs the filters, and what a group ticks
+// A selection made FOR the user has to be visible, the Selected lens has to
+// account for the count above it, and a bulk tick may only take rows that have
+// a source to deploy.
+const groupCb = (p, label) => {
+  const h = p.el('tree').find(e => e.className === 'group-header' && e.children[2].textContent === label);
+  return h && h.children[0];
+};
+
+check('a reveal clears the filters that would hide the row it just ticked', () => {
+  // The symptom: "Use active file" / "Use open tabs" / a card's "Select these N"
+  // bumped the count and changed nothing else, and Deploy later sent a component
+  // that was never on screen.
+  const p = panel({ ...BASE, filter: 'flow' });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.deepStrictEqual(names(p), ['AcmeF'], 'fixture: the text filter must hide the ApexClass');
+  p.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeA'], scroll: true });
+  assert.strictEqual(p.el('search').value, '', 'the search box still holds the filter that hid the new row');
+  assert.strictEqual(p.persisted().filter, '');
+  assert.ok(names(p).includes('AcmeA'), `the newly selected row never rendered: ${names(p).join(', ')}`);
+  // The type filter goes the same way — and a filter that hides nothing stays.
+  const q = panel({ ...BASE, typeFilter: ['Flow'], filter: 'acme' });
+  q.deliver(TFILES(THREE_TYPES));
+  q.deliver({ type: 'activeFile', key: 'ApexClass:AcmeA', select: true, scroll: true });
+  assert.deepStrictEqual(q.persisted().typeFilter, []);
+  assert.strictEqual(q.persisted().filter, 'acme', 'a filter the new row matches must be left alone');
+  assert.ok(names(q).includes('AcmeA'), `the newly selected row never rendered: ${names(q).join(', ')}`);
+  // Source filter too: an org-only reveal under "local only" is just as invisible.
+  const r = panel(BASE);
+  r.deliver(TFILES(THREE_TYPES));
+  r.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnly' }] });
+  r.el('sourceFilter').value = 'local-only'; r.el('sourceFilter').fire('change');
+  r.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeOrgOnly'] });
+  assert.strictEqual(r.el('sourceFilter').value, 'all');
+  assert.ok(names(r).includes('AcmeOrgOnly'), `the newly selected row never rendered: ${names(r).join(', ')}`);
+});
+
+check('the Selected lens ignores the type and source filters — it lists what Deploy would send', () => {
+  const THREE_CLASSES = ['ApexClass:AcmeA', 'ApexClass:AcmeB', 'ApexClass:AcmeC'];
+  const ITEMS = [item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeB'), item('ApexClass', 'AcmeC'), item('Flow', 'AcmeF')];
+  const p = panel({ ...BASE, typeFilter: ['Flow'], viewMode: 'selected', selected: THREE_CLASSES });
+  p.deliver(TFILES(ITEMS));
+  assert.deepStrictEqual(names(p).slice().sort(), ['AcmeA', 'AcmeB', 'AcmeC'], '"3 selected" stood above a list that could not account for it');
+  assert.strictEqual(tab(p, 'selected'), 'Selected (3)');
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [] });
+  p.el('sourceFilter').value = 'org-only'; p.el('sourceFilter').fire('change');
+  assert.deepStrictEqual(names(p).slice().sort(), ['AcmeA', 'AcmeB', 'AcmeC'], 'the source filter is the same kind of tool');
+  // The text filter is the user's own search WITHIN the lens, so it still applies…
+  const q = panel({ ...BASE, filter: 'acmea', viewMode: 'selected', selected: THREE_CLASSES });
+  q.deliver(TFILES(ITEMS));
+  assert.deepStrictEqual(names(q), ['AcmeA']);
+  // …and the All lens keeps obeying every one of them.
+  const r = panel({ ...BASE, typeFilter: ['Flow'], selected: THREE_CLASSES });
+  r.deliver(TFILES(ITEMS));
+  assert.deepStrictEqual(groups(r), ['Flow'], 'the type filter still narrows the All lens');
+});
+
+check('a group checkbox ticks only the local rows, and reads checked when they all are', () => {
+  const p = panel({ ...BASE, expandedGroups: ['ApexClass'] });
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeB')]));
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnly' }] });
+  assert.deepStrictEqual(names(p).slice().sort(), ['AcmeA', 'AcmeB', 'AcmeOrgOnly'], 'fixture: the group must hold the org-only row too');
+  groupCb(p, 'ApexClass').fire('change');
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), ['ApexClass:AcmeA', 'ApexClass:AcmeB'], 'an org-only row has no source to deploy');
+  assert.strictEqual(p.liveCount(), 2);
+  const cb = groupCb(p, 'ApexClass');
+  assert.strictEqual(cb.checked, true, 'every row a bulk tick may take is ticked — that is not partial');
+  assert.strictEqual(cb.indeterminate, false);
+  cb.fire('change'); // and the same click clears them again
+  assert.deepStrictEqual(p.persisted().selected, []);
+});
+
 // ------------------------------------------------ 7) Expand all / Collapse all
 check('the tools row sits above #tree in the markup', () => {
   assert.ok(/<div id="treeTools" class="mode-head tree-tools"[^>]*>[\s\S]*?<button id="expandAll"[\s\S]*?<button id="collapseAll"[\s\S]*?<\/div>\s*<div id="tree" class="tree">/.test(HTML_TS));
@@ -1038,6 +1161,34 @@ check('the tools row hides when there is nothing to expand', () => {
   assert.strictEqual(q.el('treeTools').style.display, 'none', 'an empty filtered tree has no groups either');
   q.el('typeFilterAll').fire('click');
   assert.strictEqual(q.el('treeTools').style.display, 'flex', 'and it comes back with the groups');
+});
+
+check('a real scan drops expandedGroups keys whose group no longer exists', () => {
+  // expandPathForKey adds without checking and "Collapse all" was the only way
+  // out, so every deleted or renamed object stayed in webview state for good.
+  const STALE = ['__OBJECTS__', 'obj/Gone__c', 'objc/Gone__c/CustomField', 'obj/Acme__c', 'objc/Acme__c/CustomField', 'ApexClass', 'Flow'];
+  const p = panel({ ...BASE, expandedGroups: STALE });
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  assert.deepStrictEqual(
+    p.persisted().expandedGroups.slice().sort(),
+    ['ApexClass', '__OBJECTS__', 'obj/Acme__c', 'objc/Acme__c/CustomField'],
+    'the deleted object, its child group and a vanished type all go; the rest stays'
+  );
+  // Groups are kept for org-only types too — the tree draws those rows.
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'Layout', name: 'AcmeLayout' }] });
+  p.el('expandAll').fire('click');
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  assert.ok(p.persisted().expandedGroups.includes('Layout'), 'an org-only type has a group of its own');
+  // A background rescan may not do it, for the same reason it may not prune the
+  // selection: a partial list is indistinguishable from a deletion.
+  const q = panel({ ...BASE, expandedGroups: ['obj/Gone__c'] });
+  q.deliver({ ...TFILES(NESTED, ['CustomField']), silent: true });
+  assert.deepStrictEqual(q.persisted().expandedGroups, ['obj/Gone__c']);
+  // …and neither may an empty scan, which is no evidence at all.
+  const r = panel({ ...BASE, expandedGroups: ['obj/Gone__c'] });
+  r.deliver({ type: 'files', objectChildTypes: [], items: [] });
+  r.el('clearSel').fire('click'); // any change writes back what is in memory now
+  assert.deepStrictEqual(r.persisted().expandedGroups, ['obj/Gone__c']);
 });
 
 check('Expand / Collapse all never touch the selection', () => {
