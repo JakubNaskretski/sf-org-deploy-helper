@@ -1151,21 +1151,15 @@
 
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    // Bulk select is local-only, like the Changed lens's "Select all"
-    // (localKeysInGroups): an org-only row has no source to deploy, so ticking it
-    // only inflates the count and rides along in the persisted selection. The
-    // tri-state reads the same subset — otherwise a group whose local rows are all
-    // ticked could never show as checked.
-    const localKeys = itemKeys.filter(k => state.localKeys.has(k));
-    const sel = localKeys.filter(k => state.selected.has(k)).length;
+    const sel = itemKeys.filter(k => state.selected.has(k)).length;
     if (sel === 0) { cb.checked = false; cb.indeterminate = false; }
-    else if (sel === localKeys.length) { cb.checked = true; cb.indeterminate = false; }
+    else if (sel === itemKeys.length) { cb.checked = true; cb.indeterminate = false; }
     else { cb.checked = false; cb.indeterminate = true; }
     cb.title = 'Select/deselect all visible items in this group';
     cb.addEventListener('click', (e) => e.stopPropagation());
     cb.addEventListener('change', () => {
-      const all = sel === localKeys.length;
-      for (const k of localKeys) { if (all) state.selected.delete(k); else state.selected.add(k); }
+      const all = sel === itemKeys.length;
+      for (const k of itemKeys) { if (all) state.selected.delete(k); else state.selected.add(k); }
       selectionChanged();
     });
     header.appendChild(cb);

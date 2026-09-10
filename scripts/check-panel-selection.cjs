@@ -42,9 +42,8 @@
 //      Use open tabs, a card's "Select these N") clears whatever filter would
 //      hide it — it used to bump the count and change nothing else — the Selected
 //      lens ignores the type and source filters (they are for FINDING components
-//      in All) so it can account for the count above it, a group checkbox ticks
-//      only rows with a source to deploy, and a real scan is the one thing that
-//      takes stale keys back out of the persisted expandedGroups set.
+//      in All) so it can account for the count above it, and a real scan is the
+//      one thing that takes stale keys back out of the persisted expandedGroups set.
 //
 // panel.js is a browser-only IIFE with no exports, so it is run inside a minimal
 // DOM/vscode-API shim and driven the way the provider drives it: by delivering
@@ -1021,15 +1020,9 @@ check('aliased types are labelled "Type (Alias)" on group headers and filter row
   assert.deepStrictEqual(p.persisted().typeFilter, ['OmniUiCard']);
 });
 
-// ------------------------- 6d) selection vs the filters, and what a group ticks
-// A selection made FOR the user has to be visible, the Selected lens has to
-// account for the count above it, and a bulk tick may only take rows that have
-// a source to deploy.
-const groupCb = (p, label) => {
-  const h = p.el('tree').find(e => e.className === 'group-header' && e.children[2].textContent === label);
-  return h && h.children[0];
-};
-
+// ------------------------------------------ 6d) selection vs the filters
+// A selection made FOR the user has to be visible, and the Selected lens has to
+// account for the count above it.
 check('a reveal clears the filters that would hide the row it just ticked', () => {
   // The symptom: "Use active file" / "Use open tabs" / a card's "Select these N"
   // bumped the count and changed nothing else, and Deploy later sent a component
@@ -1076,21 +1069,6 @@ check('the Selected lens ignores the type and source filters — it lists what D
   const r = panel({ ...BASE, typeFilter: ['Flow'], selected: THREE_CLASSES });
   r.deliver(TFILES(ITEMS));
   assert.deepStrictEqual(groups(r), ['Flow'], 'the type filter still narrows the All lens');
-});
-
-check('a group checkbox ticks only the local rows, and reads checked when they all are', () => {
-  const p = panel({ ...BASE, expandedGroups: ['ApexClass'] });
-  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeB')]));
-  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnly' }] });
-  assert.deepStrictEqual(names(p).slice().sort(), ['AcmeA', 'AcmeB', 'AcmeOrgOnly'], 'fixture: the group must hold the org-only row too');
-  groupCb(p, 'ApexClass').fire('change');
-  assert.deepStrictEqual(p.persisted().selected.slice().sort(), ['ApexClass:AcmeA', 'ApexClass:AcmeB'], 'an org-only row has no source to deploy');
-  assert.strictEqual(p.liveCount(), 2);
-  const cb = groupCb(p, 'ApexClass');
-  assert.strictEqual(cb.checked, true, 'every row a bulk tick may take is ticked — that is not partial');
-  assert.strictEqual(cb.indeterminate, false);
-  cb.fire('change'); // and the same click clears them again
-  assert.deepStrictEqual(p.persisted().selected, []);
 });
 
 // ------------------------------------------------ 7) Expand all / Collapse all
