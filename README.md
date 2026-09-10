@@ -16,6 +16,8 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
   above the tree. OmniStudio types answer to their designer names too (`flexcard`,
   `dataraptor`, `integration procedure`).
 - One-click **Deploy**, **Retrieve**, **Diff** against the selected org.
+- Large selections deploy and retrieve through a generated `package.xml` automatically —
+  the operating system's command-line limit never caps how many components you can pick.
 - Modal confirms before destructive ops, plus a hard **PROD** guard.
 - Right-click any metadata file in the explorer for Deploy / Retrieve / Diff.
 - Status-bar org indicator, status card history, command log with timings.

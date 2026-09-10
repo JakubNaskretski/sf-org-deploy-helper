@@ -3,6 +3,22 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.22.2
+
+- Fixed: **Deploying or retrieving a large selection no longer fails on the command line.**
+  Every selected component used to become one `--metadata Type:Name` argument, so a big
+  selection grew the command until the operating system refused to start the CLI (Windows
+  stops at 8,191 characters; macOS and Linux have a larger but still finite limit). A list
+  that would not fit is now written to a generated `package.xml` and handed to the CLI with
+  `--manifest`: the same components, spelled exactly as the flag would have spelled them, so
+  the set that reaches the org is identical (checked against the CLI itself, which produces
+  byte-identical output for the two forms — `npm run check` re-proves it on any machine with
+  `sf` installed). The decision is made per run from the actual length, on every platform
+  alike; smaller selections keep the `--metadata` form. The command log shows the manifest
+  route, the Output channel says why, and the temporary file is removed once the CLI has
+  read it. **Delete from Org**, which has no manifest form, now says up front when a selection
+  is too large to delete in one command instead of failing when the CLI is launched.
+
 ## 0.22.1
 
 - Fixed: **"No Salesforce DX project found" right after startup no longer sticks.** The first
