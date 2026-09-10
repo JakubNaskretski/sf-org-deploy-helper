@@ -522,9 +522,9 @@ check('retrieve: a local timeout is reported as a timeout, naming the setting th
   assert.ok(/timed out$/.test(card.title), card.title);
   assert.ok(card.hint && card.hint.includes('sfOrgDeployWrapper.commandTimeoutMs'),
     `the raise-the-cap setting must be named: ${JSON.stringify(card.hint)}`);
-  // Retrieve wording, NOT the deploy one: nothing was written locally, and there
-  // is no org-side deploy to go and check.
-  assert.ok(/nothing was written locally/i.test(`${card.meta} ${card.hint}`), `${card.meta} / ${card.hint}`);
+  // Retrieve wording, NOT the deploy one: files may not have been written, and
+  // there is no org-side deploy to go and check.
+  assert.ok(/files may not have been written/i.test(`${card.meta} ${card.hint}`), `${card.meta} / ${card.hint}`);
   assert.ok(!/still be running on the org/i.test(`${card.meta} ${card.hint}`), 'deploy wording leaked into a retrieve');
 });
 

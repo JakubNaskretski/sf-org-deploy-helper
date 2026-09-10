@@ -3,6 +3,34 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.23.2
+
+- Fixed: **A file added while the panel was still scanning no longer goes missing.** A component
+  created during the panel's opening scan, or during any other scan, used to stay out of the tree
+  until the next file change or a manual Refresh, because the watcher's rescan joined the scan that
+  was already running instead of following it. It now runs one more scan once that one finishes.
+- Fixed: **Components ticked from the org view survive a window reload.** The panel used to prune
+  its remembered selection the moment the local file list arrived after a reload, before the org
+  listing had, so every org-only component ticked for Retrieve was dropped and the loss saved. The
+  first scan after a reload no longer prunes; the org listing does, once it is in.
+- Fixed: **A selection made for you is always visible.** "Use active file", "Use open tabs" and a
+  card's "Select these N" now clear whatever search, type or source filter would hide the rows they
+  tick, instead of bumping the count and changing nothing else while Deploy quietly included a
+  component that was never on screen. The Selected view ignores the type and source filters, so its
+  count always matches its rows; the search box still applies inside it.
+- Fixed: **A retrieve that hits the local timeout says so.** A large retrieve killed by
+  `sfOrgDeployWrapper.commandTimeoutMs` (180 s by default) now gets the same card and hint a deploy
+  timeout gets, naming the setting, instead of a raw "timed out" error.
+- Fixed: **The command log survives a window reload.** The panel replays its recent commands, so a
+  command that finishes after the reload updates its own row instead of appearing as a blank one.
+- Fixed: **Delete from Org refuses a selection too large for one command** up front, with a note to
+  delete in smaller batches, instead of failing when the CLI is launched (the delete command has no
+  manifest form, so the large-selection package.xml route cannot apply to it).
+- Changed: **The generated package.xml for a large selection no longer pins an API version** when
+  `sfdx-project.json` names no `sourceApiVersion`; the CLI then picks the version exactly as it does
+  for a small deploy. With a `sourceApiVersion` present, nothing changes.
+- Changed: the panel forgets expanded groups that no longer exist, so its saved state stops growing.
+
 ## 0.23.1
 
 - Changed: **The remembered org listing now stays fresh for a week.** `sfOrgDeployWrapper.orgCacheMaxAgeHours`

@@ -5662,20 +5662,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.handleError(action, err);
       const retrieve = kind === 'retrieve';
       const note = retrieve
-        ? 'The org may have completed the retrieve, but nothing was written locally — no local file was changed.'
+        ? 'The org may have completed the retrieve, but the local command was stopped before it finished writing files — check your working tree before retrying.'
         : 'Killing the local command does not stop the deploy on the org — it MAY STILL BE RUNNING. Check the org\'s Deployment Status (Setup) or run `sf project deploy report` before retrying, to avoid deploying twice into a conflict.';
       this.post({
         type: 'status',
         card: {
           kind: 'err',
           title: `${action} timed out`,
-          meta: retrieve ? 'Local command timed out — nothing was written locally' : 'Local command timed out — the deploy may still be running on the org',
+          meta: retrieve ? 'Local command timed out — files may not have been written' : 'Local command timed out — the deploy may still be running on the org',
           errText: stripAnsi(message).trim(),
           hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large ${retrieve ? 'retrieves' : 'deployments'}.`
         }
       });
       this.notify('warn', retrieve
-        ? `${action} timed out — nothing was written locally. Raise sfOrgDeployWrapper.commandTimeoutMs and try again.`
+        ? `${action} timed out — files may not have been written. Raise sfOrgDeployWrapper.commandTimeoutMs and try again.`
         : `${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
         { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
