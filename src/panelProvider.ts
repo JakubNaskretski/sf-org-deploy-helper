@@ -285,9 +285,11 @@ const CHANGED_RETRY_MAX_ADDED = 100;
 const MANIFEST_THRESHOLD = 30;
 
 /** `sf project delete source` has no `--manifest` form, so a delete is always one
- *  `--metadata Type:Name` argv token per component. Past this many characters of
- *  rendered list the spawn itself fails on Windows' ~32 KB command line, with an
- *  OS-level error nobody can act on — refuse first instead. */
+ *  `--metadata Type:Name` argv token per component. On Windows the sf.cmd shim's
+ *  cmd.exe fallback caps the whole command line at 8,191 characters, where the
+ *  spawn itself fails with an OS-level error nobody can act on — refuse first
+ *  instead (deleteArgvLimit). 6,000 leaves room for the launcher path and the
+ *  fixed flags; elsewhere ARG_MAX is hundreds of KB and there is no cap. */
 const DELETE_ARGV_LIMIT = 6000;
 
 /** Cap the ECHOED `--metadata` list at this many tokens ("… (+N more)") — the
@@ -964,6 +966,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private async handleMessage(msg: Inbound): Promise<void> {
     switch (msg.type) {
       case 'ready':
+        // Replay the command log FIRST — before the awaits below — so a command
+        // that ends meanwhile merges into its replayed row instead of landing
+        // above it. Oldest first: the webview unshifts each entry and merges by
+        // id, so it ends up with exactly the list it had before the rebuild.
+        for (const entry of this.cmdLog ?? []) this.post({ type: 'cmd', entry });
         // Project discovery is the gate for every automatic org operation. The old
         // Promise.all started org loading while the scanner blindly treated the
         // first workspace folder as a valid cwd; a missing project could therefore
@@ -989,9 +996,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
-        // Same for the command log, oldest first: the webview unshifts each entry and
-        // merges by id, so it ends up with exactly the list it had before the rebuild.
-        for (const entry of this.cmdLog ?? []) this.post({ type: 'cmd', entry });
         // Re-attach the "Try with dependencies" button for any suggestion still
         // alive server-side: the persisted copy above dropped the live payload
         // (stripSuggestForHistory), so a webview rebuilt after that — sidebar
@@ -4013,6 +4017,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
         if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`);
+        else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve');
         else this.reportError(`Retrieve from ${orgLabel}`, err);
       } finally {
         this.currentCancel = undefined;
@@ -4058,7 +4063,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const noun = `${n} component${n === 1 ? '' : 's'}`;
       // No manifest escape hatch for delete (see DELETE_ARGV_LIMIT) — refuse before
       // the dry run rather than let the spawn fail on the command-line limit.
-      if (metadata.reduce((chars, key) => chars + '--metadata '.length + key.length + 1, 0) > DELETE_ARGV_LIMIT) {
+      if (metadata.reduce((chars, key) => chars + '--metadata '.length + key.length + 1, 0) > this.deleteArgvLimit()) {
         vscode.window.showWarningMessage(`SF Deploy: ${noun} are too many to delete in one command — the per-component list exceeds the command-line limit. Delete in smaller batches.`);
         return;
       }
@@ -5124,6 +5129,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       this.output.appendLine(`[manifest] couldn't remove temp manifest dir ${dir}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /** The delete cap for this platform (DELETE_ARGV_LIMIT): Windows only. A method
+   *  so the harness can pick the platform. */
+  private deleteArgvLimit(): number {
+    return process.platform === 'win32' ? DELETE_ARGV_LIMIT : Infinity;
   }
 
   private timeoutMs(): number {

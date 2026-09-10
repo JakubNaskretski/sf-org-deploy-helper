@@ -506,7 +506,8 @@ check('a silent rescan still SHOWS what changed on disk', () => {
 
 check('a silent rescan does not touch the type filter either', () => {
   const p = panel({ ...RESTORED, typeFilter: ['ApexTrigger'] });
-  p.deliver(FILES(THREE));                 // explicit: ApexTrigger is stale, it goes
+  p.deliver(FILES(THREE));                 // the first scan may not judge a name (rebuild rule)…
+  p.deliver(FILES(THREE));                 // …explicit and trusted: ApexTrigger is stale, it goes
   assert.deepStrictEqual(p.persisted().typeFilter, []);
   const q = panel({ ...RESTORED, typeFilter: ['ApexTrigger'] });
   q.deliver(SILENT(THREE));
@@ -1141,11 +1142,34 @@ check('the tools row hides when there is nothing to expand', () => {
   assert.strictEqual(q.el('treeTools').style.display, 'flex', 'and it comes back with the groups');
 });
 
+check('a type filter naming an org-only type survives the rebuild scan', () => {
+  // Same deferral as the selection: the first scan has not seen the org, so it
+  // may not judge a type it cannot know about — it used to empty the filter
+  // ("all types") on every reload of a project whose filter named an org-only type.
+  const p = panel({ ...BASE, typeFilter: ['Layout'] });
+  p.deliver(FILES(['AcmeOrderService']));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['Layout'], 'the first scan may not prune a type it has not seen the org for');
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'Layout', name: 'AcmeLayout' }] });
+  assert.deepStrictEqual(p.persisted().typeFilter, ['Layout'], 'membership vouches for it');
+  p.deliver(FILES(['AcmeOrderService']));
+  assert.deepStrictEqual(p.persisted().typeFilter, ['Layout'], 'and later scans know the org type too');
+  // Without membership, the SECOND scan is the one that prunes a truly stale type
+  // (a filter left with nothing to name reads as "all", as it always did).
+  const q = panel({ ...BASE, typeFilter: ['Layout'] });
+  q.deliver(FILES(['AcmeOrderService']));
+  q.deliver(FILES(['AcmeOrderService']));
+  assert.deepStrictEqual(q.persisted().typeFilter, [], 'nothing vouched for Layout by the second scan');
+});
+
 check('a real scan drops expandedGroups keys whose group no longer exists', () => {
   // expandPathForKey adds without checking and "Collapse all" was the only way
   // out, so every deleted or renamed object stayed in webview state for good.
   const STALE = ['__OBJECTS__', 'obj/Gone__c', 'objc/Gone__c/CustomField', 'obj/Acme__c', 'objc/Acme__c/CustomField', 'ApexClass', 'Flow'];
   const p = panel({ ...BASE, expandedGroups: STALE });
+  // The first scan of a rebuilt webview cannot vouch for org-only groups (see the
+  // rebuild check above), so it leaves the set alone; the next scan prunes.
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  assert.deepStrictEqual(p.persisted().expandedGroups.slice().sort(), STALE.slice().sort(), 'the first scan may not judge groups it has not seen the org for');
   p.deliver(TFILES(NESTED, ['CustomField']));
   assert.deepStrictEqual(
     p.persisted().expandedGroups.slice().sort(),

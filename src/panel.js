@@ -423,6 +423,22 @@
     }
   }
 
+  // Every prune a trusted scan owes (see the `files` handler): the selection, the
+  // persisted expandedGroups set and the type filter, all against local ∪ org.
+  // Returns true when the selection or the type filter changed — the two that
+  // can change what renders.
+  function pruneState() {
+    let pruned = pruneSelection();
+    pruneExpandedGroups();
+    // Drop stale type-filter entries (allow org types too). The None sentinel is
+    // not a type name: pruning it as one turned a deliberate "no types" into
+    // "all types" on every webview rebuild.
+    const types = knownTypes();
+    for (const t of Array.from(state.typeFilter)) if (t !== TYPE_NONE && !types.includes(t)) { state.typeFilter.delete(t); pruned = true; }
+    if (normalizeTypeFilter(types)) pruned = true;
+    return pruned;
+  }
+
   function handleMessage(msg) {
     switch (msg.type) {
       case 'orgs':
@@ -479,18 +495,15 @@
         // provider's own scan anyway.
         let pruned = false;
         if (!msg.silent && (state.items.length > 0 || state.orgKeys.size > 0)) {
-          if (state.scannedOnce || state.orgLoaded) pruned = pruneSelection();
+          // The same deferral covers the expandedGroups and type-filter prunes: an
+          // expanded org-only object group, or a filter naming an org-only type,
+          // would otherwise be dropped by a scan that has not seen the org yet.
+          if (state.scannedOnce || state.orgLoaded) pruned = pruneState();
+          // The filter's persisted SHAPE (normalizeTypeFilter) is repaired on every
+          // scan, as it always was — only the judging of names waits.
+          else if (normalizeTypeFilter(knownTypes())) pruned = true;
           state.scannedOnce = true;
-          // Deleted objects/types would otherwise sit in expandedGroups forever:
-          // nothing but "Collapse all" ever took a key out.
-          pruneExpandedGroups();
-          // Drop stale type-filter entries (allow org types too)
-          const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
-          // The None sentinel is not a type name: pruning it as one turned a
-          // deliberate "no types" into "all types" on every webview rebuild.
-          for (const t of Array.from(state.typeFilter)) if (t !== TYPE_NONE && !allKnownTypes.has(t)) { state.typeFilter.delete(t); pruned = true; }
-          if (normalizeTypeFilter(Array.from(allKnownTypes))) pruned = true;
-          savePersisted(); // both prunes above are now the persisted truth too
+          savePersisted(); // the prunes above are now the persisted truth too
         }
         // A type seen for the first time joins a plain-names filter so it shows
         // (noteNewTypes). It can't change an item list identical to the last one,
@@ -528,7 +541,7 @@
         // handler skipped happens here, against local ∪ org. Gated on a scan that
         // FOUND something, like every other prune: membership alone is no proof a
         // local component is gone (project discovery may simply have failed).
-        if (state.items.length > 0 && pruneSelection()) savePersisted();
+        if (state.items.length > 0 && pruneState()) savePersisted();
         noteNewTypes(knownTypes());
         renderSourceFilter();
         renderTypeFilter();
@@ -1085,6 +1098,9 @@
   function clearFiltersHiding(keys) {
     let text = false, type = false, source = false;
     for (const k of keys) {
+      // A key that renders nothing (a card naming a since-deleted component) is
+      // no reason to touch the filters.
+      if (!state.localKeys.has(k) && !state.orgKeys.has(k)) continue;
       const [t, name] = splitKey(k);
       if (!isTypeAllowed(t)) type = true;
       if (!isSourceAllowed(itemSource(k))) source = true;

@@ -490,9 +490,14 @@ const longItems = n => Array.from({ length: n }, (_, i) => ({
   files: []
 }));
 
-check('delete: 300 long-named components are refused before anything runs', async () => {
+// The cap is a Windows fact (the sf.cmd shim's cmd.exe fallback stops at 8,191
+// characters); deleteArgvLimit() is the platform's answer, stubbed here so the
+// checks read the same on every OS.
+const onWindows = { afterDelete: async () => {}, deleteArgvLimit: () => 6000 };
+
+check('delete: 300 long-named components are refused before anything runs (Windows cap)', async () => {
   const items = longItems(300);
-  const p = provider(items, { fields: { afterDelete: async () => {} } });
+  const p = provider(items, { fields: onWindows });
   warns.length = 0;
   await runDelete(p, keysOf(items));
   assert.strictEqual(p.calls.deleteSource.length, 0, 'not even the dry run may be spawned — the argv is what fails');
@@ -502,9 +507,18 @@ check('delete: 300 long-named components are refused before anything runs', asyn
   assert.ok(!refusal.modal, 'a refusal is not a confirm — nothing to agree to');
 });
 
+check('delete: the same 300 components are NOT refused where the command line has room', async () => {
+  const items = longItems(300);
+  const p = provider(items, { fields: { afterDelete: async () => {}, deleteArgvLimit: () => Infinity } });
+  warns.length = 0;
+  await runDelete(p, keysOf(items));
+  assert.ok(p.calls.deleteSource.length >= 1, 'macOS/Linux ARG_MAX is hundreds of KB — a 300-component delete worked before and must still');
+  assert.ok(!warns.some(w => /too many to delete/.test(w.message)), 'no refusal off Windows');
+});
+
 check('delete: 20 components still go through the dry run and the confirm', async () => {
   const items = longItems(20);
-  const p = provider(items, { fields: { afterDelete: async () => {} } });
+  const p = provider(items, { fields: onWindows });
   warns.length = 0;
   await runDelete(p, keysOf(items));
   assert.ok(p.calls.deleteSource.length >= 1, 'an ordinary delete must be unaffected by the guard');

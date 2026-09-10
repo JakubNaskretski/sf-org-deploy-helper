@@ -3,8 +3,10 @@
 //   1) npm run compile   2) node scripts/check-cmd-log.cjs
 //
 // The bug: begin/update/end only POSTED `{type:'cmd', entry}` and kept nothing, so
-// a window reload (or a collapsed/reopened sidebar) came back with an empty log —
-// while the Status pane beside it replayed its whole history. Worse, a command
+// a rebuilt webview (the view moved between the sidebar and the panel area; the
+// sidebar itself is retained when collapsed) came back with an empty log — while
+// the Status pane beside it replayed its whole history. A window reload restarts
+// the extension host too, so the log starts over there by design. Worse, a command
 // still running across the rebuild finished into the fresh webview as an END entry,
 // which deliberately carries no `command` text (so a completion can't wipe the text
 // of the entry it merges into): with nothing to merge onto, the webview unshifted it
@@ -144,14 +146,19 @@ check('the kept log is bounded at 50, newest kept', async () => {
   assert.deepStrictEqual(replayed, ids.slice(-50), 'the OLDEST entries are the ones dropped, order preserved');
 });
 
-check('the replay follows statusHistory — both panes rebuild in the same pass', async () => {
+check('the replay is the FIRST thing ready posts — before its awaits, so a command ending meanwhile merges into its row', async () => {
+  // `ready` awaits the file scan and the org list before it replays the Status
+  // pane. A command that ends inside that window used to reach the fresh webview
+  // before its own replayed row, which then landed ABOVE it: [c1, c2] came back
+  // as c1 over c2. Replaying before the first await closes the window.
   const p = provider();
   p.s.cardHistoryCache = [{ kind: 'ok', title: 'Deployed 1 component', at: 1 }];
   p.begin('sf project deploy start --metadata ApexClass:A --target-org acme-dev');
   await p.rebuild();
   const types = p.posted.map(m => m.type);
   assert.ok(types.includes('statusHistory'), 'fixture broken: no status history replayed');
-  assert.ok(types.indexOf('cmd') > types.indexOf('statusHistory'), types.join(','));
+  assert.strictEqual(types[0], 'cmd', types.join(','));
+  assert.ok(types.indexOf('cmd') < types.indexOf('statusHistory'), types.join(','));
 });
 
 (async () => {

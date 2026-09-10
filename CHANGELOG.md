@@ -16,13 +16,16 @@ This file starts at the current release; earlier history predates it.
 - Fixed: **A selection made for you is always visible.** "Use active file", "Use open tabs" and a
   card's "Select these N" now clear whatever search, type or source filter would hide the rows they
   tick, instead of bumping the count and changing nothing else while Deploy quietly included a
-  component that was never on screen. The Selected view ignores the type and source filters, so its
-  count always matches its rows; the search box still applies inside it.
+  component that was never on screen. The Selected view ignores the type and source filters and its
+  tab counts the whole selection, so the two can no longer disagree; the search box still applies
+  inside it.
 - Fixed: **A retrieve that hits the local timeout says so.** A large retrieve killed by
   `sfOrgDeployWrapper.commandTimeoutMs` (180 s by default) now gets the same card and hint a deploy
   timeout gets, naming the setting, instead of a raw "timed out" error.
-- Fixed: **The command log survives a window reload.** The panel replays its recent commands, so a
-  command that finishes after the reload updates its own row instead of appearing as a blank one.
+- Fixed: **The command log survives the panel being rebuilt.** When VS Code recreates the view (for
+  example after moving it between the sidebar and the panel area), the panel replays its recent
+  commands, so a command that finishes after the rebuild updates its own row instead of appearing as
+  a blank one. A window reload still starts the log afresh.
 - Fixed: **Delete from Org refuses a selection too large for one command** up front, with a note to
   delete in smaller batches, instead of failing when the CLI is launched (the delete command has no
   manifest form, so the large-selection package.xml route cannot apply to it).
