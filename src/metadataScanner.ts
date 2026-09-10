@@ -164,15 +164,14 @@ export async function resolvePackageDirs(root: string): Promise<string[]> {
   return ['force-app'];
 }
 
-/** Fallback `<version>` for a generated manifest (large-selection deploy/retrieve,
- *  see MANIFEST_THRESHOLD in panelProvider.ts) when the project names none — a
- *  recent, still-supported API version beats failing the whole run over one field. */
-const DEFAULT_MANIFEST_API_VERSION = '62.0';
-
 /** Read `sourceApiVersion` from sfdx-project.json (the same field the CLI itself
- *  defaults deploys to) for a generated manifest's `<version>`. Same read-and-
- *  fall-back shape as resolvePackageDirs. */
-export async function resolveApiVersion(root: string): Promise<string> {
+ *  defaults deploys to) for a generated manifest's `<version>`. Same read shape as
+ *  resolvePackageDirs, but NO fallback: a manifest `<version>` WINS over the
+ *  project's own sourceApiVersion (source-deploy-retrieve only defaults the field
+ *  when the component set leaves it unset), so inventing one would silently deploy
+ *  a project at an API version it never asked for. Undefined = say nothing and let
+ *  the CLI decide, exactly as the `--metadata` route does. */
+export async function resolveApiVersion(root: string): Promise<string | undefined> {
   try {
     const cfg = await fs.readFile(path.join(root, 'sfdx-project.json'), 'utf8');
     const parsed = JSON.parse(cfg) as { sourceApiVersion?: string };
@@ -180,7 +179,7 @@ export async function resolveApiVersion(root: string): Promise<string> {
   } catch {
     // ignore
   }
-  return DEFAULT_MANIFEST_API_VERSION;
+  return undefined;
 }
 
 /** Build a package.xml for a component set, types and members both sorted and
@@ -189,7 +188,7 @@ export async function resolveApiVersion(root: string): Promise<string> {
  *  `--metadata Type:Name` argv token per component — the real failure mode is
  *  Windows' ~32 KB command-line limit, hit around 500 components. Pure (no I/O),
  *  so it's directly unit-testable. */
-export function buildManifestXml(items: Array<{ type: string; name: string }>, apiVersion: string): string {
+export function buildManifestXml(items: Array<{ type: string; name: string }>, apiVersion?: string): string {
   const byType = new Map<string, Set<string>>();
   for (const { type, name } of items) {
     let names = byType.get(type);
@@ -206,7 +205,10 @@ export function buildManifestXml(items: Array<{ type: string; name: string }>, a
     const members = [...byType.get(type)!].sort().map(n => `    <members>${escape(n)}</members>`).join('\n');
     return `  <types>\n${members}\n    <name>${escape(type)}</name>\n  </types>`;
   }).join('\n');
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n${typeBlocks}\n  <version>${escape(apiVersion)}</version>\n</Package>\n`;
+  // No apiVersion → no `<version>` at all (see resolveApiVersion): the element is
+  // optional, and omitting it is what hands the choice back to the project/CLI.
+  const version = apiVersion ? `  <version>${escape(apiVersion)}</version>\n` : '';
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n${typeBlocks}\n${version}</Package>\n`;
 }
 
 /**

@@ -20,7 +20,11 @@
 //   4. The provider wiring, through the REAL DeployPanelProvider: one watcher per
 //      package dir with change events ignored, an unchanged root left alone, a
 //      changed root disposing exactly what it replaces, no root = no watcher.
-//   5. The silence contract of a watcher-triggered scan: no `sf` spawn behind a
+//   5. loadFiles' in-flight sharing: a silent rescan answers a file event that is
+//      NEWER than a scan already running, so it must wait and scan once more (all
+//      the silent requests in one flight sharing that single follow-up) instead of
+//      inheriting a directory snapshot taken before the event.
+//   6. The silence contract of a watcher-triggered scan: no `sf` spawn behind a
 //      progress notification, a discovery failure that does NOT empty the tree or
 //      pop an error toast, and a scan that came back EMPTY that is not published as
 //      the truth (a walk can land mid-checkout; the webview prunes its persisted
@@ -86,6 +90,9 @@ Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, 
 const { RescanScheduler, affectsItemList, watchTargets, watchTargetsKey } =
   require(path.join(__dirname, '..', 'out', 'fileWatch.js'));
 const { DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+// Held by reference so a check can swap scanWorkspace for a controllable one —
+// the compiled provider calls it as a module property, not a captured binding.
+const scanner = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
 
 let failed = 0;
@@ -107,9 +114,12 @@ check('source: the once-per-session flag is declared, and the toast sits inside 
 const p = (...s) => path.join(...s);
 const flush = () => new Promise(r => setImmediate(r));
 // Project roots are always absolute in practice (discovery hands back a real
-// directory), and watchTargets resolves against them.
-const PROJ = path.resolve(p('ws', 'proj'));
-const OTHER = path.resolve(p('ws', 'other'));
+// directory), and watchTargets resolves against them. Built from the filesystem
+// root rather than process.cwd(): affectsItemList rejects EVERY dot-directory
+// segment, so running from a cwd that has one (a git worktree under .claude/,
+// say) would fail these for a reason that has nothing to do with the watcher.
+const PROJ = p(path.parse(process.cwd()).root, 'ws', 'proj');
+const OTHER = p(path.parse(process.cwd()).root, 'ws', 'other');
 
 // ------------------------------------------------------------- watchTargets
 check('package dirs resolve against the project root and watch everything below', () => {
@@ -879,9 +889,12 @@ const loadProvider = () => {
 const load = (prov, opts) => DeployPanelProvider.prototype.loadFiles.call(prov, opts);
 
 check('concurrent scan requests share one scan', async () => {
+  // What the in-flight promise exists for: panel `ready` and a context-menu
+  // command both asking for a real scan at once. A SILENT request is the one
+  // case that must NOT simply join — see the follow-up checks below.
   const { prov, calls, finish } = loadProvider();
-  const a = load(prov, { silent: true });
-  const b = load(prov, { silent: true });
+  const a = load(prov, {});
+  const b = load(prov, {});
   assert.strictEqual(calls.length, 1);
   finish();
   await Promise.all([a, b]);
@@ -903,13 +916,79 @@ check('a full scan is never answered by the silent one it landed on', async () =
   await full;
 });
 
-check('a silent request joins a full scan already running', async () => {
+check('a silent request that lands on a running scan waits, then scans ONCE more', async () => {
+  // Not "a full scan is at least as fresh": the running scan's directory walk
+  // predates the file event that scheduled this silent one, and RescanScheduler
+  // re-arms only for events that arrive during its OWN run — so joining the
+  // flight loses the event entirely.
   const { prov, calls, finish } = loadProvider();
   const full = load(prov, {});
   const silent = load(prov, { silent: true });
-  assert.strictEqual(calls.length, 1, 'a full scan is at least as fresh — no reason to run twice');
+  assert.strictEqual(calls.length, 1, 'no second concurrent walk while one is running');
   finish();
-  await Promise.all([full, silent]);
+  await full;
+  await flush();
+  assert.strictEqual(calls.length, 2, 'the file event that arrived mid-scan must still get a scan');
+  assert.deepStrictEqual(calls[1], { silent: true }, 'and it stays silent — the user asked for nothing');
+  finish();
+  await silent;
+});
+
+check('several silent requests during one flight share ONE follow-up scan', async () => {
+  const { prov, calls, finish } = loadProvider();
+  const first = load(prov, { silent: true });
+  const joiners = [load(prov, { silent: true }), load(prov, { silent: true }), load(prov, { silent: true })];
+  assert.strictEqual(calls.length, 1);
+  finish();
+  await first;
+  await flush();
+  assert.strictEqual(calls.length, 2, 'three requests, one follow-up — a burst must not stack scans');
+  finish();
+  await Promise.all(joiners);
+  await flush();
+  assert.strictEqual(calls.length, 2, 'and nothing further is armed once it lands');
+});
+
+// The same contract end to end, through the REAL doLoadFiles and the REAL
+// scanWorkspace: the first walk is held open AFTER it has read the directory,
+// which is exactly the window the reported bug lives in.
+check('a file created while a scan is running still reaches the tree, without a manual Refresh', async () => {
+  const coalesce = path.join(tmp, 'coalesce');
+  const classes = path.join(coalesce, 'force-app', 'main', 'default', 'classes');
+  fs.mkdirSync(classes, { recursive: true });
+  fs.writeFileSync(path.join(coalesce, 'sfdx-project.json'), JSON.stringify({ packageDirectories: [{ path: 'force-app' }] }));
+  fs.writeFileSync(path.join(classes, 'AlphaSvc.cls'), 'public class AlphaSvc {}');
+  ws.folders = [{ uri: { fsPath: coalesce }, name: 'coalesce', index: 0 }];
+  ws.projectFiles = [path.join(coalesce, 'sfdx-project.json')];
+
+  const realScan = scanner.scanWorkspace;
+  let walks = 0;
+  let release;
+  let firstWalked;
+  const held = new Promise(r => { release = r; });
+  const walked = new Promise(r => { firstWalked = r; });
+  scanner.scanWorkspace = async (...args) => {
+    const result = await realScan(...args); // the directory snapshot is taken HERE…
+    if (++walks === 1) { firstWalked(); await held; } // …and this one is still in flight below
+    return result;
+  };
+  try {
+    const { prov, calls } = scanProvider();
+    const full = load(prov, {});          // the panel `ready` / Refresh / post-retrieve scan
+    await walked;
+    fs.writeFileSync(path.join(classes, 'BetaSvc.cls'), 'public class BetaSvc {}'); // the watcher's event
+    const silent = load(prov, { silent: true });
+    release();
+    await Promise.all([full, silent]);
+    await flush();
+    assert.strictEqual(walks, 2, 'the silent request must not be answered by a walk older than its own event');
+    const names = calls.files.map(f => f.items.map(i => i.name).sort().join(','));
+    assert.strictEqual(names[0], 'AlphaSvc', 'the first scan legitimately predates the new file');
+    assert.strictEqual(names[names.length - 1], 'AlphaSvc,BetaSvc', 'the new file never reached the tree');
+    assert.strictEqual(calls.files[calls.files.length - 1].opts.silent, true);
+  } finally {
+    scanner.scanWorkspace = realScan;
+  }
 });
 
 (async () => {

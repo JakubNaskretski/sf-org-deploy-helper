@@ -97,6 +97,20 @@ const CARD_HISTORY_KEY = 'statusCardHistory';
 /** globalState key for the dependency-suggestion feedback log. */
 const SUGGESTION_LOG_KEY = 'sfOrgDeployWrapper.suggestionLog';
 const CARD_HISTORY_MAX = 50;
+
+/** Command-log entries kept for the `ready` replay — the webview's own cap, so a
+ *  rebuilt panel is handed exactly the list it would have kept. */
+const CMD_LOG_MAX = 50;
+
+/** One row of the panel's command log, as the webview merges it (by `id`). */
+interface CmdLogEntry {
+  id: string;
+  timestamp: string;
+  command?: string;
+  status: 'run' | 'ok' | 'err';
+  durationMs?: number;
+}
+
 /** Longest key list a card BUTTON may carry into the persisted history (see
  *  pushCardHistory) — matches the 100-line cap applied to `lines` there. */
 const HISTORY_BUTTON_KEYS_MAX = 100;
@@ -269,6 +283,12 @@ const CHANGED_RETRY_MAX_ADDED = 100;
  *  thousands of flags than reading one file. Only the argv shape changes: the
  *  component set, keys, retry request and result mapping are all unaffected. */
 const MANIFEST_THRESHOLD = 30;
+
+/** `sf project delete source` has no `--manifest` form, so a delete is always one
+ *  `--metadata Type:Name` argv token per component. Past this many characters of
+ *  rendered list the spawn itself fails on Windows' ~32 KB command line, with an
+ *  OS-level error nobody can act on — refuse first instead. */
+const DELETE_ARGV_LIMIT = 6000;
 
 /** Cap the ECHOED `--metadata` list at this many tokens ("… (+N more)") — the
  *  command-log text shown the instant a deploy/retrieve/delete starts, before
@@ -969,6 +989,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Replay the persisted card history into the freshly-built webview — the
         // Status pane is the deployment history (survives reloads, newest first).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        // Same for the command log, oldest first: the webview unshifts each entry and
+        // merges by id, so it ends up with exactly the list it had before the rebuild.
+        for (const entry of this.cmdLog ?? []) this.post({ type: 'cmd', entry });
         // Re-attach the "Try with dependencies" button for any suggestion still
         // alive server-side: the persisted copy above dropped the live payload
         // (stripSuggestForHistory), so a webview rebuilt after that — sidebar
@@ -1746,15 +1769,33 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Whether the in-flight scan is the watcher's silent one. Only meaningful
    *  while `loadFilesInflight` is set (it is assigned immediately before). */
   private loadFilesInflightSilent = false;
+  /** The single follow-up scan owed to silent requests that arrived mid-flight. */
+  private loadFilesFollowUp?: Promise<void>;
 
   private async loadFiles(opts: LoadFilesOptions = {}): Promise<void> {
     // A caller that wants the FULL scan must not be answered by the watcher's
     // silent one, which skips CLI type resolution: let that finish, then run for
-    // real — the same chaining refreshFiles does for its deliberate retry.
-    if (this.loadFilesInflight && this.loadFilesInflightSilent && !opts.silent) {
+    // real — the same chaining refreshFiles does for its deliberate retry. A loop,
+    // not an `if`: the follow-up below can start another silent scan in the very
+    // tick this wakes up.
+    while (this.loadFilesInflight && this.loadFilesInflightSilent && !opts.silent) {
       await this.loadFilesInflight.catch(() => undefined);
     }
-    if (this.loadFilesInflight) return this.loadFilesInflight;
+    if (this.loadFilesInflight) {
+      // A silent request answers a file event the running scan's directory walk
+      // already predates, and RescanScheduler re-arms only for events that arrive
+      // during its OWN run — so joining the flight would leave a file created
+      // meanwhile invisible until the next event or a manual Refresh. Wait, then
+      // scan once more; every silent request during one flight shares that one
+      // follow-up.
+      if (opts.silent) {
+        return this.loadFilesFollowUp ??= this.loadFilesInflight.catch(() => undefined).then(() => {
+          this.loadFilesFollowUp = undefined;
+          return this.loadFiles({ silent: true });
+        });
+      }
+      return this.loadFilesInflight;
+    }
     this.loadFilesInflightSilent = !!opts.silent;
     return this.loadFilesInflight = this.doLoadFiles(opts).finally(() => { this.loadFilesInflight = undefined; });
   }
@@ -3724,6 +3765,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.endCmd(cmdId, false, Date.now() - start);
         // Org-labelled so the exception card is attributable in the mixed-org history.
         if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`);
+        else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve');
         else this.reportError(`Retrieve from ${orgLabel}`, err);
       } finally {
         this.currentCancel = undefined;
@@ -4014,6 +4056,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const metadata = items.map(i => `${i.type}:${i.name}`);
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
+      // No manifest escape hatch for delete (see DELETE_ARGV_LIMIT) — refuse before
+      // the dry run rather than let the spawn fail on the command-line limit.
+      if (metadata.reduce((chars, key) => chars + '--metadata '.length + key.length + 1, 0) > DELETE_ARGV_LIMIT) {
+        vscode.window.showWarningMessage(`SF Deploy: ${noun} are too many to delete in one command — the per-component list exceeds the command-line limit. Delete in smaller batches.`);
+        return;
+      }
 
       // Stage 1 — preview via `--dry-run` (deletes nothing). It validates against the
       // org too, so an auth/network/unknown-component error surfaces HERE, before the
@@ -5389,18 +5437,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   // command log helpers
   private cmdSeq = 0;
+  private cmdLog: CmdLogEntry[] = [];
   private beginCmd(command: string): string {
     const id = `c${++this.cmdSeq}`;
-    this.post({ type: 'cmd', entry: { id, timestamp: new Date().toLocaleTimeString(), command, status: 'run' } });
+    this.postCmd({ id, timestamp: new Date().toLocaleTimeString(), command, status: 'run' });
     return id;
   }
   private updateCmd(id: string, command: string): void {
-    this.post({ type: 'cmd', entry: { id, timestamp: new Date().toLocaleTimeString(), command, status: 'run' } });
+    this.postCmd({ id, timestamp: new Date().toLocaleTimeString(), command, status: 'run' });
   }
   private endCmd(id: string, success: boolean, durationMs: number): void {
     // Don't send an empty `command` — the webview merges entries by id, and a blank
     // command would otherwise wipe the text shown for the finished command.
-    this.post({ type: 'cmd', entry: { id, timestamp: new Date().toLocaleTimeString(), status: success ? 'ok' : 'err', durationMs } });
+    this.postCmd({ id, timestamp: new Date().toLocaleTimeString(), status: success ? 'ok' : 'err', durationMs });
+  }
+
+  /** Post one command-log entry AND keep it, merged by id exactly as the webview
+   *  does, so `ready` can replay the log into a rebuilt panel. Without the history a
+   *  window reload came back with an empty log, and a command that FINISHED after
+   *  the rebuild arrived as an end-entry carrying no `command` — a blank row. */
+  private postCmd(entry: CmdLogEntry): void {
+    // `??=`: harnesses drive these methods on a bare prototype where field
+    // initializers never ran.
+    const log = this.cmdLog ??= [];
+    const at = log.findIndex(e => e.id === entry.id);
+    if (at >= 0) log[at] = { ...log[at], ...entry };
+    else log.push(entry);
+    if (log.length > CMD_LOG_MAX) log.splice(0, log.length - CMD_LOG_MAX);
+    this.post({ type: 'cmd', entry });
   }
 
   private handleError(context: string, err: unknown): void {
@@ -5585,27 +5649,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Report a deploy/validate whose LOCAL process hit the timeout. Killing the sf
-   *  process does NOT stop the org-side deploy — it MAY STILL BE RUNNING — so this
-   *  is reported distinctly from a plain failure: a user who retries into that race
-   *  gets confusing conflicts. Card + toast point them at the org's status first,
-   *  alongside the raise-timeout hint. */
-  private reportDeployTimeout(action: string, err: unknown): void {
+  /** Report a deploy/validate/retrieve whose LOCAL process hit the timeout. Killing
+   *  the sf process does NOT stop the org-side deploy — it MAY STILL BE RUNNING — so
+   *  this is reported distinctly from a plain failure: a user who retries into that
+   *  race gets confusing conflicts. Card + toast point them at the org's status
+   *  first, alongside the raise-timeout hint. A retrieve changes nothing on the org
+   *  and wrote nothing locally when it is killed, so its wording says that instead —
+   *  there the raise-timeout hint is the whole advice. */
+  private reportDeployTimeout(action: string, err: unknown, kind: 'deploy' | 'retrieve' = 'deploy'): void {
     try {
       const message = err instanceof Error ? err.message : String(err);
       this.handleError(action, err);
-      const note = 'Killing the local command does not stop the deploy on the org — it MAY STILL BE RUNNING. Check the org\'s Deployment Status (Setup) or run `sf project deploy report` before retrying, to avoid deploying twice into a conflict.';
+      const retrieve = kind === 'retrieve';
+      const note = retrieve
+        ? 'The org may have completed the retrieve, but nothing was written locally — no local file was changed.'
+        : 'Killing the local command does not stop the deploy on the org — it MAY STILL BE RUNNING. Check the org\'s Deployment Status (Setup) or run `sf project deploy report` before retrying, to avoid deploying twice into a conflict.';
       this.post({
         type: 'status',
         card: {
           kind: 'err',
           title: `${action} timed out`,
-          meta: 'Local command timed out — the deploy may still be running on the org',
+          meta: retrieve ? 'Local command timed out — nothing was written locally' : 'Local command timed out — the deploy may still be running on the org',
           errText: stripAnsi(message).trim(),
-          hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large deployments.`
+          hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large ${retrieve ? 'retrieves' : 'deployments'}.`
         }
       });
-      this.notify('warn', `${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
+      this.notify('warn', retrieve
+        ? `${action} timed out — nothing was written locally. Raise sfOrgDeployWrapper.commandTimeoutMs and try again.`
+        : `${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
         { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[reportDeployTimeout] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
