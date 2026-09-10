@@ -161,10 +161,28 @@ check('the replay is the FIRST thing ready posts — before its awaits, so a com
   assert.ok(types.indexOf('cmd') < types.indexOf('statusHistory'), types.join(','));
 });
 
+check('an end for an id the cap already evicted is not kept — it would replay as a blank row', async () => {
+  // A deploy polled for minutes while 50 newer commands ran: its end entry has
+  // nothing to merge into and carries no command text by design.
+  const p = provider();
+  const slow = p.begin('sf project deploy start --metadata ApexClass:Slow --target-org acme-dev');
+  for (let i = 0; i < 60; i++) p.end(p.begin(`sf org list metadata --metadata-type T${i} --target-org acme-dev`), true, 1);
+  p.end(slow, true, 90_000);
+  await p.rebuild();
+  const replayed = p.posted.filter(m => m.type === 'cmd').map(m => m.entry);
+  assert.strictEqual(replayed.length, 50, 'the cap still holds');
+  assert.ok(replayed.every(e => e.command), 'a replayed entry without command text renders as a blank row');
+});
+
+// A check whose promise never settles would drain the loop and exit 0 with no
+// output — green for the wrong reason. The exit code is a failure until the
+// summary line has actually run.
+process.exitCode = 1;
 (async () => {
   for (const [name, fn] of queue) {
     try { await fn(); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.message}`); }
   }
   if (failed) { console.error(`cmd-log: ${failed}/${queue.length} checks FAILED`); process.exit(1); }
   console.log(`cmd-log: all ${queue.length} checks passed`);
+  process.exitCode = 0;
 })();

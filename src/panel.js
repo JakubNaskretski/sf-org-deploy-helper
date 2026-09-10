@@ -610,6 +610,7 @@
         // stays in whatever lens they were already looking at.
         if (msg.transient) {
           for (const k of keys) expandPathForKey(k);
+          clearFiltersHiding(keys); // a reveal nobody can see reveals nothing
           renderTree();
           if (msg.scroll) scrollKeyIntoView(keys[0]);
           return;
@@ -748,7 +749,9 @@
         // keeps the command text from the initial 'run' entry.
         const existing = state.cmdLog.findIndex(e => e.id === msg.entry.id);
         if (existing >= 0) state.cmdLog[existing] = { ...state.cmdLog[existing], ...msg.entry };
-        else state.cmdLog.unshift(msg.entry);
+        // An end entry with nothing to merge into (its id already fell off the
+        // 50-cap) has no command text: a blank row, not worth a line.
+        else if (msg.entry.command) state.cmdLog.unshift(msg.entry);
         if (state.cmdLog.length > 50) state.cmdLog.length = 50;
         renderCmdLog();
         return;
@@ -1102,8 +1105,12 @@
       // no reason to touch the filters.
       if (!state.localKeys.has(k) && !state.orgKeys.has(k)) continue;
       const [t, name] = splitKey(k);
-      if (!isTypeAllowed(t)) type = true;
-      if (!isSourceAllowed(itemSource(k))) source = true;
+      // The Selected lens ignores the type and source filters (buildGroups), so
+      // neither can hide a row there.
+      if (state.viewMode !== 'selected') {
+        if (!isTypeAllowed(t)) type = true;
+        if (!isSourceAllowed(itemSource(k))) source = true;
+      }
       if (state.filter && !matchesFilter({ type: t, name }, state.filter)) text = true;
     }
     if (!text && !type && !source) return;

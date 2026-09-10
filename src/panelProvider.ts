@@ -5473,7 +5473,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const log = this.cmdLog ??= [];
     const at = log.findIndex(e => e.id === entry.id);
     if (at >= 0) log[at] = { ...log[at], ...entry };
-    else log.push(entry);
+    // An end entry for an id the cap already evicted (a deploy polled for minutes
+    // while 50 newer commands ran) carries no command text — kept, it would replay
+    // as exactly the blank row this history exists to prevent.
+    else if (entry.command) log.push(entry);
     if (log.length > CMD_LOG_MAX) log.splice(0, log.length - CMD_LOG_MAX);
     this.post({ type: 'cmd', entry });
   }

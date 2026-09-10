@@ -116,7 +116,7 @@ const flush = () => new Promise(r => setImmediate(r));
 // Project roots are always absolute in practice (discovery hands back a real
 // directory), and watchTargets resolves against them. Built from the filesystem
 // root rather than process.cwd(): affectsItemList rejects EVERY dot-directory
-// segment, so running from a cwd that has one (a git worktree under .claude/,
+// segment, so running from a cwd that has one (a checkout under a dot-folder,
 // say) would fail these for a reason that has nothing to do with the watcher.
 const PROJ = p(path.parse(process.cwd()).root, 'ws', 'proj');
 const OTHER = p(path.parse(process.cwd()).root, 'ws', 'other');
@@ -991,6 +991,47 @@ check('a file created while a scan is running still reaches the tree, without a 
   }
 });
 
+check('a full request that wakes up into the follow-up scan still gets its own real scan', async () => {
+  // `while`, not `if`: the follow-up starts its silent scan in the very tick the
+  // waiting full request wakes up in (its .then was registered first), and a full
+  // scan may never be answered by a silent one.
+  const { prov, calls, finish } = loadProvider();
+  const silentA = load(prov, { silent: true });
+  const silentB = load(prov, { silent: true }); // arms the follow-up on silentA
+  const full = load(prov, {});                  // waits out silentA
+  assert.strictEqual(calls.length, 1);
+  finish();                                     // silentA done → follow-up starts
+  await silentA;
+  await flush();
+  assert.strictEqual(calls.length, 2, 'fixture: the follow-up is running');
+  assert.deepStrictEqual(calls[1], { silent: true });
+  finish();                                     // follow-up done
+  await silentB;
+  await flush();
+  assert.strictEqual(calls.length, 3, 'the full request must run for real once the follow-up has passed');
+  assert.ok(!calls[2].silent, 'and not be answered by the silent follow-up');
+  finish();
+  await full;
+});
+
+check('the follow-up slot is released — a later silent request during a new flight owes a new one', async () => {
+  const { prov, calls, finish } = loadProvider();
+  const first = load(prov, {});
+  const silent = load(prov, { silent: true });
+  finish(); await first; await flush();         // follow-up #1 running
+  finish(); await silent; await flush();        // follow-up #1 done
+  assert.strictEqual(calls.length, 2);
+  const again = load(prov, {});
+  const silent2 = load(prov, { silent: true }); // a new flight: a new follow-up is owed
+  finish(); await again; await flush();
+  assert.strictEqual(calls.length, 4, 'a follow-up that already ran must not answer a request that came after it');
+  finish(); await silent2;
+});
+
+// A check whose promise never settles would drain the loop and exit 0 with no
+// output — green for the wrong reason. The exit code is a failure until the
+// summary line has actually run.
+process.exitCode = 1;
 (async () => {
   for (const [name, fn] of queue) {
     try { await fn(); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.message}`); }
@@ -998,4 +1039,5 @@ check('a file created while a scan is running still reaches the tree, without a 
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed) { console.error(`\n${failed} of ${queue.length} check(s) failed`); process.exit(1); }
   console.log(`file-watch: all ${queue.length} checks passed`);
+  process.exitCode = 0;
 })();

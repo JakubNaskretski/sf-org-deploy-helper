@@ -542,10 +542,29 @@ check('retrieve: a local timeout is reported as a timeout, naming the setting th
   assert.ok(!/still be running on the org/i.test(`${card.meta} ${card.hint}`), 'deploy wording leaked into a retrieve');
 });
 
+check('delete: the cap is a boundary on the rendered list — at it runs, one character over is refused', async () => {
+  // 20 keys of `ApexClass:` + 40 characters: `--metadata ` (11) + 50 + 1 = 62 each.
+  const items = longItems(20);
+  const at = provider(items, { fields: { afterDelete: async () => {}, deleteArgvLimit: () => 20 * 62 } });
+  warns.length = 0;
+  await runDelete(at, keysOf(items));
+  assert.ok(at.calls.deleteSource.length >= 1, 'a list that fits exactly is not "too many"');
+  const over = provider(items, { fields: { afterDelete: async () => {}, deleteArgvLimit: () => 20 * 62 - 1 } });
+  warns.length = 0;
+  await runDelete(over, keysOf(items));
+  assert.strictEqual(over.calls.deleteSource.length, 0, 'one character over the cap must be refused');
+  assert.ok(warns.some(w => /too many to delete/.test(w.message)));
+});
+
+// A check whose promise never settles would drain the loop and exit 0 with no
+// output — green for the wrong reason. The exit code is a failure until the
+// summary line has actually run.
+process.exitCode = 1;
 (async () => {
   for (const [name, fn] of queue) {
     try { await fn(); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.message}`); }
   }
   if (failed) { console.error(`large-selection: ${failed}/${queue.length} checks FAILED`); process.exit(1); }
   console.log(`large-selection: all ${queue.length} checks passed`);
+  process.exitCode = 0;
 })();

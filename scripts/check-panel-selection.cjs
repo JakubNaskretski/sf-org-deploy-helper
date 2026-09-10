@@ -316,6 +316,8 @@ check('an org-only key survives the rebuild scan, and membership does the prune 
   const ORG_ONLY = KEY('AcmeOrgOnlyService');
   const GHOST = KEY('AcmeGhostService'); // exists nowhere: local, org, or otherwise
   const p = panel({ ...RESTORED, selected: [KEY('AcmeOrderService'), ORG_ONLY, GHOST] });
+  // A watcher scan landing first does not make the next explicit scan "trusted".
+  p.deliver({ ...FILES(['AcmeOrderService']), silent: true });
   p.deliver(FILES(['AcmeOrderService']));
   assert.strictEqual(p.liveCount(), 3, 'the first scan pruned keys nothing had been asked about yet');
   assert.ok(p.persisted().selected.includes(ORG_ONLY), 'and persisted the loss');
@@ -1050,6 +1052,21 @@ check('a reveal clears the filters that would hide the row it just ticked', () =
   r.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeOrgOnly'] });
   assert.strictEqual(r.el('sourceFilter').value, 'all');
   assert.ok(names(r).includes('AcmeOrgOnly'), `the newly selected row never rendered: ${names(r).join(', ')}`);
+  // A transient reveal (a suggestion accept: rows shown, not ticked) has the same
+  // problem — with a filter on there was nothing to look at.
+  const t = panel({ ...BASE, filter: 'flow' });
+  t.deliver(TFILES(THREE_TYPES));
+  t.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeA'], transient: true, scroll: true });
+  assert.strictEqual(t.el('search').value, '', 'a transient reveal left the filter that hid it');
+  assert.ok(names(t).includes('AcmeA'), `the revealed row never rendered: ${names(t).join(', ')}`);
+  assert.deepStrictEqual(t.persisted().selected, [], 'transient: revealed, not ticked');
+  // Inside the Selected lens the type filter hides nothing (the lens ignores it),
+  // so a reveal there leaves it alone.
+  const s = panel({ ...BASE, typeFilter: ['Flow'], viewMode: 'selected', selected: ['ApexClass:AcmeB'] });
+  s.deliver(TFILES(THREE_TYPES));
+  s.deliver({ type: 'activeFile', key: 'ApexClass:AcmeA', select: true, scroll: true });
+  assert.deepStrictEqual(s.persisted().typeFilter, ['Flow'], 'the Selected lens does not need the type filter cleared');
+  assert.ok(names(s).includes('AcmeA'), `the newly selected row never rendered: ${names(s).join(', ')}`);
 });
 
 check('the Selected lens ignores the type and source filters — it lists what Deploy would send', () => {
