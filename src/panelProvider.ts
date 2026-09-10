@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import { OrgStore } from './orgStore';
-import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
+import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, METADATA_ARGS_BUDGET, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, metadataArgsLength, metadataFitsCommandLine, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
 import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
@@ -2121,6 +2121,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (buildRetryRequest inlined at the report call, below) would build.
       const retry = buildRetryRequest(opts, items, testLevel, runTests);
 
+      if (!opts.sourceDir) this.noteManifestRoute(opts.validateOnly ? 'validate' : 'deploy', items);
       const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
       // owns releasing it, so stop the early-return releaser from double-firing.
@@ -3245,6 +3246,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // check stays as the last safety net. Deploy keeps its opt-in toggle — there
       // the overwrite hits the org, not a backed-up file.
       const ignoreConflicts = backupDir !== undefined;
+      if (!opts.sourceDir) this.noteManifestRoute('retrieve', items);
       const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
       reserved = false;
       const start = Date.now();
@@ -3608,6 +3610,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const metadata = items.map(i => `${i.type}:${i.name}`);
       const n = items.length;
       const noun = `${n} component${n === 1 ? '' : 's'}`;
+      // `sf project delete source` has no --manifest form, so a per-component list
+      // too long for the command line cannot be rerouted the way deploy/retrieve
+      // reroute theirs — refuse it here, before the dry run echoes a command the
+      // OS would reject, instead of failing at spawn.
+      if (!metadataFitsCommandLine(metadata)) {
+        vscode.window.showWarningMessage(
+          `SF Deploy: ${noun} are too many to delete in one command — the per-component list exceeds the command-line limit. Delete in smaller batches.`
+        );
+        return;
+      }
 
       // Stage 1 — preview via `--dry-run` (deletes nothing). It validates against the
       // org too, so an auth/network/unknown-component error surfaces HERE, before the
@@ -4148,6 +4160,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const proj = path.join(tmpRoot, 'proj');
           await scaffoldSourceProject(proj);
           const rStart = Date.now();
+          this.noteManifestRoute('diff', slowItems);
           const rCmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(slowItems)} --target-org ${org}`);
           const handle = this.sf.retrieveMetadata(
             slowItems.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs() }
@@ -4608,8 +4621,27 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return byPath ? `${byPath.type}:${byPath.name}` : undefined;
   }
 
+  /** Echoed per-component target list — or, when that list would not fit on the
+   *  command line, the `--manifest` placeholder the service substitutes for it
+   *  (the real temp path replaces this echo once the CLI call returns). Same
+   *  decision as the service's (metadataFitsCommandLine over the same keys), so
+   *  the log never previews a command line the OS would have refused. `delete
+   *  source` has no manifest form and refuses such a list before echoing. */
   private metadataArgs(items: MetadataItem[]): string {
-    return items.map(i => `--metadata ${i.type}:${i.name}`).join(' ');
+    const keys = items.map(i => `${i.type}:${i.name}`);
+    if (!metadataFitsCommandLine(keys)) return `--manifest <generated package.xml: ${keys.length} components>`;
+    return keys.map(k => `--metadata ${k}`).join(' ');
+  }
+
+  /** One Output-channel line when a deploy/retrieve goes through a generated
+   *  package.xml instead of a `--metadata` list, so the `--manifest <temp path>`
+   *  in the command log is explained rather than mysterious. Silent otherwise. */
+  private noteManifestRoute(what: string, items: MetadataItem[]): void {
+    const keys = items.map(i => `${i.type}:${i.name}`);
+    if (metadataFitsCommandLine(keys)) return;
+    this.output.appendLine(
+      `[${what}] ${keys.length} components: a --metadata list of ${metadataArgsLength(keys)} characters exceeds the ${METADATA_ARGS_BUDGET}-character command-line budget — running with a generated package.xml (--manifest) naming the same components`
+    );
   }
 
   /** Echoed-command target: an explicit `--source-dir <path>` when deploying/retrieving

@@ -19,6 +19,7 @@ import * as path from 'path';
 import {
   Cancellable,
   OrgInfo,
+  RunOptions,
   SfCliCancelledError,
   SfCliError,
   SfCliService as KitSfCliService,
@@ -184,6 +185,86 @@ export interface DeployOptions {
   background?: boolean;
 }
 
+/**
+ * Command-line budget, in characters, for the per-component `--metadata Type:Name`
+ * list a deploy or retrieve passes to the CLI.
+ *
+ * Every selected component becomes one `--metadata` argument, so a big
+ * selection grows the command line without bound until the OS refuses to start
+ * the CLI at all: Windows cmd.exe stops at 8,191 characters, and macOS/Linux
+ * have a far larger but still finite ARG_MAX that the environment shares. Past
+ * this budget the list is written to a generated package.xml and the CLI is
+ * pointed at it with `--manifest` instead (see buildPackageXml). The CLI parses
+ * a manifest member and a `--metadata` entry into the same component-set
+ * request and resolves both to local source through the same code, so the set
+ * that reaches the org is identical — checked against the CLI itself:
+ * `sf project convert source` produces byte-identical output for the two forms
+ * (scripts/check-manifest-cli.cjs re-proves it on any machine with `sf`).
+ *
+ * 6,000 leaves ~2,000 characters under the cmd.exe cap for the launcher path,
+ * the fixed flags (`--target-org`, `--test-level`, `--tests …`, `--async`) and
+ * quoting. Applied on EVERY platform, decided per call from the actual list, so
+ * a large deploy takes the same route on a Mac as on Windows and the manifest
+ * path is exercised everywhere rather than only where the limit bites.
+ */
+export const METADATA_ARGS_BUDGET = 6000;
+
+/** Characters the per-component list adds to the command line, as the shell
+ *  sees it: `--metadata <entry>` per component, space-separated, the entry
+ *  quoted when it contains whitespace (`Layout:Account-Account Layout`). */
+export function metadataArgsLength(metadata: string[]): number {
+  let n = 0;
+  for (const m of metadata) n += '--metadata '.length + m.length + (/\s/.test(m) ? 2 : 0) + 1;
+  return n;
+}
+
+/** Whether a per-component `--metadata` list can go on the command line as-is.
+ *  False means deployMetadata/retrieveMetadata write it to a generated
+ *  package.xml and pass `--manifest` instead. */
+export function metadataFitsCommandLine(metadata: string[]): boolean {
+  return metadataArgsLength(metadata) <= METADATA_ARGS_BUDGET;
+}
+
+/**
+ * The package.xml equivalent of a `--metadata` list: every `Type:Name` entry
+ * becomes a `<members>` under its type's `<types>` block, spelled exactly as it
+ * would have been on the command line. The CLI reads both the same way — split
+ * on the FIRST colon (a name may contain colons), trim, a bare `Type` means
+ * every member (`*`) — and resolves a manifest member to local source through
+ * the same component-set code as a `--metadata` entry, so this names precisely
+ * the components the flag would have. Nothing is renamed, re-cased or
+ * re-derived from file paths: an entry that resolved via `--metadata` resolves
+ * via this manifest, and one that didn't (no local source) fails the same way.
+ *
+ * Deliberately no `<version>`: a manifest's version OVERRIDES the project's
+ * `sourceApiVersion` inside the CLI, whereas with none present the CLI falls
+ * back to sfdx-project.json (then the org's) exactly as it does for `--metadata`.
+ */
+export function buildPackageXml(metadata: string[]): string {
+  const byType = new Map<string, Set<string>>();
+  for (const entry of metadata) {
+    const colon = entry.indexOf(':');
+    const type = (colon < 0 ? entry : entry.slice(0, colon)).trim();
+    if (!type) continue;
+    const name = colon < 0 ? '*' : entry.slice(colon + 1).trim();
+    let members = byType.get(type);
+    if (!members) byType.set(type, (members = new Set()));
+    members.add(name);
+  }
+  const lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<Package xmlns="http://soap.sforce.com/2006/04/metadata">'];
+  for (const [type, members] of byType) {
+    lines.push('    <types>');
+    for (const m of members) lines.push(`        <members>${escapeXml(m)}</members>`);
+    lines.push(`        <name>${escapeXml(type)}</name>`, '    </types>');
+  }
+  lines.push('</Package>', '');
+  return lines.join('\n');
+}
+
+function escapeXml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
 export class SfCliService extends KitSfCliService {
   deployMetadata(
     metadata: string[],
@@ -194,31 +275,94 @@ export class SfCliService extends KitSfCliService {
     // Validation is a check-only deploy that returns a job id for a later
     // quick-deploy; `start` is the real thing. Both take the same arg shape.
     const verb = opts.validateOnly ? 'validate' : 'start';
-    const args = ['project', 'deploy', verb];
-    // Target selection, in precedence order (mutually exclusive):
-    //   --manifest    a whole package.xml manifest
-    //   --source-dir  an explicit path (file may live outside the package dirs,
-    //                 where --metadata Type:Name can't resolve it)
-    //   --metadata    the per-component list
-    // A manifest wins: when set, the sourceDirs/metadata targets are ignored.
-    if (opts.manifest) args.push('--manifest', opts.manifest);
-    else if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
-    else for (const m of metadata) args.push('--metadata', m);
-    args.push('--target-org', targetOrg);
-    if (opts.ignoreConflicts) args.push('--ignore-conflicts');
-    if (opts.testLevel) args.push('--test-level', opts.testLevel);
-    if (opts.testLevel === 'RunSpecifiedTests') for (const t of opts.runTests ?? []) args.push('--tests', t);
+    const tail = ['--target-org', targetOrg];
+    if (opts.ignoreConflicts) tail.push('--ignore-conflicts');
+    if (opts.testLevel) tail.push('--test-level', opts.testLevel);
+    if (opts.testLevel === 'RunSpecifiedTests') for (const t of opts.runTests ?? []) tail.push('--tests', t);
     // `--async` returns once the org has enqueued the job (id + `Queued`), so the
     // caller polls `deployReport` instead of blocking the whole deploy on one wait.
-    if (opts.background) args.push('--async');
-    args.push('--json');
+    if (opts.background) tail.push('--async');
+    tail.push('--json');
+    return this.runTargeted<DeployResult>(
+      ['project', 'deploy', verb], metadata, tail, opts, `project deploy ${verb}`,
+      { timeoutMs: opts.timeoutMs, cwd }, 'sfodw-deploy-'
+    );
+  }
+
+  /**
+   * Run a deploy/retrieve whose components are named by, in precedence order:
+   *   --manifest    a package.xml the caller supplied (a whole manifest)
+   *   --source-dir  explicit path(s) — a file may live outside the package dirs,
+   *                 where `--metadata Type:Name` can't resolve it
+   *   --metadata    the per-component list — or, when that list would not fit
+   *                 on the command line (metadataFitsCommandLine), a GENERATED
+   *                 package.xml naming the same components, passed as --manifest
+   * A caller-supplied manifest wins: when set, sourceDirs/metadata are ignored.
+   * `cmd` in the result is the command that actually ran.
+   */
+  private runTargeted<R>(
+    head: string[],
+    metadata: string[],
+    tail: string[],
+    targets: { manifest?: string; sourceDirs?: string[] },
+    what: string,
+    runOpts: RunOptions,
+    tmpPrefix: string
+  ): Cancellable<{ result: R; cmd: string }> {
+    if (!targets.manifest && !targets.sourceDirs?.length && !metadataFitsCommandLine(metadata)) {
+      return this.runWithGeneratedManifest<R>(
+        metadata, manifestPath => [...head, '--manifest', manifestPath, ...tail], what, runOpts, tmpPrefix
+      );
+    }
+    const target: string[] = [];
+    if (targets.manifest) target.push('--manifest', targets.manifest);
+    else if (targets.sourceDirs?.length) for (const d of targets.sourceDirs) target.push('--source-dir', d);
+    else for (const m of metadata) target.push('--metadata', m);
+    const args = [...head, ...target, ...tail];
     const cmd = this.formatCmd(args);
-    const inner = this.runJsonCancellable<SfJsonEnvelope<DeployResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
-    const promise = inner.promise.then(json => ({
-      result: this.unwrapResult(json, `project deploy ${verb}`),
-      cmd
-    }));
+    const inner = this.runJsonCancellable<SfJsonEnvelope<R>>(args, runOpts);
+    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, what), cmd }));
     return { promise, cancel: inner.cancel };
+  }
+
+  /**
+   * The manifest route of runTargeted: write the per-component list to a
+   * package.xml in a fresh temp dir (buildPackageXml), run the command against
+   * it, and remove the dir once the process is gone. The CLI reads the manifest
+   * while it builds its component set — before anything reaches the org, and
+   * before an `--async` submit returns — so the file has done its job as soon
+   * as the process exits; `deploy report` polls read the CLI's own manifest
+   * cache, never this file. Cancel before the process starts simply never
+   * starts it; cancel afterwards kills it as usual.
+   */
+  private runWithGeneratedManifest<R>(
+    metadata: string[],
+    argsFor: (manifestPath: string) => string[],
+    what: string,
+    runOpts: RunOptions,
+    tmpPrefix: string
+  ): Cancellable<{ result: R; cmd: string }> {
+    let cancelled = false;
+    let inner: Cancellable<SfJsonEnvelope<R>> | undefined;
+    const promise = (async (): Promise<{ result: R; cmd: string }> => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), tmpPrefix));
+      try {
+        const manifestPath = path.join(dir, 'package.xml');
+        await fs.writeFile(manifestPath, buildPackageXml(metadata), 'utf8');
+        if (cancelled) throw new SfCliCancelledError();
+        const args = argsFor(manifestPath);
+        inner = this.runJsonCancellable<SfJsonEnvelope<R>>(args, runOpts);
+        const json = await inner.promise;
+        return { result: this.unwrapResult(json, what), cmd: this.formatCmd(args) };
+      } finally {
+        // Best-effort: a leftover temp dir is not a failure of the deploy.
+        fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    })();
+    return {
+      promise,
+      cancel: () => { cancelled = true; inner?.cancel(); }
+    };
   }
 
   /**
@@ -372,23 +516,19 @@ export class SfCliService extends KitSfCliService {
     cwd: string,
     opts: { outputDir?: string; timeoutMs?: number; sourceDirs?: string[]; manifest?: string; ignoreConflicts?: boolean } = {}
   ): Cancellable<{ result: RetrieveResult; cmd: string }> {
-    const args = ['project', 'retrieve', 'start'];
-    // A manifest wins over the source-dir / per-component targets (mutually
-    // exclusive; when set the sourceDirs/metadata args are ignored). Mirrors
-    // deployMetadata's precedence.
-    if (opts.manifest) args.push('--manifest', opts.manifest);
-    else if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
-    else for (const m of metadata) args.push('--metadata', m);
-    args.push('--target-org', targetOrg);
-    if (opts.outputDir) args.push('--target-metadata-dir', opts.outputDir, '--unzip');
+    // Target precedence (manifest > source-dir > metadata, or a generated manifest
+    // for a metadata list too long for the command line) mirrors deployMetadata —
+    // see runTargeted.
+    const tail = ['--target-org', targetOrg];
+    if (opts.outputDir) tail.push('--target-metadata-dir', opts.outputDir, '--unzip');
     // `--ignore-conflicts` skips the CLI's source-tracking conflict check. Only
     // meaningful on tracked orgs (scratch/sandbox); a no-op elsewhere.
-    if (opts.ignoreConflicts) args.push('--ignore-conflicts');
-    args.push('--json');
-    const cmd = this.formatCmd(args);
-    const inner = this.runJsonCancellable<SfJsonEnvelope<RetrieveResult>>(args, { timeoutMs: opts.timeoutMs, cwd });
-    const promise = inner.promise.then(json => ({ result: this.unwrapResult(json, 'project retrieve start'), cmd }));
-    return { promise, cancel: inner.cancel };
+    if (opts.ignoreConflicts) tail.push('--ignore-conflicts');
+    tail.push('--json');
+    return this.runTargeted<RetrieveResult>(
+      ['project', 'retrieve', 'start'], metadata, tail, opts, 'project retrieve start',
+      { timeoutMs: opts.timeoutMs, cwd }, 'sfodw-retrieve-'
+    );
   }
 
   /**
