@@ -16,8 +16,9 @@
 // unaffected (they key on Type:Name, never on argv shape). Card `lines` are
 // capped at CARD_LINE_CAP (100) with a summary tail; the full list still goes to
 // the Output channel first. `sf project delete source` has no `--manifest` flag
-// (only --metadata/--source-dir), so delete is deliberately NOT touched here —
-// see the comment on SfCliService.deleteSource.
+// (only --metadata/--source-dir), so delete cannot switch shape at all — it is
+// REFUSED above DELETE_ARGV_LIMIT instead, before the dry run, rather than left
+// to fail at spawn on the command-line limit (h below).
 //
 // Driven through the REAL runDeploy/runRetrieve (DeployPanelProvider.prototype,
 // called directly — the same "prototype method + plain object" pattern
@@ -38,7 +39,12 @@
 //   e) the temp manifest dir is gone once the run resolves;
 //   f) buildManifestXml: escaping and deterministic sort, as a pure unit test;
 //   g) a failed 10,000-item deploy's Retry button still carries all 10,000
-//      Type:Name keys — the manifest path must not touch RetryRequest at all.
+//      Type:Name keys — the manifest path must not touch RetryRequest at all;
+//   h) delete's oversize refusal (no manifest form to fall back to);
+//   i) the generated manifest's `<version>`: present only when the project names
+//      a sourceApiVersion, because a manifest version WINS over sfdx-project.json;
+//   j) a retrieve killed by the local timeout is reported AS a timeout, naming
+//      the setting that raises it — a large retrieve is exactly what hits it.
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -50,9 +56,13 @@ const ROOT = path.join(__dirname, '..');
 
 // ---------------------------------------------------------------- vscode stub
 const cfg = { backupBeforeRetrieve: false }; // skip the (unrelated) backup subsystem
+// Every warning, modal or not — a refusal (delete's oversize guard) is a plain
+// toast, so "was the user told anything?" has to be assertable.
+const warns = [];
 const vscodeStub = {
   window: {
     showWarningMessage: (message, options, ...items) => {
+      warns.push({ message, modal: !!(options && options.modal) });
       // Every confirm in these paths is auto-accepted — the double-click/queue
       // harness already covers the modal machinery itself; here only the
       // resulting TEXT (for the "via package.xml" note) and the fact that the
@@ -81,8 +91,8 @@ const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const { DeployPanelProvider } = require(path.join(ROOT, 'out', 'panelProvider.js'));
-const { SfCliService } = require(path.join(ROOT, 'out', 'sfCliService.js'));
-const { buildManifestXml } = require(path.join(ROOT, 'out', 'metadataScanner.js'));
+const { SfCliService, SfCliError } = require(path.join(ROOT, 'out', 'sfCliService.js'));
+const { buildManifestXml, resolveApiVersion } = require(path.join(ROOT, 'out', 'metadataScanner.js'));
 const proto = DeployPanelProvider.prototype;
 
 let failed = 0;
@@ -123,7 +133,7 @@ const keysOf = items => items.map(i => `${i.type}:${i.name}`);
 function provider(items, extra = {}) {
   const posted = [];
   const outputLines = [];
-  const calls = { deployMetadata: [], deployReport: [], retrieveMetadata: [] };
+  const calls = { deployMetadata: [], deployReport: [], retrieveMetadata: [], deleteSource: [] };
   const sf = {
     deployMetadata: (metadata, targetOrg, cwd, opts) => {
       // Read the manifest file (if any) NOW, synchronously — by the time
@@ -146,7 +156,20 @@ function provider(items, extra = {}) {
       const manifestContent = opts.manifest && fs.existsSync(opts.manifest) ? fs.readFileSync(opts.manifest, 'utf8') : undefined;
       calls.retrieveMetadata.push({ metadata, targetOrg, cwd, opts, manifestContent });
       return {
-        promise: Promise.resolve({ result: extra.retrieveResult ?? { inboundFiles: [] }, cmd: 'sf project retrieve start --json' }),
+        promise: extra.retrieveError
+          ? Promise.reject(extra.retrieveError)
+          : Promise.resolve({ result: extra.retrieveResult ?? { inboundFiles: [] }, cmd: 'sf project retrieve start --json' }),
+        cancel: () => undefined
+      };
+    },
+    // The first CLI-related error of a session logs `sf --version` (handleError →
+    // logSfVersionOnce). Without it the error REPORTERS throw and swallow their own
+    // card — which is exactly what the timeout check below asserts on.
+    runCancellable: () => ({ promise: Promise.resolve({ stdout: 'sf 0.0.0-test', stderr: '', code: 0 }), cancel: () => undefined }),
+    deleteSource: (metadata, targetOrg, cwd, opts) => {
+      calls.deleteSource.push({ metadata, targetOrg, cwd, opts });
+      return {
+        promise: Promise.resolve({ result: { success: true, files: [] }, cmd: 'sf project delete source --json' }),
         cancel: () => undefined
       };
     }
@@ -166,7 +189,8 @@ function provider(items, extra = {}) {
     },
     view: { visible: true, webview: { postMessage() {} } },
     sf,
-    post: m => posted.push(m)
+    post: m => posted.push(m),
+    ...(extra.fields || {})
   });
   return { s, posted, outputLines, calls };
 }
@@ -241,13 +265,16 @@ check('confirm modal names the manifest path only when it applies', async () => 
 });
 
 // --------------------------------------------------- (b)/(c) 10,000 fixture
+/** `expectedApiVersion` undefined = the manifest must carry NO <version> element
+ *  (the fixture's '/ws' has no sfdx-project.json, so nothing names one). */
 function assertManifestXmlShape(xml, expectedApiVersion) {
   assert.ok(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>\n'), 'missing XML prolog');
   assert.ok(xml.trim().endsWith('</Package>'), 'missing closing </Package>');
   assert.strictEqual((xml.match(/<types>/g) || []).length, TEN_K_TYPES.length);
   assert.strictEqual((xml.match(/<\/types>/g) || []).length, TEN_K_TYPES.length);
   assert.strictEqual((xml.match(/<members>/g) || []).length, 10_000);
-  assert.ok(xml.includes(`<version>${expectedApiVersion}</version>`), xml.slice(-80));
+  if (expectedApiVersion) assert.ok(xml.includes(`<version>${expectedApiVersion}</version>`), xml.slice(-80));
+  else assert.ok(!xml.includes('<version>'), `an invented <version> would override the project's own: ${xml.slice(-80)}`);
   // Types sorted alphabetically.
   const typeOrder = [...xml.matchAll(/<name>([^<]+)<\/name>/g)].map(m => m[1]).filter(n => TEN_K_TYPES.includes(n));
   assert.deepStrictEqual(typeOrder, [...TEN_K_TYPES].sort());
@@ -260,7 +287,7 @@ check('deploy: 10,000 items → manifest file on disk, well-formed + grouped, sh
   const call = p.calls.deployMetadata[0];
   assert.ok(typeof call.opts.manifest === 'string');
   assert.ok(call.manifestContent, 'manifest file was not readable at call time');
-  assertManifestXmlShape(call.manifestContent, '62.0'); // no sfdx-project.json at '/ws' → default
+  assertManifestXmlShape(call.manifestContent); // no sfdx-project.json at '/ws' → no <version>
 
   const cmd = firstEchoedCmd(p);
   assert.ok(cmd.length < 300, `echoed command too long (${cmd.length}): ${cmd}`);
@@ -283,7 +310,7 @@ check('retrieve: 10,000 items → manifest file on disk, well-formed + grouped, 
   await runRetrieve(p, keysOf(items));
   const call = p.calls.retrieveMetadata[0];
   assert.ok(typeof call.opts.manifest === 'string');
-  assertManifestXmlShape(call.manifestContent, '62.0');
+  assertManifestXmlShape(call.manifestContent);
 
   const cmd = firstEchoedCmd(p);
   assert.ok(cmd.length < 300, `echoed command too long (${cmd.length}): ${cmd}`);
@@ -425,10 +452,119 @@ check('buildManifestXml de-duplicates a repeated (type, name) pair', () => {
   assert.strictEqual((xml.match(/<members>Dup<\/members>/g) || []).length, 1);
 });
 
+// -------------------------------------------------------- (i) <version>
+check('the manifest names an API version only when the project does', async () => {
+  // A manifest `<version>` WINS over sfdx-project.json (source-deploy-retrieve
+  // only defaults the field when the component set leaves it unset), so a
+  // hardcoded fallback silently retargets every large deploy at an API version
+  // the project never asked for. Omitting the element hands the choice back —
+  // which is exactly what the `--metadata` route already does.
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'sf-api-version-'));
+  try {
+    assert.strictEqual(await resolveApiVersion(dir), undefined, 'no sfdx-project.json → no version');
+    await fsp.writeFile(path.join(dir, 'sfdx-project.json'), JSON.stringify({ packageDirectories: [{ path: 'force-app' }] }), 'utf8');
+    assert.strictEqual(await resolveApiVersion(dir), undefined, 'a project without sourceApiVersion → no version');
+    const without = buildManifestXml([{ type: 'ApexClass', name: 'A' }], await resolveApiVersion(dir));
+    assert.ok(!without.includes('<version>'), without);
+    assert.ok(without.includes('</types>\n</Package>'), `still well-formed without the element: ${without}`);
+
+    await fsp.writeFile(path.join(dir, 'sfdx-project.json'),
+      JSON.stringify({ sourceApiVersion: '60.0', packageDirectories: [{ path: 'force-app' }] }), 'utf8');
+    assert.strictEqual(await resolveApiVersion(dir), '60.0');
+    const with60 = buildManifestXml([{ type: 'ApexClass', name: 'A' }], await resolveApiVersion(dir));
+    assert.ok(with60.includes('<version>60.0</version>'), with60);
+    assert.ok(with60.includes('</types>\n  <version>60.0</version>\n</Package>'), with60);
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------------------- (h) delete
+const runDelete = (p, keys) => proto.runDelete.call(p.s, keys);
+/** Components whose Type:Name key is long enough that a few hundred of them blow
+ *  the command line — the only shape `sf project delete source` can be given. */
+const longItems = n => Array.from({ length: n }, (_, i) => ({
+  type: 'ApexClass',
+  name: `DeleteMe${String(i).padStart(3, '0')}`.padEnd(40, 'X'),
+  filePath: `/ws/force-app/main/default/classes/Delete${i}.cls`,
+  files: []
+}));
+
+// The cap is a Windows fact (the sf.cmd shim's cmd.exe fallback stops at 8,191
+// characters); deleteArgvLimit() is the platform's answer, stubbed here so the
+// checks read the same on every OS.
+const onWindows = { afterDelete: async () => {}, deleteArgvLimit: () => 6000 };
+
+check('delete: 300 long-named components are refused before anything runs (Windows cap)', async () => {
+  const items = longItems(300);
+  const p = provider(items, { fields: onWindows });
+  warns.length = 0;
+  await runDelete(p, keysOf(items));
+  assert.strictEqual(p.calls.deleteSource.length, 0, 'not even the dry run may be spawned — the argv is what fails');
+  const refusal = warns.find(w => /too many to delete/.test(w.message));
+  assert.ok(refusal, `expected a refusal warning, got: ${JSON.stringify(warns.map(w => w.message))}`);
+  assert.ok(/smaller batches/.test(refusal.message), refusal.message);
+  assert.ok(!refusal.modal, 'a refusal is not a confirm — nothing to agree to');
+});
+
+check('delete: the same 300 components are NOT refused where the command line has room', async () => {
+  const items = longItems(300);
+  const p = provider(items, { fields: { afterDelete: async () => {}, deleteArgvLimit: () => Infinity } });
+  warns.length = 0;
+  await runDelete(p, keysOf(items));
+  assert.ok(p.calls.deleteSource.length >= 1, 'macOS/Linux ARG_MAX is hundreds of KB — a 300-component delete worked before and must still');
+  assert.ok(!warns.some(w => /too many to delete/.test(w.message)), 'no refusal off Windows');
+});
+
+check('delete: 20 components still go through the dry run and the confirm', async () => {
+  const items = longItems(20);
+  const p = provider(items, { fields: onWindows });
+  warns.length = 0;
+  await runDelete(p, keysOf(items));
+  assert.ok(p.calls.deleteSource.length >= 1, 'an ordinary delete must be unaffected by the guard');
+  assert.strictEqual(p.calls.deleteSource[0].opts.dryRun, true, 'the preview still runs first');
+  assert.ok(!warns.some(w => /too many to delete/.test(w.message)), 'no refusal for a normal-sized delete');
+});
+
+// ---------------------------------------------------------- (j) retrieve timeout
+check('retrieve: a local timeout is reported as a timeout, naming the setting that raises it', async () => {
+  const items = makeItems(40);
+  const p = provider(items, { retrieveError: new SfCliError('sf project retrieve start timed out after 180000ms') });
+  await runRetrieve(p, keysOf(items));
+  const card = statusCards(p).pop();
+  assert.ok(card, 'a timed-out retrieve must still produce a card');
+  assert.ok(/timed out$/.test(card.title), card.title);
+  assert.ok(card.hint && card.hint.includes('sfOrgDeployWrapper.commandTimeoutMs'),
+    `the raise-the-cap setting must be named: ${JSON.stringify(card.hint)}`);
+  // Retrieve wording, NOT the deploy one: files may not have been written, and
+  // there is no org-side deploy to go and check.
+  assert.ok(/files may not have been written/i.test(`${card.meta} ${card.hint}`), `${card.meta} / ${card.hint}`);
+  assert.ok(!/still be running on the org/i.test(`${card.meta} ${card.hint}`), 'deploy wording leaked into a retrieve');
+});
+
+check('delete: the cap is a boundary on the rendered list — at it runs, one character over is refused', async () => {
+  // 20 keys of `ApexClass:` + 40 characters: `--metadata ` (11) + 50 + 1 = 62 each.
+  const items = longItems(20);
+  const at = provider(items, { fields: { afterDelete: async () => {}, deleteArgvLimit: () => 20 * 62 } });
+  warns.length = 0;
+  await runDelete(at, keysOf(items));
+  assert.ok(at.calls.deleteSource.length >= 1, 'a list that fits exactly is not "too many"');
+  const over = provider(items, { fields: { afterDelete: async () => {}, deleteArgvLimit: () => 20 * 62 - 1 } });
+  warns.length = 0;
+  await runDelete(over, keysOf(items));
+  assert.strictEqual(over.calls.deleteSource.length, 0, 'one character over the cap must be refused');
+  assert.ok(warns.some(w => /too many to delete/.test(w.message)));
+});
+
+// A check whose promise never settles would drain the loop and exit 0 with no
+// output — green for the wrong reason. The exit code is a failure until the
+// summary line has actually run.
+process.exitCode = 1;
 (async () => {
   for (const [name, fn] of queue) {
     try { await fn(); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.message}`); }
   }
   if (failed) { console.error(`large-selection: ${failed}/${queue.length} checks FAILED`); process.exit(1); }
   console.log(`large-selection: all ${queue.length} checks passed`);
+  process.exitCode = 0;
 })();

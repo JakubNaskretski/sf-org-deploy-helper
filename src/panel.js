@@ -83,6 +83,11 @@
     localKeys: new Set(),    // "Type:Name" keys that exist locally
     orgOnlyItems: [],        // { type, name } items on org but not local
     orgLoaded: false,        // has org metadata been fetched this session?
+    // Has a non-silent `files` already been pruned against this session? The
+    // FIRST one lands BEFORE org membership does (the provider's `ready` posts
+    // `files`, then `orgMetadata`), so it cannot vouch for an org-only key — see
+    // the prune in the `files` handler.
+    scannedOnce: false,
     orgAsOf: null,           // ms — when the membership on screen was listed (snapshot stamp, or now)
     sourceFilter: 'all',     // 'all' | 'local-only' | 'org-only' | 'both'
     // View mode: one tree, three lenses. 'selected' shows only checked items
@@ -381,6 +386,59 @@
     return JSON.stringify([keys, msg.reason || '', msg.base || '']);
   }
 
+  // Drop selected keys that neither the local scan nor org membership vouches for.
+  // Both callers have already established there is something to prune against.
+  // Returns true when anything went.
+  function pruneSelection() {
+    const valid = new Set([...state.localKeys, ...state.orgKeys]);
+    let pruned = false;
+    for (const k of Array.from(state.selected)) if (!valid.has(k)) { state.selected.delete(k); pruned = true; }
+    return pruned;
+  }
+
+  // Drop expandedGroups keys that no longer name a group. The set is persisted and
+  // only ever grew (expandPathForKey adds without checking, "Collapse all" was the
+  // one way out), so every deleted or renamed object stayed in webview state for
+  // good. Same key grammar renderTree reads: '<type>' | '__OBJECTS__' |
+  // 'obj/<object>' | 'objc/<object>/<childType>'.
+  function pruneExpandedGroups() {
+    const types = new Set();
+    const objects = new Set();     // objects with a group of their own (definition or children)
+    const objChildren = new Set(); // '<object>/<childType>'
+    for (const item of [...state.items, ...state.orgOnlyItems]) {
+      types.add(item.type);
+      if (item.type === 'CustomObject') objects.add(item.name);
+      else if (state.objectChildTypes.has(item.type)) {
+        const obj = item.name.split('.')[0];
+        objects.add(obj);
+        objChildren.add(obj + '/' + item.type);
+      }
+    }
+    for (const k of Array.from(state.expandedGroups)) {
+      const exists = k === '__OBJECTS__' ? objects.size > 0
+        : k.startsWith('obj/') ? objects.has(k.slice(4))
+          : k.startsWith('objc/') ? objChildren.has(k.slice(5))
+            : types.has(k);
+      if (!exists) state.expandedGroups.delete(k);
+    }
+  }
+
+  // Every prune a trusted scan owes (see the `files` handler): the selection, the
+  // persisted expandedGroups set and the type filter, all against local ∪ org.
+  // Returns true when the selection or the type filter changed — the two that
+  // can change what renders.
+  function pruneState() {
+    let pruned = pruneSelection();
+    pruneExpandedGroups();
+    // Drop stale type-filter entries (allow org types too). The None sentinel is
+    // not a type name: pruning it as one turned a deliberate "no types" into
+    // "all types" on every webview rebuild.
+    const types = knownTypes();
+    for (const t of Array.from(state.typeFilter)) if (t !== TYPE_NONE && !types.includes(t)) { state.typeFilter.delete(t); pruned = true; }
+    if (normalizeTypeFilter(types)) pruned = true;
+    return pruned;
+  }
+
   function handleMessage(msg) {
     switch (msg.type) {
       case 'orgs':
@@ -413,7 +471,7 @@
         // Drop selections that no longer exist in either local or org. This is also
         // what vets a selection RESTORED from webview state: it is written back
         // pruned below, so a key deleted between sessions can't survive another reload.
-        // Two scans may NOT do that:
+        // Three scans may NOT do that:
         //   - one that found NOTHING. The provider posts `files` with an empty item
         //     list when project discovery fails (multi-root workspace,
         //     sfdx-project.json not synced yet) and org membership is empty on a
@@ -426,20 +484,26 @@
         //     PARTIAL list is indistinguishable from a real deletion. Deleting a
         //     selection the user built by hand on that evidence, and persisting it,
         //     is unrecoverable; the next explicit Refresh Metadata Files prunes.
+        //   - the FIRST one of a webview that has no org membership yet. A rebuild
+        //     replays `files` BEFORE `orgMetadata`, so orgKeys is still empty here
+        //     and every restored org-only key — the ones ticked from the Org lens
+        //     to retrieve — would be dropped, and the drop persisted, seconds
+        //     before membership arrives. `orgMetadata` runs the same prune once it
+        //     does; every later scan prunes as it always did.
         // Keeping stale keys costs nothing: Deploy/Validate stay disabled until a
         // key is in localKeys, and every inbound key is re-resolved against the
         // provider's own scan anyway.
         let pruned = false;
         if (!msg.silent && (state.items.length > 0 || state.orgKeys.size > 0)) {
-          const valid = new Set([...state.localKeys, ...state.orgKeys]);
-          for (const k of Array.from(state.selected)) if (!valid.has(k)) { state.selected.delete(k); pruned = true; }
-          // Drop stale type-filter entries (allow org types too)
-          const allKnownTypes = new Set([...state.items.map(i => i.type), ...state.orgOnlyItems.map(i => i.type)]);
-          // The None sentinel is not a type name: pruning it as one turned a
-          // deliberate "no types" into "all types" on every webview rebuild.
-          for (const t of Array.from(state.typeFilter)) if (t !== TYPE_NONE && !allKnownTypes.has(t)) { state.typeFilter.delete(t); pruned = true; }
-          if (normalizeTypeFilter(Array.from(allKnownTypes))) pruned = true;
-          savePersisted(); // both prunes above are now the persisted truth too
+          // The same deferral covers the expandedGroups and type-filter prunes: an
+          // expanded org-only object group, or a filter naming an org-only type,
+          // would otherwise be dropped by a scan that has not seen the org yet.
+          if (state.scannedOnce || state.orgLoaded) pruned = pruneState();
+          // The filter's persisted SHAPE (normalizeTypeFilter) is repaired on every
+          // scan, as it always was — only the judging of names waits.
+          else if (normalizeTypeFilter(knownTypes())) pruned = true;
+          state.scannedOnce = true;
+          savePersisted(); // the prunes above are now the persisted truth too
         }
         // A type seen for the first time joins a plain-names filter so it shows
         // (noteNewTypes). It can't change an item list identical to the last one,
@@ -472,6 +536,12 @@
         state.orgKeys = new Set((msg.orgItems || []).map(i => `${i.type}:${i.name}`));
         state.orgOnlyItems = (msg.orgItems || []).filter(i => !state.localKeys.has(`${i.type}:${i.name}`));
         state.orgLoaded = true;
+        // The scan before this message could not prune an org-only key — nothing
+        // vouched for one yet. Membership is in now, so the prune the `files`
+        // handler skipped happens here, against local ∪ org. Gated on a scan that
+        // FOUND something, like every other prune: membership alone is no proof a
+        // local component is gone (project discovery may simply have failed).
+        if (state.items.length > 0 && pruneState()) savePersisted();
         noteNewTypes(knownTypes());
         renderSourceFilter();
         renderTypeFilter();
@@ -540,6 +610,7 @@
         // stays in whatever lens they were already looking at.
         if (msg.transient) {
           for (const k of keys) expandPathForKey(k);
+          clearFiltersHiding(keys); // a reveal nobody can see reveals nothing
           renderTree();
           if (msg.scroll) scrollKeyIntoView(keys[0]);
           return;
@@ -555,6 +626,7 @@
           expandPathForKey(k);
           state.selected.add(k);
         }
+        clearFiltersHiding(keys);
         selectionChanged();
         if (msg.scroll) scrollKeyIntoView(keys[0]);
         return;
@@ -582,6 +654,7 @@
           if (state.viewMode === 'selected' && state.selectedLensKeys) state.selectedLensKeys.add(msg.key);
           expandPathForKey(msg.key);
           state.selected.add(msg.key);
+          clearFiltersHiding([msg.key]);
           selectionChanged();
           if (msg.scroll) scrollKeyIntoView(msg.key);
         } else {
@@ -676,7 +749,9 @@
         // keeps the command text from the initial 'run' entry.
         const existing = state.cmdLog.findIndex(e => e.id === msg.entry.id);
         if (existing >= 0) state.cmdLog[existing] = { ...state.cmdLog[existing], ...msg.entry };
-        else state.cmdLog.unshift(msg.entry);
+        // An end entry with nothing to merge into (its id already fell off the
+        // 50-cap) has no command text: a blank row, not worth a line.
+        else if (msg.entry.command) state.cmdLog.unshift(msg.entry);
         if (state.cmdLog.length > 50) state.cmdLog.length = 50;
         renderCmdLog();
         return;
@@ -1018,6 +1093,34 @@
     return true;
   }
 
+  // A selection made FOR the user (Use active file, Use open tabs, a card's
+  // "Select these N", a suggestion's retry) has to be visible: with a filter on,
+  // the count changed and nothing else did, and Deploy later sent a component that
+  // was never on screen. Any filter hiding one of the keys just ticked is reset —
+  // the others are left alone, and a reveal nothing hides changes nothing.
+  function clearFiltersHiding(keys) {
+    let text = false, type = false, source = false;
+    for (const k of keys) {
+      // A key that renders nothing (a card naming a since-deleted component) is
+      // no reason to touch the filters.
+      if (!state.localKeys.has(k) && !state.orgKeys.has(k)) continue;
+      const [t, name] = splitKey(k);
+      // The Selected lens ignores the type and source filters (buildGroups), so
+      // neither can hide a row there.
+      if (state.viewMode !== 'selected') {
+        if (!isTypeAllowed(t)) type = true;
+        if (!isSourceAllowed(itemSource(k))) source = true;
+      }
+      if (state.filter && !matchesFilter({ type: t, name }, state.filter)) text = true;
+    }
+    if (!text && !type && !source) return;
+    if (text) { state.filter = ''; if ($('search')) $('search').value = ''; }
+    if (type) state.typeFilter = new Set();
+    if (source) { state.sourceFilter = 'all'; if ($('sourceFilter')) $('sourceFilter').value = 'all'; }
+    savePersisted();
+    if (type) renderTypeFilter();
+  }
+
   // Partition the (filtered) merged item list into the object tree and the flat type groups.
   function buildGroups() {
     const filter = state.filter;
@@ -1028,11 +1131,16 @@
       if (!o) { o = { obj: null, children: new Map() }; objectMap.set(n, o); }
       return o;
     };
+    // The Selected lens lists what a Deploy would send, so the type and source
+    // filters — tools for FINDING components in All — do not apply to it: with
+    // them on, "N selected" stood above a list that couldn't account for it. The
+    // text filter stays; it is the user's own search WITHIN the lens.
+    const isSelectedLens = state.viewMode === 'selected';
     for (const item of buildMergedItems()) {
-      if (!isTypeAllowed(item.type)) continue;
-      if (!isSourceAllowed(item._source)) continue;
+      if (!isSelectedLens && !isTypeAllowed(item.type)) continue;
+      if (!isSelectedLens && !isSourceAllowed(item._source)) continue;
       // View-mode lens first (cheap Set lookups), text filter within the lens.
-      if (state.viewMode === 'selected') {
+      if (isSelectedLens) {
         // Lazy rebuild covers a webview restored straight into this lens.
         const lens = state.selectedLensKeys ?? (state.selectedLensKeys = new Set(state.selected));
         if (!lens.has(`${item.type}:${item.name}`)) continue;
@@ -1206,10 +1314,11 @@
     document.querySelectorAll('#viewModes button').forEach((btn) => {
       const m = btn.dataset.mode;
       btn.classList.toggle('active', state.viewMode === m);
-      // Counts honour the type filter, like the rows do: a key is `Type:Name`
-      // (split on the FIRST colon), so no item lookup is needed. Otherwise
-      // "Changed (3)" sat above a tree showing one row.
-      const count = m === 'selected' ? visibleKeyCount(state.selected)
+      // Each count is what its lens would draw. Changed honours the type filter,
+      // like its rows do — a key is `Type:Name` (split on the FIRST colon), so no
+      // item lookup is needed — otherwise "Changed (3)" sat above a tree showing
+      // one row. Selected ignores it, because the lens does (buildGroups).
+      const count = m === 'selected' ? state.selected.size
         : (m === 'changed' && state.changedKeys ? visibleKeyCount(state.changedKeys) : null);
       btn.textContent = count === null || count === 0 ? labels[m] : `${labels[m]} (${count})`;
     });
