@@ -580,6 +580,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       gitSub.dispose();
       visSub.dispose();
       if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
+      this.cancelGitPoke();
       this.view = undefined;
     });
   }
@@ -2008,8 +2009,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
     this.fileWatchers = [];
     this.watchedTargetsKey = undefined;
-    if (this.gitPokeTimer) { clearTimeout(this.gitPokeTimer); this.gitPokeTimer = undefined; }
-    this.gitPokePaths?.clear();
+    this.cancelGitPoke();
   }
 
   /** One create/delete notification from the package-directory watcher. */
@@ -2032,15 +2032,35 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  is one more trigger for the existing path, not a second way to compute the
    *  lens. Coalesced per burst (a retrieve or a checkout writes hundreds of files)
    *  and de-duplicated per repository; a path in no open repository pokes
-   *  nothing. Not gated on the panel being visible: the refresh itself is held
-   *  while hidden (scheduleChangedRefresh), and keeping vscode.git's state current
-   *  is what makes the on-show refresh right. Never throws. */
+   *  nothing. No panel at fire time, no poke: watchGitState — the only reader
+   *  of the run — lives and dies with the view, and a never-opened panel must
+   *  not turn every save into a status run for someone who set git.autorefresh
+   *  off. A hidden
+   *  panel still pokes: the refresh itself is held while hidden
+   *  (scheduleChangedRefresh), and keeping vscode.git's state current is what
+   *  makes the on-show refresh right. The affectsItemList filter is load-bearing
+   *  beyond taste: when a package directory IS the repository root, the status
+   *  run's own `.git/index` write would otherwise poke again, forever. Never
+   *  throws. */
   private pokeGitStatus(uri: vscode.Uri): void {
     if (!affectsItemList(uri?.fsPath)) return;
     (this.gitPokePaths ??= new Set()).add(uri.fsPath);
+    this.armGitPoke();
+  }
+
+  /** (Re)start the poke window. Fires after GIT_POKE_DEBOUNCE_MS of quiet — unless
+   *  an operation holds the busy slot: then the panel's own retrieve or restore
+   *  is what is writing, every 150 ms gap in that stream would cost a status run
+   *  (and, with changedBaseRef set, a `git diff`), and the operation ends in
+   *  loadFiles → postChangedComponents anyway. Re-armed instead, as
+   *  RescanScheduler does, so a save the user made meanwhile still lands once
+   *  the slot frees. */
+  private armGitPoke(): void {
     if (this.gitPokeTimer) clearTimeout(this.gitPokeTimer);
     this.gitPokeTimer = setTimeout(() => {
       this.gitPokeTimer = undefined;
+      if (!this.view) { this.gitPokePaths?.clear(); return; }
+      if (this.busy) { this.armGitPoke(); return; }
       const paths = [...(this.gitPokePaths ?? [])];
       this.gitPokePaths?.clear();
       void (async () => {
@@ -2055,6 +2075,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await Promise.all([...repos].map(repo => repo.status()));
       })().catch(err => this.output.appendLine(`[changed] git status refresh failed: ${err instanceof Error ? err.message : String(err)}`));
     }, GIT_POKE_DEBOUNCE_MS);
+  }
+
+  /** Drop a pending poke and its paths — the watchers or the view are going away. */
+  private cancelGitPoke(): void {
+    if (this.gitPokeTimer) clearTimeout(this.gitPokeTimer);
+    this.gitPokeTimer = undefined;
+    this.gitPokePaths?.clear();
   }
 
   /** The watcher's rescan: SILENT by design — no toast, no progress
