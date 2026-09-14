@@ -17,7 +17,14 @@
 //      (vscode.git runs status on every write under the repo — a background
 //      build must not cost a `git diff <changedBaseRef>` per pass);
 //   6. source pins: resolveWebviewView wires the watch and the show-again
-//      resume, and disposes both with the view.
+//      resume, and disposes both with the view;
+//   7. a write under a package directory (the watcher's create/change/delete)
+//      pokes `Repository.status()` on the repository owning the path — once per
+//      burst, once per repository — so the refresh follows the write instead of
+//      vscode.git's own watcher cooldown (a second's debounce, idle-and-focused,
+//      five seconds' sleep, nothing at all with git.autorefresh off); paths that
+//      cannot be a component, paths outside every open repository and a missing
+//      git extension poke nothing; a rejecting status() is logged, never thrown.
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
@@ -35,7 +42,11 @@ function repo(paths) {
   const change = emitter();
   const r = {
     state: { workingTreeChanges: paths.map(p => ({ uri: { fsPath: p } })), indexChanges: [], onDidChange: change.event },
-    diffWith: async () => []
+    diffWith: async () => [],
+    // vscode.git's Repository.status(): re-reads the working tree (onStatus stands
+    // in for that), then fires onDidRunGitStatus = state.onDidChange.
+    statusCalls: 0,
+    status: async () => { r.statusCalls++; if (r.onStatus) await r.onStatus(); change.fire(); }
   };
   return { r, change };
 }
@@ -185,6 +196,67 @@ check('a git API that throws is logged, not thrown', async () => {
   assert.ok(p.log.some(l => l.startsWith('[changed] git state watch failed: boom')), p.log.join('\n'));
 });
 
+// ------------------------------------------------- 7) a write pokes git status
+const pokeSettle = () => new Promise(r => setTimeout(r, 250)); // past the 150 ms poke debounce
+const write = (p, fsPath) => p.s.pokeGitStatus({ fsPath, scheme: 'file' });
+
+check('a write pokes status() on the owning repository once per burst, and the lens follows that run', async () => {
+  const one = repo([]);
+  const other = repo([]);
+  const owner = (uri) => (uri.fsPath.startsWith('/ws/') ? one.r : uri.fsPath.startsWith('/elsewhere/') ? other.r : null);
+  git = { api: { repositories: [one.r, other.r], onDidOpenRepository: emitter().event, getRepository: owner } };
+  const p = provider();
+  const sub = p.s.watchGitState();
+  await tick();
+  // What vscode.git's status run finds: A turned dirty.
+  one.r.onStatus = async () => { one.r.state.workingTreeChanges = [{ uri: { fsPath: A } }]; };
+  write(p, A); write(p, B); write(p, A);
+  assert.strictEqual(one.r.statusCalls, 0, 'coalesced: nothing runs synchronously');
+  await pokeSettle();
+  assert.strictEqual(one.r.statusCalls, 1, 'one status run per burst');
+  assert.strictEqual(other.r.statusCalls, 0, 'only the repository owning the paths');
+  await settle();
+  assert.deepStrictEqual(p.changed(), [['ApexClass:AcmeA']], 'the refresh reads the state that status run produced');
+  // Two repositories in one burst: one run each.
+  write(p, A); write(p, '/elsewhere/force-app/classes/Z.cls');
+  await pokeSettle();
+  assert.strictEqual(one.r.statusCalls, 2);
+  assert.strictEqual(other.r.statusCalls, 1);
+  sub.dispose();
+});
+
+check('paths that cannot be a component, paths in no open repository, and a missing git extension poke nothing', async () => {
+  const one = repo([]);
+  git = { api: { repositories: [one.r], onDidOpenRepository: emitter().event, getRepository: () => one.r } };
+  const p = provider();
+  write(p, '/ws/force-app/classes/.AcmeA.cls.swp');
+  write(p, '/ws/force-app/.git/index');
+  write(p, '/ws/force-app/classes/AcmeA.cls~');
+  await pokeSettle();
+  assert.strictEqual(one.r.statusCalls, 0, 'editor scratch and dot-paths are not git changes worth a status run');
+  git.api.getRepository = () => null;
+  write(p, A);
+  await pokeSettle();
+  assert.strictEqual(one.r.statusCalls, 0, 'a path outside every open repository');
+  git = undefined;
+  write(p, A);
+  await pokeSettle();
+  assert.deepStrictEqual(p.log, []);
+  assert.strictEqual(p.posted.length, 0);
+});
+
+check('a rejecting status() is logged, not thrown', async () => {
+  const one = repo([]);
+  one.r.status = async () => { throw new Error('boom'); };
+  git = { api: { repositories: [one.r], onDidOpenRepository: emitter().event, getRepository: () => one.r } };
+  const p = provider();
+  write(p, A);
+  await pokeSettle();
+  await tick();
+  assert.ok(p.log.some(l => l.startsWith('[changed] git status refresh failed: boom')), p.log.join('\n'));
+  assert.strictEqual(p.posted.length, 0);
+});
+
 // ------------------------------------------------------- 5) source pins
 check('resolveWebviewView wires the watch and the show-again resume, and disposes both with the view', () => {
   assert.ok(src.includes('const gitSub = this.watchGitState();'));
@@ -193,6 +265,10 @@ check('resolveWebviewView wires the watch and the show-again resume, and dispose
   assert.ok(!src.includes('onDidSaveTextDocument(() => this.scheduleChangedRefresh())'), 'the save listener is gone — it read git state before vscode.git had caught up');
   assert.ok(src.includes('subs.push(repo.state.onDidChange(() => this.scheduleChangedRefresh()));'), 'the git event goes through the same debounce as a save');
   assert.ok(src.includes('subs.push(api.onDidOpenRepository(hook));'));
+  // The watcher is the trigger: a change event pokes git; create and delete rescan AND poke.
+  assert.ok(src.includes('watcher.onDidChange(uri => this.pokeGitStatus(uri))'), 'a change event must poke git status');
+  assert.ok(src.includes('watcher.onDidCreate(uri => { this.onWatchedPathChanged(uri); this.pokeGitStatus(uri); })'));
+  assert.ok(src.includes('watcher.onDidDelete(uri => { this.onWatchedPathChanged(uri); this.pokeGitStatus(uri); })'));
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   assert.ok(pkg.scripts.check.includes('node ./scripts/check-changed-live.cjs'), 'this harness is in `check`');
 });

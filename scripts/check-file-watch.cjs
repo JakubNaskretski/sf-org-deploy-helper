@@ -18,7 +18,7 @@
 //   3. RescanScheduler — the coalescing itself, on an injected clock: one rescan
 //      per burst, never while an operation holds the busy slot, never re-entrant.
 //   4. The provider wiring, through the REAL DeployPanelProvider: one watcher per
-//      package dir with change events ignored, an unchanged root left alone, a
+//      package dir (create/delete rescan, every event pokes git status), an unchanged root left alone, a
 //      changed root disposing exactly what it replaces, no root = no watcher.
 //   5. loadFiles' in-flight sharing: a silent rescan answers a file event that is
 //      NEWER than a scan already running, so it must wait and scan once more (all
@@ -468,18 +468,26 @@ check('one watcher per package directory, anchored at that directory', async () 
   assert.ok(watchers.every(w => w.pattern.pattern === '**/*'));
 });
 
-check('CHANGE events are ignored; create and delete are subscribed', async () => {
+check('every event pokes git status; create and delete rescan, a change does not', async () => {
   watchers.length = 0;
-  const prov = provider();
+  const prov = provider({ poked: [], pokeGitStatus(uri) { this.poked.push(uri.fsPath); } });
   await sync(prov, projA);
   for (const w of watchers) {
-    assert.strictEqual(w.ignoreChange, true, 'editing a file body cannot change the item list — a rescan per save is pure cost');
+    assert.strictEqual(w.ignoreChange, false, 'a save must reach git status right away — the Changed lens follows the write');
     assert.strictEqual(w.ignoreCreate, false, 'a created file is the reported bug');
     assert.strictEqual(w.ignoreDelete, false, 'a deleted component must leave the tree');
     assert.strictEqual(w.onCreate.length, 1);
     assert.strictEqual(w.onDelete.length, 1);
-    assert.strictEqual(w.onChange.length, 0);
+    assert.strictEqual(w.onChange.length, 1);
   }
+  const uri = { fsPath: path.join(projA, 'force-app', 'classes', 'AcmeA.cls'), scheme: 'file' };
+  watchers[0].onChange[0](uri);
+  assert.strictEqual(prov.rescanScheduler.scheduled, 0, 'editing a file body cannot change the item list — a rescan per save is pure cost');
+  assert.deepStrictEqual(prov.poked, [uri.fsPath]);
+  watchers[0].onCreate[0](uri);
+  watchers[0].onDelete[0](uri);
+  assert.strictEqual(prov.rescanScheduler.scheduled, 2);
+  assert.strictEqual(prov.poked.length, 3, 'a new or deleted file is a git change too');
 });
 
 check('re-syncing the same root leaves the live watchers running', async () => {
@@ -499,11 +507,11 @@ check('a changed root disposes the old watchers AND their subscriptions', async 
   const old = watchers.slice();
   await sync(prov, projB);
   assert.ok(old.every(w => w.disposed === 1), 'a re-created watcher must not leak the one it replaces');
-  assert.ok(old.every(w => w.subs.every(s => s.disposed === 1)), 'the create/delete subscriptions leak otherwise');
+  assert.ok(old.every(w => w.subs.every(s => s.disposed === 1)), 'the create/change/delete subscriptions leak otherwise');
   const live = watchers.slice(old.length);
   assert.strictEqual(live.length, 1);
   assert.ok(live.every(w => w.disposed === 0));
-  assert.strictEqual(prov.fileWatchers.length, 3, 'watcher + its two subscriptions must all be held for disposal');
+  assert.strictEqual(prov.fileWatchers.length, 4, 'watcher + its three subscriptions must all be held for disposal');
 });
 
 check('no project root means no watcher, and tears the current one down', async () => {
@@ -518,7 +526,7 @@ check('no project root means no watcher, and tears the current one down', async 
   // …and a recovered root really does re-arm rather than being mistaken for
   // the empty set that is already 'in place'.
   await sync(prov, projA);
-  assert.strictEqual(prov.fileWatchers.length, 6);
+  assert.strictEqual(prov.fileWatchers.length, 8);
 });
 
 check('a watcher API failure leaves nothing half-wired', async () => {
@@ -536,7 +544,7 @@ check('a watcher API failure leaves nothing half-wired', async () => {
   assert.strictEqual(prov.watchedTargetsKey, undefined, 'the next scan must retry rather than believe it is watching');
   // …and the retry really does re-arm.
   await sync(prov, projA);
-  assert.strictEqual(prov.fileWatchers.length, 6);
+  assert.strictEqual(prov.fileWatchers.length, 8);
 });
 
 check('a watcher failure toasts ONCE per session; every failure still logs, a second failure does not re-toast', async () => {
