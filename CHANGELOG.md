@@ -3,6 +3,16 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.23.3
+
+- Fixed: **The Changed view follows your saves.** It refreshed only when VS Code's git extension
+  got around to re-running `git status` on its own: a second's debounce, only while the window
+  is idle and focused, then a five-second cooldown, and never at all with `git.autorefresh` off.
+  A saved, created or deleted file therefore showed up seconds later, or not until the view was
+  re-entered. The panel's own package-directory watcher now asks the git extension for a status
+  run the moment a file under a package directory is written, so the view and its tab count
+  update within about a second of the save.
+
 ## 0.23.2
 
 - Fixed: **A file added while the panel was still scanning no longer goes missing.** A component
