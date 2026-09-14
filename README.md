@@ -8,7 +8,8 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
 - Tree of workspace metadata grouped by type (Apex, LWC, Aura, Flows, Layouts, PermissionSets, EmailTemplates, …).
 - Three tree views: **All**, **Selected** (your current pick list, navigable), and
   **Changed** — components whose files have uncommitted git changes, i.e. what you'd
-  actually deploy (deleted files aren't listed; deploys can't delete).
+  actually deploy (deleted files aren't listed; deploys can't delete). It follows your
+  saves as they happen; no re-entering needed.
 - Smart search: word tokens in any order (`acc trig`), camelCase initials (`avt` finds
   `AccountValidationTrigger`), and a type qualifier (`type:flow`, `t:field`) — plus the
   type-filter dropdown, with persisted state across reloads — All / None buttons stay

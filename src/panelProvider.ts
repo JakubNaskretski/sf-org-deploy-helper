@@ -83,8 +83,16 @@ interface GitChangeLite { uri?: vscode.Uri }
 interface GitRepoLite {
   state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[]; onDidChange: vscode.Event<void> };
   diffWith(ref: string): Promise<GitChangeLite[]>;
+  /** Re-run `git status` now (the real API's `status(): Promise<void>`); ends
+   *  in `state.onDidChange` once the in-memory state is current. */
+  status(): Promise<void>;
 }
-interface GitApiLite { repositories: GitRepoLite[]; onDidOpenRepository: vscode.Event<GitRepoLite> }
+interface GitApiLite {
+  repositories: GitRepoLite[];
+  onDidOpenRepository: vscode.Event<GitRepoLite>;
+  /** The open repository containing `uri`, or null (the real API's `getRepository`). */
+  getRepository(uri: vscode.Uri): GitRepoLite | null;
+}
 interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
@@ -338,6 +346,11 @@ interface LoadFilesOptions { silent?: boolean }
  *  the panel already uses for saves. */
 const WATCH_DEBOUNCE_MS = 600;
 
+/** Trailing debounce for pokeGitStatus. A save is one event; a retrieve or a
+ *  checkout is hundreds within a second or two, and vscode.git's status only
+ *  needs to run once the writes stop. Short: the status run itself is the wait. */
+const GIT_POKE_DEBOUNCE_MS = 150;
+
 /** How long a SUCCESS hidden-panel notice stays on screen before closing itself.
  *  Long enough to be noticed by someone looking at the editor rather than the
  *  corner of the screen; short enough that a run of context-menu deploys doesn't
@@ -567,6 +580,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       gitSub.dispose();
       visSub.dispose();
       if (this.changedRefreshTimer) clearTimeout(this.changedRefreshTimer);
+      this.cancelGitPoke();
       this.view = undefined;
     });
   }
@@ -1934,21 +1948,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (key === this.watchedTargetsKey) return;
       this.disposeFileWatchers();
       for (const target of targets) {
-        // Create and delete only — ignoreChangeEvents is the `true` in the middle.
-        // Editing a file's BODY cannot add or remove a component, so an onDidChange
-        // rescan would walk the whole package tree on every keystroke-save to
-        // rebuild the identical list. What a save DOES change — git state — is
-        // already covered by the git state watch (watchGitState → scheduleChangedRefresh).
+        // Create and delete rescan; a change does NOT — editing a file's BODY cannot
+        // add or remove a component, so an onDidChange rescan would walk the whole
+        // package tree on every save to rebuild the identical list. What a save
+        // DOES change is git state, and every event pokes vscode.git for it
+        // (pokeGitStatus), so the Changed lens follows the write instead of
+        // vscode.git's own seconds-long watcher cooldown.
         const watcher = vscode.workspace.createFileSystemWatcher(
           new vscode.RelativePattern(vscode.Uri.file(target.base), target.pattern),
           false,
-          true,
+          false,
           false
         );
         created.push(
           watcher,
-          watcher.onDidCreate(uri => this.onWatchedPathChanged(uri)),
-          watcher.onDidDelete(uri => this.onWatchedPathChanged(uri))
+          watcher.onDidCreate(uri => { this.onWatchedPathChanged(uri); this.pokeGitStatus(uri); }),
+          watcher.onDidChange(uri => this.pokeGitStatus(uri)),
+          watcher.onDidDelete(uri => { this.onWatchedPathChanged(uri); this.pokeGitStatus(uri); })
         );
       }
       this.fileWatchers = created;
@@ -1993,12 +2009,79 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
     this.fileWatchers = [];
     this.watchedTargetsKey = undefined;
+    this.cancelGitPoke();
   }
 
   /** One create/delete notification from the package-directory watcher. */
   private onWatchedPathChanged(uri: vscode.Uri): void {
     if (!affectsItemList(uri?.fsPath)) return;
     this.rescanScheduler.schedule();
+  }
+
+  private gitPokeTimer?: ReturnType<typeof setTimeout>;
+  /** Paths written since the last poke ran — resolved to repositories when it fires. */
+  private gitPokePaths?: Set<string>;
+
+  /** A write under a package directory: have vscode.git re-run `git status` NOW.
+   *  Left to itself vscode.git debounces its own watcher by a second, waits for
+   *  the window to be idle and focused, sleeps five seconds after each run, and
+   *  with `git.autorefresh` off never runs at all — so the Changed lens trailed a
+   *  save by anything from two seconds to forever. `Repository.status()` skips
+   *  all of that (only vscode.git's one-running-one-queued throttle applies) and
+   *  ends in the same `state.onDidChange` watchGitState refreshes from, so this
+   *  is one more trigger for the existing path, not a second way to compute the
+   *  lens. Coalesced per burst (a retrieve or a checkout writes hundreds of files)
+   *  and de-duplicated per repository; a path in no open repository pokes
+   *  nothing. No panel at fire time, no poke: watchGitState — the only reader
+   *  of the run — lives and dies with the view, and a never-opened panel must
+   *  not turn every save into a status run for someone who set git.autorefresh
+   *  off. A hidden
+   *  panel still pokes: the refresh itself is held while hidden
+   *  (scheduleChangedRefresh), and keeping vscode.git's state current is what
+   *  makes the on-show refresh right. The affectsItemList filter is load-bearing
+   *  beyond taste: when a package directory IS the repository root, the status
+   *  run's own `.git/index` write would otherwise poke again, forever. Never
+   *  throws. */
+  private pokeGitStatus(uri: vscode.Uri): void {
+    if (!affectsItemList(uri?.fsPath)) return;
+    (this.gitPokePaths ??= new Set()).add(uri.fsPath);
+    this.armGitPoke();
+  }
+
+  /** (Re)start the poke window. Fires after GIT_POKE_DEBOUNCE_MS of quiet — unless
+   *  an operation holds the busy slot: then the panel's own retrieve or restore
+   *  is what is writing, every 150 ms gap in that stream would cost a status run
+   *  (and, with changedBaseRef set, a `git diff`), and the operation ends in
+   *  loadFiles → postChangedComponents anyway. Re-armed instead, as
+   *  RescanScheduler does, so a save the user made meanwhile still lands once
+   *  the slot frees. */
+  private armGitPoke(): void {
+    if (this.gitPokeTimer) clearTimeout(this.gitPokeTimer);
+    this.gitPokeTimer = setTimeout(() => {
+      this.gitPokeTimer = undefined;
+      if (!this.view) { this.gitPokePaths?.clear(); return; }
+      if (this.busy) { this.armGitPoke(); return; }
+      const paths = [...(this.gitPokePaths ?? [])];
+      this.gitPokePaths?.clear();
+      void (async () => {
+        const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
+        if (!gitExt) return;
+        const api = (gitExt.isActive ? gitExt.exports : await gitExt.activate()).getAPI(1);
+        const repos = new Set<GitRepoLite>();
+        for (const p of paths) {
+          const repo = api.getRepository(vscode.Uri.file(p));
+          if (repo) repos.add(repo);
+        }
+        await Promise.all([...repos].map(repo => repo.status()));
+      })().catch(err => this.output.appendLine(`[changed] git status refresh failed: ${err instanceof Error ? err.message : String(err)}`));
+    }, GIT_POKE_DEBOUNCE_MS);
+  }
+
+  /** Drop a pending poke and its paths — the watchers or the view are going away. */
+  private cancelGitPoke(): void {
+    if (this.gitPokeTimer) clearTimeout(this.gitPokeTimer);
+    this.gitPokeTimer = undefined;
+    this.gitPokePaths?.clear();
   }
 
   /** The watcher's rescan: SILENT by design — no toast, no progress
