@@ -343,19 +343,24 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
     // file mapped to no component (foldPathKey was exact off Windows). The CLI
     // itself resolves non-strict types by suffix alone, so folder case carries
     // no meaning there either. Two on-disk entries differing only in case
-    // (case-sensitive filesystem) keep the first.
-    let entries: import('fs').Dirent[];
-    try { entries = await fs.readdir(defaultDir, { withFileTypes: true }); } catch { continue; }
-    const onDisk = new Map<string, string>();
-    for (const e of entries) {
-      if (e.isDirectory() && !onDisk.has(e.name.toLowerCase())) onDisk.set(e.name.toLowerCase(), e.name);
+    // (case-sensitive filesystem) are both scanned. A symlinked type folder
+    // counts (fs.access followed it before). A default dir that can be
+    // traversed but not listed — or a transient listing error — falls back to
+    // the rule's own spelling, exactly the pre-0.23.4 behaviour.
+    let entries: import('fs').Dirent[] | undefined;
+    try { entries = await fs.readdir(defaultDir, { withFileTypes: true }); } catch { entries = undefined; }
+    const onDisk = new Map<string, string[]>();
+    for (const e of entries ?? []) {
+      if (!(e.isDirectory() || (e.isSymbolicLink() && await isDirectory(path.join(defaultDir, e.name))))) continue;
+      const k = e.name.toLowerCase();
+      onDisk.set(k, [...(onDisk.get(k) ?? []), e.name]);
     }
-    const realDir = (folder: string): string | undefined => {
-      const name = onDisk.get(folder.toLowerCase());
-      return name === undefined ? undefined : path.join(defaultDir, name);
+    const realDirs = async (folder: string): Promise<string[]> => {
+      if (!entries) { const p = path.join(defaultDir, folder); return (await pathExists(p)) ? [p] : []; }
+      return (onDisk.get(folder.toLowerCase()) ?? []).map(n => path.join(defaultDir, n));
     };
     // Collect unrecognized sibling folders that hold metadata-looking files.
-    for (const e of entries) {
+    for (const e of entries ?? []) {
       if (!e.isDirectory() || shouldSkipDir(e.name) || STATIC_RULE_FOLDERS_LOWER.has(e.name.toLowerCase())) continue;
       const p = path.join(defaultDir, e.name);
       const metas = await walkForFilesMatching(p, ['-meta.xml']);
@@ -363,9 +368,9 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
       const residual = exts ? metas.filter(f => !exts.some(x => f.endsWith(x))) : metas;
       if (residual.length) unknownFolders.push(p);
     }
-    for (const rule of rules) {
-      const dir = realDir(rule.folder);
-      if (!dir) continue;
+    const targets: Array<{ rule: FolderRule; dir: string }> = [];
+    for (const rule of rules) for (const dir of await realDirs(rule.folder)) targets.push({ rule, dir });
+    for (const { rule, dir } of targets) {
       if (rule.bundle) {
         // Walk recursively; treat any folder whose name matches its child metadata file as a bundle.
         const markers = bundleMarkersForType(rule.type);
@@ -417,8 +422,7 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
       }
     }
     // CustomObject: walk recursively under objects/ to allow org-hint subfolders.
-    const objectsDir = realDir('objects');
-    if (objectsDir) {
+    for (const objectsDir of await realDirs('objects')) {
       const bundleDirs = await walkForBundleDirs(objectsDir, ['.object-meta.xml']);
       for (const bundlePath of bundleDirs) {
         const files = await listAllFiles(bundlePath);

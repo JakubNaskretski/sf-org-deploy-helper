@@ -94,9 +94,11 @@ export function rulesFromRegistry(registry: unknown, staticFolders: ReadonlySet<
 
 /** Folders the registry KNOWS cannot yield a per-file rule — folder-based
  *  types (documents), bundles, mixed/matching content, decomposed types — keyed
- *  by directoryName → type name. The scanner uses this to skip the CLI call
- *  that could only fail, and to tell the user the honest reason. Static
- *  folders are excluded (they have their own shape rules). */
+ *  by LOWERCASED directoryName → type name (look up with the on-disk basename
+ *  lowercased: folders match case-insensitively everywhere else too). The
+ *  scanner uses this to skip the CLI call that could only fail, and to tell the
+ *  user the honest reason. Static folders are excluded (they have their own
+ *  shape rules). */
 export function nonDerivableFolders(registry: unknown, staticFolders: ReadonlySet<string>): Map<string, string> {
   const r = registry as { types?: Record<string, RegistryType>; childTypes?: Record<string, unknown> } | null;
   const out = new Map<string, string>();
@@ -110,7 +112,8 @@ export function nonDerivableFolders(registry: unknown, staticFolders: ReadonlySe
     if (staticLower.has(directoryName.toLowerCase())) continue;
     const adapter = (t.strategies as { adapter?: unknown } | undefined)?.adapter;
     const derivable = !(t.strategies && adapter !== 'default') && !t.inFolder;
-    if (!derivable && !out.has(directoryName)) out.set(directoryName, name);
+    const k = directoryName.toLowerCase();
+    if (!derivable && !out.has(k)) out.set(k, name);
   }
   return out;
 }

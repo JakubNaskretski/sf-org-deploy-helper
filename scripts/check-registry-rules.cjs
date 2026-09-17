@@ -85,6 +85,8 @@ const FIXTURE = {
     assert.deepStrictEqual([...m.entries()].sort(), [['bundlish', 'Bundlish'], ['infolds', 'Infold']]);
     assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'classes', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed');
     assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'CLASSES', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed, whatever its case');
+    // Keys are lowercased so the on-disk basename (any case) looks them up.
+    assert.deepStrictEqual([...nonDerivableFolders({ types: { d: { name: 'Doc', directoryName: 'Documents', inFolder: true } } }, STATIC).entries()], [['documents', 'Doc']], 'key is the lowercased directoryName');
     assert.deepStrictEqual([...nonDerivableFolders(null, STATIC).keys()], []);
     assert.deepStrictEqual([...registryNonDerivable().keys()].length >= 0, true, 'getter is safe before any load');
   });
@@ -230,10 +232,15 @@ const FIXTURE = {
   });
   await check('known-shape folders skip the CLI and get their own banner; CLI resolutions run 3 at a time', () => {
     assert.ok(/const nonDerivable = registryNonDerivable\(\);/.test(src));
-    assert.ok(/const known = nonDerivable\.get\(path\.basename\(folder\)\);\s*\n\s*if \(known\) \{\s*\n\s*this\.markUnresolvable\(folder\);/.test(src), 'known shape → negative-cached without a CLI call');
+    assert.ok(/const known = nonDerivable\.get\(path\.basename\(folder\)\.toLowerCase\(\)\);\s*\n\s*if \(known\) \{\s*\n\s*this\.markUnresolvable\(folder\);/.test(src), 'known shape → negative-cached without a CLI call, looked up case-insensitively');
     assert.ok(/const limit = 3;/.test(src) && /Array\.from\(\{ length: Math\.min\(limit, toResolve\.length\) \}, worker\)/.test(src), 'bounded concurrency');
     assert.ok(/Not shown in the tree \(folder-based or bundle types, deploy via right-click\): \$\{this\.knownShapeSkips\.join\(', '\)\}/.test(src));
     assert.ok(/Couldn't resolve metadata type for: \$\{realFailures\.join\(', '\)\}/.test(src), 'real failures keep the error wording');
+  });
+  await check('the registry naming check is part of npm run check (0.23.4)', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert.ok(/node \.\/scripts\/check-registry-names\.cjs/.test(pkg.scripts.check), 'check-registry-names.cjs dropped from the check chain');
+    assert.ok(fs.existsSync(path.join(__dirname, 'check-registry-names.cjs')));
   });
 
   await check('an explicit scan that finds no project retries before believing it; folder changes rescan', () => {

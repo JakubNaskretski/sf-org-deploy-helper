@@ -43,8 +43,11 @@ const failures = [];
 const fail = msg => failures.push(msg);
 
 (async () => {
-  const registryPath = await locateRegistry();
-  assert.ok(registryPath, 'no sf CLI registry found on PATH — install the sf CLI; this check must run against the real metadataRegistry.json');
+  // SF_METADATA_REGISTRY=<path to metadataRegistry.json> overrides the PATH
+  // lookup for a machine where `sf` is a version-manager shim locateRegistry
+  // can't follow. Still a real registry file — never a fixture.
+  const registryPath = process.env.SF_METADATA_REGISTRY || await locateRegistry();
+  assert.ok(registryPath && fs.existsSync(registryPath), 'no sf CLI registry found — install the sf CLI so `sf` on PATH resolves to it, or set SF_METADATA_REGISTRY=<path>/metadataRegistry.json; this check only means something against the real file');
   const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   let version = 'unknown';
   try { version = JSON.parse(fs.readFileSync(path.join(path.dirname(registryPath), '..', '..', '..', 'package.json'), 'utf8')).version; } catch { /* informational */ }
@@ -61,7 +64,7 @@ const fail = msg => failures.push(msg);
 
   // 1. Static folder rules: folder = directoryName, suffixes = the registry suffix
   //    (`.<suffix>` content file and/or `.<suffix>-meta.xml`), all exact.
-  assert.ok(RULES.length > 30, 'RULES not exported / empty');
+  assert.ok(RULES.length >= 40, `RULES not exported / shrank: ${RULES.length}`); // 40 at 0.23.4 — raise as rules are added, never lower
   for (const r of RULES) {
     const t = byName.get(r.type);
     if (!t) { fail(`RULES ${r.type}: type not in registry`); continue; }
@@ -112,7 +115,10 @@ const fail = msg => failures.push(msg);
   //    (rel: '<folder>/<Name>.<suffix>-meta.xml' per type) must use registry spellings.
   const matrixSrc = fs.readFileSync(path.join(__dirname, 'check-diff-matrix.cjs'), 'utf8');
   const fixtures = [...matrixSrc.matchAll(/rel: '([^']+)', type: '([^']+)'/g)];
-  assert.ok(fixtures.length > 20, 'check-diff-matrix.cjs FIX list not found');
+  // Every `{ rel:` entry must have parsed — a fixture whose shape drifted from
+  // the regex would otherwise silently leave the pinned surface.
+  const entries = (matrixSrc.match(/\{ rel: '/g) ?? []).length;
+  assert.ok(fixtures.length >= 40 && fixtures.length === entries, `check-diff-matrix.cjs FIX list: parsed ${fixtures.length} of ${entries} entries`);
   for (const [, rel, type] of fixtures) {
     const t = byName.get(type);
     if (!t) { fail(`check-diff-matrix ${type}: type not in registry`); continue; }

@@ -310,6 +310,27 @@ check('REGRESSION: with the exact file absent, another type\'s near-miss is NOT 
   assert.deepStrictEqual(card && card.lines, ['— CustomTab:Widget__c — not on org']);
 });
 
+// 0.23.4: the scanner now spells paths the way the user's disk does, so a field
+// under `Objects/Widget__c/Fields/` is a real local item — while the retrieve
+// tree is written by the CLI with the registry's `objects/…/fields/`. The
+// suffix pairing must ignore case or the child diffs as "not on org".
+check('REGRESSION: an object child under a differently-cased folder still finds its org copy', async () => {
+  resetUi();
+  const field = FIX.find(f => f.type === 'CustomField');
+  const drifted = path.join('Objects', 'Widget__c', 'Fields', path.basename(field.rel));
+  const local = path.join(workspace, PKG, drifted);
+  await fsp.mkdir(path.dirname(local), { recursive: true });
+  await fsp.writeFile(local, localBody(drifted), 'utf8');
+  const item = inferItemForPath(local);
+  assert.strictEqual(`${item.type}:${item.name}`, `${field.type}:${field.name}`, 'drifted folder case still infers the child');
+  const { stub, posted, log } = diffStub([item], orgFilesFor(field)); // org tree: registry spelling
+  await runDiff(stub, [`${field.type}:${field.name}`]);
+  assert.strictEqual(ui.diffs.length, 1, `no diff opened — card: ${JSON.stringify(cards(posted))} log: ${log.join(' | ')}`);
+  assert.strictEqual(ui.diffs[0].right, local);
+  assert.strictEqual(await fsp.readFile(ui.diffs[0].left, 'utf8'), orgBody(field.rel), 'paired with the wrong org file');
+  drainTmpCleanup();
+});
+
 // A type absent from the org is the other verdict that must stay honest per type.
 check('BATCH: types the org does not have report as missing, not as opened', async () => {
   resetUi();

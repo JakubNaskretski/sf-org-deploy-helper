@@ -416,6 +416,38 @@ try {
     assert.strictEqual(findItemForPath(scan.items, path.join(dflt, 'Classes', 'Odd.cls-meta.xml'), 'linux').name, 'Odd', 'sidecar path spelled as on disk');
   } catch (e) { failed++; console.error('FAIL scanWorkspace (folder case):', e.message); }
 
+  // Reading the default dir once must not lose what the per-rule probe found
+  // before (0.23.4 review): a SYMLINKED type folder is a directory to fs.access
+  // but not to Dirent.isDirectory(), and a default dir that can be traversed but
+  // not listed (mode --x, or a transient EACCES/EMFILE) must fall back to the
+  // rule's own spelling instead of scanning to nothing.
+  try {
+    const proj = path.join(tmp, 'edge');
+    const pkg = 'edge/force-app/main/default/';
+    await w('edge/sfdx-project.json', JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }] }));
+    await w('edge/shared/triggers/T.trigger', 'trigger T on Account (before insert) {}');
+    await w('edge/shared/triggers/T.trigger-meta.xml');
+    await w(pkg + 'classes/A.cls', 'public class A {}');
+    await fsp.symlink(path.join(proj, 'shared', 'triggers'), path.join(proj, 'force-app', 'main', 'default', 'triggers'), 'dir');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'edge', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const scan = await scanWorkspace();
+    assert.deepStrictEqual(scan.items.map(i => `${i.type}:${i.name}`).sort(), ['ApexClass:A', 'ApexTrigger:T'], 'symlinked type folder scans');
+    const trig = scan.items.find(i => i.type === 'ApexTrigger');
+    assert.strictEqual(trig.filePath, path.join(proj, 'force-app', 'main', 'default', 'triggers', 'T.trigger'), 'through the symlink, not the target');
+    assert.strictEqual(trig.metaPath, path.join(proj, 'force-app', 'main', 'default', 'triggers', 'T.trigger-meta.xml'));
+    // Unlistable default dir: traversable (x) but no read bit. Root ignores mode
+    // bits, so this case is only exercised by an unprivileged run; the assertions
+    // hold either way.
+    const dflt = path.join(proj, 'force-app', 'main', 'default');
+    await fsp.chmod(dflt, 0o311);
+    try {
+      const blind = await scanWorkspace();
+      assert.deepStrictEqual(blind.items.map(i => `${i.type}:${i.name}`).sort(), ['ApexClass:A', 'ApexTrigger:T'], 'unlistable default dir still scans by the rule spelling');
+      assert.deepStrictEqual(blind.unknownFolders, [], 'nothing to report when the dir cannot be listed');
+    } finally { await fsp.chmod(dflt, 0o755); }
+  } catch (e) { failed++; console.error('FAIL scanWorkspace (symlink / unlistable dir):', e.message); }
+
   // Discovery retry (0.22.1): only the "not found" outcome is retried.
   try {
     const notFound = { projectError: 'No Salesforce DX project found in this workspace. Expected exactly one sfdx-project.json.' };
