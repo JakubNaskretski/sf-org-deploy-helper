@@ -93,13 +93,13 @@ const FIX = [
   { rel: 'quickActions/Widget__c.New_Widget.quickAction-meta.xml', type: 'QuickAction', name: 'Widget__c.New_Widget' },
   { rel: 'customPermissions/Manage_Widgets.customPermission-meta.xml', type: 'CustomPermission', name: 'Manage_Widgets' },
   { rel: 'namedCredentials/Widget_API.namedCredential-meta.xml', type: 'NamedCredential', name: 'Widget_API' },
-  { rel: 'externalDataSources/Widget_Source.externalDataSource-meta.xml', type: 'ExternalDataSource', name: 'Widget_Source' },
-  { rel: 'remoteSiteSettings/Widget_Site.remoteSiteSetting-meta.xml', type: 'RemoteSiteSetting', name: 'Widget_Site' },
+  { rel: 'dataSources/Widget_Source.dataSource-meta.xml', type: 'ExternalDataSource', name: 'Widget_Source' },
+  { rel: 'remoteSiteSettings/Widget_Site.remoteSite-meta.xml', type: 'RemoteSiteSetting', name: 'Widget_Site' },
   { rel: 'roles/Widget_Manager.role-meta.xml', type: 'Role', name: 'Widget_Manager' },
   { rel: 'settings/Account.settings-meta.xml', type: 'Settings', name: 'Account' },
   { rel: 'messageChannels/Widget_Channel.messageChannel-meta.xml', type: 'LightningMessageChannel', name: 'Widget_Channel' },
   { rel: 'testSuites/Widget_Suite.testSuite-meta.xml', type: 'ApexTestSuite', name: 'Widget_Suite' },
-  { rel: 'platformEventSubscriberConfigs/Widget_Cfg.platformEventSubscriberConfig-meta.xml', type: 'PlatformEventSubscriberConfig', name: 'Widget_Cfg' },
+  { rel: 'PlatformEventSubscriberConfigs/Widget_Cfg.platformEventSubscriberConfig-meta.xml', type: 'PlatformEventSubscriberConfig', name: 'Widget_Cfg' },
   // OmniStudio (standard runtime): one `<fullName>.<suffix>-meta.xml` per component,
   // no sidecar, no bundle. Names carry the version (and, for OmniScripts, the
   // language) segments the platform bakes into the fullName.

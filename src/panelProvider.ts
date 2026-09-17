@@ -6275,8 +6275,9 @@ function isUnder(root: string, abs: string): boolean {
   return a === r || a.startsWith(r + path.sep);
 }
 
-/** All metadata types the extension supports — fetched in one batch when the user clicks "Fetch Org". */
-const FETCH_ORG_TYPES: readonly string[] = [
+/** All metadata types the extension supports — fetched in one batch when the user clicks "Fetch Org".
+ *  Exported for scripts/check-registry-names.cjs: every name must exist in the CLI registry, exact case. */
+export const FETCH_ORG_TYPES: readonly string[] = [
   // Apex / Visualforce
   'ApexClass', 'ApexTrigger', 'ApexPage', 'ApexComponent', 'ApexTestSuite',
   // Lightning
@@ -6326,7 +6327,7 @@ const FETCH_ORG_TYPES: readonly string[] = [
  *  enumerated first. Members come back as `Folder/Name`, matching local keys.
  *  (EmailTemplateFolder is the long-standing alias of EmailFolder — kept because
  *  it's what this plugin has always queried successfully.) */
-const FOLDERED_TYPES: Record<string, string> = {
+export const FOLDERED_TYPES: Record<string, string> = {
   EmailTemplate: 'EmailTemplateFolder',
   Report: 'ReportFolder',
   Dashboard: 'DashboardFolder'
@@ -6354,7 +6355,7 @@ export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningCompo
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
  *  one REST query instead of a Metadata API retrieve round-trip. */
-const FAST_DIFF_FIELD: Record<string, string> = {
+export const FAST_DIFF_FIELD: Record<string, string> = {
   ApexClass: 'Body',
   ApexTrigger: 'Body',
   ApexPage: 'Markup',

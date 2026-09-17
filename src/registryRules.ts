@@ -57,10 +57,16 @@ interface RegistryType {
  *  are skipped (the static rule knows the shape better, e.g. bundles/objects).
  *  Shape- and charset-guarded: the file is local and trusted, but its values
  *  become paths and argv, so a malformed entry degrades to "no rule". */
+/** Static folders are owned whatever their case — the scanner matches type
+ *  folders to the disk case-insensitively, so a registry entry that differs from
+ *  a static rule only in case must not become a second, competing rule. */
+const lowerSet = (s: ReadonlySet<string>): Set<string> => new Set([...s].map(f => f.toLowerCase()));
+
 export function rulesFromRegistry(registry: unknown, staticFolders: ReadonlySet<string>): FolderRule[] {
   const r = registry as { types?: Record<string, RegistryType>; childTypes?: Record<string, unknown> } | null;
   if (!r || typeof r !== 'object' || !r.types || typeof r.types !== 'object') return [];
   const childIds = new Set(Object.keys(r.childTypes && typeof r.childTypes === 'object' ? r.childTypes : {}));
+  const staticLower = lowerSet(staticFolders);
   const out: FolderRule[] = [];
   const seen = new Set<string>();
   for (const [id, t] of Object.entries(r.types)) {
@@ -75,7 +81,7 @@ export function rulesFromRegistry(registry: unknown, staticFolders: ReadonlySet<
     if ((t.strategies && adapter !== 'default') || t.inFolder) continue;
     if (typeof name !== 'string' || typeof directoryName !== 'string' || typeof suffix !== 'string') continue;
     if (!TOKEN.test(name) || !DIR_TOKEN.test(directoryName) || !TOKEN.test(suffix)) continue;
-    if (staticFolders.has(directoryName)) continue;
+    if (staticLower.has(directoryName.toLowerCase())) continue;
     // Several types can share a folder with different suffixes (wave/, email/);
     // each gets its own rule. Same folder + same suffix keeps the first.
     const key = `${directoryName}/${suffix}`;
@@ -96,11 +102,12 @@ export function nonDerivableFolders(registry: unknown, staticFolders: ReadonlySe
   const out = new Map<string, string>();
   if (!r || typeof r !== 'object' || !r.types || typeof r.types !== 'object') return out;
   const childIds = new Set(Object.keys(r.childTypes && typeof r.childTypes === 'object' ? r.childTypes : {}));
+  const staticLower = lowerSet(staticFolders);
   for (const [id, t] of Object.entries(r.types)) {
     if (!t || typeof t !== 'object' || childIds.has(id)) continue;
     const { name, directoryName } = t;
     if (typeof name !== 'string' || typeof directoryName !== 'string' || !TOKEN.test(name) || !DIR_TOKEN.test(directoryName)) continue;
-    if (staticFolders.has(directoryName)) continue;
+    if (staticLower.has(directoryName.toLowerCase())) continue;
     const adapter = (t.strategies as { adapter?: unknown } | undefined)?.adapter;
     const derivable = !(t.strategies && adapter !== 'default') && !t.inFolder;
     if (!derivable && !out.has(directoryName)) out.set(directoryName, name);

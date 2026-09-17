@@ -54,7 +54,18 @@ const cases = [
   [p('x', 'layouts', 'Foo__mdt-Some Layout.layout-meta.xml'), 'Layout', 'Foo__mdt-Some Layout'],
   [p('x', 'permissionsets', 'Admin.permissionset-meta.xml'), 'PermissionSet', 'Admin'],
   [p('x', 'flexipages', 'Home.flexipage-meta.xml'), 'FlexiPage', 'Home'],
-  [p('x', 'platformEventSubscriberConfigs', 'nameSmth.platformEventSubscriberConfig-meta.xml'), 'PlatformEventSubscriberConfig', 'nameSmth'],
+  // Registry spelling (capital P). The rule once said `platformEventSubscriberConfigs`
+  // and this line agreed with it, so the harness confirmed the typo: the scan still
+  // found the files on macOS, but with the rule's spelling in the path, and the
+  // Changed view — matching vscode.git's on-disk path — never saw the component.
+  [p('x', 'PlatformEventSubscriberConfigs', 'nameSmth.platformEventSubscriberConfig-meta.xml'), 'PlatformEventSubscriberConfig', 'nameSmth'],
+  // Folder case drift in either direction is matched case-insensitively; the
+  // suffix stays exact.
+  [p('x', 'platformeventsubscriberconfigs', 'nameSmth.platformEventSubscriberConfig-meta.xml'), 'PlatformEventSubscriberConfig', 'nameSmth'],
+  [p('x', 'Classes', 'Odd.cls'), 'ApexClass', 'Odd'],
+  [p('x', 'LWC', 'myCmp', 'myCmp.js'), 'LightningComponentBundle', 'myCmp', p('x', 'LWC', 'myCmp')],
+  [p('x', 'Objects', 'Account', 'Fields', 'My__c.field-meta.xml'), 'CustomField', 'Account.My__c'],
+  [p('x', 'Email', 'Marketing', 'Welcome.email'), 'EmailTemplate', 'Marketing/Welcome'],
   // OmniStudio standard-runtime types: static RULES, so NO learned rule is passed
   // here — a tree that only knew them through the registry cache lost every row
   // on the first silent rescan after the cache expired.
@@ -210,35 +221,40 @@ try {
   assert.deepStrictEqual(deriveRule('omniIntegrationProcedures', 'OmniIntegrationProcedure', ['Widget_Fetch_1'], ['Widget_Fetch_1.oip-meta.xml']).primaryExt, ['.oip-meta.xml']);
 } catch (e) { failed++; console.error('FAIL deriveRule (OmniStudio):', e.message); }
 
-// foldPathKey + findItemForPath case-folding. Windows filesystems are
-// case-insensitive and VS Code's URI sources disagree about drive-letter casing;
-// the platform param lets us exercise win32 folding on this non-Windows host.
+// foldPathKey + findItemForPath case-folding. Windows AND macOS filesystems are
+// case-insensitive by default, and VS Code's URI sources disagree about casing
+// (drive letters; a differently-cased opened folder); Linux stays exact. The
+// platform param lets us exercise every fold on this one host.
 try {
-  // win32: normalize + lowercase, so a case/drive-letter drift folds together
-  // (the exact drive-letter case from the audit).
+  // win32 / darwin: normalize + lowercase, so a case/drive-letter drift folds
+  // together (the exact drive-letter case from the audit).
   assert.strictEqual(foldPathKey('C:\\Ws\\a.CLS', 'win32'), foldPathKey('c:\\ws\\A.cls', 'win32'), 'win32 fold must ignore case');
-  // darwin: normalize only — case preserved (case-sensitive filesystem).
-  const dwn = p('Ws', 'A.CLS');
-  assert.strictEqual(foldPathKey(dwn, 'darwin'), path.normalize(dwn), 'darwin fold must keep case');
-  assert.notStrictEqual(foldPathKey(p('Ws', 'A.CLS'), 'darwin'), foldPathKey(p('Ws', 'a.cls'), 'darwin'), 'darwin treats differing case as different');
+  assert.strictEqual(foldPathKey(p('Ws', 'A.CLS'), 'darwin'), foldPathKey(p('ws', 'a.cls'), 'darwin'), 'darwin fold must ignore case');
+  // linux: normalize only — case preserved (case-sensitive filesystem).
+  const lnx = p('Ws', 'A.CLS');
+  assert.strictEqual(foldPathKey(lnx, 'linux'), path.normalize(lnx), 'linux fold must keep case');
+  assert.notStrictEqual(foldPathKey(p('Ws', 'A.CLS'), 'linux'), foldPathKey(p('Ws', 'a.cls'), 'linux'), 'linux treats differing case as different');
 
-  // findItemForPath honors the fold: a mis-cased query matches under win32, not darwin.
+  // findItemForPath honors the fold: a mis-cased query matches under win32 and darwin, not linux.
   const item = {
     type: 'ApexClass', name: 'MyClass',
     filePath: p('Ws', 'classes', 'MyClass.cls'),
     files: [p('Ws', 'classes', 'MyClass.cls'), p('Ws', 'classes', 'MyClass.cls-meta.xml')]
   };
   const items = [item];
-  // pass 1 (exact primary file), pass 2 (listed sidecar) — mis-cased, win32 matches
-  assert.strictEqual(findItemForPath(items, p('ws', 'CLASSES', 'myclass.cls'), 'win32'), item, 'win32 primary-file fold');
-  assert.strictEqual(findItemForPath(items, p('WS', 'classes', 'MyClass.CLS-META.XML'), 'win32'), item, 'win32 listed-file fold');
-  // darwin: same mis-cased query must NOT match; exact case still does (control)
-  assert.strictEqual(findItemForPath(items, p('ws', 'CLASSES', 'myclass.cls'), 'darwin'), undefined, 'darwin must not fold case');
-  assert.strictEqual(findItemForPath(items, p('Ws', 'classes', 'MyClass.cls'), 'darwin'), item, 'darwin exact match');
-  // pass 3 (containing bundle folder) — mis-cased dir prefix, win32 matches, darwin doesn't
+  for (const plat of ['win32', 'darwin']) {
+    // pass 1 (exact primary file), pass 2 (listed sidecar) — mis-cased, folded platforms match
+    assert.strictEqual(findItemForPath(items, p('ws', 'CLASSES', 'myclass.cls'), plat), item, `${plat} primary-file fold`);
+    assert.strictEqual(findItemForPath(items, p('WS', 'classes', 'MyClass.CLS-META.XML'), plat), item, `${plat} listed-file fold`);
+  }
+  // linux: same mis-cased query must NOT match; exact case still does (control)
+  assert.strictEqual(findItemForPath(items, p('ws', 'CLASSES', 'myclass.cls'), 'linux'), undefined, 'linux must not fold case');
+  assert.strictEqual(findItemForPath(items, p('Ws', 'classes', 'MyClass.cls'), 'linux'), item, 'linux exact match');
+  // pass 3 (containing bundle folder) — mis-cased dir prefix, folded platforms match, linux doesn't
   const bundle = { type: 'LightningComponentBundle', name: 'myCmp', filePath: p('Ws', 'lwc', 'myCmp'), files: [] };
   assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'win32'), bundle, 'win32 bundle-dir fold');
-  assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'darwin'), undefined, 'darwin bundle-dir no fold');
+  assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'darwin'), bundle, 'darwin bundle-dir fold');
+  assert.strictEqual(findItemForPath([bundle], p('ws', 'LWC', 'MYCMP', 'myCmp.js'), 'linux'), undefined, 'linux bundle-dir no fold');
 } catch (e) { failed++; console.error('FAIL foldPathKey/findItemForPath:', e.message); }
 
 // detectMissingDependencies: shape contract only — the exhaustive pattern and
@@ -355,6 +371,50 @@ try {
     const mail = scan.items.find(i => i.type === 'EmailTemplate');
     assert.ok(mail.metaPath && mail.files.length === 2, 'nested content+meta pair still paired');
   } catch (e) { failed++; console.error('FAIL scanWorkspace (folder-based types):', e.message); }
+
+  // Folder case (0.23.4): type folders match the disk case-insensitively and the
+  // scanned paths carry the ON-DISK spelling — what vscode.git, the editor and
+  // the watcher report. Asserted under 'linux' (exact compare) so the spelling
+  // itself is proven, not merely folded over. Every static folder is owned in
+  // any case, so none is ever an unknown folder, and the CustomObject tree and
+  // its decomposed children follow the same contract.
+  try {
+    const proj = path.join(tmp, 'casing');
+    const pkg = 'casing/force-app/main/default/';
+    await w('casing/sfdx-project.json', JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }] }));
+    await w(pkg + 'PlatformEventSubscriberConfigs/MyCfg.platformEventSubscriberConfig-meta.xml'); // registry spelling
+    await w(pkg + 'Classes/Odd.cls', 'public class Odd {}'); // drifted spelling
+    await w(pkg + 'Classes/Odd.cls-meta.xml');
+    await w(pkg + 'LWC/myCmp/myCmp.js');
+    await w(pkg + 'LWC/myCmp/myCmp.js-meta.xml');
+    await w(pkg + 'Objects/Acme__c/Acme__c.object-meta.xml');
+    await w(pkg + 'Objects/Acme__c/Fields/Amount__c.field-meta.xml');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'casing', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const scan = await scanWorkspace();
+    assert.deepStrictEqual(scan.unknownFolders, [], 'a static folder is owned whatever its case');
+    assert.deepStrictEqual(scan.items.map(i => `${i.type}:${i.name}`).sort(), [
+      'ApexClass:Odd', 'CustomField:Acme__c.Amount__c', 'CustomObject:Acme__c', 'LightningComponentBundle:myCmp', 'PlatformEventSubscriberConfig:MyCfg'
+    ]);
+    const dflt = path.join(proj, 'force-app', 'main', 'default');
+    const onDisk = {
+      'PlatformEventSubscriberConfig:MyCfg': path.join(dflt, 'PlatformEventSubscriberConfigs', 'MyCfg.platformEventSubscriberConfig-meta.xml'),
+      'ApexClass:Odd': path.join(dflt, 'Classes', 'Odd.cls'),
+      'LightningComponentBundle:myCmp': path.join(dflt, 'LWC', 'myCmp'),
+      'CustomObject:Acme__c': path.join(dflt, 'Objects', 'Acme__c'),
+      'CustomField:Acme__c.Amount__c': path.join(dflt, 'Objects', 'Acme__c', 'Fields', 'Amount__c.field-meta.xml')
+    };
+    for (const [key, real] of Object.entries(onDisk)) {
+      const it = scan.items.find(i => `${i.type}:${i.name}` === key);
+      assert.strictEqual(it.filePath, real, `${key}: path spelled as on disk`);
+      assert.ok(it.files.every(f => f.startsWith(dflt + path.sep) && !f.includes(path.sep + 'classes' + path.sep) && !f.includes(path.sep + 'lwc' + path.sep)), `${key}: listed files spelled as on disk`);
+      // The git→component mapping under an EXACT compare — the Changed view's
+      // real question — now resolves; before, the rule's spelling leaked into
+      // the path and this returned undefined on macOS.
+      assert.strictEqual(findItemForPath(scan.items, real, 'linux'), it, `${key}: on-disk path maps to the component`);
+    }
+    assert.strictEqual(findItemForPath(scan.items, path.join(dflt, 'Classes', 'Odd.cls-meta.xml'), 'linux').name, 'Odd', 'sidecar path spelled as on disk');
+  } catch (e) { failed++; console.error('FAIL scanWorkspace (folder case):', e.message); }
 
   // Discovery retry (0.22.1): only the "not found" outcome is retried.
   try {

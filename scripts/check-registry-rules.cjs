@@ -55,6 +55,9 @@ const FIXTURE = {
     parent: { name: 'Parent', directoryName: 'parents', suffix: 'parent', children: { types: {} } },
     kid: { name: 'Kid', directoryName: 'kids', suffix: 'kid' },
     stat: { name: 'Stat', directoryName: 'classes', suffix: 'stat' },
+    // Same static folder, different case: the scanner matches folders to the disk
+    // case-insensitively, so this must not become a second, competing rule (0.23.4).
+    statCase: { name: 'StatCase', directoryName: 'Classes', suffix: 'sc' },
     badname: { name: 'Bad-Name', directoryName: 'bads', suffix: 'bad' },
     baddir: { name: 'BadDir', directoryName: 'bad/dir', suffix: 'bd' },
     nosuffix: { name: 'NoSuffix', directoryName: 'nosuffix' },
@@ -74,13 +77,14 @@ const FIXTURE = {
     assert.deepStrictEqual(byType.Deflt, { folder: 'deflts', type: 'Deflt', primaryExt: ['.deflt-meta.xml'] });
     // A parent with children but no strategy is still one -meta.xml file (AssignmentRules…).
     assert.deepStrictEqual(byType.Parent, { folder: 'parents', type: 'Parent', primaryExt: ['.parent-meta.xml'] });
-    for (const t of ['Bundlish', 'Infold', 'Kid', 'Stat', 'Bad-Name', 'BadDir', 'NoSuffix', 'AlphaTwin']) assert.ok(!byType[t], `${t} must be skipped`);
+    for (const t of ['Bundlish', 'Infold', 'Kid', 'Stat', 'StatCase', 'Bad-Name', 'BadDir', 'NoSuffix', 'AlphaTwin']) assert.ok(!byType[t], `${t} must be skipped`);
   });
 
   await check('nonDerivableFolders: bundle / folder-based types only, static folders and child types excluded', () => {
     const m = nonDerivableFolders(FIXTURE, STATIC);
     assert.deepStrictEqual([...m.entries()].sort(), [['bundlish', 'Bundlish'], ['infolds', 'Infold']]);
     assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'classes', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed');
+    assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'CLASSES', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed, whatever its case');
     assert.deepStrictEqual([...nonDerivableFolders(null, STATIC).keys()], []);
     assert.deepStrictEqual([...registryNonDerivable().keys()].length >= 0, true, 'getter is safe before any load');
   });
