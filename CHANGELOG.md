@@ -11,7 +11,11 @@ This file starts at the current release; earlier history predates it.
   one built-in rule did not, and on macOS the scan still found the files — under the rule's
   spelling, so the path never matched the one git reports and the component was treated as
   unchanged. Type folders now match the disk case-insensitively, scanned paths carry the on-disk
-  spelling, and path comparisons fold case on macOS as they already did on Windows.
+  spelling, path comparisons fold case on macOS as they already did on Windows, and a diff of a
+  field or other object child under such a folder finds its org copy instead of reporting it missing.
+- Fixed: **ExternalDataSource and RemoteSiteSetting components now appear in the tree.** Their
+  built-in rules used spellings the Salesforce registry never had (`dataSources/*.dataSource-meta.xml`
+  and `*.remoteSite-meta.xml` are the real ones), so those folders never scanned.
 - Internal: every built-in type name, folder and file suffix is now checked byte-for-byte against
   the sf CLI's own metadata registry as part of the build, so a spelling that drifts from the
   registry fails the build instead of a view.

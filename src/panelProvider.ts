@@ -1679,7 +1679,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const nonDerivable = registryNonDerivable();
     const toResolve: string[] = [];
     for (const folder of folders) {
-      const known = nonDerivable.get(path.basename(folder));
+      const known = nonDerivable.get(path.basename(folder).toLowerCase());
       if (known) {
         this.markUnresolvable(folder);
         this.knownShapeSkips.push(`${path.basename(folder)} (${known})`);
@@ -6851,8 +6851,13 @@ async function findFileMatching(dir: string, exactBasename: string, leafName: st
  *  (a relative path like `objects/Account/fields/Foo__c.field-meta.xml`). Used to
  *  locate a decomposed child inside the converted source tree without assuming the
  *  tree's root nesting, while still keying on the object + child folder. */
-async function findFileBySuffix(dir: string, suffixPath: string): Promise<string | undefined> {
-  return findFile(dir, (_n, full) => full === suffixPath || full.endsWith(path.sep + suffixPath));
+/** Case-insensitive on every platform: the wanted suffix is built from the LOCAL
+ *  path (spelled as the user's disk spells it — `Objects/Acme__c/Fields/…`), while
+ *  the retrieve tree is written by the CLI with the registry's spelling. Exported
+ *  for the harness. */
+export async function findFileBySuffix(dir: string, suffixPath: string): Promise<string | undefined> {
+  const want = suffixPath.toLowerCase();
+  return findFile(dir, (_n, full) => { const f = full.toLowerCase(); return f === want || f.endsWith(path.sep + want); });
 }
 
 /** Scaffold a throwaway SFDX project so a source-format retrieve has somewhere to
