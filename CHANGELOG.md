@@ -3,6 +3,19 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.23.4
+
+- Fixed: **A component whose type folder is spelled in a different case than the extension
+  expected no longer goes missing from the Changed view, Use Active File, diff and the watcher.**
+  `PlatformEventSubscriberConfigs` is the case in point: the Salesforce registry capitalises it,
+  one built-in rule did not, and on macOS the scan still found the files — under the rule's
+  spelling, so the path never matched the one git reports and the component was treated as
+  unchanged. Type folders now match the disk case-insensitively, scanned paths carry the on-disk
+  spelling, and path comparisons fold case on macOS as they already did on Windows.
+- Internal: every built-in type name, folder and file suffix is now checked byte-for-byte against
+  the sf CLI's own metadata registry as part of the build, so a spelling that drifts from the
+  registry fails the build instead of a view.
+
 ## 0.23.3
 
 - Fixed: **The Changed view follows your saves.** It refreshed only when VS Code's git extension
