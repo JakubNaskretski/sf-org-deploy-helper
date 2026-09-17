@@ -3,6 +3,10 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.24.0
+
+- **?** in the panel title opens a short guide — org selection, the tree and its lenses, Deploy / Validate / Retrieve / Diff, the context-menu actions, confirmations and prerequisites — with an **Open README** button for the full documentation.
+
 ## 0.23.3
 
 - Fixed: **The Changed view follows your saves.** It refreshed only when VS Code's git extension

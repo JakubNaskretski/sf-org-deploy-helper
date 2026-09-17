@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.23.3",
+  "version": "0.24.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -100,6 +100,11 @@
       {
         "command": "sfOrgDeployWrapper.deleteFromOrg",
         "title": "SF Deploy: Delete from Org"
+      },
+      {
+        "command": "sfOrgDeployWrapper.help",
+        "title": "SF Deploy: How It Works",
+        "icon": "$(question)"
       }
     ],
     "menus": {
@@ -185,6 +190,13 @@
           "command": "sfOrgDeployWrapper.deleteFromOrg",
           "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
           "group": "sfdeploy@7"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "sfOrgDeployWrapper.help",
+          "when": "view == sfOrgDeployWrapper.panel",
+          "group": "navigation@9"
         }
       ]
     },

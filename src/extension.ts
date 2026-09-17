@@ -61,7 +61,8 @@ export function activate(context: vscode.ExtensionContext): void {
     // guard are identical either way.
     registerSafe('sfOrgDeployWrapper.loginOrg', () => provider.loginOrg()),
     registerSafe('sfOrgDeployWrapper.openInOrg', (uri?: vscode.Uri) => provider.openInOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    registerSafe('sfOrgDeployWrapper.deleteFromOrg', (uri?: vscode.Uri) => provider.deleteFromOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri))
+    registerSafe('sfOrgDeployWrapper.deleteFromOrg', (uri?: vscode.Uri) => provider.deleteFromOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
+    registerSafe('sfOrgDeployWrapper.help', () => showHelp(context))
   );
 
   // Settle the remembered org (one-time adoption of the family setting, then a
@@ -90,4 +91,29 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   // no-op
+}
+
+// The "?" in the panel title: a short plain-text guide (a modal's detail renders no markdown).
+async function showHelp(context: vscode.ExtensionContext): Promise<void> {
+  const HELP = `1. Open SF Deploy Wrapper in the Activity Bar and pick an org from the dropdown (＋ logs in to a new one).
+2. Tick components in the tree; the All / Selected / Changed tabs and search (acc trig, type:flow) narrow it; the type filter narrows All and Changed.
+3. Deploy pushes local files; Validate is a check-only deploy; Retrieve pulls the org's copy; Diff compares the two.
+4. Fetch Org lists what the org has, so org-only components appear; Rescan re-reads the workspace.
+5. Right-click a metadata file in the Explorer or editor for Deploy, Retrieve, Diff, Compare, Deploy File + Dependencies, Open in Org, Delete from Org.
+6. Most actions are also in the Command Palette under "SF Deploy:", including Restore Retrieve Backup, which otherwise appears only on a retrieve's result card.
+7. Destructive actions confirm first and production orgs get an extra guard; long runs can be cancelled.
+8. Needs the Salesforce CLI (sf) on PATH, a logged-in org, and exactly one sfdx-project.json somewhere under the opened folder.`;
+  const choice = await vscode.window.showInformationMessage('SF Deploy Wrapper', { modal: true, detail: HELP }, 'Open README');
+  if (choice === 'Open README') {
+    // vsce ships the file as readme.md while the dev host has README.md: open whichever exists
+    for (const name of ['readme.md', 'README.md']) {
+      const uri = vscode.Uri.joinPath(context.extensionUri, name);
+      try {
+        await vscode.workspace.fs.stat(uri);
+        await vscode.commands.executeCommand('markdown.showPreview', uri);
+        return;
+      } catch { /* try the other spelling */ }
+    }
+    void vscode.window.showWarningMessage('README not found in the extension folder.');
+  }
 }
