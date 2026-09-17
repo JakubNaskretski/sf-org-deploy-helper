@@ -51,7 +51,9 @@ export interface FolderRule {
   relName?: boolean;
 }
 
-const RULES: FolderRule[] = [
+/** Static folder rules. Every folder/suffix here is pinned to the sf CLI's own
+ *  registry by scripts/check-registry-names.cjs — byte-for-byte, case included. */
+export const RULES: FolderRule[] = [
   { folder: 'classes', type: 'ApexClass', primaryExt: ['.cls'], metaSuffix: '.cls-meta.xml' },
   { folder: 'triggers', type: 'ApexTrigger', primaryExt: ['.trigger'], metaSuffix: '.trigger-meta.xml' },
   { folder: 'pages', type: 'ApexPage', primaryExt: ['.page'], metaSuffix: '.page-meta.xml' },
@@ -77,13 +79,16 @@ const RULES: FolderRule[] = [
   { folder: 'quickActions', type: 'QuickAction', primaryExt: ['.quickAction-meta.xml'] },
   { folder: 'customPermissions', type: 'CustomPermission', primaryExt: ['.customPermission-meta.xml'] },
   { folder: 'namedCredentials', type: 'NamedCredential', primaryExt: ['.namedCredential-meta.xml'] },
-  { folder: 'externalDataSources', type: 'ExternalDataSource', primaryExt: ['.externalDataSource-meta.xml'] },
-  { folder: 'remoteSiteSettings', type: 'RemoteSiteSetting', primaryExt: ['.remoteSiteSetting-meta.xml'] },
+  // `dataSources/<Name>.dataSource-meta.xml` and `remoteSiteSettings/<Name>.remoteSite-meta.xml`
+  // are the registry's spellings (0.23.4: both rules had never matched a real project, and the
+  // static folder kept the registry rule out too, so RemoteSiteSetting was unscannable).
+  { folder: 'dataSources', type: 'ExternalDataSource', primaryExt: ['.dataSource-meta.xml'] },
+  { folder: 'remoteSiteSettings', type: 'RemoteSiteSetting', primaryExt: ['.remoteSite-meta.xml'] },
   { folder: 'roles', type: 'Role', primaryExt: ['.role-meta.xml'] },
   { folder: 'settings', type: 'Settings', primaryExt: ['.settings-meta.xml'] },
   { folder: 'messageChannels', type: 'LightningMessageChannel', primaryExt: ['.messageChannel-meta.xml'] },
   { folder: 'testSuites', type: 'ApexTestSuite', primaryExt: ['.testSuite-meta.xml'] },
-  { folder: 'platformEventSubscriberConfigs', type: 'PlatformEventSubscriberConfig', primaryExt: ['.platformEventSubscriberConfig-meta.xml'] },
+  { folder: 'PlatformEventSubscriberConfigs', type: 'PlatformEventSubscriberConfig', primaryExt: ['.platformEventSubscriberConfig-meta.xml'] },
   { folder: 'email', type: 'EmailTemplate', primaryExt: ['.email'], metaSuffix: '.email-meta.xml', nested: true },
   // Folder-based types: <dir>/<Folder>/<Name>.<suffix>-meta.xml (fullName
   // `Folder/Name`), plus the folder's own <dir>/<Folder>.<x>Folder-meta.xml at
@@ -112,8 +117,10 @@ const RULES: FolderRule[] = [
 /** Folders the static rules own. Registry-derived rules skip these: the static
  *  entry knows shapes the registry's default adapter doesn't (bundles, objects). */
 export const STATIC_RULE_FOLDERS: ReadonlySet<string> = new Set([...RULES.map(r => r.folder), 'objects']);
+/** Lowercased view: type folders match the disk case-insensitively (see scanWorkspace). */
+const STATIC_RULE_FOLDERS_LOWER: ReadonlySet<string> = new Set([...STATIC_RULE_FOLDERS].map(f => f.toLowerCase()));
 
-const OBJECT_CHILD_RULES: Array<{ folder: string; type: string; suffix: string }> = [
+export const OBJECT_CHILD_RULES: Array<{ folder: string; type: string; suffix: string }> = [
   { folder: 'fields', type: 'CustomField', suffix: '.field-meta.xml' },
   { folder: 'businessProcesses', type: 'BusinessProcess', suffix: '.businessProcess-meta.xml' },
   { folder: 'compactLayouts', type: 'CompactLayout', suffix: '.compactLayout-meta.xml' },
@@ -126,7 +133,7 @@ const OBJECT_CHILD_RULES: Array<{ folder: string; type: string; suffix: string }
   { folder: 'webLinks', type: 'WebLink', suffix: '.webLink-meta.xml' },
 ];
 
-const OBJECT_CHILD_BY_FOLDER = new Map(OBJECT_CHILD_RULES.map(r => [r.folder, r]));
+const OBJECT_CHILD_BY_FOLDER = new Map(OBJECT_CHILD_RULES.map(r => [r.folder.toLowerCase(), r]));
 
 /** A FolderRule learned at runtime from the sf CLI's own metadata registry
  *  (via `sf project generate manifest`), cached with a timestamp so it can
@@ -314,7 +321,10 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
   // reaching the CLI for the shapes the registry rules don't describe.
   const unknownFolders: string[] = [];
   const extraExts = new Map<string, string[]>();
-  for (const r of extraRules) extraExts.set(r.folder, [...(extraExts.get(r.folder) ?? []), ...(r.primaryExt ?? [])]);
+  for (const r of extraRules) {
+    const k = r.folder.toLowerCase();
+    extraExts.set(k, [...(extraExts.get(k) ?? []), ...(r.primaryExt ?? [])]);
+  }
   for (const pkg of pkgDirs) {
     // Standard layout is <pkg>/main/default, but SFDX only requires <pkg>; metadata
     // can sit directly under the package dir. Fall back to <pkg> when main/default is
@@ -323,20 +333,39 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
     const mainDefault = path.join(pkgRoot, 'main', 'default');
     const defaultDir = (await pathExists(mainDefault)) ? mainDefault : pkgRoot;
     if (!(await pathExists(defaultDir))) continue;
+    // Type folders are matched to the on-disk entries CASE-INSENSITIVELY, and
+    // every scanned path is spelled the way the disk spells it. A rule and a
+    // repo can disagree on a folder's case (the registry capitalises
+    // `PlatformEventSubscriberConfigs`; one static rule didn't), and on a
+    // case-insensitive filesystem `path.join(defaultDir, rule.folder)` resolved
+    // regardless — but with the RULE's spelling, so the item's path never
+    // equalled the one vscode.git, the editor and the watcher report, and the
+    // file mapped to no component (foldPathKey was exact off Windows). The CLI
+    // itself resolves non-strict types by suffix alone, so folder case carries
+    // no meaning there either. Two on-disk entries differing only in case
+    // (case-sensitive filesystem) keep the first.
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(defaultDir, { withFileTypes: true }); } catch { continue; }
+    const onDisk = new Map<string, string>();
+    for (const e of entries) {
+      if (e.isDirectory() && !onDisk.has(e.name.toLowerCase())) onDisk.set(e.name.toLowerCase(), e.name);
+    }
+    const realDir = (folder: string): string | undefined => {
+      const name = onDisk.get(folder.toLowerCase());
+      return name === undefined ? undefined : path.join(defaultDir, name);
+    };
     // Collect unrecognized sibling folders that hold metadata-looking files.
-    try {
-      for (const e of await fs.readdir(defaultDir, { withFileTypes: true })) {
-        if (!e.isDirectory() || shouldSkipDir(e.name) || STATIC_RULE_FOLDERS.has(e.name)) continue;
-        const p = path.join(defaultDir, e.name);
-        const metas = await walkForFilesMatching(p, ['-meta.xml']);
-        const exts = extraExts.get(e.name);
-        const residual = exts ? metas.filter(f => !exts.some(x => f.endsWith(x))) : metas;
-        if (residual.length) unknownFolders.push(p);
-      }
-    } catch { /* unreadable dir — nothing to report */ }
+    for (const e of entries) {
+      if (!e.isDirectory() || shouldSkipDir(e.name) || STATIC_RULE_FOLDERS_LOWER.has(e.name.toLowerCase())) continue;
+      const p = path.join(defaultDir, e.name);
+      const metas = await walkForFilesMatching(p, ['-meta.xml']);
+      const exts = extraExts.get(e.name.toLowerCase());
+      const residual = exts ? metas.filter(f => !exts.some(x => f.endsWith(x))) : metas;
+      if (residual.length) unknownFolders.push(p);
+    }
     for (const rule of rules) {
-      const dir = path.join(defaultDir, rule.folder);
-      if (!(await pathExists(dir))) continue;
+      const dir = realDir(rule.folder);
+      if (!dir) continue;
       if (rule.bundle) {
         // Walk recursively; treat any folder whose name matches its child metadata file as a bundle.
         const markers = bundleMarkersForType(rule.type);
@@ -388,8 +417,8 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
       }
     }
     // CustomObject: walk recursively under objects/ to allow org-hint subfolders.
-    const objectsDir = path.join(defaultDir, 'objects');
-    if (await pathExists(objectsDir)) {
+    const objectsDir = realDir('objects');
+    if (objectsDir) {
       const bundleDirs = await walkForBundleDirs(objectsDir, ['.object-meta.xml']);
       for (const bundlePath of bundleDirs) {
         const files = await listAllFiles(bundlePath);
@@ -446,7 +475,7 @@ async function scanObjectChildren(objectsDir: string, items: MetadataItem[]): Pr
     try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       if (!e.isDirectory() || shouldSkipDir(e.name)) continue;
-      const rule = OBJECT_CHILD_BY_FOLDER.get(e.name);
+      const rule = OBJECT_CHILD_BY_FOLDER.get(e.name.toLowerCase());
       if (rule) {
         const objectName = path.basename(dir);
         const found = await walkForFilesMatching(path.join(dir, e.name), [rule.suffix]);
@@ -464,18 +493,21 @@ async function scanObjectChildren(objectsDir: string, items: MetadataItem[]): Pr
 }
 
 /**
- * Canonical comparison key for a filesystem path. Windows filesystems are
- * case-insensitive AND VS Code's URI sources disagree about drive-letter casing
- * (the workspace folder, the vscode.git extension, and open/save dialogs can each
- * hand back a different case for the same file) — so every cross-source path
- * COMPARISON must run both sides through this, or a mere casing drift reads as a
- * different file. Display strings keep their original casing; only comparison keys
+ * Canonical comparison key for a filesystem path. Windows and macOS filesystems
+ * are case-insensitive by default, AND VS Code's URI sources disagree about
+ * casing (the workspace folder, the vscode.git extension, and open/save dialogs
+ * can each hand back a different case for the same file — the drive letter on
+ * Windows, a differently-cased opened folder on macOS) — so every cross-source
+ * path COMPARISON must run both sides through this, or a mere casing drift reads
+ * as a different file. Salesforce component names are case-insensitively unique
+ * in the org, so a case-sensitive macOS volume loses nothing to the fold; Linux
+ * stays exact. Display strings keep their original casing; only comparison keys
  * are folded. The `platform` param defaults to the host but is overridable so
- * win32 folding is testable off Windows.
+ * each platform's folding is testable anywhere.
  */
 export function foldPathKey(p: string, platform: NodeJS.Platform = process.platform): string {
   const n = path.normalize(p);
-  return platform === 'win32' ? n.toLowerCase() : n;
+  return platform === 'win32' || platform === 'darwin' ? n.toLowerCase() : n;
 }
 
 /** Find the workspace metadata item that owns the given absolute file path, if any. */
@@ -548,15 +580,19 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
   const norm = path.normalize(absPath);
   const base = path.basename(norm);
   const segs = norm.split(path.sep);
+  // Folder segments compare case-insensitively — the scanWorkspace contract;
+  // file suffixes stay exact, as the CLI's own suffix lookup is.
+  const lower = segs.map(s => s.toLowerCase());
+  const lastSeg = (folder: string): number => lower.lastIndexOf(folder.toLowerCase());
   const rules = [...RULES, ...extraRules];
   const item = (type: string, name: string, filePath = norm): MetadataItem => ({ type, name, filePath, files: [filePath] });
 
   // 1. Decomposed object children (and the CustomObject itself) under objects/<Object>/…
-  const oi = segs.lastIndexOf('objects');
+  const oi = lastSeg('objects');
   if (oi >= 0 && oi + 1 < segs.length) {
     const objectName = segs[oi + 1];
     for (const rule of OBJECT_CHILD_RULES) {
-      if (base.endsWith(rule.suffix) && segs.slice(oi + 2).includes(rule.folder)) {
+      if (base.endsWith(rule.suffix) && lower.slice(oi + 2).includes(rule.folder.toLowerCase())) {
         return item(rule.type, `${objectName}.${base.slice(0, -rule.suffix.length)}`);
       }
     }
@@ -566,7 +602,7 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
   // 2. Bundle types (LWC/Aura): the component is the bundle directory under lwc/ or aura/.
   for (const rule of rules) {
     if (!rule.bundle) continue;
-    const bi = segs.lastIndexOf(rule.folder);
+    const bi = lastSeg(rule.folder);
     if (bi >= 0 && bi + 1 < segs.length) {
       const bundleDir = segs.slice(0, bi + 2).join(path.sep);
       return item(rule.type, segs[bi + 1], bundleDir);
@@ -576,7 +612,7 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
   // 3. Nested EmailTemplate: email/<Folder>/<Name>.email → fullName `Folder/Name`.
   // Require a folder level (file at ei+2 or deeper) — a bare email/<Name>.email has no
   // valid fullName, so leave it unrecognized rather than inventing `<Name>.email/<Name>`.
-  const ei = segs.lastIndexOf('email');
+  const ei = lastSeg('email');
   if (ei >= 0 && ei + 2 < segs.length) {
     for (const suffix of ['.email-meta.xml', '.email']) {
       if (base.endsWith(suffix)) return item('EmailTemplate', `${segs[ei + 1]}/${base.slice(0, -suffix.length)}`);
@@ -585,7 +621,7 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
 
   // 4. Regular single-/per-file types — matched by the type's folder plus extension.
   for (const rule of rules) {
-    if (rule.bundle || rule.nested || segs.lastIndexOf(rule.folder) < 0) continue;
+    if (rule.bundle || rule.nested || lastSeg(rule.folder) < 0) continue;
     for (const ext of rule.primaryExt ?? []) {
       if (base.endsWith(ext)) return item(rule.type, base.slice(0, -ext.length));
     }
