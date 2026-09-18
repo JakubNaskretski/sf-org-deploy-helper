@@ -3,6 +3,17 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.25.1
+
+- Fixed: **Groups fold again in the Changed and Selected views.** Both views open their groups
+  for you, and a click on a group header did nothing at all — so a commit section's contents
+  could not be folded away. Groups now fold and unfold wherever they are, including inside a
+  commit section, where folding one leaves the same type open in the other sections.
+- Fixed: **Expand all / Collapse all work in every view.** They were disabled outside **All**
+  ("groups auto-expand"); in the Changed view Collapse all now closes the sections and Expand
+  all opens them and their groups.
+- The Changed header names the branch it is showing — `feature/acme` rather than "This branch".
+
 ## 0.25.0
 
 - **The Changed view keeps your work after a commit — and after a push.** It used to answer

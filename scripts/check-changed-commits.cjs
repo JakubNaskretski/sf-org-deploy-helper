@@ -477,6 +477,35 @@ check('one repository giving up does not label the whole view a fallback', async
   assert.strictEqual(p.last().note, undefined, 'so the header must not announce a fallback above it');
 });
 
+check('the branch being shown is named, unless the repositories disagree', async () => {
+  config = { changedBaseRef: 'auto' };
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'B', [REL('AcmeB')]));
+  git = { repositories: [repo({ branch: 'feature/acme', diff: [B_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  const p = provider();
+  await p.s.postChangedComponents();
+  assert.strictEqual(p.last().branch, 'feature/acme');
+  // Two repositories on different branches: no single name means anything.
+  git = {
+    repositories: [repo({ branch: 'feature/acme', diff: [B_CLS] }), repo({ root: '/ws2', branch: 'devInt', diff: [] })],
+    onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN
+  };
+  const q = provider();
+  await q.s.postChangedComponents();
+  assert.strictEqual(q.last().branch, undefined);
+  // Detached HEAD has no name at all.
+  git = { repositories: [repo({ branch: null, diff: [B_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  const r = provider();
+  await r.s.postChangedComponents();
+  assert.strictEqual(r.last().branch, undefined);
+  // An explicit ref names itself; the branch is not the comparison then.
+  config = { changedBaseRef: 'main' };
+  git = { repositories: [repo({ branch: 'feature/acme', diff: [B_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  const t = provider();
+  await t.s.postChangedComponents();
+  assert.strictEqual(t.last().branch, undefined);
+  assert.strictEqual(t.last().base, 'main');
+});
+
 check('a slower refresh never posts over a newer one', async () => {
   config = { changedBaseRef: '' };
   git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
