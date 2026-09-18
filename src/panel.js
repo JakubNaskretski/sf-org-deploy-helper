@@ -98,9 +98,15 @@
     changedBase: '',         // git ref the Changed lens compares against ('' = uncommitted only)
     changedAuto: false,      // true when that comparison is this branch's own commits
     changedNote: '',         // why the automatic comparison gave up, when it did
+    changedBranch: '',       // the branch the automatic comparison is showing, named in the header
     changedUncommitted: null,// Set of keys with uncommitted edits (the lens's first section)
     changedCommits: [],      // [{hash, short, subject, keys}] newest first — one section each
     expandedSections: new Set(['uncommitted']), // open Changed sections; in-memory, unlike expandedGroups
+    // expandedGroups records what the user OPENED; under a lens or a filter every
+    // group is open to begin with, so folding one has to be recorded as a
+    // closure instead. In-memory and section-scoped (keys carry the section id),
+    // so a type folded inside one commit stays open in the next.
+    collapsedGroups: new Set(),
     // Signatures of the last APPLIED 'files' / 'changed' payloads (see
     // filesSignature / changedSignature). Every render replaces the tree's
     // innerHTML — scroll position and keyboard focus go with it — and the package
@@ -391,7 +397,7 @@
     // The sections are part of what's drawn: the same key set split differently
     // (a commit made, an edit staged) has to repaint.
     const commits = (msg.commits || []).map(c => [c.hash, c.author || '', (c.keys || []).slice().sort()]);
-    return JSON.stringify([keys, msg.reason || '', msg.base || '', !!msg.auto, msg.note || '',
+    return JSON.stringify([keys, msg.reason || '', msg.base || '', !!msg.auto, msg.note || '', msg.branch || '',
       Array.from(msg.uncommitted || []).sort(), commits]);
   }
 
@@ -602,6 +608,7 @@
         state.changedBase = msg.base || '';
         state.changedAuto = !!msg.auto;
         state.changedNote = msg.note || '';
+        state.changedBranch = msg.branch || '';
         state.changedUncommitted = msg.keys === null ? null : new Set(msg.uncommitted || []);
         state.changedCommits = msg.keys === null ? [] : (msg.commits || []);
         // Every scan ends by recomputing this lens, so a background rescan would
@@ -1057,9 +1064,30 @@
   }
   // Expand all = every visible group; Collapse all = EVERY key, visible or not
   // (a group hidden by today's lens would otherwise reopen by itself later).
+  // Under a lens or a filter the render forces groups open, so there the two
+  // buttons drive the in-memory closure set — the same buttons, the same
+  // meaning, a different set.
   function setAllGroups(expand) {
+    if (state.viewMode !== 'all' || state.filter) {
+      if (expand) {
+        state.collapsedGroups.clear();
+        for (const sec of changedSections() || []) state.expandedSections.add(sec.id);
+      } else {
+        const sections = changedSections();
+        if (sections) {
+          // Closing the sections IS collapsing everything here; their contents
+          // stay as they were for when one is opened again.
+          for (const sec of sections) state.expandedSections.delete(sec.id);
+        } else {
+          const { objectMap, flatGroups } = buildGroups();
+          for (const k of groupKeysInGroups(objectMap, flatGroups)) state.collapsedGroups.add(k);
+        }
+      }
+      renderTree();
+      return;
+    }
     if (expand) {
-      const { objectMap, flatGroups } = buildGroups();
+      const { objectMap, flatGroups } = buildGroups(undefined, buildMergedItems());
       for (const k of groupKeysInGroups(objectMap, flatGroups)) state.expandedGroups.add(k);
     } else {
       state.expandedGroups.clear();
@@ -1377,14 +1405,13 @@
     const tools = $('treeTools');
     if (!tools) return;
     tools.style.display = (objectMap.size > 0 || flatGroups.size > 0) ? 'flex' : 'none';
-    const auto = state.viewMode !== 'all' ? 'Groups auto-expand in the Selected and Changed views'
-      : (state.filter ? 'Groups auto-expand while a filter is typed' : '');
     const ex = $('expandAll');
     const co = $('collapseAll');
-    ex.disabled = !!auto;
-    co.disabled = !!auto;
-    ex.title = auto || 'Expand every group';
-    co.title = auto || 'Collapse every group';
+    // Groups start open under a lens or a filter, but they fold — so do these.
+    ex.disabled = false;
+    co.disabled = false;
+    ex.title = 'Expand every group';
+    co.title = state.viewMode === 'changed' ? 'Collapse every section' : 'Collapse every group';
   }
 
   function renderTree() {
@@ -1438,7 +1465,9 @@
       // `changedNote` means the automatic comparison gave up (a trunk-only
       // checkout, or too long a branch): say what IS on screen rather than let
       // the label claim a comparison that isn't happening.
-      lbl.textContent = state.changedAuto && !state.changedNote ? 'This branch'
+      // Name the branch when we know it: "This branch" told the user nothing
+      // they couldn't already see, and nothing about WHICH branch.
+      lbl.textContent = state.changedAuto && !state.changedNote ? (state.changedBranch || 'This branch')
         : state.changedBase ? `vs ${state.changedBase}` : 'Uncommitted only';
       lbl.title = state.changedNote
         ? `${state.changedNote}\nClick to change what this view compares against.`
@@ -1550,7 +1579,7 @@
       });
       node.group.classList.add('section');
       tree.appendChild(node.group); budget.nodes++; painted++;
-      if (expanded) renderGroups(node.body, objectMap, flatGroups, budget, 1);
+      if (expanded) renderGroups(node.body, objectMap, flatGroups, budget, 1, sec.id + '/');
     }
     if (painted === 0) {
       const d = document.createElement('div');
@@ -1570,25 +1599,35 @@
   // Paint one group set into `container`. `budget` is shared across every call of a
   // single render, so the cap bounds the whole tree rather than each Changed-view
   // section; `depth` indents a section's contents under its header.
-  function renderGroups(container, objectMap, flatGroups, budget, depth) {
+  function renderGroups(container, objectMap, flatGroups, budget, depth, prefix = '') {
     const filter = state.filter;
-    const forceExpand = state.viewMode !== 'all';
+    const forced = state.viewMode !== 'all' || !!filter;
     const budgetLeft = () => budget.nodes < NODE_CAP;
+    // Open unless folded when the render forces groups open; the persisted
+    // "what did the user open" set otherwise.
+    const isOpen = (key) => (forced ? !state.collapsedGroups.has(prefix + key) : state.expandedGroups.has(key));
+    // Only forced groups need the in-memory closure; the rest toggle the
+    // persisted set exactly as before (makeGroupNode's default).
+    const fold = (key) => (forced ? () => {
+      const k = prefix + key;
+      if (state.collapsedGroups.has(k)) state.collapsedGroups.delete(k);
+      else state.collapsedGroups.add(k);
+    } : undefined);
 
     // ---- Objects super-group: object → child-type sub-groups → rows ----
     if (objectMap.size > 0) {
       const objectNames = Array.from(objectMap.keys()).sort();
       const allKeys = objectNames.flatMap(n => keysUnderObject(objectMap.get(n)));
-      const objectsExpanded = state.expandedGroups.has('__OBJECTS__') || !!filter || forceExpand;
-      const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: depth });
+      const objectsExpanded = isOpen('__OBJECTS__');
+      const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: depth, toggle: fold('__OBJECTS__') });
       container.appendChild(objectsNode.group); budget.nodes++;
       if (objectsExpanded) {
         for (const name of objectNames) {
           if (!budgetLeft()) { budget.truncated = true; break; }
           const o = objectMap.get(name);
           const objKeys = keysUnderObject(o);
-          const objExpanded = state.expandedGroups.has('obj/' + name) || !!filter || forceExpand;
-          const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: depth + 1 });
+          const objExpanded = isOpen('obj/' + name);
+          const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: depth + 1, toggle: fold('obj/' + name) });
           objectsNode.body.appendChild(objNode.group); budget.nodes++;
           if (!objExpanded) continue;
           // The object's own definition (CustomObject) — diff is unsupported, but it
@@ -1601,8 +1640,8 @@
             if (!budgetLeft()) { budget.truncated = true; break; }
             const arr = o.children.get(ct).slice().sort((a, b) => a.name.localeCompare(b.name));
             const ctKeys = arr.map(it => `${it.type}:${it.name}`);
-            const ctExpanded = state.expandedGroups.has('objc/' + name + '/' + ct) || !!filter || forceExpand;
-            const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: depth + 2 });
+            const ctExpanded = isOpen('objc/' + name + '/' + ct);
+            const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: depth + 2, toggle: fold('objc/' + name + '/' + ct) });
             objNode.body.appendChild(ctNode.group); budget.nodes++;
             if (!ctExpanded) continue;
             for (const it of arr) {
@@ -1619,8 +1658,8 @@
       if (!budgetLeft()) { budget.truncated = true; break; }
       const arr = flatGroups.get(type).slice().sort((a, b) => a.name.localeCompare(b.name));
       const keys = arr.map(it => `${it.type}:${it.name}`);
-      const expanded = state.expandedGroups.has(type) || !!filter || forceExpand;
-      const node = makeGroupNode({ key: type, label: typeLabel(type), count: arr.length, itemKeys: keys, expanded, depth: depth });
+      const expanded = isOpen(type);
+      const node = makeGroupNode({ key: type, label: typeLabel(type), count: arr.length, itemKeys: keys, expanded, depth: depth, toggle: fold(type) });
       container.appendChild(node.group); budget.nodes++;
       if (expanded) for (const it of arr) {
         if (!budgetLeft()) { budget.truncated = true; break; }

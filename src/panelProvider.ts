@@ -117,7 +117,7 @@ interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 /** One commit section of the Changed view: the components that commit touched. */
 interface ChangedCommitSection { hash: string; short: string; subject: string; when: number; keys: string[]; author?: string }
 /** The Changed view's answer: the union the lens lists, split into its sections. */
-interface ChangedComponents { keys: string[]; base?: string; auto?: boolean; note?: string; uncommitted: string[]; commits: ChangedCommitSection[] }
+interface ChangedComponents { keys: string[]; base?: string; auto?: boolean; branch?: string; note?: string; uncommitted: string[]; commits: ChangedCommitSection[] }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
 
@@ -2440,10 +2440,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const sections: ChangedCommitSection[] = [];
       let usedBase: string | undefined;
       let note: string | undefined;
+      // The branch the view is showing, for the header to name. One workspace can
+      // hold several repositories: only a name they agree on means anything.
+      const branches = new Set<string>();
       for (const repo of api.repositories) {
         // With an explicit ref that IS the base; on auto it is where the branch
         // joins the rest of the repository, so the diff spans every commit of
         // this branch — including any the section cap drops.
+        if (repo.state.HEAD?.name) branches.add(repo.state.HEAD.name);
         const branch = configuredRef || !auto ? undefined : await this.branchBase(api, repo);
         if (branch?.note) note = branch.note;
         const baseRef = configuredRef ?? branch?.base;
@@ -2504,6 +2508,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         commits: sections.slice(0, COMMIT_CAP),
         ...(usedBase ? { base: usedBase } : {}),
         ...(auto ? { auto: true } : {}),
+        ...(auto && branches.size === 1 ? { branch: [...branches][0] } : {}),
         ...(note ? { note } : {})
       };
     } catch (err) {
@@ -2531,6 +2536,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       commits: changed.commits,
       ...(changed.base ? { base: changed.base } : {}),
       ...(changed.auto ? { auto: true } : {}),
+      ...(changed.branch ? { branch: changed.branch } : {}),
       ...(changed.note ? { note: changed.note } : {})
     });
   }

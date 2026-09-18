@@ -1129,16 +1129,25 @@ check('Expand all is scoped to what the filters show; Collapse all clears hidden
   assert.deepStrictEqual(q.persisted().expandedGroups, [], 'a key for a hidden group would reopen it later by itself');
 });
 
-check('the controls are disabled, with the reason, while the tree is force-expanded', () => {
+check('the controls work everywhere — a lens and a filter open groups, they do not freeze them', () => {
+  // They used to be disabled here ("groups auto-expand"), which left the whole
+  // tree unfoldable under a lens or a filter.
   const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeA'] });
   p.deliver(TFILES(NESTED, ['CustomField']));
-  assert.strictEqual(p.el('expandAll').disabled, true);
-  assert.strictEqual(p.el('collapseAll').disabled, true);
-  assert.strictEqual(p.el('expandAll').title, 'Groups auto-expand in the Selected and Changed views');
+  assert.strictEqual(p.el('expandAll').disabled, false);
+  assert.strictEqual(p.el('collapseAll').disabled, false);
+  assert.strictEqual(p.el('expandAll').title, 'Expand every group');
+  assert.ok(names(p).includes('AcmeA'), 'a lens still opens its groups to begin with');
+  p.el('collapseAll').fire('click');
+  assert.deepStrictEqual(names(p), [], 'Collapse all closes them');
+  p.el('expandAll').fire('click');
+  assert.ok(names(p).includes('AcmeA'), 'and Expand all opens them again');
   const q = panel({ ...BASE, filter: 'acme' });
   q.deliver(TFILES(NESTED, ['CustomField']));
-  assert.strictEqual(q.el('expandAll').disabled, true);
-  assert.strictEqual(q.el('collapseAll').title, 'Groups auto-expand while a filter is typed');
+  assert.strictEqual(q.el('expandAll').disabled, false);
+  assert.strictEqual(q.el('collapseAll').title, 'Collapse every group');
+  q.el('collapseAll').fire('click');
+  assert.deepStrictEqual(names(q), [], 'a typed filter opens groups too, and they close');
   const r = panel(BASE);
   r.deliver(TFILES(NESTED, ['CustomField']));
   assert.strictEqual(r.el('expandAll').disabled, false);
@@ -1516,7 +1525,8 @@ const sectionNodes = (p) => {
 };
 const sectionLabels = (p) => sectionNodes(p).map(g => `${g.children[0].children[2].textContent} ${g.children[0].children[3].textContent}`);
 const sectionRows = (p, i) => { const o = []; sectionNodes(p)[i].find(e => { if (e.className === 'name') o.push(e.textContent); return false; }); return o; };
-const baseBtn = (p) => p.el('tree').find(e => e.tagName === 'BUTTON' && /^(This branch|vs |Uncommitted only)/.test(e.textContent));
+const modeHead = (p) => p.el('tree').find(e => e.className === 'mode-head');
+const baseBtn = (p) => { const h = modeHead(p); return h && h.children[0]; };
 const CHANGED = (extra) => ({
   type: 'changed',
   keys: ['ApexClass:AcmeA', 'ApexClass:AcmeB', 'Flow:AcmeF'],
@@ -1577,6 +1587,52 @@ check('a commit that is not yours carries its author in the section label', () =
     'aaaaaaa fix the card (by Jane) (1)',
     'bbbbbbb first cut (1)'
   ], 'your own commits must not be labelled with your name, and someone else\'s must');
+});
+
+check('groups inside a section fold, and fold only inside that section', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED({
+    uncommitted: ['ApexClass:AcmeA'],
+    commits: [
+      { hash: 'a'.repeat(40), short: 'aaaaaaa', subject: 'one', when: 2, keys: ['ApexClass:AcmeB'] },
+      { hash: 'b'.repeat(40), short: 'bbbbbbb', subject: 'two', when: 1, keys: ['ApexClass:AcmeB'] }
+    ]
+  }));
+  sectionNodes(p)[1].children[0].fire('click');
+  sectionNodes(p)[2].children[0].fire('click');
+  assert.deepStrictEqual(sectionRows(p, 1), ['AcmeB']);
+  // The ApexClass group header inside the first commit section.
+  const group = sectionNodes(p)[1].find(e => e.className === 'group-header' && e.children[2].textContent === 'ApexClass');
+  assert.ok(group, 'no type group inside the section');
+  group.fire('click');
+  assert.deepStrictEqual(sectionRows(p, 1), [], 'the group folded');
+  assert.deepStrictEqual(sectionRows(p, 2), ['AcmeB'], 'and only in its own section');
+  group.fire('click');
+  assert.deepStrictEqual(sectionRows(p, 1), ['AcmeB'], 'and unfolds again');
+  assert.deepStrictEqual(p.persisted().expandedGroups, [], 'none of this touches the persisted set');
+});
+
+check('Collapse all closes the sections; Expand all opens them and their groups', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED());
+  assert.ok(names(p).includes('AcmeA'), 'the uncommitted section starts open');
+  p.el('collapseAll').fire('click');
+  assert.deepStrictEqual(names(p), []);
+  assert.ok(sectionLabels(p).length >= 3, 'the section headers stay — that is what you reopen');
+  p.el('expandAll').fire('click');
+  assert.ok(names(p).includes('AcmeA') && names(p).includes('AcmeB'));
+});
+
+check('the header names the branch it is showing', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED({ branch: 'feature/acme' }));
+  assert.strictEqual(baseBtn(p).textContent, 'feature/acme', '"This branch" named neither the comparison nor the branch');
+  // Nothing to name (detached HEAD, or repositories on different branches).
+  p.deliver(CHANGED({ branch: undefined, uncommitted: ['ApexClass:AcmeB'] }));
+  assert.strictEqual(baseBtn(p).textContent, 'This branch');
 });
 
 check('a component touched twice is listed under both commits', () => {
