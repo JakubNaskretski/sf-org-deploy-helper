@@ -3,6 +3,21 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.25.0
+
+- **The Changed view keeps your work after a commit — and after a push.** It used to answer
+  only "what is uncommitted?", so committing emptied it. It now lists the commits that no other
+  branch has, one collapsible section each, with your uncommitted edits at the top and a final
+  group for anything the comparison reports that no listed commit accounts for. Nothing needs
+  configuring and no branch is named, so it works the same off `main`, `devInt` or `develop`,
+  and pushing your branch doesn't empty it.
+- The header label (**This branch**) says what the view compares against and opens a picker:
+  this branch's own commits, any branch, a typed ref, or uncommitted changes only.
+  `sfOrgDeployWrapper.changedBaseRef` holds the choice — `auto` by default, a git ref for the
+  "what would this branch deploy?" question, empty for the old uncommitted-only view.
+- Commit sections start collapsed (the uncommitted one open), so the view stays as short as it
+  was; a section's checkbox ticks exactly that commit's components.
+
 ## 0.24.0
 
 - **?** in the panel title opens a short guide — org selection, the tree and its lenses, Deploy / Validate / Retrieve / Diff, the context-menu actions, confirmations and prerequisites — with an **Open README** button for the full documentation.

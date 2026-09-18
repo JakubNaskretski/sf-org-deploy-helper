@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -250,8 +250,8 @@
         },
         "sfOrgDeployWrapper.changedBaseRef": {
           "type": "string",
-          "default": "",
-          "markdownDescription": "When set — e.g. `main` or `origin/main` — the **Changed** view shows components whose files differ from that git ref (committed changes included: the release-promotion question — \"what will this branch deploy?\"), instead of only uncommitted changes. Uncommitted edits are always included on top. Empty (the default) = uncommitted changes only."
+          "default": "auto",
+          "markdownDescription": "What the **Changed** view compares against — also settable by clicking the label in that view's header.\n\n- `auto` (the default): your uncommitted edits plus the commits no OTHER branch has, one section per commit. Works whatever the integration branch is called (main, devInt, develop), and your work stays listed after you commit and after you push.\n- a git ref — e.g. `main`, `origin/devInt`, a tag: everything that differs from it, the release-promotion question (\"what would this branch deploy?\"), with a section per commit on top of that ref.\n- empty: uncommitted changes only (working tree + index)."
         },
         "sfOrgDeployWrapper.openDiffInFloatingWindow": {
           "type": "boolean",
@@ -317,7 +317,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },

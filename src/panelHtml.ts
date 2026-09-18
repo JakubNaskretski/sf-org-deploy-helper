@@ -133,7 +133,10 @@ body.resizing { cursor: row-resize; user-select: none; }
   display: flex; align-items: center; gap: 8px; white-space: nowrap;
   padding: 2px 10px; font-size: 11px; color: var(--muted);
 }
-.mode-head span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+/* First child grows and ellipsizes — a span in most rows, the base-ref button in
+   the Changed header. */
+.mode-head > :first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.mode-head > button:first-child { text-decoration: underline dotted; }
 .mode-head button {
   background: transparent; border: none; color: var(--muted); cursor: pointer;
   font-size: 11px; font-family: inherit; padding: 0;
@@ -198,6 +201,10 @@ body.resizing { cursor: row-resize; user-select: none; }
   display: flex; align-items: center; gap: 6px;
 }
 .tree .group-header:hover { background: var(--row-hover); }
+/* Changed-view section header (Uncommitted / one per commit): a rule above it
+   separates the sections without adding a row of its own. */
+.tree .group.section > .group-header { border-top: 1px solid var(--border); }
+.tree .group.section > .group-header > span:nth-of-type(2) { overflow: hidden; text-overflow: ellipsis; }
 .tree .group-header .count { color: var(--muted); font-weight: normal; font-size: 11px; }
 .tree .row {
   padding: 2px 8px 2px 28px; cursor: pointer;
