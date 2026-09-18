@@ -35,6 +35,14 @@ const Module = require('module');
 
 const ROOT = path.join(__dirname, '..');
 
+// The commit-sections suite is a separate file; a rebase that drops it from the
+// chain would take its 34 checks with it silently. Pin it here.
+{
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  assert.ok(/check-changed-commits\.cjs/.test(pkg.scripts.check),
+    'scripts/check-changed-commits.cjs must stay in `npm run check`');
+}
+
 // ---------------------------------------------------------------- vscode stub
 function emitter() {
   const fns = [];

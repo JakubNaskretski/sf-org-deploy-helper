@@ -226,8 +226,8 @@ try {
 // (drive letters; a differently-cased opened folder); Linux stays exact. The
 // platform param lets us exercise every fold on this one host.
 try {
-  // win32 / darwin: normalize + lowercase, so a case/drive-letter drift folds
-  // together (the exact drive-letter case from the audit).
+  // win32 / darwin: normalize + lowercase, so a case or drive-letter drift folds
+  // together — vscode.git and the scan disagree on both.
   assert.strictEqual(foldPathKey('C:\\Ws\\a.CLS', 'win32'), foldPathKey('c:\\ws\\A.cls', 'win32'), 'win32 fold must ignore case');
   assert.strictEqual(foldPathKey(p('Ws', 'A.CLS'), 'darwin'), foldPathKey(p('ws', 'a.cls'), 'darwin'), 'darwin fold must ignore case');
   // linux: normalize only — case preserved (case-sensitive filesystem).

@@ -26,6 +26,10 @@ export interface CommitInfo {
   short: string;
   /** Committer date, seconds since the epoch; sorts commits across repositories. */
   when: number;
+  /** Author's display name, and the email the view compares against your own to
+   *  tell your work from someone else's on a shared branch. */
+  author: string;
+  email: string;
   subject: string;
   /** Repository-relative paths the commit touched (empty for a merge commit:
    *  `--name-only` reports no files for one without `-m`). */
@@ -50,7 +54,7 @@ export function commitLogArgs(opts: { baseRef?: string; branch?: string; cap?: n
     // --no-show-signature: with log.showSignature=true a signed commit prepends
     // gpg output, which would land in the -z stream as junk paths.
     '--no-show-signature',
-    `--format=${RS}%H${FS}%ct${FS}%s`,
+    `--format=${RS}%H${FS}%ct${FS}%an${FS}%ae${FS}%s`,
     '--name-only',
     '-z',
     '-n', String(cap)
@@ -75,12 +79,17 @@ function rangeArgs(opts: { baseRef?: string; branch?: string }): string[] {
 }
 
 /** argv for the cheap question asked BEFORE the commit listing: where does this
- *  branch join the rest of the repository, and how far back is that? Hashes only
- *  — no file lists — so it stays cheap even on a long range, and it is NOT capped:
- *  a cap here would move the diff base and drop components from the view
- *  entirely, which is the one thing the section cap must never do. */
-export function boundaryArgs(opts: { baseRef?: string; branch?: string }): string[] {
-  return ['rev-list', '--boundary'].concat(rangeArgs(opts));
+ *  branch join the rest of the repository, and how far back is that? Hashes only,
+ *  no file lists.
+ *
+ *  Capped ONE PAST the limit rather than uncapped: a truncated walk still prints
+ *  a boundary, but it is the parent of the last commit walked — an artifact, not
+ *  the fork point — so the count reaching the cap is exactly the signal to throw
+ *  the answer away (baseFromBoundary). Under the cap the walk ran to the end of
+ *  the range and the boundary is the real one. Without the cap this query walked
+ *  the entire history of a trunk-only checkout on every refresh. */
+export function boundaryArgs(opts: { baseRef?: string; branch?: string; cap?: number }): string[] {
+  return ['rev-list', '--boundary', '-n', String(opts.cap ?? MAX_BRANCH_COMMITS + 1)].concat(rangeArgs(opts));
 }
 
 /** Read `rev-list --boundary`: `-<hash>` lines are the commits just OUTSIDE the
@@ -91,9 +100,9 @@ export function boundaryArgs(opts: { baseRef?: string; branch?: string }): strin
  *  boundary at all means the range runs to the root: this branch is the whole
  *  repository (a trunk-only checkout), which is not "this branch's work" — the
  *  caller then shows uncommitted changes only.
- *  ponytail: with several boundaries (a branch merged in) the first one is used,
- *  so the diff can be a little wider than this branch alone; the sections still
- *  say where each component came from. */
+ *  With several boundaries (a branch merged in) the first one is used, so the
+ *  diff can be a little wider than this branch alone; the sections still say
+ *  where each component came from. */
 export function parseBoundary(stdout: string): { count: number; base?: string } {
   let count = 0;
   let base: string | undefined;
@@ -107,7 +116,7 @@ export function parseBoundary(stdout: string): { count: number; base?: string } 
 }
 
 /** Parse the output of `commitLogArgs`. Shape per commit: RS, then
- *  `hash FS ct FS subject`, then a NUL-separated file list (`-z`
+ *  `hash FS ct FS author FS email FS subject`, then a NUL-separated file list (`-z`
  *  keeps paths unquoted and unescaped, so a space or a non-ASCII name survives).
  *  Anything malformed is skipped rather than throwing — this feeds a view. */
 export function parseCommitLog(stdout: string): CommitInfo[] {
@@ -116,16 +125,20 @@ export function parseCommitLog(stdout: string): CommitInfo[] {
     if (!chunk) continue;
     const parts = chunk.split('\0');
     const head = parts[0].split(FS);
-    if (head.length < 3) continue;
-    const [hash, ct] = head;
+    if (head.length < 5) continue;
+    const [hash, ct, author, email] = head;
     if (!/^[0-9a-f]{7,40}$/.test(hash)) continue;
     out.push({
       hash,
       short: hash.slice(0, 7),
       when: Number(ct) || 0,
-      // A subject may itself contain FS only if someone wrote one; re-join so it
-      // survives intact.
-      subject: head.slice(2).join(FS).replace(/\n/g, ' ').trim(),
+      author,
+      email,
+      // A subject may itself contain FS; re-join so it survives intact. One
+      // containing the RECORD separator splits its own chunk and loses that
+      // commit's section (the head then fails the hash test and is skipped) —
+      // the component still reaches the view through the base diff.
+      subject: head.slice(4).join(FS).replace(/\n/g, ' ').trim(),
       // The format line ends in a newline before the first path; trailing empties
       // come from the final NUL.
       files: parts.slice(1).map(p => p.replace(/^\n+/, '')).filter(Boolean)
@@ -134,13 +147,17 @@ export function parseCommitLog(stdout: string): CommitInfo[] {
   return out;
 }
 
-/** The diff base for a `--boundary` answer, or undefined when the view should
- *  stay uncommitted-only: nothing of this branch's own, no boundary to diff
- *  against (a trunk-only checkout), or more commits than MAX_BRANCH_COMMITS —
- *  at which point "this branch" is someone's trunk, not a piece of work. */
-export function baseFromBoundary(b: { count: number; base?: string }): string | undefined {
-  // An empty range and an unbounded one both leave `base` undefined, which IS the
-  // fallback — the length is the only extra question worth asking.
-  if (b.count > MAX_BRANCH_COMMITS) return undefined;
-  return b.base;
+/** Why the automatic comparison gave up, for the view to say so. */
+export type BranchBaseGiveUp = 'whole-history' | 'too-long';
+
+/** The diff base for a `--boundary` answer, or a reason the view should stay
+ *  uncommitted-only: no boundary to diff against (a trunk-only checkout, where
+ *  this branch IS the repository), or a range at least as long as the query's
+ *  cap — at which point "this branch" is someone's trunk, not a piece of work,
+ *  and the boundary is a truncation artifact rather than the fork point.
+ *  An empty range is neither: there is simply nothing committed to show. */
+export function baseFromBoundary(b: { count: number; base?: string }): { base?: string; giveUp?: BranchBaseGiveUp } {
+  if (b.count > MAX_BRANCH_COMMITS) return { giveUp: 'too-long' };
+  if (b.count > 0 && !b.base) return { giveUp: 'whole-history' };
+  return { base: b.base };
 }

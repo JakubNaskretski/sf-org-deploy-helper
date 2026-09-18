@@ -115,9 +115,9 @@ interface GitApiLite {
 interface GitExtensionLite { getAPI(version: 1): GitApiLite }
 
 /** One commit section of the Changed view: the components that commit touched. */
-interface ChangedCommitSection { hash: string; short: string; subject: string; when: number; keys: string[] }
+interface ChangedCommitSection { hash: string; short: string; subject: string; when: number; keys: string[]; author?: string }
 /** The Changed view's answer: the union the lens lists, split into its sections. */
-interface ChangedComponents { keys: string[]; base?: string; auto?: boolean; uncommitted: string[]; commits: ChangedCommitSection[] }
+interface ChangedComponents { keys: string[]; base?: string; auto?: boolean; note?: string; uncommitted: string[]; commits: ChangedCommitSection[] }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
 
@@ -2222,12 +2222,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  the choice to `changedBaseRef`. Written at User scope on purpose — a
    *  Workspace write would drop a .vscode/settings.json into the user's own
    *  repository, and `auto` already covers per-project branch naming.
-   *  ponytail: branch list comes from vscode.git's in-memory refs; "Other ref…"
-   *  covers tags and anything it hasn't loaded. */
+   *  The branch list comes from vscode.git's in-memory refs; "Other ref…" covers
+   *  tags and anything it hasn't loaded. */
   private async pickChangedBase(): Promise<void> {
     const OTHER = 'Other ref…';
     const config = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
     const current = config.get<string>('changedBaseRef', 'auto').trim();
+    // User scope by default (no .vscode/settings.json dropped into someone's
+    // repository), but a workspace-scoped value already set would shadow a User
+    // write and make the picker look inert — write where it will be read.
+    const scoped = config.inspect<string>('changedBaseRef')?.workspaceValue !== undefined;
+    const target = scoped ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
     const currently = (value: string): string | undefined => (value === current ? 'current' : undefined);
     const items: (vscode.QuickPickItem & { value?: string })[] = [
       { label: 'This branch', description: currently('auto'), detail: 'Uncommitted edits plus the commits no other branch has — survives commit and push', value: 'auto' },
@@ -2262,7 +2267,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (value === undefined) return;
     }
     if (value === undefined || value === current) return;
-    await config.update('changedBaseRef', value, vscode.ConfigurationTarget.Global);
+    await config.update('changedBaseRef', value, target);
     // The configuration listener reposts the lens; nothing else to do here.
   }
 
@@ -2271,8 +2276,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private async runGit(api: GitApiLite, repo: GitRepoLite, args: string[]): Promise<string> {
     const cwd = repo.rootUri?.fsPath;
     if (!cwd) throw new Error('repository root unknown');
+    // Absolute path only, never a bare 'git': the cwd is a repository we did not
+    // write, and Windows resolves a bare command name from the child's cwd first
+    // — a planted git.exe at a repo root would run.
+    const bin = api.git?.path;
+    if (!bin) throw new Error('git binary path unknown');
     return await new Promise<string>((resolve, reject) => {
-      execFile(api.git?.path || 'git', args, { cwd, timeout: 10_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      execFile(bin, args, { cwd, timeout: 10_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
         (err, stdout) => err ? reject(err) : resolve(stdout));
     });
   }
@@ -2291,6 +2301,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** This repository's configured author email, cached for the session — the
+   *  view marks commits that are NOT yours, which is what tells a branch of your
+   *  own from a shared one you happen to be standing on. Empty string when git
+   *  has no identity here: nothing is marked rather than everything. */
+  private gitIdentity?: Map<string, string>;
+  private async repoIdentity(api: GitApiLite, repo: GitRepoLite): Promise<string> {
+    const cache = (this.gitIdentity ??= new Map<string, string>());
+    const root = repo.rootUri?.fsPath ?? '';
+    const cached = cache.get(root);
+    if (cached !== undefined) return cached;
+    let email = '';
+    try {
+      email = (await this.runGit(api, repo, ['config', '--get', 'user.email'])).trim().toLowerCase();
+    } catch { /* no identity configured here, or git unavailable */ }
+    cache.set(root, email);
+    return email;
+  }
+
   /** Where this branch joins the rest of the repository — the ref to diff the
    *  working tree against on the `auto` comparison. Asked BEFORE the commit
    *  listing and over the UNCAPPED range, because a base taken from the capped
@@ -2300,21 +2328,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  nothing of its own, when the range runs to the root — a trunk-only checkout,
    *  where "my branch" is the whole project — or when it is longer than
    *  MAX_BRANCH_COMMITS. Never throws. */
-  private async branchBase(api: GitApiLite, repo: GitRepoLite): Promise<string | undefined> {
+  private async branchBase(api: GitApiLite, repo: GitRepoLite): Promise<{ base?: string; note?: string }> {
     let boundary: { count: number; base?: string };
     try {
       boundary = parseBoundary(await this.runGit(api, repo, boundaryArgs({ branch: repo.state.HEAD?.name })));
     } catch (err) {
       this.output.appendLine(`[changed] branch range failed: ${err instanceof Error ? err.message : String(err)}`);
-      return undefined;
+      return {};
     }
-    const base = baseFromBoundary(boundary);
-    if (!base && boundary.count > 0) {
-      this.output.appendLine(boundary.base
-        ? `[changed] ${boundary.count} commits on this branch alone (limit ${MAX_BRANCH_COMMITS}) — showing uncommitted changes only. Set sfOrgDeployWrapper.changedBaseRef to compare against a ref.`
-        : '[changed] this branch is the repository\'s whole history (no other branch to measure against) — showing uncommitted changes only.');
-    }
-    return base;
+    const { base, giveUp } = baseFromBoundary(boundary);
+    if (!giveUp) return { base };
+    // Say it in the view, not just the log: the label would otherwise claim to be
+    // showing the branch while showing only the working tree.
+    const note = giveUp === 'too-long'
+      ? `More than ${MAX_BRANCH_COMMITS} commits of its own on this branch — showing uncommitted changes only. Set sfOrgDeployWrapper.changedBaseRef to compare against a ref.`
+      : 'This branch is the whole repository (no other branch to measure against) — showing uncommitted changes only.';
+    this.output.appendLine(`[changed] ${note}`);
+    return { note };
   }
 
   /** Compute which local components differ, via the built-in vscode.git
@@ -2409,11 +2439,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const uncommitted = new Set<string>();
       const sections: ChangedCommitSection[] = [];
       let usedBase: string | undefined;
+      let note: string | undefined;
       for (const repo of api.repositories) {
         // With an explicit ref that IS the base; on auto it is where the branch
         // joins the rest of the repository, so the diff spans every commit of
         // this branch — including any the section cap drops.
-        const baseRef = configuredRef ?? (auto ? await this.branchBase(api, repo) : undefined);
+        const branch = configuredRef || !auto ? undefined : await this.branchBase(api, repo);
+        if (branch?.note) note = branch.note;
+        const baseRef = configuredRef ?? branch?.base;
         const commits = baseRef ? await this.listBranchCommits(api, repo, configuredRef) : [];
         if (baseRef) {
           // `diffWith(ref)` = working tree vs the ref (committed + uncommitted
@@ -2434,6 +2467,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           for (const change of refChanges) addPath(change.uri?.fsPath, keys);
         }
         const root = repo.rootUri?.fsPath;
+        const mine = commits.length ? await this.repoIdentity(api, repo) : '';
         for (const commit of commits) {
           const commitKeys = new Set<string>();
           // `--name-only` paths are repository-relative; a commit whose files are
@@ -2441,7 +2475,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           for (const file of commit.files) addPath(root ? path.join(root, file) : file, commitKeys);
           if (commitKeys.size === 0) continue;
           for (const k of commitKeys) keys.add(k);
-          sections.push({ hash: commit.hash, short: commit.short, subject: commit.subject, when: commit.when, keys: [...commitKeys] });
+          // Someone else's commit is disclosed by name: standing on a shared
+          // branch (rather than one cut from it) otherwise reads the team's work
+          // as yours, one "Select all" away from a deploy.
+          const foreign = mine && commit.email && commit.email.toLowerCase() !== mine;
+          sections.push({
+            hash: commit.hash, short: commit.short, subject: commit.subject, when: commit.when,
+            keys: [...commitKeys], ...(foreign ? { author: commit.author } : {})
+          });
         }
         // Uncommitted edits on top: diffWith(ref) omits untracked files (brand-new
         // components), and with no ref this IS the whole answer.
@@ -2458,7 +2499,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         uncommitted: [...uncommitted],
         commits: sections.slice(0, COMMIT_CAP),
         ...(usedBase ? { base: usedBase } : {}),
-        ...(auto ? { auto: true } : {})
+        ...(auto ? { auto: true } : {}),
+        ...(note ? { note } : {})
       };
     } catch (err) {
       this.output.appendLine(`[changed] git change detection failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -2484,7 +2526,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       uncommitted: changed.uncommitted,
       commits: changed.commits,
       ...(changed.base ? { base: changed.base } : {}),
-      ...(changed.auto ? { auto: true } : {})
+      ...(changed.auto ? { auto: true } : {}),
+      ...(changed.note ? { note: changed.note } : {})
     });
   }
 

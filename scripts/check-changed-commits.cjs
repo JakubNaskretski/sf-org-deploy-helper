@@ -42,6 +42,8 @@ const ROOT = path.join(__dirname, '..');
 
 // --------------------------------------------------------------- module stubs
 let config = { changedBaseRef: 'auto' };
+// Mirrors ConfigurationScope: a value set at Workspace scope shadows a User write.
+let workspaceScoped = false;
 const updates = [];
 let quickPick = { pick: async () => undefined, input: async () => undefined, items: null, inputOpts: null };
 const vscodeStub = {
@@ -49,6 +51,7 @@ const vscodeStub = {
   workspace: {
     getConfiguration: () => ({
       get: (k, d) => (k in config ? config[k] : d),
+      inspect: (k) => ({ workspaceValue: workspaceScoped ? config[k] : undefined }),
       update: (k, v, target) => { updates.push([k, v, target]); return Promise.resolve(); }
     })
   },
@@ -91,8 +94,11 @@ const FS = '\x1f';
 /** One commit's worth of `git log --format=… --name-only -z` output. */
 // Shape git actually emits: the format line is NUL-terminated, then a newline,
 // then each path NUL-terminated (a merge commit stops after the NUL).
-const logged = (hash, ct, subject, files) =>
-  `${RS}${hash}${FS}${ct}${FS}${subject}\0`
+// The identity git reports for this repository's own commits, and what the
+// fixtures author their commits as.
+const MINE = 'me';
+const logged = (hash, ct, subject, files, who = MINE, name = 'Me') =>
+  `${RS}${hash}${FS}${ct}${FS}${name}${FS}${who}${FS}${subject}\0`
   + (files.length ? '\n' + files.map(f => f + '\0').join('') : '');
 
 const WS = '/ws';
@@ -110,6 +116,10 @@ const BUNDLE = {
 const ITEMS = [cls('AcmeA'), cls('AcmeB'), cls('AcmeC'), BUNDLE];
 
 let git; // the vscode.git API stub
+// The real API always carries the binary's absolute path; the provider refuses to
+// spawn a bare 'git' (a planted git.exe in an untrusted repo's cwd would win on
+// Windows), so every stub has one.
+const GIT_BIN = { path: '/usr/bin/git' };
 function repo(opts = {}) {
   return {
     rootUri: opts.root === null ? undefined : { fsPath: opts.root || WS },
@@ -135,10 +145,15 @@ const sections = (msg) => (msg.commits || []).map(c => [c.short, c.keys.slice().
 /** Answer both calls the auto comparison makes: the boundary query (hashes, the
  *  last one prefixed '-') and the commit listing. `log` may be a function of the
  *  repository's cwd. */
-const gitScript = (log, boundary = ['x'.repeat(40), '-' + 'f'.repeat(40)].join('\n')) =>
-  (args, opts) => (args[0] === 'rev-list'
-    ? (typeof boundary === 'function' ? boundary(opts) : boundary)
-    : (typeof log === 'function' ? log(opts) : log));
+const gitScript = (log, boundary = ['x'.repeat(40), '-' + 'f'.repeat(40)].join('\n'), identity = MINE) =>
+  (args, opts) => {
+    if (args[0] === 'config') {
+      if (identity === null) throw new Error('no user.email configured');
+      return identity + '\n';
+    }
+    if (args[0] === 'rev-list') return typeof boundary === 'function' ? boundary(opts) : boundary;
+    return typeof log === 'function' ? log(opts) : log;
+  };
 
 // ------------------------------------------------------------------ 1) argv
 check('an explicit base ref asks for the commits that ref does not have', () => {
@@ -185,6 +200,8 @@ check('a commit list parses to hash, short, time, subject and files', () => {
   assert.strictEqual(commits[0].short, 'aaaaaaa');
   assert.strictEqual(commits[0].when, 1700000002);
   assert.strictEqual(commits[0].subject, 'fix the thing');
+  assert.strictEqual(commits[0].author, 'Me');
+  assert.strictEqual(commits[0].email, MINE);
   assert.deepStrictEqual(commits[0].files, ['a/One.cls', 'a/Two.cls'], 'the newline after the format line is not part of a path');
   assert.deepStrictEqual(commits[1].files, ['a/One.cls']);
 });
@@ -207,28 +224,35 @@ check('junk is skipped, not thrown', () => {
 });
 
 // -------------------------------------------------------------- 3) the base
-check('the boundary query is uncapped and cheap: hashes only, same range', () => {
+check('the boundary query is hashes only, the same range, capped ONE past the limit', () => {
   const args = boundaryArgs({ branch: 'feature/acme' });
   assert.deepStrictEqual(args.slice(0, 2), ['rev-list', '--boundary']);
-  assert.ok(!args.includes('--name-only'), 'file lists would make the uncapped range expensive');
-  assert.ok(!args.includes('-n'), 'a cap here would move the diff base and drop components');
-  assert.deepStrictEqual(args.slice(2), commitLogArgs({ branch: 'feature/acme' }).slice(-6), 'the same range as the listing');
-  assert.deepStrictEqual(boundaryArgs({ baseRef: 'main' }).slice(2), ['main..HEAD']);
+  assert.ok(!args.includes('--name-only'), 'file lists would make this expensive');
+  // One past: a walk that STOPS at the cap prints a boundary of its own (see the
+  // live-git check below), so the count reaching the cap is the signal to discard
+  // the answer — capping AT the limit would make a legal 100-commit branch
+  // indistinguishable from a truncated one.
+  assert.deepStrictEqual(args.slice(2, 4), ['-n', String(MAX_BRANCH_COMMITS + 1)]);
+  assert.deepStrictEqual(args.slice(4), commitLogArgs({ branch: 'feature/acme' }).slice(-6), 'the same range as the listing');
+  assert.deepStrictEqual(boundaryArgs({ baseRef: 'main' }).slice(4), ['main..HEAD']);
 });
 
 check('the diff base is where the branch joins the rest of the repository', () => {
   const b = parseBoundary(['a'.repeat(40), 'c'.repeat(40), '-' + 'f'.repeat(40), ''].join('\n'));
   assert.deepStrictEqual(b, { count: 2, base: 'f'.repeat(40) });
-  assert.strictEqual(baseFromBoundary(b), 'f'.repeat(40));
+  assert.deepStrictEqual(baseFromBoundary(b), { base: 'f'.repeat(40) });
 });
 
-check('no commits, no boundary, or a range longer than a branch means uncommitted-only', () => {
-  assert.strictEqual(baseFromBoundary(parseBoundary('')), undefined, 'nothing of this branch\'s own');
-  // A trunk-only checkout: the range runs to the root, so nothing bounds it.
-  assert.strictEqual(baseFromBoundary(parseBoundary(['a'.repeat(40), 'b'.repeat(40)].join('\n'))), undefined);
-  // Past the limit it is a trunk with a stale branch behind it, not a piece of work.
-  assert.strictEqual(baseFromBoundary({ count: MAX_BRANCH_COMMITS, base: 'f'.repeat(40) }), 'f'.repeat(40));
-  assert.strictEqual(baseFromBoundary({ count: MAX_BRANCH_COMMITS + 1, base: 'f'.repeat(40) }), undefined);
+check('nothing committed, a trunk-only checkout and an over-long branch are told apart', () => {
+  // Nothing of this branch's own: no base, but nothing went wrong either.
+  assert.deepStrictEqual(baseFromBoundary(parseBoundary('')), { base: undefined });
+  // A trunk-only checkout: commits, but no boundary — the range runs to the root.
+  assert.deepStrictEqual(
+    baseFromBoundary(parseBoundary(['a'.repeat(40), 'b'.repeat(40)].join('\n'))),
+    { giveUp: 'whole-history' });
+  // At the limit the walk still completed, so the boundary is the real one.
+  assert.deepStrictEqual(baseFromBoundary({ count: MAX_BRANCH_COMMITS, base: 'f'.repeat(40) }), { base: 'f'.repeat(40) });
+  assert.deepStrictEqual(baseFromBoundary({ count: MAX_BRANCH_COMMITS + 1, base: 'f'.repeat(40) }), { giveUp: 'too-long' });
 });
 
 // ----------------------------------------------------------- 4) the payload
@@ -241,7 +265,7 @@ check('auto: uncommitted edits and one section per commit, over the union of bot
   gitRuns = [];
   gitAnswer = gitScript(logged('a'.repeat(40), '200', 'B and the card', [REL('AcmeB'), 'force-app/main/default/lwc/acmeCard/acmeCard.js'])
     + logged('c'.repeat(40), '100', 'C', [REL('AcmeC')]));
-  git = { repositories: [repo({ working: [A_CLS], diff: [B_CLS, `${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }), git: { path: '/usr/bin/git' } };
+  git = { repositories: [repo({ working: [A_CLS], diff: [B_CLS, `${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   const msg = p.last();
@@ -262,7 +286,7 @@ check('a commit that touched no component contributes no section', async () => {
   config = { changedBaseRef: 'auto' };
   gitAnswer = gitScript(logged('a'.repeat(40), '200', 'docs: readme', ['README.md', '.github/workflows/ci.yml'])
     + logged('c'.repeat(40), '100', 'C', [REL('AcmeC')]));
-  git = { repositories: [repo({ diff: [`${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ diff: [`${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(sections(p.last()), [['ccccccc', ['ApexClass:AcmeC']]]);
@@ -273,7 +297,7 @@ check('a component reverted later still belongs to the commit that touched it', 
   // listing it has to be able to draw it, so the union carries it.
   config = { changedBaseRef: 'auto' };
   gitAnswer = gitScript(logged('a'.repeat(40), '200', 'add B', [REL('AcmeB')]));
-  git = { repositories: [repo({ working: [A_CLS], diff: [] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS], diff: [] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.ok(p.last().keys.includes('ApexClass:AcmeB'));
@@ -282,7 +306,7 @@ check('a component reverted later still belongs to the commit that touched it', 
 
 check('staged and unstaged edits to one component are one entry', async () => {
   config = { changedBaseRef: '' };
-  git = { repositories: [repo({ working: [A_CLS], index: [A_CLS, `${WS}/${CLASSES}/AcmeA.cls-meta.xml`] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS], index: [A_CLS, `${WS}/${CLASSES}/AcmeA.cls-meta.xml`] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().uncommitted, ['ApexClass:AcmeA']);
@@ -296,7 +320,7 @@ check('an explicit ref is the base, is named in the payload, and bounds the comm
   let diffedWith;
   git = {
     repositories: [repo({ diffWith: async (ref) => { diffedWith = ref; return [{ uri: { fsPath: B_CLS } }]; } })],
-    onDidOpenRepository: () => ({ dispose() {} })
+    onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN
   };
   const p = provider();
   await p.s.postChangedComponents();
@@ -311,7 +335,7 @@ check('the empty setting is uncommitted-only, and spawns no git at all', async (
   config = { changedBaseRef: '' };
   gitRuns = [];
   let diffed = false;
-  git = { repositories: [repo({ working: [A_CLS], diffWith: async () => { diffed = true; return []; } })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS], diffWith: async () => { diffed = true; return []; } })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
@@ -328,7 +352,7 @@ check('an auto base that will not diff falls back to the uncommitted answer', as
   gitAnswer = gitScript(logged('a'.repeat(40), '200', 'B', [REL('AcmeB')]));
   git = {
     repositories: [repo({ working: [A_CLS], diffWith: async () => { throw new Error('bad object p…'); } })],
-    onDidOpenRepository: () => ({ dispose() {} })
+    onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN
   };
   const p = provider();
   await p.s.postChangedComponents();
@@ -342,7 +366,7 @@ check('an explicitly configured ref that will not diff is named, never shown as 
   gitAnswer = () => '';
   git = {
     repositories: [repo({ working: [A_CLS], diffWith: async () => { throw new Error("unknown revision 'origin/nope'"); } })],
-    onDidOpenRepository: () => ({ dispose() {} })
+    onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN
   };
   const p = provider();
   await p.s.postChangedComponents();
@@ -353,7 +377,7 @@ check('an explicitly configured ref that will not diff is named, never shown as 
 check('a flag-shaped ref never reaches argv', async () => {
   config = { changedBaseRef: '--upload-pack=sh' };
   gitRuns = [];
-  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.strictEqual(p.last().keys, null);
@@ -364,7 +388,7 @@ check('a flag-shaped ref never reaches argv', async () => {
 check('git failing costs the sections, not the lens — at either call', async () => {
   config = { changedBaseRef: 'auto' };
   gitAnswer = () => { throw new Error('git not found'); };
-  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
@@ -385,29 +409,59 @@ check('a trunk-only checkout shows uncommitted changes only, and says why', asyn
   config = { changedBaseRef: 'auto' };
   gitAnswer = gitScript(logged('a'.repeat(40), '200', 'c3', [REL('AcmeB')]), ['a'.repeat(40), 'b'.repeat(40)].join('\n'));
   let diffed = false;
-  git = { repositories: [repo({ working: [A_CLS], diffWith: async () => { diffed = true; return []; } })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS], diffWith: async () => { diffed = true; return []; } })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA'], 'every tracked file would otherwise read as changed');
   assert.deepStrictEqual(p.last().commits, []);
   assert.strictEqual(diffed, false, 'and no diff against the empty tree');
-  assert.ok(p.log.some(l => l.includes('whole history')));
+  assert.ok(p.log.some(l => l.includes('whole repository')));
+  assert.ok(/whole repository/.test(p.last().note), 'the view has to say so too — the label would otherwise claim a comparison');
 });
 
 check('a range longer than a branch of work falls back, naming the setting', async () => {
   config = { changedBaseRef: 'auto' };
   const long = Array.from({ length: MAX_BRANCH_COMMITS + 1 }, (_, i) => String(i).padEnd(40, '0'));
   gitAnswer = gitScript(logged('a'.repeat(40), '200', 'x', [REL('AcmeB')]), [...long, '-' + 'f'.repeat(40)].join('\n'));
-  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
   assert.ok(p.log.some(l => l.includes('changedBaseRef')), 'the way out has to be discoverable');
+  assert.ok(p.last().note.includes('changedBaseRef'), 'and discoverable in the view, not only the log');
+});
+
+check('a commit that is not yours is disclosed by name', async () => {
+  // Standing ON a shared branch (rather than one cut from it) reads the team's
+  // commits as "this branch" — the section has to say whose work it is, with
+  // "Select all" one click from a deploy.
+  config = { changedBaseRef: 'auto' };
+  gitAnswer = gitScript(
+    logged('a'.repeat(40), '200', 'their fix', [REL('AcmeB')], 'jane', 'Jane')
+    + logged('c'.repeat(40), '100', 'my fix', [REL('AcmeC')]));
+  git = { repositories: [repo({ diff: [B_CLS, `${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  const p = provider();
+  await p.s.postChangedComponents();
+  assert.deepStrictEqual(p.last().commits.map(c => [c.short, c.author]), [['aaaaaaa', 'Jane'], ['ccccccc', undefined]]);
+  // The identity is read once per repository, not once per refresh.
+  const configRuns = () => gitRuns.filter(r => r.args[0] === 'config').length;
+  gitRuns = [];
+  await p.s.postChangedComponents();
+  assert.strictEqual(configRuns(), 0, 'cached for the session');
+});
+
+check('with no git identity configured, nothing is marked as someone else\'s', async () => {
+  config = { changedBaseRef: 'auto' };
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'their fix', [REL('AcmeB')], 'jane', 'Jane'), undefined, null);
+  git = { repositories: [repo({ diff: [B_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  const p = provider();
+  await p.s.postChangedComponents();
+  assert.strictEqual(p.last().commits[0].author, undefined, 'marking everything would be worse than marking nothing');
 });
 
 check('a slower refresh never posts over a newer one', async () => {
   config = { changedBaseRef: '' };
-  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   const first = p.s.postChangedComponents();
   const second = p.s.postChangedComponents();
@@ -415,11 +469,24 @@ check('a slower refresh never posts over a newer one', async () => {
   assert.strictEqual(p.posted.length, 1, 'two overlapping refreshes, one payload — the newer one');
 });
 
+check('without an absolute git path nothing is spawned, and the lens still answers', async () => {
+  // Bare 'git' is refused on purpose: the cwd is a repository we did not write,
+  // and Windows resolves a bare command name from the child's cwd first.
+  config = { changedBaseRef: 'auto' };
+  gitRuns = [];
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'B', [REL('AcmeB')]));
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  const p = provider();
+  await p.s.postChangedComponents();
+  assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
+  assert.strictEqual(gitRuns.length, 0);
+});
+
 check('a repository whose root is unknown is skipped, not fatal', async () => {
   config = { changedBaseRef: 'auto' };
   gitRuns = [];
   gitAnswer = () => '';
-  git = { repositories: [repo({ root: null, working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ root: null, working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const p = provider();
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
@@ -433,7 +500,7 @@ check('no git extension, and no repositories, each say why', async () => {
   await p.s.postChangedComponents();
   assert.strictEqual(p.last().keys, null);
   assert.ok(/git extension/i.test(p.last().reason));
-  git = { repositories: [], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   const q = provider();
   await q.s.postChangedComponents();
   assert.strictEqual(q.last().keys, null);
@@ -457,7 +524,7 @@ check('sections from several repositories interleave by date and stay capped', a
   const other = { type: 'ApexClass', name: 'AcmeD', filePath: `/ws2/${CLASSES}/AcmeD.cls`, files: [`/ws2/${CLASSES}/AcmeD.cls`] };
   git = {
     repositories: [repo({ diff: [A_CLS] }), repo({ root: '/ws2', diff: [] })],
-    onDidOpenRepository: () => ({ dispose() {} })
+    onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN
   };
   const p = provider([...ITEMS, other]);
   await p.s.postChangedComponents();
@@ -472,7 +539,7 @@ check('sections from several repositories interleave by date and stay capped', a
 check('picking "This branch" writes auto at user scope', async () => {
   config = { changedBaseRef: '' };
   updates.length = 0;
-  git = { repositories: [repo({ refs: [{ name: 'main', type: 0 }, { name: 'origin/devInt', type: 1 }, { name: 'v1.0', type: 2 }] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({ refs: [{ name: 'main', type: 0 }, { name: 'origin/devInt', type: 1 }, { name: 'v1.0', type: 2 }] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   quickPick = { pick: async (items) => items.find(i => i.value === 'auto'), input: async () => undefined };
   const p = provider();
   await p.s.pickChangedBase();
@@ -482,10 +549,24 @@ check('picking "This branch" writes auto at user scope', async () => {
   assert.ok(!labels.includes('v1.0'), 'tags are not — "Other ref…" covers them');
 });
 
+check('a workspace-scoped setting is written where it will be read', async () => {
+  // A User write under a Workspace value changes nothing the user can see — the
+  // picker would look inert.
+  config = { changedBaseRef: 'main' };
+  workspaceScoped = true;
+  updates.length = 0;
+  git = { repositories: [repo({})], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  quickPick = { pick: async (items) => items.find(i => i.value === 'auto'), input: async () => undefined };
+  const p = provider();
+  await p.s.pickChangedBase();
+  assert.deepStrictEqual(updates, [['changedBaseRef', 'auto', vscodeStub.ConfigurationTarget.Workspace]]);
+  workspaceScoped = false;
+});
+
 check('"Other ref…" takes a typed ref, and rejects a flag-shaped one', async () => {
   config = { changedBaseRef: 'auto' };
   updates.length = 0;
-  git = { repositories: [repo({})], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({})], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   quickPick = { pick: async (items) => items.find(i => i.label === 'Other ref…'), input: async () => ' origin/release ' };
   const p = provider();
   await p.s.pickChangedBase();
@@ -497,7 +578,7 @@ check('"Other ref…" takes a typed ref, and rejects a flag-shaped one', async (
 check('cancelling, or picking what is already set, writes nothing', async () => {
   config = { changedBaseRef: 'auto' };
   updates.length = 0;
-  git = { repositories: [repo({})], onDidOpenRepository: () => ({ dispose() {} }) };
+  git = { repositories: [repo({})], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
   quickPick = { pick: async () => undefined, input: async () => undefined };
   const p = provider();
   await p.s.pickChangedBase();
@@ -520,7 +601,8 @@ check('git agrees: the range is this branch\'s own commits, and a push does not 
   ], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   const commit = (file, msg) => { fs.writeFileSync(path.join(dir, file), msg); g('add', file); g('commit', '-m', msg); return g('rev-parse', 'HEAD').trim(); };
   const log = (opts) => parseCommitLog(g(...commitLogArgs(opts)));
-  const base = (opts) => baseFromBoundary(parseBoundary(g(...boundaryArgs(opts))));
+  const base = (opts) => baseFromBoundary(parseBoundary(g(...boundaryArgs(opts)))).base;
+  const boundary = (opts) => parseBoundary(g(...boundaryArgs(opts)));
   try {
     g('init', '-b', 'main');
     const first = commit('a.cls', 'on main');
@@ -568,6 +650,13 @@ check('git agrees: the range is this branch\'s own commits, and a push does not 
     for (let i = 0; i < COMMIT_CAP + 5; i++) commit(`x${i}.cls`, `extra ${i}`);
     assert.strictEqual(log({ branch: 'feature/big' }).length, COMMIT_CAP, 'the listing is capped');
     assert.strictEqual(base({ branch: 'feature/big' }), first, 'the base is still the fork point, not the oldest LISTED commit');
+
+    // Why the boundary query is capped one PAST the limit: a walk cut short by
+    // -n still prints a boundary, and it is the parent of the last commit walked
+    // — a truncation artifact. Reaching the cap is the only way to tell.
+    const cut = boundary({ branch: 'feature/big', cap: 4 });
+    assert.strictEqual(cut.count, 4, 'the walk stopped at the cap');
+    assert.ok(cut.base && cut.base !== first, 'and printed a boundary that is NOT the fork point');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

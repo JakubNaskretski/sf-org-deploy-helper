@@ -1546,8 +1546,8 @@ check('sections run newest work first: uncommitted, each commit, then what no co
     'Uncommitted (1)',
     'aaaaaaa fix the card (1)',
     'bbbbbbb first cut (2)',
-    'Earlier commits (1)'
-  ]);
+    'Other changes (1)'
+  ], 'the residue is not necessarily "earlier": under an explicit ref it is whatever no listed commit accounts for');
   assert.strictEqual(baseBtn(p).textContent, 'This branch');
 });
 
@@ -1561,6 +1561,22 @@ check('uncommitted work is open, commits are collapsed, and a section keeps its 
   assert.deepStrictEqual(sectionRows(p, 1), ['AcmeB']);
   assert.deepStrictEqual(sectionRows(p, 2), [], 'one section opened, not all of them');
   assert.deepStrictEqual(p.persisted().expandedGroups, [], 'commit hashes never enter the persisted group set');
+});
+
+check('a commit that is not yours carries its author in the section label', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED({
+    commits: [
+      { hash: 'a'.repeat(40), short: 'aaaaaaa', subject: 'fix the card', when: 2, keys: ['ApexClass:AcmeB'], author: 'Jane' },
+      { hash: 'b'.repeat(40), short: 'bbbbbbb', subject: 'first cut', when: 1, keys: ['Flow:AcmeF'] }
+    ]
+  }));
+  assert.deepStrictEqual(sectionLabels(p), [
+    'Uncommitted (1)',
+    'aaaaaaa fix the card — Jane (1)',
+    'bbbbbbb first cut (1)'
+  ], 'your own commits must not be labelled with your name, and someone else\'s must');
 });
 
 check('a component touched twice is listed under both commits', () => {
@@ -1597,6 +1613,23 @@ check('the base label is the picker: it names the comparison and asks the provid
   assert.strictEqual(baseBtn(p).textContent, 'vs origin/devInt');
   baseBtn(p).fire('click');
   assert.strictEqual(p.outbound.filter(m => m.type === 'pickChangedBase').length, 1, 'one request per click, and nothing else to do webview-side');
+});
+
+check('when the automatic comparison gives up, the label says what is on screen', () => {
+  // The provider sends `note` when it could not read this branch (a trunk-only
+  // checkout, or a branch longer than a branch of work). Claiming "This branch"
+  // over a working-tree-only list is the one thing the header must not do.
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver({
+    type: 'changed', keys: ['ApexClass:AcmeA'], uncommitted: ['ApexClass:AcmeA'], commits: [],
+    auto: true, note: 'This branch is the whole repository (no other branch to measure against) — showing uncommitted changes only.'
+  });
+  assert.strictEqual(baseBtn(p).textContent, 'Uncommitted only');
+  assert.ok(baseBtn(p).title.includes('whole repository'), 'and the reason is one hover away, not only in the output channel');
+  // Auto that DID read the branch keeps its label.
+  p.deliver(CHANGED());
+  assert.strictEqual(baseBtn(p).textContent, 'This branch');
 });
 
 check('a payload that only re-splits the same keys still repaints', () => {

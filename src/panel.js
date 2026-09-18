@@ -97,6 +97,7 @@
     changedReason: '',       // why change detection is unavailable (when changedKeys is null)
     changedBase: '',         // git ref the Changed lens compares against ('' = uncommitted only)
     changedAuto: false,      // true when that comparison is this branch's own commits
+    changedNote: '',         // why the automatic comparison gave up, when it did
     changedUncommitted: null,// Set of keys with uncommitted edits (the lens's first section)
     changedCommits: [],      // [{hash, short, subject, keys}] newest first — one section each
     expandedSections: new Set(['uncommitted']), // open Changed sections; in-memory, unlike expandedGroups
@@ -389,8 +390,8 @@
     const keys = msg.keys === null ? null : Array.from(msg.keys || []).sort();
     // The sections are part of what's drawn: the same key set split differently
     // (a commit made, an edit staged) has to repaint.
-    const commits = (msg.commits || []).map(c => [c.hash, (c.keys || []).slice().sort()]);
-    return JSON.stringify([keys, msg.reason || '', msg.base || '', !!msg.auto,
+    const commits = (msg.commits || []).map(c => [c.hash, c.author || '', (c.keys || []).slice().sort()]);
+    return JSON.stringify([keys, msg.reason || '', msg.base || '', !!msg.auto, msg.note || '',
       Array.from(msg.uncommitted || []).sort(), commits]);
   }
 
@@ -600,6 +601,7 @@
         // the message with `base`; empty/absent = the default uncommitted-only lens.
         state.changedBase = msg.base || '';
         state.changedAuto = !!msg.auto;
+        state.changedNote = msg.note || '';
         state.changedUncommitted = msg.keys === null ? null : new Set(msg.uncommitted || []);
         state.changedCommits = msg.keys === null ? [] : (msg.commits || []);
         // Every scan ends by recomputing this lens, so a background rescan would
@@ -1433,9 +1435,14 @@
       const head = document.createElement('div');
       head.className = 'mode-head';
       const lbl = document.createElement('button');
-      lbl.textContent = state.changedAuto ? 'This branch'
+      // `changedNote` means the automatic comparison gave up (a trunk-only
+      // checkout, or too long a branch): say what IS on screen rather than let
+      // the label claim a comparison that isn't happening.
+      lbl.textContent = state.changedAuto && !state.changedNote ? 'This branch'
         : state.changedBase ? `vs ${state.changedBase}` : 'Uncommitted only';
-      lbl.title = 'What this view compares against — click to change';
+      lbl.title = state.changedNote
+        ? `${state.changedNote}\nClick to change what this view compares against.`
+        : 'What this view compares against — click to change';
       lbl.addEventListener('click', () => send('pickChangedBase'));
       head.appendChild(lbl);
       // Select all, mirroring the Selected lens's Clear all. Additive: it ticks the
@@ -1500,11 +1507,20 @@
       const keys = (c.keys || []).filter(k => state.changedKeys.has(k));
       if (!keys.length) continue;
       for (const k of keys) accounted.add(k);
-      out.push({ id: 'c/' + c.hash, label: `${c.short} ${c.subject}`, keys: new Set(keys) });
+      // The author shows only when the provider says the commit isn't yours —
+      // on a branch of your own every section would otherwise carry your name.
+      out.push({
+        id: 'c/' + c.hash,
+        label: c.author ? `${c.short} ${c.subject} — ${c.author}` : `${c.short} ${c.subject}`,
+        keys: new Set(keys)
+      });
     }
     const rest = [];
     for (const k of state.changedKeys) if (!accounted.has(k)) rest.push(k);
-    if (rest.length) out.push({ id: 'earlier', label: 'Earlier commits', keys: new Set(rest) });
+    // Not "earlier commits": under an explicit ref this is simply everything the
+    // comparison reports that no listed commit accounts for (a merge, or history
+    // past the cap).
+    if (rest.length) out.push({ id: 'earlier', label: 'Other changes', keys: new Set(rest) });
     return out.length ? out : null;
   }
 
