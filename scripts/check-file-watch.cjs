@@ -173,20 +173,21 @@ check('the target order does not depend on the order package dirs were listed', 
   assert.deepStrictEqual(a, b);
 });
 
-check('case-only duplicates collapse on win32 and stay distinct elsewhere', () => {
-  const win = watchTargets(PROJ, ['force-app', 'FORCE-APP'], 'win32');
-  assert.strictEqual(win.length, 1);
-  const posix = watchTargets(PROJ, ['force-app', 'FORCE-APP'], 'darwin');
-  assert.strictEqual(posix.length, 2);
+check('case-only duplicates collapse on win32 and darwin, stay distinct on linux', () => {
+  for (const plat of ['win32', 'darwin']) assert.strictEqual(watchTargets(PROJ, ['force-app', 'FORCE-APP'], plat).length, 1, plat);
+  assert.strictEqual(watchTargets(PROJ, ['force-app', 'FORCE-APP'], 'linux').length, 2);
 });
 
-check('nesting is detected across win32 casing too', () => {
+check('nesting is detected across win32/darwin casing too', () => {
   // sfdx-project.json is hand-written: `force-app` and `FORCE-APP/main` are the
-  // same tree on Windows, and an unfolded containment test would watch both.
-  const win = watchTargets(PROJ, ['force-app', p('FORCE-APP', 'main')], 'win32');
-  assert.deepStrictEqual(win.map(x => x.base), [p(PROJ, 'force-app')]);
-  const posix = watchTargets(PROJ, ['force-app', p('FORCE-APP', 'main')], 'darwin');
-  assert.strictEqual(posix.length, 2, 'on a case-sensitive filesystem they really are two trees');
+  // same tree on a case-insensitive filesystem, and an unfolded containment test
+  // would watch both.
+  for (const plat of ['win32', 'darwin']) {
+    const folded = watchTargets(PROJ, ['force-app', p('FORCE-APP', 'main')], plat);
+    assert.deepStrictEqual(folded.map(x => x.base), [p(PROJ, 'force-app')], plat);
+  }
+  const linux = watchTargets(PROJ, ['force-app', p('FORCE-APP', 'main')], 'linux');
+  assert.strictEqual(linux.length, 2, 'on a case-sensitive filesystem they really are two trees');
 });
 
 // ---------------------------------------------------------- watchTargetsKey

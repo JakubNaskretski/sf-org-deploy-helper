@@ -1503,5 +1503,148 @@ check('B1: suggestionRestore for an id with no matching card, or already carryin
   assert.strictEqual(openSuggestBtn(q).textContent, 'Try with dependencies (1)', 'a live suggest was overwritten by a restore');
 });
 
+// ---------------------------------- 10) the Changed view's commit sections ----
+// A commit used to empty the lens. It now splits it: the uncommitted edits, then
+// one collapsible section per commit on this branch, and a catch-all for what the
+// base diff reports that no listed commit accounts for. The rows inside a section
+// are the ordinary type/object groups, so everything above still applies to them.
+const CH_ITEMS = [item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeB'), item('Flow', 'AcmeF')];
+const sectionNodes = (p) => {
+  const o = [];
+  p.el('tree').find(e => { if (e.classList.contains('section')) o.push(e); return false; });
+  return o;
+};
+const sectionLabels = (p) => sectionNodes(p).map(g => `${g.children[0].children[2].textContent} ${g.children[0].children[3].textContent}`);
+const sectionRows = (p, i) => { const o = []; sectionNodes(p)[i].find(e => { if (e.className === 'name') o.push(e.textContent); return false; }); return o; };
+const baseBtn = (p) => p.el('tree').find(e => e.tagName === 'BUTTON' && /^(This branch|vs |Uncommitted only)/.test(e.textContent));
+const CHANGED = (extra) => ({
+  type: 'changed',
+  keys: ['ApexClass:AcmeA', 'ApexClass:AcmeB', 'Flow:AcmeF'],
+  uncommitted: ['ApexClass:AcmeA'],
+  auto: true,
+  commits: [
+    { hash: 'a'.repeat(40), short: 'aaaaaaa', subject: 'fix the card', when: 2, keys: ['ApexClass:AcmeB'] },
+    { hash: 'b'.repeat(40), short: 'bbbbbbb', subject: 'first cut', when: 1, keys: ['ApexClass:AcmeB', 'Flow:AcmeF'] }
+  ],
+  ...extra
+});
+
+check('no commits to show renders the flat tree exactly as before', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver({ type: 'changed', keys: ['ApexClass:AcmeA'], uncommitted: ['ApexClass:AcmeA'], commits: [] });
+  assert.deepStrictEqual(sectionNodes(p), [], 'one section would be pure overhead');
+  assert.deepStrictEqual(names(p), ['AcmeA']);
+  assert.strictEqual(baseBtn(p).textContent, 'Uncommitted only');
+});
+
+check('sections run newest work first: uncommitted, each commit, then what no commit accounts for', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES([...CH_ITEMS, item('ApexClass', 'AcmeOld')]));
+  p.deliver(CHANGED({ keys: ['ApexClass:AcmeA', 'ApexClass:AcmeB', 'Flow:AcmeF', 'ApexClass:AcmeOld'] }));
+  assert.deepStrictEqual(sectionLabels(p), [
+    'Uncommitted (1)',
+    'aaaaaaa fix the card (1)',
+    'bbbbbbb first cut (2)',
+    'Other changes (1)'
+  ], 'the residue is not necessarily "earlier": under an explicit ref it is whatever no listed commit accounts for');
+  assert.strictEqual(baseBtn(p).textContent, 'This branch');
+});
+
+check('uncommitted work is open, commits are collapsed, and a section keeps its own expansion', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED());
+  assert.deepStrictEqual(sectionRows(p, 0), ['AcmeA'], 'the edits you have in hand are the point of the view');
+  assert.deepStrictEqual(sectionRows(p, 1), [], 'commits start collapsed — the tab must not become a wall');
+  sectionNodes(p)[1].children[0].fire('click');
+  assert.deepStrictEqual(sectionRows(p, 1), ['AcmeB']);
+  assert.deepStrictEqual(sectionRows(p, 2), [], 'one section opened, not all of them');
+  assert.deepStrictEqual(p.persisted().expandedGroups, [], 'commit hashes never enter the persisted group set');
+});
+
+check('a commit that is not yours carries its author in the section label', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED({
+    commits: [
+      { hash: 'a'.repeat(40), short: 'aaaaaaa', subject: 'fix the card', when: 2, keys: ['ApexClass:AcmeB'], author: 'Jane' },
+      { hash: 'b'.repeat(40), short: 'bbbbbbb', subject: 'first cut', when: 1, keys: ['Flow:AcmeF'] }
+    ]
+  }));
+  assert.deepStrictEqual(sectionLabels(p), [
+    'Uncommitted (1)',
+    'aaaaaaa fix the card (by Jane) (1)',
+    'bbbbbbb first cut (1)'
+  ], 'your own commits must not be labelled with your name, and someone else\'s must');
+});
+
+check('a component touched twice is listed under both commits', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED());
+  sectionNodes(p)[1].children[0].fire('click');
+  sectionNodes(p)[2].children[0].fire('click');
+  assert.deepStrictEqual(sectionRows(p, 1), ['AcmeB']);
+  assert.deepStrictEqual(sectionRows(p, 2).slice().sort(), ['AcmeB', 'AcmeF']);
+});
+
+check('a section whose components are all filtered out renders no header at all', () => {
+  const p = panel({ ...BASE, viewMode: 'changed', typeFilter: ['Flow'] });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED());
+  assert.deepStrictEqual(sectionLabels(p), ['bbbbbbb first cut (1)'], 'only the commit with a Flow in it');
+  assert.strictEqual(tab(p, 'changed'), 'Changed (1)', 'and the tab count agrees with the rows');
+});
+
+check('a section header ticks exactly its own components', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED());
+  sectionNodes(p)[2].children[0].children[0].fire('change'); // "first cut" checkbox
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), ['ApexClass:AcmeB', 'Flow:AcmeF']);
+  assert.strictEqual(p.liveCount(), 2);
+});
+
+check('the base label is the picker: it names the comparison and asks the provider for a new one', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver(CHANGED({ auto: false, base: 'origin/devInt' }));
+  assert.strictEqual(baseBtn(p).textContent, 'vs origin/devInt');
+  baseBtn(p).fire('click');
+  assert.strictEqual(p.outbound.filter(m => m.type === 'pickChangedBase').length, 1, 'one request per click, and nothing else to do webview-side');
+});
+
+check('when the automatic comparison gives up, the label says what is on screen', () => {
+  // The provider sends `note` when it could not read this branch (a trunk-only
+  // checkout, or a branch longer than a branch of work). Claiming "This branch"
+  // over a working-tree-only list is the one thing the header must not do.
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver({
+    type: 'changed', keys: ['ApexClass:AcmeA'], uncommitted: ['ApexClass:AcmeA'], commits: [],
+    auto: true, note: 'This branch is the whole repository (no other branch to measure against) — showing uncommitted changes only.'
+  });
+  assert.strictEqual(baseBtn(p).textContent, 'Uncommitted only');
+  assert.ok(baseBtn(p).title.includes('whole repository'), 'and the reason is one hover away, not only in the output channel');
+  // Auto that DID read the branch keeps its label.
+  p.deliver(CHANGED());
+  assert.strictEqual(baseBtn(p).textContent, 'This branch');
+});
+
+check('a payload that only re-splits the same keys still repaints', () => {
+  // Committing moves a component out of "Uncommitted" without changing the key
+  // set; the identical-payload shortcut must not swallow that.
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  p.deliver({ type: 'changed', keys: ['ApexClass:AcmeB'], uncommitted: ['ApexClass:AcmeB'], auto: true, commits: [] });
+  assert.deepStrictEqual(names(p), ['AcmeB']);
+  p.deliver({
+    type: 'changed', keys: ['ApexClass:AcmeB'], uncommitted: [], auto: true,
+    commits: [{ hash: 'c'.repeat(40), short: 'ccccccc', subject: 'commit it', when: 3, keys: ['ApexClass:AcmeB'] }]
+  });
+  assert.deepStrictEqual(sectionLabels(p), ['ccccccc commit it (1)']);
+});
+
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }
 console.log(`panel selection: all ${ran} checks passed`);

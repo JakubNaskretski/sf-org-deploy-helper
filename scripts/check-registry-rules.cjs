@@ -55,6 +55,9 @@ const FIXTURE = {
     parent: { name: 'Parent', directoryName: 'parents', suffix: 'parent', children: { types: {} } },
     kid: { name: 'Kid', directoryName: 'kids', suffix: 'kid' },
     stat: { name: 'Stat', directoryName: 'classes', suffix: 'stat' },
+    // Same static folder, different case: the scanner matches folders to the disk
+    // case-insensitively, so this must not become a second, competing rule (0.23.4).
+    statCase: { name: 'StatCase', directoryName: 'Classes', suffix: 'sc' },
     badname: { name: 'Bad-Name', directoryName: 'bads', suffix: 'bad' },
     baddir: { name: 'BadDir', directoryName: 'bad/dir', suffix: 'bd' },
     nosuffix: { name: 'NoSuffix', directoryName: 'nosuffix' },
@@ -74,13 +77,16 @@ const FIXTURE = {
     assert.deepStrictEqual(byType.Deflt, { folder: 'deflts', type: 'Deflt', primaryExt: ['.deflt-meta.xml'] });
     // A parent with children but no strategy is still one -meta.xml file (AssignmentRules…).
     assert.deepStrictEqual(byType.Parent, { folder: 'parents', type: 'Parent', primaryExt: ['.parent-meta.xml'] });
-    for (const t of ['Bundlish', 'Infold', 'Kid', 'Stat', 'Bad-Name', 'BadDir', 'NoSuffix', 'AlphaTwin']) assert.ok(!byType[t], `${t} must be skipped`);
+    for (const t of ['Bundlish', 'Infold', 'Kid', 'Stat', 'StatCase', 'Bad-Name', 'BadDir', 'NoSuffix', 'AlphaTwin']) assert.ok(!byType[t], `${t} must be skipped`);
   });
 
   await check('nonDerivableFolders: bundle / folder-based types only, static folders and child types excluded', () => {
     const m = nonDerivableFolders(FIXTURE, STATIC);
     assert.deepStrictEqual([...m.entries()].sort(), [['bundlish', 'Bundlish'], ['infolds', 'Infold']]);
     assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'classes', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed');
+    assert.deepStrictEqual([...nonDerivableFolders({ types: { s: { name: 'S', directoryName: 'CLASSES', strategies: { adapter: 'bundle' } } } }, STATIC).keys()], [], 'static folder never listed, whatever its case');
+    // Keys are lowercased so the on-disk basename (any case) looks them up.
+    assert.deepStrictEqual([...nonDerivableFolders({ types: { d: { name: 'Doc', directoryName: 'Documents', inFolder: true } } }, STATIC).entries()], [['documents', 'Doc']], 'key is the lowercased directoryName');
     assert.deepStrictEqual([...nonDerivableFolders(null, STATIC).keys()], []);
     assert.deepStrictEqual([...registryNonDerivable().keys()].length >= 0, true, 'getter is safe before any load');
   });
@@ -226,10 +232,15 @@ const FIXTURE = {
   });
   await check('known-shape folders skip the CLI and get their own banner; CLI resolutions run 3 at a time', () => {
     assert.ok(/const nonDerivable = registryNonDerivable\(\);/.test(src));
-    assert.ok(/const known = nonDerivable\.get\(path\.basename\(folder\)\);\s*\n\s*if \(known\) \{\s*\n\s*this\.markUnresolvable\(folder\);/.test(src), 'known shape → negative-cached without a CLI call');
+    assert.ok(/const known = nonDerivable\.get\(path\.basename\(folder\)\.toLowerCase\(\)\);\s*\n\s*if \(known\) \{\s*\n\s*this\.markUnresolvable\(folder\);/.test(src), 'known shape → negative-cached without a CLI call, looked up case-insensitively');
     assert.ok(/const limit = 3;/.test(src) && /Array\.from\(\{ length: Math\.min\(limit, toResolve\.length\) \}, worker\)/.test(src), 'bounded concurrency');
     assert.ok(/Not shown in the tree \(folder-based or bundle types, deploy via right-click\): \$\{this\.knownShapeSkips\.join\(', '\)\}/.test(src));
     assert.ok(/Couldn't resolve metadata type for: \$\{realFailures\.join\(', '\)\}/.test(src), 'real failures keep the error wording');
+  });
+  await check('the registry naming check is part of npm run check (0.23.4)', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert.ok(/node \.\/scripts\/check-registry-names\.cjs/.test(pkg.scripts.check), 'check-registry-names.cjs dropped from the check chain');
+    assert.ok(fs.existsSync(path.join(__dirname, 'check-registry-names.cjs')));
   });
 
   await check('an explicit scan that finds no project retries before believing it; folder changes rescan', () => {

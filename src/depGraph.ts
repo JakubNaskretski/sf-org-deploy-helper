@@ -500,7 +500,7 @@ export function extractApexStringRefs(source: string): BundleRef[] {
  *  stable across runs. */
 type ScanIndex = Map<string, Map<string, MetadataItem>>;
 
-const INDEXED_TYPES = ['ApexClass', 'ApexPage', 'ApexComponent', 'CustomObject', 'CustomField',
+export const INDEXED_TYPES = ['ApexClass', 'ApexPage', 'ApexComponent', 'CustomObject', 'CustomField',
   'LightningComponentBundle', 'AuraDefinitionBundle', 'LightningMessageChannel', 'StaticResource'];
 
 function buildIndex(items: MetadataItem[]): ScanIndex {

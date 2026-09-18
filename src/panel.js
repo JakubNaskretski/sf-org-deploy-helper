@@ -96,6 +96,11 @@
     changedKeys: null,       // Set of "Type:Name" with git changes; null = unknown/unavailable
     changedReason: '',       // why change detection is unavailable (when changedKeys is null)
     changedBase: '',         // git ref the Changed lens compares against ('' = uncommitted only)
+    changedAuto: false,      // true when that comparison is this branch's own commits
+    changedNote: '',         // why the automatic comparison gave up, when it did
+    changedUncommitted: null,// Set of keys with uncommitted edits (the lens's first section)
+    changedCommits: [],      // [{hash, short, subject, keys}] newest first — one section each
+    expandedSections: new Set(['uncommitted']), // open Changed sections; in-memory, unlike expandedGroups
     // Signatures of the last APPLIED 'files' / 'changed' payloads (see
     // filesSignature / changedSignature). Every render replaces the tree's
     // innerHTML — scroll position and keyboard focus go with it — and the package
@@ -383,7 +388,11 @@
   // state of its own, never an empty list.
   function changedSignature(msg) {
     const keys = msg.keys === null ? null : Array.from(msg.keys || []).sort();
-    return JSON.stringify([keys, msg.reason || '', msg.base || '']);
+    // The sections are part of what's drawn: the same key set split differently
+    // (a commit made, an edit staged) has to repaint.
+    const commits = (msg.commits || []).map(c => [c.hash, c.author || '', (c.keys || []).slice().sort()]);
+    return JSON.stringify([keys, msg.reason || '', msg.base || '', !!msg.auto, msg.note || '',
+      Array.from(msg.uncommitted || []).sort(), commits]);
   }
 
   // Drop selected keys that neither the local scan nor org membership vouches for.
@@ -591,6 +600,10 @@
         // Base ref (Feature 2): when the provider compares against a git ref it tags
         // the message with `base`; empty/absent = the default uncommitted-only lens.
         state.changedBase = msg.base || '';
+        state.changedAuto = !!msg.auto;
+        state.changedNote = msg.note || '';
+        state.changedUncommitted = msg.keys === null ? null : new Set(msg.uncommitted || []);
+        state.changedCommits = msg.keys === null ? [] : (msg.commits || []);
         // Every scan ends by recomputing this lens, so a background rescan would
         // rebuild the tree here even when the `files` handler above correctly
         // declined to — same scroll and focus loss, one message later. An identical
@@ -1122,7 +1135,12 @@
   }
 
   // Partition the (filtered) merged item list into the object tree and the flat type groups.
-  function buildGroups() {
+  // `onlyKeys` (a Set) narrows the build to one Changed-view section; the lens's
+  // own membership test still applies, so a section can never widen it. `merged`
+  // is the merged item list, built ONCE per render and passed in: it allocates an
+  // object per component, and a sectioned render calls this once per section —
+  // on every checkbox tick, since selectionChanged re-renders.
+  function buildGroups(onlyKeys, merged) {
     const filter = state.filter;
     const objectMap = new Map(); // objectName -> { obj: item|null, children: Map<type, item[]> }
     const flatGroups = new Map(); // type -> item[]
@@ -1136,7 +1154,7 @@
     // them on, "N selected" stood above a list that couldn't account for it. The
     // text filter stays; it is the user's own search WITHIN the lens.
     const isSelectedLens = state.viewMode === 'selected';
-    for (const item of buildMergedItems()) {
+    for (const item of merged || buildMergedItems()) {
       if (!isSelectedLens && !isTypeAllowed(item.type)) continue;
       if (!isSelectedLens && !isSourceAllowed(item._source)) continue;
       // View-mode lens first (cheap Set lookups), text filter within the lens.
@@ -1146,6 +1164,7 @@
         if (!lens.has(`${item.type}:${item.name}`)) continue;
       }
       if (state.viewMode === 'changed' && !(state.changedKeys && state.changedKeys.has(`${item.type}:${item.name}`))) continue;
+      if (onlyKeys && !onlyKeys.has(`${item.type}:${item.name}`)) continue;
       if (!matchesFilter(item, filter)) continue;
       if (item.type === 'CustomObject') {
         getObj(item.name).obj = item;
@@ -1165,7 +1184,7 @@
 
   // A collapsible group node with a tri-state select-all checkbox. Returns the wrapper
   // and the body element to append children into (only when expanded).
-  function makeGroupNode({ key, label, count, itemKeys, expanded, depth }) {
+  function makeGroupNode({ key, label, count, itemKeys, expanded, depth, toggle, title }) {
     const group = document.createElement('div');
     group.className = 'group';
     const header = document.createElement('div');
@@ -1199,8 +1218,10 @@
     cnt.textContent = `(${count})`;
     header.appendChild(cnt);
 
+    if (title) header.title = title;
     header.addEventListener('click', (e) => {
       if (e.target === cb) return;
+      if (toggle) { toggle(); renderTree(); return; }
       if (state.expandedGroups.has(key)) state.expandedGroups.delete(key);
       else state.expandedGroups.add(key);
       savePersisted();
@@ -1386,8 +1407,8 @@
     const filter = state.filter;
     // The Selected/Changed lenses show small curated lists — auto-expand their
     // groups like an active text filter does (NODE_CAP still bounds the render).
-    const forceExpand = state.viewMode !== 'all';
-    const { objectMap, flatGroups } = buildGroups();
+    const merged = buildMergedItems();
+    const { objectMap, flatGroups } = buildGroups(undefined, merged);
     renderTreeTools(objectMap, flatGroups);
     // Slim header for the Selected lens: the count and the one action the old
     // chip tray provided that checkboxes don't cover in one click.
@@ -1413,8 +1434,16 @@
     if (state.viewMode === 'changed') {
       const head = document.createElement('div');
       head.className = 'mode-head';
-      const lbl = document.createElement('span');
-      lbl.textContent = state.changedBase ? `Changed vs ${state.changedBase}` : 'Uncommitted changes';
+      const lbl = document.createElement('button');
+      // `changedNote` means the automatic comparison gave up (a trunk-only
+      // checkout, or too long a branch): say what IS on screen rather than let
+      // the label claim a comparison that isn't happening.
+      lbl.textContent = state.changedAuto && !state.changedNote ? 'This branch'
+        : state.changedBase ? `vs ${state.changedBase}` : 'Uncommitted only';
+      lbl.title = state.changedNote
+        ? `${state.changedNote}\nClick to change what this view compares against.`
+        : 'What this view compares against — click to change';
+      lbl.addEventListener('click', () => send('pickChangedBase'));
       head.appendChild(lbl);
       // Select all, mirroring the Selected lens's Clear all. Additive: it ticks the
       // rows this lens is showing (filters included) and touches nothing else.
@@ -1449,49 +1478,136 @@
       return;
     }
 
-    // Cap the number of DOM nodes built in a single render. On a large org the merged
-    // tree can be tens of thousands of components; force-expanding (via filter) and
-    // building a node per row would freeze the webview. We stop at NODE_CAP and show a
-    // "narrow your filter" notice instead — the data is all still there, just not all
-    // painted at once.
-    const NODE_CAP = 1000;
-    let nodes = 0;
-    let truncated = false;
-    const budgetLeft = () => nodes < NODE_CAP;
+    const budget = { nodes: 0, truncated: false };
+    const sections = changedSections();
+    if (sections) renderSections(tree, sections, budget, merged);
+    else renderGroups(tree, objectMap, flatGroups, budget, 0);
+    if (budget.truncated) {
+      const d = document.createElement('div');
+      d.className = 'status-empty';
+      d.textContent = `Showing the first ${NODE_CAP} rows. Narrow with the filter box, type filter, or source filter to see the rest.`;
+      tree.appendChild(d);
+    }
+  }
+
+  // The Changed view's sections, newest work first: the uncommitted edits, then one
+  // per commit that touched a component, then whatever the base diff reports that no
+  // listed commit accounts for (a merge, or history past the commit cap). Null when
+  // the lens isn't sectioned — another view, or nothing committed to show — and the
+  // tree renders flat exactly as before.
+  function changedSections() {
+    if (state.viewMode !== 'changed' || !state.changedKeys) return null;
+    if (!state.changedCommits.length) return null;
+    const out = [];
+    const accounted = new Set();
+    const uncommitted = [];
+    for (const k of state.changedUncommitted || []) { uncommitted.push(k); accounted.add(k); }
+    if (uncommitted.length) out.push({ id: 'uncommitted', label: 'Uncommitted', keys: new Set(uncommitted) });
+    for (const c of state.changedCommits) {
+      const keys = (c.keys || []).filter(k => state.changedKeys.has(k));
+      if (!keys.length) continue;
+      for (const k of keys) accounted.add(k);
+      // The author shows only when the provider says the commit isn't yours —
+      // on a branch of your own every section would otherwise carry your name.
+      out.push({
+        id: 'c/' + c.hash,
+        // "(by X)", not "— X": commit subjects use dashes themselves, and an
+        // attribution that reads as part of the subject discloses nothing.
+        label: c.author ? `${c.short} ${c.subject} (by ${c.author})` : `${c.short} ${c.subject}`,
+        keys: new Set(keys)
+      });
+    }
+    const rest = [];
+    for (const k of state.changedKeys) if (!accounted.has(k)) rest.push(k);
+    // Not "earlier commits": under an explicit ref this is simply everything the
+    // comparison reports that no listed commit accounts for (a merge, or history
+    // past the cap).
+    if (rest.length) out.push({ id: 'earlier', label: 'Other changes', keys: new Set(rest) });
+    return out.length ? out : null;
+  }
+
+  // Paint the Changed view's sections: a collapsible header per section over the
+  // ordinary type/object groups, built from that section's keys alone.
+  function renderSections(tree, sections, budget, merged) {
+    let painted = 0;
+    for (const sec of sections) {
+      const { objectMap, flatGroups } = buildGroups(sec.keys, merged);
+      if (objectMap.size === 0 && flatGroups.size === 0) continue; // filtered away
+      const itemKeys = localKeysInGroups(objectMap, flatGroups);
+      const expanded = state.expandedSections.has(sec.id);
+      const node = makeGroupNode({
+        key: 'sec/' + sec.id,
+        label: sec.label,
+        count: itemKeys.length,
+        itemKeys,
+        expanded,
+        depth: 0,
+        title: sec.label,
+        toggle: () => {
+          if (state.expandedSections.has(sec.id)) state.expandedSections.delete(sec.id);
+          else state.expandedSections.add(sec.id);
+        }
+      });
+      node.group.classList.add('section');
+      tree.appendChild(node.group); budget.nodes++; painted++;
+      if (expanded) renderGroups(node.body, objectMap, flatGroups, budget, 1);
+    }
+    if (painted === 0) {
+      const d = document.createElement('div');
+      d.className = 'status-empty';
+      d.textContent = emptyTreeText(state.filter);
+      tree.appendChild(d);
+    }
+  }
+
+  // Cap the number of DOM nodes built in a single render. On a large org the merged
+  // tree can be tens of thousands of components; force-expanding (via filter) and
+  // building a node per row would freeze the webview. We stop at NODE_CAP and show a
+  // "narrow your filter" notice instead — the data is all still there, just not all
+  // painted at once.
+  const NODE_CAP = 1000;
+
+  // Paint one group set into `container`. `budget` is shared across every call of a
+  // single render, so the cap bounds the whole tree rather than each Changed-view
+  // section; `depth` indents a section's contents under its header.
+  function renderGroups(container, objectMap, flatGroups, budget, depth) {
+    const filter = state.filter;
+    const forceExpand = state.viewMode !== 'all';
+    const budgetLeft = () => budget.nodes < NODE_CAP;
 
     // ---- Objects super-group: object → child-type sub-groups → rows ----
     if (objectMap.size > 0) {
       const objectNames = Array.from(objectMap.keys()).sort();
       const allKeys = objectNames.flatMap(n => keysUnderObject(objectMap.get(n)));
       const objectsExpanded = state.expandedGroups.has('__OBJECTS__') || !!filter || forceExpand;
-      const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: 0 });
-      tree.appendChild(objectsNode.group); nodes++;
+      const objectsNode = makeGroupNode({ key: '__OBJECTS__', label: 'Objects', count: objectNames.length, itemKeys: allKeys, expanded: objectsExpanded, depth: depth });
+      container.appendChild(objectsNode.group); budget.nodes++;
       if (objectsExpanded) {
         for (const name of objectNames) {
-          if (!budgetLeft()) { truncated = true; break; }
+          if (!budgetLeft()) { budget.truncated = true; break; }
           const o = objectMap.get(name);
           const objKeys = keysUnderObject(o);
           const objExpanded = state.expandedGroups.has('obj/' + name) || !!filter || forceExpand;
-          const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: 1 });
-          objectsNode.body.appendChild(objNode.group); nodes++;
+          const objNode = makeGroupNode({ key: 'obj/' + name, label: name, count: objKeys.length, itemKeys: objKeys, expanded: objExpanded, depth: depth + 1 });
+          objectsNode.body.appendChild(objNode.group); budget.nodes++;
           if (!objExpanded) continue;
           // The object's own definition (CustomObject) — diff is unsupported, but it
           // can still be deployed/retrieved, so surface it as a selectable row.
           if (o.obj) {
-            if (!budgetLeft()) { truncated = true; break; }
-            objNode.body.appendChild(makeLeafRow(o.obj, '⊙ object definition', 2)); nodes++;
+            if (!budgetLeft()) { budget.truncated = true; break; }
+            objNode.body.appendChild(makeLeafRow(o.obj, '⊙ object definition', depth + 2)); budget.nodes++;
           }
           for (const ct of Array.from(o.children.keys()).sort()) {
-            if (!budgetLeft()) { truncated = true; break; }
+            if (!budgetLeft()) { budget.truncated = true; break; }
             const arr = o.children.get(ct).slice().sort((a, b) => a.name.localeCompare(b.name));
             const ctKeys = arr.map(it => `${it.type}:${it.name}`);
             const ctExpanded = state.expandedGroups.has('objc/' + name + '/' + ct) || !!filter || forceExpand;
-            const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: 2 });
-            objNode.body.appendChild(ctNode.group); nodes++;
+            const ctNode = makeGroupNode({ key: 'objc/' + name + '/' + ct, label: childLabel(ct), count: arr.length, itemKeys: ctKeys, expanded: ctExpanded, depth: depth + 2 });
+            objNode.body.appendChild(ctNode.group); budget.nodes++;
             if (!ctExpanded) continue;
             for (const it of arr) {
-              if (!budgetLeft()) { truncated = true; break; }
-              ctNode.body.appendChild(makeLeafRow(it, it.name.slice(name.length + 1), 3)); nodes++;
+              if (!budgetLeft()) { budget.truncated = true; break; }
+              ctNode.body.appendChild(makeLeafRow(it, it.name.slice(name.length + 1), depth + 3)); budget.nodes++;
             }
           }
         }
@@ -1500,25 +1616,20 @@
 
     // ---- Flat groups for everything that isn't an object or object child ----
     for (const type of Array.from(flatGroups.keys()).sort()) {
-      if (!budgetLeft()) { truncated = true; break; }
+      if (!budgetLeft()) { budget.truncated = true; break; }
       const arr = flatGroups.get(type).slice().sort((a, b) => a.name.localeCompare(b.name));
       const keys = arr.map(it => `${it.type}:${it.name}`);
       const expanded = state.expandedGroups.has(type) || !!filter || forceExpand;
-      const node = makeGroupNode({ key: type, label: typeLabel(type), count: arr.length, itemKeys: keys, expanded, depth: 0 });
-      tree.appendChild(node.group); nodes++;
+      const node = makeGroupNode({ key: type, label: typeLabel(type), count: arr.length, itemKeys: keys, expanded, depth: depth });
+      container.appendChild(node.group); budget.nodes++;
       if (expanded) for (const it of arr) {
-        if (!budgetLeft()) { truncated = true; break; }
-        node.body.appendChild(makeLeafRow(it, it.name, 1)); nodes++;
+        if (!budgetLeft()) { budget.truncated = true; break; }
+        node.body.appendChild(makeLeafRow(it, it.name, depth + 1)); budget.nodes++;
       }
     }
 
-    if (truncated) {
-      const d = document.createElement('div');
-      d.className = 'status-empty';
-      d.textContent = `Showing the first ${NODE_CAP} rows. Narrow with the filter box, type filter, or source filter to see the rest.`;
-      tree.appendChild(d);
-    }
   }
+
 
   function scrollKeyIntoView(key) {
     const row = document.querySelector(`.row[data-key="${cssEscape(key)}"]`);
