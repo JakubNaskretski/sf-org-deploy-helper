@@ -97,6 +97,7 @@ export function deactivate(): void {
 async function showHelp(context: vscode.ExtensionContext): Promise<void> {
   const HELP = `1. Open SF Deploy Wrapper in the Activity Bar and pick an org from the dropdown (＋ logs in to a new one).
 2. Tick components in the tree; the All / Selected / Changed tabs and search (acc trig, type:flow) narrow it; the type filter narrows All and Changed.
+2a. Changed lists your uncommitted edits plus this branch's commits, one section each — click its header label to compare against a ref instead (or show uncommitted only).
 3. Deploy pushes local files; Validate is a check-only deploy; Retrieve pulls the org's copy; Diff compares the two.
 4. Fetch Org lists what the org has, so org-only components appear; Rescan re-reads the workspace.
 5. Right-click a metadata file in the Explorer or editor for Deploy, Retrieve, Diff, Compare, Deploy File + Dependencies, Open in Org, Delete from Org.

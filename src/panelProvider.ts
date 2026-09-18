@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
+import { execFile } from 'child_process';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
@@ -15,6 +16,7 @@ import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTarge
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
+import { COMMIT_CAP, CommitInfo, baseRefForCommits, commitLogArgs, parseCommitLog } from './gitChanges';
 
 type Inbound =
   | { type: 'ready' }
@@ -41,6 +43,9 @@ type Inbound =
   | { type: 'openInOrg'; keys: string[] }
   | { type: 'copyText'; text: string }
   | { type: 'refreshChanged' }
+  // The Changed header's base-ref button. Carries nothing: the provider offers
+  // its own quick pick and writes the setting itself.
+  | { type: 'pickChangedBase' }
   | { type: 'retryDeploy'; request?: RetryRequest }
   // "Retry + changed vs branch" card button — the same untrusted RetryRequest
   // round-trip as retryDeploy; the changed set itself is computed provider-side
@@ -80,8 +85,19 @@ type Inbound =
 // differences (untracked files aren't included, which is why the caller also merges
 // in workingTreeChanges/indexChanges). Rejects for an unknown ref.
 interface GitChangeLite { uri?: vscode.Uri }
+interface GitRefLite { name?: string; type?: number }
 interface GitRepoLite {
-  state: { workingTreeChanges: GitChangeLite[]; indexChanges: GitChangeLite[]; onDidChange: vscode.Event<void> };
+  /** Repository root (the real API's `rootUri`) — the cwd for our own `git log`. */
+  rootUri?: vscode.Uri;
+  state: {
+    workingTreeChanges: GitChangeLite[];
+    indexChanges: GitChangeLite[];
+    onDidChange: vscode.Event<void>;
+    /** Current branch; absent on a detached HEAD. */
+    HEAD?: { name?: string };
+    /** Known refs (heads 0, remote heads 1, tags 2) — the base-ref quick pick's list. */
+    refs?: GitRefLite[];
+  };
   diffWith(ref: string): Promise<GitChangeLite[]>;
   /** Re-run `git status` now (the real API's `status(): Promise<void>`); ends
    *  in `state.onDidChange` once the in-memory state is current. */
@@ -90,10 +106,18 @@ interface GitRepoLite {
 interface GitApiLite {
   repositories: GitRepoLite[];
   onDidOpenRepository: vscode.Event<GitRepoLite>;
+  /** The real API's `git: { path: string }` — the binary VS Code itself uses, so
+   *  the commit listing doesn't depend on `git` being on PATH. */
+  git?: { path?: string };
   /** The open repository containing `uri`, or null (the real API's `getRepository`). */
   getRepository(uri: vscode.Uri): GitRepoLite | null;
 }
 interface GitExtensionLite { getAPI(version: 1): GitApiLite }
+
+/** One commit section of the Changed view: the components that commit touched. */
+interface ChangedCommitSection { hash: string; short: string; subject: string; when: number; keys: string[] }
+/** The Changed view's answer: the union the lens lists, split into its sections. */
+interface ChangedComponents { keys: string[]; base?: string; auto?: boolean; uncommitted: string[]; commits: ChangedCommitSection[] }
 
 interface OrgPayload { username: string; alias?: string; label: string; kind: 'prod' | 'sandbox' | 'scratch' | 'other'; }
 
@@ -1181,6 +1205,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       case 'refreshChanged':
         await this.postChangedComponents();
         return;
+      case 'pickChangedBase':
+        await this.pickChangedBase();
+        return;
       case 'retryDeploy': {
         // The request round-trips through the webview (and persisted history) —
         // re-validate every field; runDeploy's own confirm modal + org guard then
@@ -2186,19 +2213,104 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return { dispose: () => { disposed = true; for (const d of subs.splice(0)) d.dispose(); } };
   }
 
+  /** The Changed header's base label, clicked: offer the three comparisons the
+   *  lens supports (this branch's commits / a ref / uncommitted only) and write
+   *  the choice to `changedBaseRef`. Written at User scope on purpose — a
+   *  Workspace write would drop a .vscode/settings.json into the user's own
+   *  repository, and `auto` already covers per-project branch naming.
+   *  ponytail: branch list comes from vscode.git's in-memory refs; "Other ref…"
+   *  covers tags and anything it hasn't loaded. */
+  private async pickChangedBase(): Promise<void> {
+    const OTHER = 'Other ref…';
+    const config = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
+    const current = config.get<string>('changedBaseRef', 'auto').trim();
+    const currently = (value: string): string | undefined => (value === current ? 'current' : undefined);
+    const items: (vscode.QuickPickItem & { value?: string })[] = [
+      { label: 'This branch', description: currently('auto'), detail: 'Uncommitted edits plus the commits no other branch has — survives commit and push', value: 'auto' },
+      { label: 'Uncommitted only', description: currently(''), detail: 'Working tree and staged edits, nothing committed', value: '' }
+    ];
+    const refs = new Set<string>();
+    try {
+      const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
+      const api = gitExt ? (gitExt.isActive ? gitExt.exports : await gitExt.activate()).getAPI(1) : undefined;
+      for (const repo of api?.repositories ?? []) {
+        for (const ref of repo.state.refs ?? []) {
+          if (ref.name && (ref.type === 0 || ref.type === 1)) refs.add(ref.name);
+        }
+      }
+    } catch { /* the ref list is a convenience; "Other ref…" still works */ }
+    if (refs.size > 0) {
+      items.push({ label: 'Compare against a branch', kind: vscode.QuickPickItemKind.Separator });
+      for (const name of [...refs].sort()) items.push({ label: name, description: currently(name), value: name });
+    }
+    items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+    items.push({ label: OTHER, detail: 'Type a branch, tag or commit' });
+    const picked = await vscode.window.showQuickPick(items, { title: 'Changed view — compare against', placeHolder: current || 'uncommitted only' });
+    if (!picked) return;
+    let value = picked.value;
+    if (picked.label === OTHER && value === undefined) {
+      value = (await vscode.window.showInputBox({
+        title: 'Changed view — compare against',
+        prompt: 'Git ref: a branch, tag or commit',
+        value: current === 'auto' ? '' : current,
+        validateInput: v => v.trim().startsWith('-') ? "A git ref can't start with '-'." : undefined
+      }))?.trim();
+      if (value === undefined) return;
+    }
+    if (value === undefined || value === current) return;
+    await config.update('changedBaseRef', value, vscode.ConfigurationTarget.Global);
+    // The configuration listener reposts the lens; nothing else to do here.
+  }
+
+  /** Run one `git` command in a repository, with the binary vscode.git itself
+   *  uses (so no PATH assumption) and no shell. Rejects on a non-zero exit. */
+  private async runGit(api: GitApiLite, repo: GitRepoLite, args: string[]): Promise<string> {
+    const cwd = repo.rootUri?.fsPath;
+    if (!cwd) throw new Error('repository root unknown');
+    return await new Promise<string>((resolve, reject) => {
+      execFile(api.git?.path || 'git', args, { cwd, timeout: 10_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+        (err, stdout) => err ? reject(err) : resolve(stdout));
+    });
+  }
+
+  /** The commits the Changed view shows as sections, newest first. With
+   *  `baseRef`, the commits that ref doesn't have; without one, the commits no
+   *  OTHER branch has (see commitLogArgs). Never throws — git failing here costs
+   *  the sections, not the lens. */
+  private async listBranchCommits(api: GitApiLite, repo: GitRepoLite, baseRef?: string): Promise<CommitInfo[]> {
+    try {
+      const args = commitLogArgs({ baseRef, branch: repo.state.HEAD?.name });
+      return parseCommitLog(await this.runGit(api, repo, args));
+    } catch (err) {
+      this.output.appendLine(`[changed] commit list failed: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  }
+
   /** Compute which local components differ, via the built-in vscode.git
    *  extension — shared by the "Changed" view (postChangedComponents) and the
    *  "Retry + changed vs branch" card button (the retryDeployChanged handler).
-   *  Default: uncommitted changes only (working tree + index — includes
-   *  untracked files, i.e. brand-new components). When
-   *  `sfOrgDeployWrapper.changedBaseRef` is set, ALSO include everything that
-   *  differs from that ref (committed changes too — the release-promotion
-   *  question), reported as `base` alongside the keys. Returns `{ reason }` when
-   *  git can't answer (or the ref is bad/unknown), so the caller says why
+   *
+   *  `sfOrgDeployWrapper.changedBaseRef` picks the comparison:
+   *   - `auto` (the default) — the commits only this branch has, plus the
+   *     uncommitted edits on top. Branch-flow agnostic: it never needs to know
+   *     whether the integration branch is main, devInt or develop, and pushing
+   *     doesn't empty it (the branch's own remote ref is excluded by name).
+   *   - a ref (`main`, `origin/devInt`, a tag) — everything that differs from
+   *     it: the release-promotion question, "what would this branch deploy?".
+   *   - empty — uncommitted changes only (working tree + index, untracked files
+   *     included, i.e. brand-new components).
+   *
+   *  `keys` is the union the lens shows; `uncommitted` and `commits` split it
+   *  into the view's sections (a key can appear in several — it is one component
+   *  touched at several points). Keys reached only through a commit stay in the
+   *  union even if a later commit reverted the file: the section that lists a
+   *  row must be able to show it. Returns `{ reason }` when git can't answer (or
+   *  an explicitly configured ref is bad/unknown), so the caller says why
    *  instead of showing a false "no changes". Computed fresh per call and posts
    *  nothing itself (output-channel logging aside) — callers own presentation.
    *  Never throws. */
-  private async changedComponentKeys(): Promise<{ keys: string[]; base?: string } | { reason: string }> {
+  private async changedComponentKeys(): Promise<ChangedComponents | { reason: string }> {
     try {
       const gitExt = vscode.extensions.getExtension<GitExtensionLite>('vscode.git');
       if (!gitExt) {
@@ -2211,14 +2323,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // Optional base ref. Trim, and reject a value shaped like a git flag (leading
       // '-') before it reaches `git diff <ref>` argv — execFile blocks shell
       // injection, but a flag-shaped ref would still be mis-read as an option.
-      const rawBase = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<string>('changedBaseRef', '').trim();
-      let baseRef: string | undefined;
-      if (rawBase) {
-        if (rawBase.startsWith('-')) {
-          return { reason: `Invalid changedBaseRef "${rawBase}" — a git ref can't start with '-'.` };
-        }
-        baseRef = rawBase;
+      const rawBase = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<string>('changedBaseRef', 'auto').trim();
+      if (rawBase.startsWith('-')) {
+        return { reason: `Invalid changedBaseRef "${rawBase}" — a git ref can't start with '-'.` };
       }
+      const auto = rawBase.toLowerCase() === 'auto';
+      const configuredRef = auto || !rawBase ? undefined : rawBase;
       // A pathological repo can report tens of thousands of changed paths
       // (untracked count too), and per-path findItemForPath scans would be
       // O(paths × items) on the extension-host thread. Precompute lookup maps
@@ -2242,15 +2352,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           if (!byFile.has(p)) byFile.set(p, key);
         }
       }
-      const seen = new Set<string>();
-      const keys = new Set<string>();
-      // Map one changed file path to its owning component key (exact primary >
-      // listed file > containing bundle folder), de-duping repeated paths.
-      const addPath = (fsPath: string | undefined): void => {
-        if (!fsPath) return;
+      // path → owning component key (null = none), memoised: the same file recurs
+      // across the diff, the commit list and the working-tree lists, and the miss
+      // case walks ancestors.
+      const memo = new Map<string, string | null>();
+      const keyForPath = (fsPath: string | undefined): string | null => {
+        if (!fsPath) return null;
         const p = foldPathKey(fsPath);
-        if (seen.has(p)) return; // a staged+modified (or ref+working) file recurs across lists
-        seen.add(p);
+        const hit = memo.get(p);
+        if (hit !== undefined) return hit;
         let key = byPrimary.get(p) ?? byFile.get(p);
         for (let dir = path.dirname(p); !key; ) {
           key = byDir.get(dir);
@@ -2258,44 +2368,93 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           if (parent === dir) break;
           dir = parent;
         }
-        if (key) keys.add(key);
+        memo.set(p, key ?? null);
+        return key ?? null;
       };
+      const addPath = (fsPath: string | undefined, into: Set<string>): void => {
+        const key = keyForPath(fsPath);
+        if (key) into.add(key);
+      };
+      const keys = new Set<string>();
+      const uncommitted = new Set<string>();
+      const sections: ChangedCommitSection[] = [];
+      let usedBase: string | undefined;
       for (const repo of api.repositories) {
+        const commits = auto || configuredRef ? await this.listBranchCommits(api, repo, configuredRef) : [];
+        // With an explicit ref that IS the base; on auto, the parent of the oldest
+        // listed commit — so the diff covers exactly the commits shown plus the
+        // uncommitted edits, and a repo with no commits of its own stays
+        // uncommitted-only.
+        const baseRef = configuredRef ?? baseRefForCommits(commits);
         if (baseRef) {
           // `diffWith(ref)` = working tree vs the ref (committed + uncommitted
           // tracked differences). An unknown ref rejects — name it rather than
-          // showing a false "no changes".
-          let refChanges: GitChangeLite[];
+          // showing a false "no changes". On auto the ref came from git itself, so
+          // a failure is this repo's problem alone: log it and fall back to the
+          // uncommitted answer instead of blanking a multi-repo workspace.
+          let refChanges: GitChangeLite[] = [];
           try {
             refChanges = await repo.diffWith(baseRef);
+            usedBase = configuredRef ?? usedBase;
           } catch (err) {
             this.output.appendLine(`[changed] diffWith(${baseRef}) failed: ${err instanceof Error ? err.message : String(err)}`);
-            return { reason: `Can't compare against "${baseRef}" — unknown git ref? (${stripAnsi(err instanceof Error ? err.message : String(err)).trim()})` };
+            if (configuredRef) {
+              return { reason: `Can't compare against "${configuredRef}" — unknown git ref? (${stripAnsi(err instanceof Error ? err.message : String(err)).trim()})` };
+            }
           }
-          for (const change of refChanges) addPath(change.uri?.fsPath);
+          for (const change of refChanges) addPath(change.uri?.fsPath, keys);
+        }
+        const root = repo.rootUri?.fsPath;
+        for (const commit of commits) {
+          const commitKeys = new Set<string>();
+          // `--name-only` paths are repository-relative; a commit whose files are
+          // all non-metadata (docs, CI config) contributes no section.
+          for (const file of commit.files) addPath(root ? path.join(root, file) : file, commitKeys);
+          if (commitKeys.size === 0) continue;
+          for (const k of commitKeys) keys.add(k);
+          sections.push({ hash: commit.hash, short: commit.short, subject: commit.subject, when: commit.when, keys: [...commitKeys] });
         }
         // Uncommitted edits on top: diffWith(ref) omits untracked files (brand-new
         // components), and with no ref this IS the whole answer.
         for (const change of [...repo.state.workingTreeChanges, ...repo.state.indexChanges]) {
-          addPath(change.uri?.fsPath);
+          addPath(change.uri?.fsPath, uncommitted);
         }
       }
-      return { keys: [...keys], ...(baseRef ? { base: baseRef } : {}) };
+      for (const k of uncommitted) keys.add(k);
+      // Newest first, and capped again across repositories (each contributed up to
+      // COMMIT_CAP of its own).
+      sections.sort((a, b) => b.when - a.when);
+      return {
+        keys: [...keys],
+        uncommitted: [...uncommitted],
+        commits: sections.slice(0, COMMIT_CAP),
+        ...(usedBase ? { base: usedBase } : {}),
+        ...(auto ? { auto: true } : {})
+      };
     } catch (err) {
       this.output.appendLine(`[changed] git change detection failed: ${err instanceof Error ? err.message : String(err)}`);
       return { reason: 'Change detection failed — see the output channel.' };
     }
   }
 
-  /** Post the Changed-view payload: the computed keys (tagged `base: <ref>` when
-   *  a base ref applies), or `keys: null` with the reason git couldn't answer. */
+  /** Post the Changed-view payload: the computed keys plus the section split
+   *  (`uncommitted`, `commits`, tagged `base: <ref>` when an explicit ref applies
+   *  and `auto: true` when the branch's own commits define it), or `keys: null`
+   *  with the reason git couldn't answer. */
   private async postChangedComponents(): Promise<void> {
     const changed = await this.changedComponentKeys();
     if ('reason' in changed) {
       this.post({ type: 'changed', keys: null, reason: changed.reason });
       return;
     }
-    this.post({ type: 'changed', keys: changed.keys, ...(changed.base ? { base: changed.base } : {}) });
+    this.post({
+      type: 'changed',
+      keys: changed.keys,
+      uncommitted: changed.uncommitted,
+      commits: changed.commits,
+      ...(changed.base ? { base: changed.base } : {}),
+      ...(changed.auto ? { auto: true } : {})
+    });
   }
 
   private sendActiveFile(notifyIfMissing = false, selectAndScroll = false): void {
