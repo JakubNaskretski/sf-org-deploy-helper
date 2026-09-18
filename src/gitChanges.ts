@@ -59,10 +59,12 @@ export function commitLogArgs(opts: { baseRef?: string; branch?: string; cap?: n
   args.push('HEAD', '--not');
   // Each --exclude applies to the ONE following --branches/--remotes, hence the
   // interleaving; the globs drop this branch and its remote counterparts so the
-  // range isn't emptied by its own tips.
-  if (opts.branch) args.push(`--exclude=refs/heads/${opts.branch}`);
+  // range isn't emptied by its own tips. The patterns are matched with the
+  // refs/heads/ and refs/remotes/ prefixes REMOVED — spelling them out matches
+  // nothing, and git then quietly reports no commits at all.
+  if (opts.branch) args.push(`--exclude=${opts.branch}`);
   args.push('--branches');
-  if (opts.branch) args.push(`--exclude=refs/remotes/*/${opts.branch}`);
+  if (opts.branch) args.push(`--exclude=*/${opts.branch}`);
   args.push('--remotes');
   return args;
 }

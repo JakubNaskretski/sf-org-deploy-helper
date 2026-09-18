@@ -29,7 +29,14 @@
 //   6. the empty setting still means uncommitted-only, with no git spawned at all.
 const path = require('path');
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const Module = require('module');
+// The REAL child_process, captured before the stub below replaces it: section 7
+// runs the argv against git itself, because git is the only authority on what
+// these options mean (the first version of this file asserted a plausible
+// --exclude spelling that git silently matches against nothing).
+const realExecFileSync = require('child_process').execFileSync;
 
 const ROOT = path.join(__dirname, '..');
 
@@ -139,9 +146,9 @@ check('auto asks for the commits no OTHER branch has, excluding this one by name
   const tail = args.slice(args.indexOf('HEAD'));
   assert.deepStrictEqual(tail, [
     'HEAD', '--not',
-    '--exclude=refs/heads/feature/acme', '--branches',
-    '--exclude=refs/remotes/*/feature/acme', '--remotes'
-  ], 'each --exclude must precede the option it narrows');
+    '--exclude=feature/acme', '--branches',
+    '--exclude=*/feature/acme', '--remotes'
+  ], 'each --exclude must precede the option it narrows, and drops the refs/ prefix git strips');
 });
 
 check('a detached HEAD excludes nothing, and the cap is the commit count', () => {
@@ -440,6 +447,59 @@ check('cancelling, or picking what is already set, writes nothing', async () => 
   quickPick = { pick: async (items) => items.find(i => i.label === 'Other ref…'), input: async () => undefined };
   await p.s.pickChangedBase();
   assert.deepStrictEqual(updates, []);
+});
+
+// -------------------------------------------- 7) the argv, against git itself
+// Everything above pins the argv as a string. Only git can say whether that
+// string means what the feature needs, so this builds a throwaway repository and
+// asks it. No network, no fixtures — one init and four commits.
+check('git agrees: the range is this branch\'s own commits, and a push does not empty it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sfodw-git-'));
+  const g = (...args) => realExecFileSync('git', [
+    '-c', 'user.email=check', '-c', 'user.name=check',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args
+  ], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const commit = (file, msg) => { fs.writeFileSync(path.join(dir, file), msg); g('add', file); g('commit', '-m', msg); return g('rev-parse', 'HEAD').trim(); };
+  const log = (opts) => parseCommitLog(g(...commitLogArgs(opts)));
+  try {
+    g('init', '-b', 'main');
+    const first = commit('a.cls', 'on main');
+    // The root commit alone on its branch: base = the empty tree, or there is
+    // nothing to diff against.
+    assert.deepStrictEqual(log({ branch: 'main' }).map(c => c.subject), ['on main']);
+    assert.strictEqual(baseRefForCommits(log({ branch: 'main' })), EMPTY_TREE);
+
+    g('checkout', '-q', '-b', 'feature/acme');
+    commit('b.cls', 'mine one');
+    const mine2 = commit('c.cls', 'mine two');
+    const ours = log({ branch: 'feature/acme' });
+    assert.deepStrictEqual(ours.map(c => c.subject), ['mine two', 'mine one'], 'newest first, and main\'s commit is not mine');
+    assert.deepStrictEqual(ours[0].files, ['c.cls']);
+    assert.strictEqual(baseRefForCommits(ours), first, 'the diff base is where the branch left main');
+
+    // Pushed: a remote-tracking ref for this very branch must not exclude it.
+    g('update-ref', 'refs/remotes/origin/feature/acme', mine2);
+    assert.deepStrictEqual(log({ branch: 'feature/acme' }).map(c => c.subject), ['mine two', 'mine one'], 'a push emptied the view');
+
+    // Merged elsewhere: once another branch carries them, they are no longer
+    // this branch's own work and the view falls back to uncommitted-only.
+    g('branch', 'devInt', mine2);
+    assert.deepStrictEqual(log({ branch: 'feature/acme' }), []);
+    assert.strictEqual(baseRefForCommits(log({ branch: 'feature/acme' })), undefined);
+
+    // The explicit-ref form is a plain range and answers regardless.
+    assert.deepStrictEqual(log({ baseRef: 'main', branch: 'feature/acme' }).map(c => c.subject), ['mine two', 'mine one']);
+
+    // A merge commit lists no files but still carries the branch's history.
+    g('checkout', '-q', 'main');
+    commit('d.cls', 'theirs');
+    g('checkout', '-q', 'feature/acme');
+    g('-c', 'core.mergeoptions=--no-ff', 'merge', '--no-edit', '-q', 'main');
+    const merged = log({ baseRef: 'devInt', branch: 'feature/acme' });
+    assert.ok(merged.some(c => c.files.length === 0 && /Merge/i.test(c.subject)), 'a merge commit is listed, with no files of its own');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --------------------------------------------------------------------- run
