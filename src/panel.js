@@ -1511,7 +1511,9 @@
       // on a branch of your own every section would otherwise carry your name.
       out.push({
         id: 'c/' + c.hash,
-        label: c.author ? `${c.short} ${c.subject} — ${c.author}` : `${c.short} ${c.subject}`,
+        // "(by X)", not "— X": commit subjects use dashes themselves, and an
+        // attribution that reads as part of the subject discloses nothing.
+        label: c.author ? `${c.short} ${c.subject} (by ${c.author})` : `${c.short} ${c.subject}`,
         keys: new Set(keys)
       });
     }

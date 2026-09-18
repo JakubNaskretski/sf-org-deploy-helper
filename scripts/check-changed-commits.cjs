@@ -459,6 +459,24 @@ check('with no git identity configured, nothing is marked as someone else\'s', a
   assert.strictEqual(p.last().commits[0].author, undefined, 'marking everything would be worse than marking nothing');
 });
 
+check('one repository giving up does not label the whole view a fallback', async () => {
+  // Multi-root: a trunk-only repo alongside a real feature branch. The header
+  // speaks for the view, and the view is showing sections.
+  config = { changedBaseRef: 'auto' };
+  gitAnswer = gitScript(
+    opts => (opts.cwd === WS ? '' : logged('a'.repeat(40), '200', 'B', [REL('AcmeB')])),
+    opts => (opts.cwd === WS ? ['a'.repeat(40), 'b'.repeat(40)].join('\n') : ['x'.repeat(40), '-' + 'f'.repeat(40)].join('\n')));
+  git = {
+    repositories: [repo({ working: [A_CLS] }), repo({ root: '/ws2', diff: [] })],
+    onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN
+  };
+  const other = { type: 'ApexClass', name: 'AcmeB', filePath: `/ws2/${CLASSES}/AcmeB.cls`, files: [`/ws2/${CLASSES}/AcmeB.cls`] };
+  const p = provider([...ITEMS, other]);
+  await p.s.postChangedComponents();
+  assert.strictEqual(p.last().commits.length, 1, 'the other repository still contributed its section');
+  assert.strictEqual(p.last().note, undefined, 'so the header must not announce a fallback above it');
+});
+
 check('a slower refresh never posts over a newer one', async () => {
   config = { changedBaseRef: '' };
   git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };

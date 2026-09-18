@@ -2491,6 +2491,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
       }
       for (const k of uncommitted) keys.add(k);
+      // One repository giving up doesn't make the VIEW a fallback: in a multi-root
+      // workspace another may have produced sections, and the header must not
+      // announce "uncommitted only" above them.
+      if (sections.length) note = undefined;
       // Newest first, and capped again across repositories (each contributed up to
       // COMMIT_CAP of its own).
       sections.sort((a, b) => b.when - a.when);

@@ -1574,7 +1574,7 @@ check('a commit that is not yours carries its author in the section label', () =
   }));
   assert.deepStrictEqual(sectionLabels(p), [
     'Uncommitted (1)',
-    'aaaaaaa fix the card — Jane (1)',
+    'aaaaaaa fix the card (by Jane) (1)',
     'bbbbbbb first cut (1)'
   ], 'your own commits must not be labelled with your name, and someone else\'s must');
 });
