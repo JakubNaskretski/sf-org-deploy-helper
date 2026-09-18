@@ -76,7 +76,7 @@ const cpStub = {
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : req === 'child_process' ? cpStub : origLoad(req, ...rest));
 
-const { COMMIT_CAP, EMPTY_TREE, baseRefForCommits, commitLogArgs, parseCommitLog } = require(path.join(ROOT, 'out', 'gitChanges.js'));
+const { COMMIT_CAP, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } = require(path.join(ROOT, 'out', 'gitChanges.js'));
 const { DeployPanelProvider } = require(path.join(ROOT, 'out', 'panelProvider.js'));
 const proto = DeployPanelProvider.prototype;
 
@@ -91,8 +91,8 @@ const FS = '\x1f';
 /** One commit's worth of `git log --format=… --name-only -z` output. */
 // Shape git actually emits: the format line is NUL-terminated, then a newline,
 // then each path NUL-terminated (a merge commit stops after the NUL).
-const logged = (hash, ct, parent, subject, files) =>
-  `${RS}${hash}${FS}${ct}${FS}${parent}${FS}${subject}\0`
+const logged = (hash, ct, subject, files) =>
+  `${RS}${hash}${FS}${ct}${FS}${subject}\0`
   + (files.length ? '\n' + files.map(f => f + '\0').join('') : '');
 
 const WS = '/ws';
@@ -132,6 +132,13 @@ function provider(items = ITEMS) {
   return { s, posted, log, last: () => posted[posted.length - 1] };
 }
 const sections = (msg) => (msg.commits || []).map(c => [c.short, c.keys.slice().sort()]);
+/** Answer both calls the auto comparison makes: the boundary query (hashes, the
+ *  last one prefixed '-') and the commit listing. `log` may be a function of the
+ *  repository's cwd. */
+const gitScript = (log, boundary = ['x'.repeat(40), '-' + 'f'.repeat(40)].join('\n')) =>
+  (args, opts) => (args[0] === 'rev-list'
+    ? (typeof boundary === 'function' ? boundary(opts) : boundary)
+    : (typeof log === 'function' ? log(opts) : log));
 
 // ------------------------------------------------------------------ 1) argv
 check('an explicit base ref asks for the commits that ref does not have', () => {
@@ -164,55 +171,64 @@ check('the format is NUL-separated and machine-readable', () => {
   const args = commitLogArgs({});
   assert.ok(args.includes('-z'), 'paths must be NUL-separated, never quoted');
   assert.ok(args.includes('--name-only'));
-  assert.ok(args.some(a => a.startsWith('--format=') && a.includes('%H') && a.includes('%ct') && a.includes('%P') && a.includes('%s')));
+  assert.ok(args.some(a => a.startsWith('--format=') && a.includes('%H') && a.includes('%ct') && a.includes('%s')));
+  assert.ok(args.includes('--no-show-signature'), 'log.showSignature=true would otherwise inject gpg output into the stream');
 });
 
 // ----------------------------------------------------------------- 2) parsing
-check('a commit list parses to hash, short, time, first parent, subject and files', () => {
-  const out = logged('a'.repeat(40), '1700000002', 'b'.repeat(40), 'fix the thing', ['a/One.cls', 'a/Two.cls'])
-    + logged('c'.repeat(40), '1700000001', 'd'.repeat(40), 'first', ['a/One.cls']);
+check('a commit list parses to hash, short, time, subject and files', () => {
+  const out = logged('a'.repeat(40), '1700000002', 'fix the thing', ['a/One.cls', 'a/Two.cls'])
+    + logged('c'.repeat(40), '1700000001', 'first', ['a/One.cls']);
   const commits = parseCommitLog(out);
   assert.strictEqual(commits.length, 2);
   assert.strictEqual(commits[0].hash, 'a'.repeat(40));
   assert.strictEqual(commits[0].short, 'aaaaaaa');
   assert.strictEqual(commits[0].when, 1700000002);
-  assert.strictEqual(commits[0].parent, 'b'.repeat(40));
   assert.strictEqual(commits[0].subject, 'fix the thing');
   assert.deepStrictEqual(commits[0].files, ['a/One.cls', 'a/Two.cls'], 'the newline after the format line is not part of a path');
   assert.deepStrictEqual(commits[1].files, ['a/One.cls']);
 });
 
-check('a path with spaces survives, and a merge commit reports its first parent and no files', () => {
-  const out = logged('e'.repeat(40), '3', 'f'.repeat(40) + ' ' + '9'.repeat(40), 'Merge branch devInt', [])
-    + logged('1'.repeat(40), '2', '2'.repeat(40), 'add reports', ['force-app/My Folder/Thing.cls']);
+check('a path with spaces survives, and a merge commit reports no files of its own', () => {
+  const out = logged('e'.repeat(40), '3', 'Merge branch devInt', [])
+    + logged('1'.repeat(40), '2', 'add reports', ['force-app/My Folder/Thing.cls']);
   const commits = parseCommitLog(out);
   assert.deepStrictEqual(commits[0].files, [], 'a merge lists no files without -m');
-  assert.strictEqual(commits[0].parent, 'f'.repeat(40), 'first parent only');
   assert.deepStrictEqual(commits[1].files, ['force-app/My Folder/Thing.cls']);
 });
 
 check('junk is skipped, not thrown', () => {
   assert.deepStrictEqual(parseCommitLog(''), []);
   assert.deepStrictEqual(parseCommitLog('not a commit at all'), []);
-  const mixed = `${RS}zzz${FS}1${FS}${FS}bad hash\n` + logged('b'.repeat(40), '5', '', 'root', ['x.cls']);
+  const mixed = `${RS}zzz${FS}1${FS}bad hash\n` + logged('b'.repeat(40), '5', 'root', ['x.cls']);
   const commits = parseCommitLog(mixed);
   assert.strictEqual(commits.length, 1);
   assert.strictEqual(commits[0].subject, 'root');
 });
 
 // -------------------------------------------------------------- 3) the base
-check('the diff base is the parent of the oldest listed commit', () => {
-  const commits = parseCommitLog(
-    logged('a'.repeat(40), '2', 'b'.repeat(40), 'newer', ['x'])
-    + logged('c'.repeat(40), '1', 'd'.repeat(40), 'older', ['y'])
-  );
-  assert.strictEqual(baseRefForCommits(commits), 'd'.repeat(40));
+check('the boundary query is uncapped and cheap: hashes only, same range', () => {
+  const args = boundaryArgs({ branch: 'feature/acme' });
+  assert.deepStrictEqual(args.slice(0, 2), ['rev-list', '--boundary']);
+  assert.ok(!args.includes('--name-only'), 'file lists would make the uncapped range expensive');
+  assert.ok(!args.includes('-n'), 'a cap here would move the diff base and drop components');
+  assert.deepStrictEqual(args.slice(2), commitLogArgs({ branch: 'feature/acme' }).slice(-6), 'the same range as the listing');
+  assert.deepStrictEqual(boundaryArgs({ baseRef: 'main' }).slice(2), ['main..HEAD']);
 });
 
-check('a root commit diffs against the empty tree, and no commits means no base', () => {
-  const root = parseCommitLog(logged('a'.repeat(40), '1', '', 'initial', ['x']));
-  assert.strictEqual(baseRefForCommits(root), EMPTY_TREE);
-  assert.strictEqual(baseRefForCommits([]), undefined);
+check('the diff base is where the branch joins the rest of the repository', () => {
+  const b = parseBoundary(['a'.repeat(40), 'c'.repeat(40), '-' + 'f'.repeat(40), ''].join('\n'));
+  assert.deepStrictEqual(b, { count: 2, base: 'f'.repeat(40) });
+  assert.strictEqual(baseFromBoundary(b), 'f'.repeat(40));
+});
+
+check('no commits, no boundary, or a range longer than a branch means uncommitted-only', () => {
+  assert.strictEqual(baseFromBoundary(parseBoundary('')), undefined, 'nothing of this branch\'s own');
+  // A trunk-only checkout: the range runs to the root, so nothing bounds it.
+  assert.strictEqual(baseFromBoundary(parseBoundary(['a'.repeat(40), 'b'.repeat(40)].join('\n'))), undefined);
+  // Past the limit it is a trunk with a stale branch behind it, not a piece of work.
+  assert.strictEqual(baseFromBoundary({ count: MAX_BRANCH_COMMITS, base: 'f'.repeat(40) }), 'f'.repeat(40));
+  assert.strictEqual(baseFromBoundary({ count: MAX_BRANCH_COMMITS + 1, base: 'f'.repeat(40) }), undefined);
 });
 
 // ----------------------------------------------------------- 4) the payload
@@ -223,8 +239,8 @@ const REL = (name) => `${CLASSES}/${name}.cls`;
 check('auto: uncommitted edits and one section per commit, over the union of both', async () => {
   config = { changedBaseRef: 'auto' };
   gitRuns = [];
-  gitAnswer = () => logged('a'.repeat(40), '200', 'p'.repeat(40), 'B and the card', [REL('AcmeB'), 'force-app/main/default/lwc/acmeCard/acmeCard.js'])
-    + logged('c'.repeat(40), '100', 'q'.repeat(40), 'C', [REL('AcmeC')]);
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'B and the card', [REL('AcmeB'), 'force-app/main/default/lwc/acmeCard/acmeCard.js'])
+    + logged('c'.repeat(40), '100', 'C', [REL('AcmeC')]));
   git = { repositories: [repo({ working: [A_CLS], diff: [B_CLS, `${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }), git: { path: '/usr/bin/git' } };
   const p = provider();
   await p.s.postChangedComponents();
@@ -244,8 +260,8 @@ check('auto: uncommitted edits and one section per commit, over the union of bot
 
 check('a commit that touched no component contributes no section', async () => {
   config = { changedBaseRef: 'auto' };
-  gitAnswer = () => logged('a'.repeat(40), '200', 'p'.repeat(40), 'docs: readme', ['README.md', '.github/workflows/ci.yml'])
-    + logged('c'.repeat(40), '100', 'q'.repeat(40), 'C', [REL('AcmeC')]);
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'docs: readme', ['README.md', '.github/workflows/ci.yml'])
+    + logged('c'.repeat(40), '100', 'C', [REL('AcmeC')]));
   git = { repositories: [repo({ diff: [`${WS}/${CLASSES}/AcmeC.cls`] })], onDidOpenRepository: () => ({ dispose() {} }) };
   const p = provider();
   await p.s.postChangedComponents();
@@ -256,7 +272,7 @@ check('a component reverted later still belongs to the commit that touched it', 
   // The base diff no longer reports AcmeB (added, then reverted). The section
   // listing it has to be able to draw it, so the union carries it.
   config = { changedBaseRef: 'auto' };
-  gitAnswer = () => logged('a'.repeat(40), '200', 'p'.repeat(40), 'add B', [REL('AcmeB')]);
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'add B', [REL('AcmeB')]));
   git = { repositories: [repo({ working: [A_CLS], diff: [] })], onDidOpenRepository: () => ({ dispose() {} }) };
   const p = provider();
   await p.s.postChangedComponents();
@@ -276,7 +292,7 @@ check('staged and unstaged edits to one component are one entry', async () => {
 check('an explicit ref is the base, is named in the payload, and bounds the commit list', async () => {
   config = { changedBaseRef: 'origin/devInt' };
   gitRuns = [];
-  gitAnswer = () => logged('a'.repeat(40), '200', 'p'.repeat(40), 'B', [REL('AcmeB')]);
+  gitAnswer = () => logged('a'.repeat(40), '200', 'B', [REL('AcmeB')]);
   let diffedWith;
   git = {
     repositories: [repo({ diffWith: async (ref) => { diffedWith = ref; return [{ uri: { fsPath: B_CLS } }]; } })],
@@ -309,7 +325,7 @@ check('the empty setting is uncommitted-only, and spawns no git at all', async (
 // ------------------------------------------------------------ 5) degradation
 check('an auto base that will not diff falls back to the uncommitted answer', async () => {
   config = { changedBaseRef: 'auto' };
-  gitAnswer = () => logged('a'.repeat(40), '200', 'p'.repeat(40), 'B', [REL('AcmeB')]);
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'B', [REL('AcmeB')]));
   git = {
     repositories: [repo({ working: [A_CLS], diffWith: async () => { throw new Error('bad object p…'); } })],
     onDidOpenRepository: () => ({ dispose() {} })
@@ -345,7 +361,7 @@ check('a flag-shaped ref never reaches argv', async () => {
   assert.strictEqual(gitRuns.length, 0);
 });
 
-check('git failing to list commits costs the sections, not the lens', async () => {
+check('git failing costs the sections, not the lens — at either call', async () => {
   config = { changedBaseRef: 'auto' };
   gitAnswer = () => { throw new Error('git not found'); };
   git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
@@ -353,7 +369,50 @@ check('git failing to list commits costs the sections, not the lens', async () =
   await p.s.postChangedComponents();
   assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
   assert.deepStrictEqual(p.last().commits, []);
-  assert.ok(p.log.some(l => l.includes('commit list failed')));
+  assert.ok(p.log.some(l => l.includes('branch range failed')));
+  // The range answers, the listing does not: the base is known but there is
+  // nothing to section by, so the lens is the base diff alone.
+  gitAnswer = gitScript(() => { throw new Error('boom'); });
+  const q = provider();
+  await q.s.postChangedComponents();
+  assert.deepStrictEqual(q.last().commits, []);
+  assert.ok(q.log.some(l => l.includes('commit list failed')));
+});
+
+check('a trunk-only checkout shows uncommitted changes only, and says why', async () => {
+  // Nothing excludes anything (one branch, its own remote ref skipped), so the
+  // range runs to the root: this is the project's history, not "my branch".
+  config = { changedBaseRef: 'auto' };
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'c3', [REL('AcmeB')]), ['a'.repeat(40), 'b'.repeat(40)].join('\n'));
+  let diffed = false;
+  git = { repositories: [repo({ working: [A_CLS], diffWith: async () => { diffed = true; return []; } })], onDidOpenRepository: () => ({ dispose() {} }) };
+  const p = provider();
+  await p.s.postChangedComponents();
+  assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA'], 'every tracked file would otherwise read as changed');
+  assert.deepStrictEqual(p.last().commits, []);
+  assert.strictEqual(diffed, false, 'and no diff against the empty tree');
+  assert.ok(p.log.some(l => l.includes('whole history')));
+});
+
+check('a range longer than a branch of work falls back, naming the setting', async () => {
+  config = { changedBaseRef: 'auto' };
+  const long = Array.from({ length: MAX_BRANCH_COMMITS + 1 }, (_, i) => String(i).padEnd(40, '0'));
+  gitAnswer = gitScript(logged('a'.repeat(40), '200', 'x', [REL('AcmeB')]), [...long, '-' + 'f'.repeat(40)].join('\n'));
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  const p = provider();
+  await p.s.postChangedComponents();
+  assert.deepStrictEqual(p.last().keys, ['ApexClass:AcmeA']);
+  assert.ok(p.log.some(l => l.includes('changedBaseRef')), 'the way out has to be discoverable');
+});
+
+check('a slower refresh never posts over a newer one', async () => {
+  config = { changedBaseRef: '' };
+  git = { repositories: [repo({ working: [A_CLS] })], onDidOpenRepository: () => ({ dispose() {} }) };
+  const p = provider();
+  const first = p.s.postChangedComponents();
+  const second = p.s.postChangedComponents();
+  await Promise.all([first, second]);
+  assert.strictEqual(p.posted.length, 1, 'two overlapping refreshes, one payload — the newer one');
 });
 
 check('a repository whose root is unknown is skipped, not fatal', async () => {
@@ -388,11 +447,11 @@ check('sections from several repositories interleave by date and stay capped', a
   const many = (prefix, base, file) => {
     let out = '';
     for (let i = 0; i < COMMIT_CAP; i++) {
-      out += logged((prefix + i).padEnd(40, '0'), String(base + i), 'p'.repeat(40), `c${i}`, [file]);
+      out += logged((prefix + i).padEnd(40, '0'), String(base + i), `c${i}`, [file]);
     }
     return out;
   };
-  gitAnswer = (_args, opts) => (opts.cwd === WS ? many('a', 1000, REL('AcmeA')) : many('b', 2000, REL('AcmeD')));
+  gitAnswer = gitScript(opts => (opts.cwd === WS ? many('a', 1000, REL('AcmeA')) : many('b', 2000, REL('AcmeD'))));
   // The second repository's commits are repo-relative to ITS root: a component
   // there must resolve against /ws2, never against the first repository.
   const other = { type: 'ApexClass', name: 'AcmeD', filePath: `/ws2/${CLASSES}/AcmeD.cls`, files: [`/ws2/${CLASSES}/AcmeD.cls`] };
@@ -461,13 +520,16 @@ check('git agrees: the range is this branch\'s own commits, and a push does not 
   ], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   const commit = (file, msg) => { fs.writeFileSync(path.join(dir, file), msg); g('add', file); g('commit', '-m', msg); return g('rev-parse', 'HEAD').trim(); };
   const log = (opts) => parseCommitLog(g(...commitLogArgs(opts)));
+  const base = (opts) => baseFromBoundary(parseBoundary(g(...boundaryArgs(opts))));
   try {
     g('init', '-b', 'main');
     const first = commit('a.cls', 'on main');
-    // The root commit alone on its branch: base = the empty tree, or there is
-    // nothing to diff against.
-    assert.deepStrictEqual(log({ branch: 'main' }).map(c => c.subject), ['on main']);
-    assert.strictEqual(baseRefForCommits(log({ branch: 'main' })), EMPTY_TREE);
+    // A trunk-only checkout: nothing else exists to measure against, so the range
+    // reaches the root and there is no base — the view stays uncommitted-only
+    // rather than reporting every tracked file as changed.
+    assert.strictEqual(base({ branch: 'main' }), undefined);
+    g('update-ref', 'refs/remotes/origin/main', first);
+    assert.strictEqual(base({ branch: 'main' }), undefined, 'the branch\'s own remote ref is not the other side');
 
     g('checkout', '-q', '-b', 'feature/acme');
     commit('b.cls', 'mine one');
@@ -475,17 +537,18 @@ check('git agrees: the range is this branch\'s own commits, and a push does not 
     const ours = log({ branch: 'feature/acme' });
     assert.deepStrictEqual(ours.map(c => c.subject), ['mine two', 'mine one'], 'newest first, and main\'s commit is not mine');
     assert.deepStrictEqual(ours[0].files, ['c.cls']);
-    assert.strictEqual(baseRefForCommits(ours), first, 'the diff base is where the branch left main');
+    assert.strictEqual(base({ branch: 'feature/acme' }), first, 'the diff base is where the branch left main');
 
     // Pushed: a remote-tracking ref for this very branch must not exclude it.
     g('update-ref', 'refs/remotes/origin/feature/acme', mine2);
     assert.deepStrictEqual(log({ branch: 'feature/acme' }).map(c => c.subject), ['mine two', 'mine one'], 'a push emptied the view');
+    assert.strictEqual(base({ branch: 'feature/acme' }), first);
 
-    // Merged elsewhere: once another branch carries them, they are no longer
-    // this branch's own work and the view falls back to uncommitted-only.
+    // Merged elsewhere: once another branch carries them, they are no longer this
+    // branch's own work and the view falls back to uncommitted-only.
     g('branch', 'devInt', mine2);
     assert.deepStrictEqual(log({ branch: 'feature/acme' }), []);
-    assert.strictEqual(baseRefForCommits(log({ branch: 'feature/acme' })), undefined);
+    assert.strictEqual(base({ branch: 'feature/acme' }), undefined);
 
     // The explicit-ref form is a plain range and answers regardless.
     assert.deepStrictEqual(log({ baseRef: 'main', branch: 'feature/acme' }).map(c => c.subject), ['mine two', 'mine one']);
@@ -497,6 +560,14 @@ check('git agrees: the range is this branch\'s own commits, and a push does not 
     g('-c', 'core.mergeoptions=--no-ff', 'merge', '--no-edit', '-q', 'main');
     const merged = log({ baseRef: 'devInt', branch: 'feature/acme' });
     assert.ok(merged.some(c => c.files.length === 0 && /Merge/i.test(c.subject)), 'a merge commit is listed, with no files of its own');
+
+    // Past the section cap the base must NOT move: a component whose only change
+    // is in a commit the cap dropped would vanish from the view entirely — it
+    // would be in no section AND outside the diff.
+    g('checkout', '-q', '-b', 'feature/big', first);
+    for (let i = 0; i < COMMIT_CAP + 5; i++) commit(`x${i}.cls`, `extra ${i}`);
+    assert.strictEqual(log({ branch: 'feature/big' }).length, COMMIT_CAP, 'the listing is capped');
+    assert.strictEqual(base({ branch: 'feature/big' }), first, 'the base is still the fork point, not the oldest LISTED commit');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

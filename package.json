@@ -251,7 +251,7 @@
         "sfOrgDeployWrapper.changedBaseRef": {
           "type": "string",
           "default": "auto",
-          "markdownDescription": "What the **Changed** view compares against — also settable by clicking the label in that view's header.\n\n- `auto` (the default): your uncommitted edits plus the commits no OTHER branch has, one section per commit. Works whatever the integration branch is called (main, devInt, develop), and your work stays listed after you commit and after you push.\n- a git ref — e.g. `main`, `origin/devInt`, a tag: everything that differs from it, the release-promotion question (\"what would this branch deploy?\"), with a section per commit on top of that ref.\n- empty: uncommitted changes only (working tree + index)."
+          "markdownDescription": "What the **Changed** view compares against — also settable by clicking the label in that view's header.\n\n- `auto` (the default): your uncommitted edits plus the commits no OTHER branch has, one section per commit. Works whatever the integration branch is called (main, devInt, develop), and your work stays listed after you commit and after you push. On a checkout with no other branch to measure against, or one carrying more than 100 commits of its own, it falls back to uncommitted-only (the output channel says so) — set a ref below for those.\n- a git ref — e.g. `main`, `origin/devInt`, a tag: everything that differs from it, the release-promotion question (\"what would this branch deploy?\"), with a section per commit on top of that ref.\n- empty: uncommitted changes only (working tree + index)."
         },
         "sfOrgDeployWrapper.openDiffInFloatingWindow": {
           "type": "boolean",
