@@ -16,7 +16,7 @@ import { RescanScheduler, WatchTarget, affectsItemList, watchTargets, watchTarge
 import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from './suggestionLog';
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
-import { COMMIT_CAP, CommitInfo, baseRefForCommits, commitLogArgs, parseCommitLog } from './gitChanges';
+import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
 
 type Inbound =
   | { type: 'ready' }
@@ -2126,6 +2126,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private changedRefreshTimer?: ReturnType<typeof setTimeout>;
   /** A Changed refresh fell due while the panel was hidden — run it on show. */
   private changedRefreshHeld = false;
+  /** Bumped by every postChangedComponents; a slower answer whose number is no
+   *  longer current is dropped rather than posted over a newer one (the git
+   *  spawns made overlapping refreshes easy to reorder). */
+  private changedPostSeq = 0;
 
   /** Apply a failed unique-root search as a hard local stop. In particular, if a
    *  webview rebuild discovers the failure while automatic Fetch Org is already
@@ -2287,6 +2291,32 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Where this branch joins the rest of the repository — the ref to diff the
+   *  working tree against on the `auto` comparison. Asked BEFORE the commit
+   *  listing and over the UNCAPPED range, because a base taken from the capped
+   *  list would exclude the commits the cap dropped, and a component whose only
+   *  change is in one of them would vanish from the view entirely.
+   *  Undefined (uncommitted-only, with the reason logged) when the branch has
+   *  nothing of its own, when the range runs to the root — a trunk-only checkout,
+   *  where "my branch" is the whole project — or when it is longer than
+   *  MAX_BRANCH_COMMITS. Never throws. */
+  private async branchBase(api: GitApiLite, repo: GitRepoLite): Promise<string | undefined> {
+    let boundary: { count: number; base?: string };
+    try {
+      boundary = parseBoundary(await this.runGit(api, repo, boundaryArgs({ branch: repo.state.HEAD?.name })));
+    } catch (err) {
+      this.output.appendLine(`[changed] branch range failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+    const base = baseFromBoundary(boundary);
+    if (!base && boundary.count > 0) {
+      this.output.appendLine(boundary.base
+        ? `[changed] ${boundary.count} commits on this branch alone (limit ${MAX_BRANCH_COMMITS}) — showing uncommitted changes only. Set sfOrgDeployWrapper.changedBaseRef to compare against a ref.`
+        : '[changed] this branch is the repository\'s whole history (no other branch to measure against) — showing uncommitted changes only.');
+    }
+    return base;
+  }
+
   /** Compute which local components differ, via the built-in vscode.git
    *  extension — shared by the "Changed" view (postChangedComponents) and the
    *  "Retry + changed vs branch" card button (the retryDeployChanged handler).
@@ -2380,12 +2410,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const sections: ChangedCommitSection[] = [];
       let usedBase: string | undefined;
       for (const repo of api.repositories) {
-        const commits = auto || configuredRef ? await this.listBranchCommits(api, repo, configuredRef) : [];
-        // With an explicit ref that IS the base; on auto, the parent of the oldest
-        // listed commit — so the diff covers exactly the commits shown plus the
-        // uncommitted edits, and a repo with no commits of its own stays
-        // uncommitted-only.
-        const baseRef = configuredRef ?? baseRefForCommits(commits);
+        // With an explicit ref that IS the base; on auto it is where the branch
+        // joins the rest of the repository, so the diff spans every commit of
+        // this branch — including any the section cap drops.
+        const baseRef = configuredRef ?? (auto ? await this.branchBase(api, repo) : undefined);
+        const commits = baseRef ? await this.listBranchCommits(api, repo, configuredRef) : [];
         if (baseRef) {
           // `diffWith(ref)` = working tree vs the ref (committed + uncommitted
           // tracked differences). An unknown ref rejects — name it rather than
@@ -2442,7 +2471,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  and `auto: true` when the branch's own commits define it), or `keys: null`
    *  with the reason git couldn't answer. */
   private async postChangedComponents(): Promise<void> {
+    const seq = this.changedPostSeq = (this.changedPostSeq || 0) + 1;
     const changed = await this.changedComponentKeys();
+    if (seq !== this.changedPostSeq) return; // a newer refresh overtook this one
     if ('reason' in changed) {
       this.post({ type: 'changed', keys: null, reason: changed.reason });
       return;

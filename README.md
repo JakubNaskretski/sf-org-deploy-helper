@@ -7,9 +7,11 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
 - Pick any authenticated `sf` org from a dropdown (with `[PROD]` / `[SBX]` / `[SCR]` badges).
 - Tree of workspace metadata grouped by type (Apex, LWC, Aura, Flows, Layouts, PermissionSets, EmailTemplates, …).
 - Three tree views: **All**, **Selected** (your current pick list, navigable), and
-  **Changed** — components whose files have uncommitted git changes, i.e. what you'd
-  actually deploy (deleted files aren't listed; deploys can't delete). It follows your
-  saves as they happen; no re-entering needed.
+  **Changed** — what this branch has done: your uncommitted edits at the top, then one
+  collapsible section per commit that no other branch has, so a commit (or a push) no
+  longer empties the view. Deleted files aren't listed; deploys can't delete. It follows
+  your saves as they happen; no re-entering needed, and the header label switches the
+  comparison (this branch, any ref, or uncommitted only).
 - Smart search: word tokens in any order (`acc trig`), camelCase initials (`avt` finds
   `AccountValidationTrigger`), and a type qualifier (`type:flow`, `t:field`) — plus the
   type-filter dropdown, with persisted state across reloads — All / None buttons stay
@@ -66,7 +68,7 @@ the component whose source pulled it in. `sfOrgDeployWrapper.dependencyMaxDepth`
 - `sfOrgDeployWrapper.fetchConcurrency` — how many metadata types Fetch Org lists in parallel (default 5, 1–12). Machine-scoped: lower it on a weaker machine, raise it on a capable one.
 - `sfOrgDeployWrapper.orgCacheMaxAgeHours` — how long (hours, default 168 — a week) the remembered per-org listing counts as fresh: the panel opens on it instantly ("org as of HH:MM"), only an older one is re-fetched in the background, and Fetch Org always re-lists.
 - `sfOrgDeployWrapper.typeCacheDays` — how many days (default 7) to cache metadata-type rules learned from the `sf` CLI registry, and how long a folder that failed resolution is remembered as a lost cause. 0 disables both caches.
-- `sfOrgDeployWrapper.changedBaseRef` — what the **Changed** view compares against. `auto` (the default) shows your uncommitted edits plus the commits no other branch has, one collapsible section per commit — so work stays listed after a commit and after a push, whatever the integration branch is called. Set a git ref (e.g. `main`, `origin/devInt`) to show everything that differs from it instead, or empty for uncommitted changes only. The label in the Changed view's header switches it.
+- `sfOrgDeployWrapper.changedBaseRef` — what the **Changed** view compares against. `auto` (the default) shows your uncommitted edits plus the commits no other branch has, one collapsible section per commit — so work stays listed after a commit and after a push, whatever the integration branch is called. On a checkout with no other branch to compare against, or one more than 100 commits ahead, it falls back to uncommitted-only. Set a git ref (e.g. `main`, `origin/devInt`) to show everything that differs from it instead, or empty for uncommitted changes only. The label in the Changed view's header switches it.
 - `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
 - `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.

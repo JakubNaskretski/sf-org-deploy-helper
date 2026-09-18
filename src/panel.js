@@ -1134,10 +1134,11 @@
 
   // Partition the (filtered) merged item list into the object tree and the flat type groups.
   // `onlyKeys` (a Set) narrows the build to one Changed-view section; the lens's
-  // own membership test still applies, so a section can never widen it.
-  // ponytail: one pass per section, so a 20-commit branch walks the merged item
-  // list 21 times — fine at scan sizes; hoist a key→item map if that ever bites.
-  function buildGroups(onlyKeys) {
+  // own membership test still applies, so a section can never widen it. `merged`
+  // is the merged item list, built ONCE per render and passed in: it allocates an
+  // object per component, and a sectioned render calls this once per section —
+  // on every checkbox tick, since selectionChanged re-renders.
+  function buildGroups(onlyKeys, merged) {
     const filter = state.filter;
     const objectMap = new Map(); // objectName -> { obj: item|null, children: Map<type, item[]> }
     const flatGroups = new Map(); // type -> item[]
@@ -1151,7 +1152,7 @@
     // them on, "N selected" stood above a list that couldn't account for it. The
     // text filter stays; it is the user's own search WITHIN the lens.
     const isSelectedLens = state.viewMode === 'selected';
-    for (const item of buildMergedItems()) {
+    for (const item of merged || buildMergedItems()) {
       if (!isSelectedLens && !isTypeAllowed(item.type)) continue;
       if (!isSelectedLens && !isSourceAllowed(item._source)) continue;
       // View-mode lens first (cheap Set lookups), text filter within the lens.
@@ -1404,7 +1405,8 @@
     const filter = state.filter;
     // The Selected/Changed lenses show small curated lists — auto-expand their
     // groups like an active text filter does (NODE_CAP still bounds the render).
-    const { objectMap, flatGroups } = buildGroups();
+    const merged = buildMergedItems();
+    const { objectMap, flatGroups } = buildGroups(undefined, merged);
     renderTreeTools(objectMap, flatGroups);
     // Slim header for the Selected lens: the count and the one action the old
     // chip tray provided that checkboxes don't cover in one click.
@@ -1471,7 +1473,7 @@
 
     const budget = { nodes: 0, truncated: false };
     const sections = changedSections();
-    if (sections) renderSections(tree, sections, budget);
+    if (sections) renderSections(tree, sections, budget, merged);
     else renderGroups(tree, objectMap, flatGroups, budget, 0);
     if (budget.truncated) {
       const d = document.createElement('div');
@@ -1508,10 +1510,10 @@
 
   // Paint the Changed view's sections: a collapsible header per section over the
   // ordinary type/object groups, built from that section's keys alone.
-  function renderSections(tree, sections, budget) {
+  function renderSections(tree, sections, budget, merged) {
     let painted = 0;
     for (const sec of sections) {
-      const { objectMap, flatGroups } = buildGroups(sec.keys);
+      const { objectMap, flatGroups } = buildGroups(sec.keys, merged);
       if (objectMap.size === 0 && flatGroups.size === 0) continue; // filtered away
       const itemKeys = localKeysInGroups(objectMap, flatGroups);
       const expanded = state.expandedSections.has(sec.id);

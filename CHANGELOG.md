@@ -17,6 +17,10 @@ This file starts at the current release; earlier history predates it.
   "what would this branch deploy?" question, empty for the old uncommitted-only view.
 - Commit sections start collapsed (the uncommitted one open), so the view stays as short as it
   was; a section's checkbox ticks exactly that commit's components.
+- The comparison is anchored where your branch joins the rest of the repository, so a branch
+  with more commits than the 20 the view lists still shows every component it touched. A
+  checkout with no other branch to measure against (or one more than 100 commits ahead) falls
+  back to uncommitted-only rather than reporting the whole project as changed.
 
 ## 0.24.0
 
