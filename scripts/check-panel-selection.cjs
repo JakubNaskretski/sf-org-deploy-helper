@@ -1625,6 +1625,75 @@ check('Collapse all closes the sections; Expand all opens them and their groups'
   assert.ok(names(p).includes('AcmeA') && names(p).includes('AcmeB'));
 });
 
+check('a reveal opens what a FOLD hid, not only what a filter hid', () => {
+  // The 0.23.x contract: a reveal nobody can see reveals nothing, and a deploy
+  // must never carry a component that was never on screen. A fold hides a row
+  // exactly like a filter does.
+  const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeB'] });
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeB')]));
+  p.el('tree').find(e => e.className === 'group-header').fire('click');
+  assert.deepStrictEqual(names(p), [], 'folded');
+  p.deliver({ type: 'activeFile', key: 'ApexClass:AcmeA', select: true, scroll: true });
+  assert.ok(names(p).includes('AcmeA'), `the revealed row is still hidden by the fold: ${names(p).join(', ')}`);
+  // Same in the All view, where a fold under a typed filter hid the match.
+  const q = panel({ ...BASE, filter: 'acme' });
+  q.deliver(TFILES([item('ApexClass', 'AcmeA'), item('Flow', 'AcmeF')]));
+  q.el('tree').find(e => e.className === 'group-header').fire('click');
+  q.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeA'], transient: true, scroll: true });
+  assert.ok(names(q).includes('AcmeA'));
+  // A key nothing can render is no reason to unfold anything.
+  const r = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeB'] });
+  r.deliver(TFILES([item('ApexClass', 'AcmeB')]));
+  r.el('tree').find(e => e.className === 'group-header').fire('click');
+  r.deliver({ type: 'selectKeys', keys: ['ApexClass:LongGone'], transient: true });
+  assert.deepStrictEqual(names(r), [], 'a since-deleted component must not reopen the tree');
+});
+
+check('a fold belongs to the search it was made under', () => {
+  const p = panel({ ...BASE, filter: 'acme' });
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('Flow', 'AcmeF')]));
+  p.el('tree').find(e => e.className === 'group-header').fire('click');
+  assert.deepStrictEqual(names(p), ['AcmeF'], 'the ApexClass group folded under this search');
+  const search = p.el('search');
+  search.value = 'acmea';
+  search.fire('input');
+  // The fold is dropped as the key is typed, not 200 ms later when the debounce
+  // fires — so whatever renders first already shows the new search's matches
+  // (here a scan landing in between; an identical payload would not re-render).
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('Flow', 'AcmeF'), item('ApexClass', 'AcmeZ')]));
+  assert.ok(names(p).includes('AcmeA'), `a fold from the previous search swallowed this one: ${names(p).join(', ')}`);
+});
+
+check('folds do not leak between views', () => {
+  const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeA'] });
+  p.deliver(TFILES([item('ApexClass', 'AcmeA')]));
+  p.deliver({ type: 'changed', keys: ['ApexClass:AcmeA'], uncommitted: ['ApexClass:AcmeA'], commits: [] });
+  p.el('tree').find(e => e.className === 'group-header').fire('click');
+  assert.deepStrictEqual(names(p), [], 'folded in the Selected lens');
+  p.el('viewModes').children.find(b => b.dataset.mode === 'changed').fire('click');
+  assert.ok(names(p).includes('AcmeA'), 'the Changed view has its own folds');
+});
+
+check('under a filter, Collapse all still means every key once the filter is gone', () => {
+  const p = panel({ ...BASE, filter: 'acme', expandedGroups: ['ApexClass', 'Flow', 'GoneType'] });
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('Flow', 'AcmeF')]));
+  p.el('collapseAll').fire('click');
+  assert.deepStrictEqual(names(p), []);
+  assert.deepStrictEqual(p.persisted().expandedGroups, [], 'Collapse all clears EVERY key, visible or not — that is what survives the filter');
+  p.el('expandAll').fire('click');
+  assert.deepStrictEqual(p.persisted().expandedGroups.slice().sort(), ['ApexClass', 'Flow']);
+});
+
+check('the Collapse all tooltip says what the click will actually do', () => {
+  const p = panel({ ...BASE, viewMode: 'changed' });
+  p.deliver(TFILES(CH_ITEMS));
+  // Uncommitted-only: no sections exist, so it collapses groups.
+  p.deliver({ type: 'changed', keys: ['ApexClass:AcmeA'], uncommitted: ['ApexClass:AcmeA'], commits: [] });
+  assert.strictEqual(p.el('collapseAll').title, 'Collapse every group');
+  p.deliver(CHANGED());
+  assert.strictEqual(p.el('collapseAll').title, 'Collapse every section');
+});
+
 check('the header names the branch it is showing', () => {
   const p = panel({ ...BASE, viewMode: 'changed' });
   p.deliver(TFILES(CH_ITEMS));

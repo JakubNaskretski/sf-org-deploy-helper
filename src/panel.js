@@ -251,6 +251,10 @@
   let searchTimer = null;
   $('search').addEventListener('input', (e) => {
     const v = e.target.value.toLowerCase();
+    // Groups open for a new search — a fold made under the previous one would
+    // otherwise hide this one's matches. Immediate, not in the debounced body:
+    // the fold set has to be gone before anything renders, whatever renders it.
+    if (v !== state.filter) state.collapsedGroups.clear();
     if (searchTimer) clearTimeout(searchTimer);
     searchTimer = setTimeout(() => { state.filter = v; savePersisted(); renderTree(); }, 200);
   });
@@ -1069,10 +1073,19 @@
   // meaning, a different set.
   function setAllGroups(expand) {
     if (state.viewMode !== 'all' || state.filter) {
+      // A filtered All view still writes the persisted set underneath, so the
+      // buttons mean the same thing once the filter is cleared.
+      const persists = state.viewMode === 'all';
       if (expand) {
         state.collapsedGroups.clear();
         for (const sec of changedSections() || []) state.expandedSections.add(sec.id);
+        if (persists) {
+          const { objectMap, flatGroups } = buildGroups();
+          for (const k of groupKeysInGroups(objectMap, flatGroups)) state.expandedGroups.add(k);
+          savePersisted();
+        }
       } else {
+        if (persists) { state.expandedGroups.clear(); savePersisted(); }
         const sections = changedSections();
         if (sections) {
           // Closing the sections IS collapsing everything here; their contents
@@ -1080,14 +1093,14 @@
           for (const sec of sections) state.expandedSections.delete(sec.id);
         } else {
           const { objectMap, flatGroups } = buildGroups();
-          for (const k of groupKeysInGroups(objectMap, flatGroups)) state.collapsedGroups.add(k);
+          for (const k of groupKeysInGroups(objectMap, flatGroups)) state.collapsedGroups.add(state.viewMode + '/' + k);
         }
       }
       renderTree();
       return;
     }
     if (expand) {
-      const { objectMap, flatGroups } = buildGroups(undefined, buildMergedItems());
+      const { objectMap, flatGroups } = buildGroups();
       for (const k of groupKeysInGroups(objectMap, flatGroups)) state.expandedGroups.add(k);
     } else {
       state.expandedGroups.clear();
@@ -1140,6 +1153,11 @@
   // was never on screen. Any filter hiding one of the keys just ticked is reset —
   // the others are left alone, and a reveal nothing hides changes nothing.
   function clearFiltersHiding(keys) {
+    // A folded group hides a row exactly like a filter does, and the fold set is
+    // in-memory and cheap to rebuild, so a reveal simply drops every fold rather
+    // than working out which one is in the way (a key can sit under several
+    // sections at once).
+    if (keys.some(k => state.localKeys.has(k) || state.orgKeys.has(k))) state.collapsedGroups.clear();
     let text = false, type = false, source = false;
     for (const k of keys) {
       // A key that renders nothing (a card naming a since-deleted component) is
@@ -1411,7 +1429,7 @@
     ex.disabled = false;
     co.disabled = false;
     ex.title = 'Expand every group';
-    co.title = state.viewMode === 'changed' ? 'Collapse every section' : 'Collapse every group';
+    co.title = state.viewMode === 'changed' && changedSections() ? 'Collapse every section' : 'Collapse every group';
   }
 
   function renderTree() {
@@ -1471,7 +1489,9 @@
         : state.changedBase ? `vs ${state.changedBase}` : 'Uncommitted only';
       lbl.title = state.changedNote
         ? `${state.changedNote}\nClick to change what this view compares against.`
-        : 'What this view compares against — click to change';
+        : state.changedAuto && state.changedBranch
+          ? `Showing your work on ${state.changedBranch} — click to compare against something else`
+          : 'What this view compares against — click to change';
       lbl.addEventListener('click', () => send('pickChangedBase'));
       head.appendChild(lbl);
       // Select all, mirroring the Selected lens's Clear all. Additive: it ticks the
@@ -1510,7 +1530,7 @@
     const budget = { nodes: 0, truncated: false };
     const sections = changedSections();
     if (sections) renderSections(tree, sections, budget, merged);
-    else renderGroups(tree, objectMap, flatGroups, budget, 0);
+    else renderGroups(tree, objectMap, flatGroups, budget, 0, state.viewMode + '/');
     if (budget.truncated) {
       const d = document.createElement('div');
       d.className = 'status-empty';
@@ -1579,7 +1599,7 @@
       });
       node.group.classList.add('section');
       tree.appendChild(node.group); budget.nodes++; painted++;
-      if (expanded) renderGroups(node.body, objectMap, flatGroups, budget, 1, sec.id + '/');
+      if (expanded) renderGroups(node.body, objectMap, flatGroups, budget, 1, state.viewMode + '/' + sec.id + '/');
     }
     if (painted === 0) {
       const d = document.createElement('div');

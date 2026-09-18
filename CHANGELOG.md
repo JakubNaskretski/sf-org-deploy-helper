@@ -3,6 +3,17 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.25.2
+
+- Fixed: **A reveal opens what a fold hid.** With a group folded, "Use active file", "Use open
+  tabs" and a card's "Select these N" ticked the component with nothing visible in the tree —
+  the same thing the filters were already cleared to prevent. A reveal now drops the folds too.
+- Fixed: a fold made under one search no longer hides the next search's matches, folds no longer
+  leak between the All, Selected and Changed views, and under a typed filter Collapse all /
+  Expand all again mean every group once the filter is cleared.
+- The Changed header's tooltip names the branch (a long name ellipsizes in the button), and
+  Collapse all no longer promises to collapse sections in a view that has none.
+
 ## 0.25.1
 
 - Fixed: **Groups fold again in the Changed and Selected views.** Both views open their groups
