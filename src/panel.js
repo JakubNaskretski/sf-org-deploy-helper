@@ -1113,11 +1113,10 @@
 
   // ---- Search matching ----
   // A LIST of names is OR-ed: clauses are split on commas, semicolons or
-  // newlines (a pasted error list), or the line itself holds two or more full
-  // names. A clause naming a component (namesIn) matches it by equality, so
-  // "Account, Contact" does not drag in AccountService; a clause naming nothing
-  // falls back to the single-clause grammar below, so a partial in the list
-  // still finds something.
+  // newlines (a pasted error list). A clause naming a component (namesIn)
+  // matches it by equality, so "Account, Contact" does not drag in
+  // AccountService; a clause naming nothing falls back to the single-clause
+  // grammar below, so a partial in the list still finds something.
   // A single clause = whitespace-separated tokens, ALL of which must match (AND, any order):
   //   type:xxx / t:xxx — constrains the metadata TYPE (substring, e.g. type:flow,
   //                      t:field). Several type: tokens must all hold.
@@ -1175,19 +1174,16 @@
     const known = knownNames();
     const exact = new Set();
     const loose = [];
-    if (clauses.length === 1) {
-      // One name is a search; two or more full names on the line are a list —
-      // kept ALONGSIDE the old AND result, so "account case" still finds
-      // AccountCaseSync, and a stranger among them ("Typoo") hides nothing.
-      const found = namesIn(clauses[0], known);
-      if (found.length < 2) return (item) => matchesClause(item, clauses[0]);
+    for (const c of clauses) {
+      // A type: qualifier keeps the single-clause grammar: a match on the bare
+      // name would drop the scope the user just typed.
+      const found = /(^|\s)(type|t):/.test(c) ? [] : namesIn(c, known);
       for (const n of found) exact.add(n);
-      loose.push(clauses[0]);
-    } else {
-      for (const c of clauses) {
-        const found = namesIn(c, known);
-        if (found.length) for (const n of found) exact.add(n); else loose.push(c);
-      }
+      // A single line is also a search in that grammar, kept ALONGSIDE the
+      // names it holds: "account case" still finds AccountCaseSync, and one
+      // pasted error row finds its class. In a list, a line naming something
+      // is exact and a line naming nothing searches.
+      if (clauses.length === 1 || found.length === 0) loose.push(c);
     }
     return (item) => exact.has(item.name.toLowerCase()) || exact.has(`${item.type}:${item.name}`.toLowerCase())
       || loose.some(c => matchesClause(item, c));

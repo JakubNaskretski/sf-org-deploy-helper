@@ -16,8 +16,8 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
   `AccountValidationTrigger`), a type qualifier (`type:flow`, `t:field`), and a pasted list —
   `AccountService, ContactHandler`, one name per line, or a deploy error's rows as they come
   (paths, `.cls` / `-meta.xml` tails and the error text around a name are ignored) shows
-  exactly those, so nothing needs ticking one by one; two or more full names on one line are
-  a list too, shown alongside the ordinary search — plus the
+  exactly those, so nothing needs ticking one by one; a single line is read the same way,
+  alongside the ordinary search — plus the
   type-filter dropdown, with persisted state across reloads — All / None buttons stay
   above the list, each row has an *only* shortcut, and Expand all / Collapse all sit
   above the tree. OmniStudio types answer to their designer names too (`flexcard`,

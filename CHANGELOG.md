@@ -10,9 +10,10 @@ This file starts at the current release; earlier history predates it.
   tree shows exactly those, ready to tick. A name in a list matches by equality (`Account,
   Contact` does not drag in `AccountService`), and each line is read for the name in it, so
   paths, `.cls` / `-meta.xml` tails, quotes, bullets and the error text around a name are
-  ignored; a line naming nothing still searches the usual way. Two or more full names on one
-  line are a list too, shown alongside the ordinary search (`account case` still finds
-  `AccountCaseSync`). The box grows with the pasted lines. A single search works as before.
+  ignored; a line naming nothing still searches the usual way. A single line is read the same
+  way, alongside the ordinary search (`account case` still finds `AccountCaseSync`, and a
+  `type:` qualifier keeps its scope). The box grows with the pasted lines. A plain search
+  works as before.
 
 ## 0.25.2
 

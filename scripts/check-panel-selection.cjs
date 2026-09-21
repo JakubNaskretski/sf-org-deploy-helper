@@ -1794,8 +1794,24 @@ check('in a list a partial or a type: clause still searches the usual way', () =
 check('a single clause keeps the old grammar: substring, tokens AND-ed', () => {
   assert.deepStrictEqual(seenList('AcmeA'), ['AcmeA', 'AcmeAB'], 'one name is still a substring');
   assert.deepStrictEqual(seenList('acme ab'), ['AcmeAB', 'AcmeB'], 'two partial tokens still AND (AcmeB by its initials)');
-  assert.deepStrictEqual(seenList('AcmeA zzz'), [], 'a full name next to a stranger is still AND');
+  assert.deepStrictEqual(seenList('AcmeA zzz'), ['AcmeA'], 'a full name on the line shows even when the rest matches nothing');
   assert.deepStrictEqual(seenList('AcmeA AcmeB zzz'), ['AcmeA', 'AcmeB'], 'two full names are a list; the stranger (a typo) hides nothing');
+  assert.deepStrictEqual(seenList('acmea ab'), ['AcmeA', 'AcmeAB'], 'a full name plus a partial: the name, and the old AND result');
+});
+
+check('one pasted error row, path or bracketed name finds its component', () => {
+  assert.deepStrictEqual(seenList('ApexClass AcmeA Variable does not exist: foo 12:5'), ['AcmeA']);
+  assert.deepStrictEqual(seenList("- 'AcmeB.cls' failed to compile"), ['AcmeB']);
+  assert.deepStrictEqual(seenList('force-app\\main\\default\\classes\\AcmeA.cls'), ['AcmeA'], 'a Windows path');
+  assert.deepStrictEqual(seenList('(AcmeA)'), ['AcmeA']);
+});
+
+check('a type: qualifier keeps its scope inside a list', () => {
+  const TWO = [item('Flow', 'AcmeF'), item('ApexClass', 'AcmeF'), item('ApexClass', 'AcmeA')];
+  const seen = (filter) => { const p = panel({ ...BASE, filter }); p.deliver(TFILES(TWO)); return names(p); };
+  assert.deepStrictEqual(seen('type:flow AcmeF'), ['AcmeF'], 'fixture: the Flow only');
+  assert.deepStrictEqual(seen('type:flow AcmeF, AcmeA'), ['AcmeA', 'AcmeF'], 'the ApexClass AcmeF must not ride in on the bare name');
+  assert.deepStrictEqual(seen('t:apex AcmeF\nAcmeA'), ['AcmeA', 'AcmeF'], 'the Flow AcmeF must not ride in on the bare name');
 });
 
 check('a pasted line is read for the name in it', () => {
@@ -1818,7 +1834,7 @@ check('full names separated by spaces add to the old AND result rather than repl
 check('an org-only name counts as a full name once the org has loaded', () => {
   const p = panel({ ...BASE, filter: 'AcmeA AcmeOrg' });
   p.deliver(TFILES(LIST));
-  assert.deepStrictEqual(names(p), [], 'fixture: AcmeOrg is nobody yet, so this is a two-token AND');
+  assert.deepStrictEqual(names(p), ['AcmeA'], 'fixture: AcmeOrg is nobody yet, so only the local name shows');
   p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrg' }] });
   assert.deepStrictEqual(names(p), ['AcmeA', 'AcmeOrg']);
 });
