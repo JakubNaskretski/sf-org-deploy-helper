@@ -1795,6 +1795,16 @@ check('a single clause keeps the old grammar: substring, tokens AND-ed', () => {
   assert.deepStrictEqual(seenList('AcmeA'), ['AcmeA', 'AcmeAB'], 'one name is still a substring');
   assert.deepStrictEqual(seenList('acme ab'), ['AcmeAB', 'AcmeB'], 'two partial tokens still AND (AcmeB by its initials)');
   assert.deepStrictEqual(seenList('AcmeA zzz'), [], 'a full name next to a stranger is still AND');
+  assert.deepStrictEqual(seenList('AcmeA AcmeB zzz'), ['AcmeA', 'AcmeB'], 'two full names are a list; the stranger (a typo) hides nothing');
+});
+
+check('a pasted line is read for the name in it', () => {
+  const paste = "ApexClass  AcmeA    Variable does not exist: foo  12:5\n- 'AcmeB.cls'\nforce-app/main/default/flows/AcmeF.flow-meta.xml\r\n\n`AcmeAB`,";
+  assert.deepStrictEqual(seenList(paste), ['AcmeA', 'AcmeAB', 'AcmeB', 'AcmeF']);
+  // An extension is peeled only when what is left is a component: a field keeps its dots.
+  const p = panel({ ...BASE, filter: 'Account.Foo__c, Account.Zzz__c' });
+  p.deliver(TFILES([item('CustomObject', 'Account'), item('CustomField', 'Account.Foo__c'), item('CustomField', 'Account.Bar__c')]));
+  assert.deepStrictEqual(names(p), ['Account.Foo__c'], 'an unknown field must not resolve to its object');
 });
 
 check('full names separated by spaces add to the old AND result rather than replacing it', () => {

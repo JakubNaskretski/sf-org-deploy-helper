@@ -1112,12 +1112,12 @@
   }
 
   // ---- Search matching ----
-  // A LIST of names is OR-ed, one clause per name: clauses are split on commas,
-  // semicolons or newlines (a pasted error list), or on whitespace when EVERY
-  // whitespace token is the full name of a component. A clause that is a full
-  // name (or a Type:Name key) matches by equality, so "Account, Contact" does
-  // not drag in AccountService; any other clause falls back to the single-clause
-  // grammar below, so a typo or a partial in the list still finds something.
+  // A LIST of names is OR-ed: clauses are split on commas, semicolons or
+  // newlines (a pasted error list), or the line itself holds two or more full
+  // names. A clause naming a component (namesIn) matches it by equality, so
+  // "Account, Contact" does not drag in AccountService; a clause naming nothing
+  // falls back to the single-clause grammar below, so a partial in the list
+  // still finds something.
   // A single clause = whitespace-separated tokens, ALL of which must match (AND, any order):
   //   type:xxx / t:xxx — constrains the metadata TYPE (substring, e.g. type:flow,
   //                      t:field). Several type: tokens must all hold.
@@ -1150,21 +1150,45 @@
     return set;
   }
 
+  // A pasted line rarely holds a bare name: "- 'AccountService.cls'", a path,
+  // "AccountService.cls-meta.xml", or a deploy-error row ("ApexClass
+  // AccountService  Variable does not exist  12:5"). Whatever on the line is a
+  // known component's name (or Type:Name key) is the match; bullets, quotes,
+  // the directory, the -meta.xml tail and a file extension are peeled off.
+  // The extension has to be plain letters/digits: "Account.Foo__c" is a field.
+  function namesIn(text, known) {
+    const out = [];
+    for (const raw of text.split(/\s+/)) {
+      let s = raw.replace(/^[-*•'"`(\[]+|[,;:'"`)\]]+$/g, '').replace(/-meta\.xml$/, '');
+      s = s.slice(Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\')) + 1);
+      if (known.has(s)) { out.push(s); continue; }
+      const stem = s.replace(/\.[a-z0-9]+$/, '');
+      if (stem && known.has(stem)) out.push(stem);
+    }
+    return out;
+  }
+
   // The predicate for a query — compiled once per render, not once per item.
   function compileFilter(query) {
-    let clauses = (query || '').toLowerCase().split(/[,;\n]+/).map(c => c.trim()).filter(Boolean);
+    const clauses = (query || '').toLowerCase().split(/[,;\n]+/).map(c => c.trim()).filter(Boolean);
     if (clauses.length === 0) return () => true;
-    let loose = [];
-    if (clauses.length === 1) {
-      const toks = clauses[0].split(/\s+/);
-      // Full names separated by spaces are a list too — kept ALONGSIDE the old
-      // AND result, so "account case" still finds AccountCaseSync.
-      if (toks.length > 1 && toks.every(t => knownNames().has(t))) { loose = clauses; clauses = toks; }
-    }
-    if (clauses.length === 1) return (item) => matchesClause(item, clauses[0]);
     const known = knownNames();
-    const exact = new Set(clauses.filter(c => known.has(c)));
-    loose = loose.concat(clauses.filter(c => !known.has(c)));
+    const exact = new Set();
+    const loose = [];
+    if (clauses.length === 1) {
+      // One name is a search; two or more full names on the line are a list —
+      // kept ALONGSIDE the old AND result, so "account case" still finds
+      // AccountCaseSync, and a stranger among them ("Typoo") hides nothing.
+      const found = namesIn(clauses[0], known);
+      if (found.length < 2) return (item) => matchesClause(item, clauses[0]);
+      for (const n of found) exact.add(n);
+      loose.push(clauses[0]);
+    } else {
+      for (const c of clauses) {
+        const found = namesIn(c, known);
+        if (found.length) for (const n of found) exact.add(n); else loose.push(c);
+      }
+    }
     return (item) => exact.has(item.name.toLowerCase()) || exact.has(`${item.type}:${item.name}`.toLowerCase())
       || loose.some(c => matchesClause(item, c));
   }

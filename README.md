@@ -14,8 +14,10 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
   comparison (this branch, any ref, or uncommitted only).
 - Smart search: word tokens in any order (`acc trig`), camelCase initials (`avt` finds
   `AccountValidationTrigger`), a type qualifier (`type:flow`, `t:field`), and a pasted list —
-  `AccountService, ContactHandler` (commas, newlines or spaces between full names) shows
-  exactly those, so a deploy error's class list needs no ticking one by one — plus the
+  `AccountService, ContactHandler`, one name per line, or a deploy error's rows as they come
+  (paths, `.cls` / `-meta.xml` tails and the error text around a name are ignored) shows
+  exactly those, so nothing needs ticking one by one; two or more full names on one line are
+  a list too, shown alongside the ordinary search — plus the
   type-filter dropdown, with persisted state across reloads — All / None buttons stay
   above the list, each row has an *only* shortcut, and Expand all / Collapse all sit
   above the tree. OmniStudio types answer to their designer names too (`flexcard`,
