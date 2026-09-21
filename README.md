@@ -13,7 +13,9 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
   your saves as they happen; no re-entering needed, and the header label switches the
   comparison (this branch, any ref, or uncommitted only).
 - Smart search: word tokens in any order (`acc trig`), camelCase initials (`avt` finds
-  `AccountValidationTrigger`), and a type qualifier (`type:flow`, `t:field`) — plus the
+  `AccountValidationTrigger`), a type qualifier (`type:flow`, `t:field`), and a pasted list —
+  `AccountService, ContactHandler` (commas, newlines or spaces between full names) shows
+  exactly those, so a deploy error's class list needs no ticking one by one — plus the
   type-filter dropdown, with persisted state across reloads — All / None buttons stay
   above the list, each row has an *only* shortcut, and Expand all / Collapse all sit
   above the tree. OmniStudio types answer to their designer names too (`flexcard`,

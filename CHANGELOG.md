@@ -3,6 +3,14 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.26.0
+
+- **Paste a list into the search box.** A deploy error names five classes; paste them —
+  `AccountService, ContactHandler`, one per line, or full names separated by spaces — and the
+  tree shows exactly those, ready to tick. A full name in a list matches by equality (`Account,
+  Contact` does not drag in `AccountService`); a partial or a typo in the list still searches the
+  usual way. The box grows with the pasted lines. A single search works as before.
+
 ## 0.25.2
 
 - Fixed: **A reveal opens what a fold hid.** With a group folded, "Use active file", "Use open
