@@ -3,6 +3,18 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.26.0
+
+- **Paste a list into the search box.** A deploy error names five classes; paste them —
+  `AccountService, ContactHandler`, one per line, or the error's rows as they come — and the
+  tree shows exactly those, ready to tick. A name in a list matches by equality (`Account,
+  Contact` does not drag in `AccountService`), and each line is read for the name in it, so
+  paths, `.cls` / `-meta.xml` tails, quotes, bullets and the error text around a name are
+  ignored; a line naming nothing still searches the usual way. A single line is read the same
+  way, alongside the ordinary search (`account case` still finds `AccountCaseSync`, and a
+  `type:` qualifier keeps its scope). The box grows with the pasted lines. A plain search
+  works as before.
+
 ## 0.25.2
 
 - Fixed: **A reveal opens what a fold hid.** With a group folded, "Use active file", "Use open

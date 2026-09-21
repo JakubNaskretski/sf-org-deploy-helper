@@ -251,6 +251,7 @@
   let searchTimer = null;
   $('search').addEventListener('input', (e) => {
     const v = e.target.value.toLowerCase();
+    sizeSearch(e.target);
     // Groups open for a new search — a fold made under the previous one would
     // otherwise hide this one's matches. Immediate, not in the debounced body:
     // the fold set has to be gone before anything renders, whatever renders it.
@@ -259,6 +260,7 @@
     searchTimer = setTimeout(() => { state.filter = v; savePersisted(); renderTree(); }, 200);
   });
   $('search').value = state.filter;
+  sizeSearch($('search'));
   if ($('testClasses')) $('testClasses').value = state.testClasses;
   syncTestClassesVisibility();
   // Mirror the chosen test level (+ RunSpecifiedTests classes) to the provider so
@@ -1110,7 +1112,12 @@
   }
 
   // ---- Search matching ----
-  // Query = whitespace-separated tokens, ALL of which must match (AND, any order):
+  // A LIST of names is OR-ed: clauses are split on commas, semicolons or
+  // newlines (a pasted error list). A clause naming a component (namesIn)
+  // matches it by equality, so "Account, Contact" does not drag in
+  // AccountService; a clause naming nothing falls back to the single-clause
+  // grammar below, so a partial in the list still finds something.
+  // A single clause = whitespace-separated tokens, ALL of which must match (AND, any order):
   //   type:xxx / t:xxx — constrains the metadata TYPE (substring, e.g. type:flow,
   //                      t:field). Several type: tokens must all hold.
   //   plain token      — substring of "Type Name", OR a match on the name's
@@ -1127,7 +1134,68 @@
       .toLowerCase();
   }
 
-  function matchesFilter(item, query) {
+  // Lowercased names and Type:Name keys of everything the tree can show, built
+  // once per items/org delivery (the arrays are replaced, never mutated in
+  // place) — a Changed render calls buildGroups once per section.
+  let namesCache = null;
+  function knownNames() {
+    const c = namesCache;
+    if (c && c.items === state.items && c.org === state.orgOnlyItems && c.loaded === state.orgLoaded) return c.set;
+    const set = new Set();
+    const add = (it) => { set.add(it.name.toLowerCase()); set.add(`${it.type}:${it.name}`.toLowerCase()); };
+    for (const it of state.items) add(it);
+    if (state.orgLoaded) for (const it of state.orgOnlyItems) add(it);
+    namesCache = { items: state.items, org: state.orgOnlyItems, loaded: state.orgLoaded, set };
+    return set;
+  }
+
+  // A pasted line rarely holds a bare name: "- 'AccountService.cls'", a path,
+  // "AccountService.cls-meta.xml", or a deploy-error row ("ApexClass
+  // AccountService  Variable does not exist  12:5"). Whatever on the line is a
+  // known component's name (or Type:Name key) is the match; bullets, quotes,
+  // the directory, the -meta.xml tail and a file extension are peeled off.
+  // The extension has to be plain letters/digits: "Account.Foo__c" is a field.
+  function namesIn(text, known) {
+    const out = [];
+    for (const raw of text.split(/\s+/)) {
+      let s = raw.replace(/^[-*•'"`(\[]+|[,;:'"`)\]]+$/g, '').replace(/-meta\.xml$/, '');
+      s = s.slice(Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\')) + 1);
+      if (known.has(s)) { out.push(s); continue; }
+      const stem = s.replace(/\.[a-z0-9]+$/, '');
+      if (stem && known.has(stem)) out.push(stem);
+    }
+    return out;
+  }
+
+  // The predicate for a query — compiled once per render, not once per item.
+  function compileFilter(query) {
+    const clauses = (query || '').toLowerCase().split(/[,;\n]+/).map(c => c.trim()).filter(Boolean);
+    if (clauses.length === 0) return () => true;
+    const known = knownNames();
+    const exact = new Set();
+    const loose = [];
+    for (const c of clauses) {
+      // A type: qualifier keeps the single-clause grammar: a match on the bare
+      // name would drop the scope the user just typed.
+      const found = /(^|\s)(type|t):/.test(c) ? [] : namesIn(c, known);
+      for (const n of found) exact.add(n);
+      // A single line is also a search in that grammar, kept ALONGSIDE the
+      // names it holds: "account case" still finds AccountCaseSync, and one
+      // pasted error row finds its class. In a list, a line naming something
+      // is exact and a line naming nothing searches.
+      if (clauses.length === 1 || found.length === 0) loose.push(c);
+    }
+    return (item) => exact.has(item.name.toLowerCase()) || exact.has(`${item.type}:${item.name}`.toLowerCase())
+      || loose.some(c => matchesClause(item, c));
+  }
+
+  // The box grows with a pasted list (up to a few rows, then scrolls) and
+  // shrinks back when it is cleared.
+  function sizeSearch(el) {
+    el.rows = Math.min(6, Math.max(1, (el.value || '').split('\n').length));
+  }
+
+  function matchesClause(item, query) {
     if (!query) return true;
     let hay = null;
     let initials = null;
@@ -1159,6 +1227,7 @@
     // sections at once).
     if (keys.some(k => state.localKeys.has(k) || state.orgKeys.has(k))) state.collapsedGroups.clear();
     let text = false, type = false, source = false;
+    const matches = state.filter ? compileFilter(state.filter) : null;
     for (const k of keys) {
       // A key that renders nothing (a card naming a since-deleted component) is
       // no reason to touch the filters.
@@ -1170,10 +1239,10 @@
         if (!isTypeAllowed(t)) type = true;
         if (!isSourceAllowed(itemSource(k))) source = true;
       }
-      if (state.filter && !matchesFilter({ type: t, name }, state.filter)) text = true;
+      if (matches && !matches({ type: t, name })) text = true;
     }
     if (!text && !type && !source) return;
-    if (text) { state.filter = ''; if ($('search')) $('search').value = ''; }
+    if (text) { state.filter = ''; if ($('search')) { $('search').value = ''; sizeSearch($('search')); } }
     if (type) state.typeFilter = new Set();
     if (source) { state.sourceFilter = 'all'; if ($('sourceFilter')) $('sourceFilter').value = 'all'; }
     savePersisted();
@@ -1188,6 +1257,7 @@
   // on every checkbox tick, since selectionChanged re-renders.
   function buildGroups(onlyKeys, merged) {
     const filter = state.filter;
+    const matches = compileFilter(filter);
     const objectMap = new Map(); // objectName -> { obj: item|null, children: Map<type, item[]> }
     const flatGroups = new Map(); // type -> item[]
     const getObj = (n) => {
@@ -1211,7 +1281,7 @@
       }
       if (state.viewMode === 'changed' && !(state.changedKeys && state.changedKeys.has(`${item.type}:${item.name}`))) continue;
       if (onlyKeys && !onlyKeys.has(`${item.type}:${item.name}`)) continue;
-      if (!matchesFilter(item, filter)) continue;
+      if (!matches(item)) continue;
       if (item.type === 'CustomObject') {
         getObj(item.name).obj = item;
       } else if (state.objectChildTypes.has(item.type)) {

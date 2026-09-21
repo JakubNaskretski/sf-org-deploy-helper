@@ -1771,5 +1771,94 @@ check('a payload that only re-splits the same keys still repaints', () => {
   assert.deepStrictEqual(sectionLabels(p), ['ccccccc commit it (1)']);
 });
 
+// ------------------------------------------------- 6e) a pasted list of names
+// "The deploy error names five classes — show me those, not one at a time."
+const LIST = [item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeAB'), item('ApexClass', 'AcmeB'), item('Flow', 'AcmeF'), item('CustomObject', 'Acme__c')];
+const seenList = (filter) => { const p = panel({ ...BASE, filter }); p.deliver(TFILES(LIST)); return names(p); };
+
+check('a list of full names, however separated, shows exactly those', () => {
+  assert.deepStrictEqual(seenList('AcmeA, AcmeB'), ['AcmeA', 'AcmeB'], 'commas — and AcmeAB is not dragged in by the substring');
+  assert.deepStrictEqual(seenList('AcmeA\nAcmeB\n'), ['AcmeA', 'AcmeB'], 'newlines');
+  assert.deepStrictEqual(seenList('AcmeA AcmeB'), ['AcmeA', 'AcmeB'], 'spaces between full names');
+  assert.deepStrictEqual(seenList('acmea;AcmeF'), ['AcmeA', 'AcmeF'], 'semicolons, any case, across types');
+  assert.deepStrictEqual(seenList('ApexClass:AcmeA, AcmeF'), ['AcmeA', 'AcmeF'], 'a Type:Name key is a name too');
+});
+
+check('in a list a partial or a type: clause still searches the usual way', () => {
+  assert.deepStrictEqual(seenList('AcmeA, cmeb'), ['AcmeA', 'AcmeB'], 'a partial in the list still finds its component');
+  assert.deepStrictEqual(seenList('AcmeA\ncmeb'), ['AcmeA', 'AcmeB'], 'a newline separates clauses even when a token is a stranger');
+  assert.deepStrictEqual(seenList('AcmeA, type:flow'), ['AcmeA', 'AcmeF']);
+  assert.deepStrictEqual(seenList('AcmeA, zzz'), ['AcmeA'], 'a stranger in the list hides nothing else');
+});
+
+check('a single clause keeps the old grammar: substring, tokens AND-ed', () => {
+  assert.deepStrictEqual(seenList('AcmeA'), ['AcmeA', 'AcmeAB'], 'one name is still a substring');
+  assert.deepStrictEqual(seenList('acme ab'), ['AcmeAB', 'AcmeB'], 'two partial tokens still AND (AcmeB by its initials)');
+  assert.deepStrictEqual(seenList('AcmeA zzz'), ['AcmeA'], 'a full name on the line shows even when the rest matches nothing');
+  assert.deepStrictEqual(seenList('AcmeA AcmeB zzz'), ['AcmeA', 'AcmeB'], 'two full names are a list; the stranger (a typo) hides nothing');
+  assert.deepStrictEqual(seenList('acmea ab'), ['AcmeA', 'AcmeAB'], 'a full name plus a partial: the name, and the old AND result');
+});
+
+check('one pasted error row, path or bracketed name finds its component', () => {
+  assert.deepStrictEqual(seenList('ApexClass AcmeA Variable does not exist: foo 12:5'), ['AcmeA']);
+  assert.deepStrictEqual(seenList("- 'AcmeB.cls' failed to compile"), ['AcmeB']);
+  assert.deepStrictEqual(seenList('force-app\\main\\default\\classes\\AcmeA.cls'), ['AcmeA'], 'a Windows path');
+  assert.deepStrictEqual(seenList('(AcmeA)'), ['AcmeA']);
+});
+
+check('a type: qualifier keeps its scope inside a list', () => {
+  const TWO = [item('Flow', 'AcmeF'), item('ApexClass', 'AcmeF'), item('ApexClass', 'AcmeA')];
+  const seen = (filter) => { const p = panel({ ...BASE, filter }); p.deliver(TFILES(TWO)); return names(p); };
+  assert.deepStrictEqual(seen('type:flow AcmeF'), ['AcmeF'], 'fixture: the Flow only');
+  assert.deepStrictEqual(seen('type:flow AcmeF, AcmeA'), ['AcmeA', 'AcmeF'], 'the ApexClass AcmeF must not ride in on the bare name');
+  assert.deepStrictEqual(seen('t:apex AcmeF\nAcmeA'), ['AcmeA', 'AcmeF'], 'the Flow AcmeF must not ride in on the bare name');
+});
+
+check('a pasted line is read for the name in it', () => {
+  const paste = "ApexClass  AcmeA    Variable does not exist: foo  12:5\n- 'AcmeB.cls'\nforce-app/main/default/flows/AcmeF.flow-meta.xml\r\n\n`AcmeAB`,";
+  assert.deepStrictEqual(seenList(paste), ['AcmeA', 'AcmeAB', 'AcmeB', 'AcmeF']);
+  // An extension is peeled only when what is left is a component: a field keeps its dots.
+  const p = panel({ ...BASE, filter: 'Account.Foo__c, Account.Zzz__c' });
+  p.deliver(TFILES([item('CustomObject', 'Account'), item('CustomField', 'Account.Foo__c'), item('CustomField', 'Account.Bar__c')]));
+  assert.deepStrictEqual(names(p), ['Account.Foo__c'], 'an unknown field must not resolve to its object');
+});
+
+check('full names separated by spaces add to the old AND result rather than replacing it', () => {
+  // "account case" used to find AccountCaseSync; it still does, plus the two objects.
+  const NOUNS = [item('ApexClass', 'Account'), item('ApexClass', 'Case'), item('ApexClass', 'AccountCaseSync')];
+  const seen = (filter) => { const p = panel({ ...BASE, filter }); p.deliver(TFILES(NOUNS)); return names(p); };
+  assert.deepStrictEqual(seen('account case'), ['Account', 'AccountCaseSync', 'Case']);
+  assert.deepStrictEqual(seen('account, case'), ['Account', 'Case'], 'an explicit list is exact');
+});
+
+check('an org-only name counts as a full name once the org has loaded', () => {
+  const p = panel({ ...BASE, filter: 'AcmeA AcmeOrg' });
+  p.deliver(TFILES(LIST));
+  assert.deepStrictEqual(names(p), ['AcmeA'], 'fixture: AcmeOrg is nobody yet, so only the local name shows');
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrg' }] });
+  assert.deepStrictEqual(names(p), ['AcmeA', 'AcmeOrg']);
+});
+
+check('the search box grows with a pasted list and shrinks when it is cleared', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(LIST));
+  const search = p.el('search');
+  assert.strictEqual(search.rows, 1);
+  search.value = 'AcmeA\nAcmeB\nAcmeF';
+  search.fire('input');
+  assert.strictEqual(search.rows, 3, 'one row per pasted line, before the debounce');
+  search.value = 'x\n'.repeat(20);
+  search.fire('input');
+  assert.strictEqual(search.rows, 6, 'capped; the rest scrolls');
+  assert.strictEqual(panel({ ...BASE, filter: 'AcmeA\nAcmeB' }).el('search').rows, 2, 'a restored list is sized at boot');
+  // A reveal that clears the text filter shrinks the box with it.
+  const q = panel({ ...BASE, filter: 'AcmeB\nAcmeF' });
+  q.deliver(TFILES(LIST));
+  assert.strictEqual(q.el('search').rows, 2);
+  q.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeA'], scroll: true });
+  assert.strictEqual(q.el('search').value, '');
+  assert.strictEqual(q.el('search').rows, 1);
+});
+
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }
 console.log(`panel selection: all ${ran} checks passed`);

@@ -111,7 +111,12 @@ body.resizing { cursor: row-resize; user-select: none; }
 .tree-search {
   padding: 4px 8px; border-bottom: 1px solid var(--border);
 }
-.tree-search input { width: 100%; }
+.tree-search textarea {
+  width: 100%; box-sizing: border-box; resize: none; overflow: hidden auto; display: block;
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 2px;
+  padding: 3px 6px; font-family: inherit; font-size: inherit; line-height: 1.4;
+}
 
 /* View modes: All | Selected | Changed — one tree, three lenses (IntelliJ-style).
    Replaces the selected-chip tray: the Selected view IS the selection, fully
@@ -284,7 +289,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 /* RunSpecifiedTests class-list input — same full-row treatment as #testLevel
    (comment above) so it lands on its own row directly below the select, hidden
    by default via the inline style on the element. Kept as minimal as
-   .tree-search input: just the sizing, no bespoke look. */
+   .tree-search textarea: just the sizing, no bespoke look. */
 .actions input#testClasses { flex: 1 1 100%; }
 .actions input#testClasses.input-error { border-color: var(--err); }
 .conflict-toggle {
@@ -498,7 +503,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         <button id="modeChanged" data-mode="changed" role="tab" title="Components whose files have uncommitted git changes">Changed</button>
       </div>
       <div class="tree-search">
-        <input id="search" type="text" placeholder="Filter… tokens · initials (avt) · type:flow" />
+        <textarea id="search" rows="1" wrap="off" spellcheck="false" placeholder="Filter… tokens · initials (avt) · type:flow · or a list of names"></textarea>
         <div id="sourceFilterRow" style="display:none;">
           <select id="sourceFilter">
             <option value="all">All sources</option>
