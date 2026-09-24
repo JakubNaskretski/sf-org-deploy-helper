@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -284,7 +284,7 @@
           "type": "boolean",
           "default": false,
           "scope": "machine",
-          "markdownDescription": "Follow and publish the Salesforce org shared across the Skrety SF plugins (`skrety.salesforce.targetOrg`). Off: this plugin keeps its own org and ignores switches made in sibling plugins."
+          "markdownDescription": "Follow and publish the Salesforce org shared across the Skrety SF plugins (`skrety.salesforce.targetOrg`). Off: this plugin keeps its own org and ignores switches made in sibling plugins. The shared org is machine-wide, so with sync on every VS Code window follows the same org; with it off each window keeps its own."
         },
         "sfOrgDeployWrapper.debugTiming": {
           "type": "boolean",
