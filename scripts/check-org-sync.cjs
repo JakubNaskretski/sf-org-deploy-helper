@@ -2,9 +2,10 @@
 // No framework.   1) npm run compile   2) node scripts/check-org-sync.cjs
 //
 // The rule the whole family now follows: each plugin remembers its OWN org in its
-// private globalState key, and the family-shared setting
-// `skrety.salesforce.targetOrg` is opt-in per plugin via
-// `sfOrgDeployWrapper.syncOrgWithFamily` (default OFF).
+// private key — held in the WINDOW's workspaceState, so two windows keep two
+// targets — and the family-shared setting `skrety.salesforce.targetOrg` is opt-in
+// per plugin via `sfOrgDeployWrapper.syncOrgWithFamily` (default OFF). The
+// one-time migration marker stays in globalState: once per install, not per window.
 //
 // Contracts under test, driven through the REAL OrgStore against a vscode stub:
 //   - the private key is the source of truth and is written on EVERY applied
@@ -15,7 +16,11 @@
 //     off is a no-op, and flipping it on adopts a differing family org;
 //   - the store fires its own change event (a pick is visible with sync off),
 //     de-duped on same-value writes and never looping on its own shared write;
-//   - the one-time migration adopts the shared value once, then stops.
+//   - the one-time migration adopts the shared value once, then stops;
+//   - the org and the marker land in their own mementos and never cross over;
+//   - a window with no org of its own ports the legacy globalState value forward
+//     (read-only) instead of silently falling back to the CLI default org, at most
+//     once per window, so a target cleared later is never resurrected.
 // Plus source pins on the call sites, where "user-initiated" is decided.
 const path = require('path');
 const fs = require('fs');
@@ -80,9 +85,13 @@ const SHARED = 'skrety.salesforce.targetOrg';
 const SYNC = 'sfOrgDeployWrapper.syncOrgWithFamily';
 const PRIVATE_KEY = 'sfOrgDeployWrapper.selectedOrg.v1';
 const MIGRATED_KEY = 'sfOrgDeployWrapper.orgSyncMigrated.v1';
+const PORTED_KEY = 'sfOrgDeployWrapper.orgPortedFromGlobal.v1';
 // Fictional fixtures only.
 const DEV = 'dev@acme.example';
 const QA = 'qa@acme.example';
+const OPS = 'ops@acme.example';
+/** What a pre-split release left in globalState under the private key. */
+const LEGACY = 'legacy@acme.example';
 
 // ------------------------------------------------------------------- harness
 let failed = 0;
@@ -90,26 +99,35 @@ let ran = 0;
 const cases = [];
 function check(name, fn) { cases.push({ name, fn }); }
 
-/** Fresh world: empty settings, a memento seeded from `state`, a live OrgStore. */
-function world({ shared, sync, state = {} } = {}) {
+/** Fresh world: empty settings, TWO mementos seeded from `state` — the window's
+ *  workspaceState (the org) and globalState (the migration marker), wired exactly
+ *  as extension.ts wires them — and a live OrgStore. Seeds are routed by key and
+ *  each accessor reads only its own store, so a value written to the wrong memento
+ *  shows up as a failed check rather than passing on a shared map. */
+function world({ shared, sync, state = {}, legacy } = {}) {
   config.clear();
   configWrites.length = 0;
   configListeners.length = 0;
   if (shared !== undefined) config.set(SHARED, shared);
   if (sync !== undefined) config.set(SYNC, sync);
-  const store = new Map(Object.entries(state));
-  const events = [];
-  const logs = [];
-  const memento = {
+  const privStore = new Map();
+  const installStore = new Map();
+  // A pre-split release wrote the org to globalState under the private key.
+  if (legacy !== undefined) installStore.set(PRIVATE_KEY, legacy);
+  for (const [k, v] of Object.entries(state)) (k === MIGRATED_KEY ? installStore : privStore).set(k, v);
+  const asMemento = (store) => ({
     get: (k, d) => (store.has(k) ? store.get(k) : d),
     update: async (k, v) => { if (v === undefined) store.delete(k); else store.set(k, v); }
-  };
-  const orgStore = new OrgStore(memento, m => logs.push(m));
+  });
+  const events = [];
+  const logs = [];
+  const orgStore = new OrgStore(asMemento(privStore), asMemento(installStore), m => logs.push(m));
   orgStore.onDidChange(v => events.push(v));
   return {
-    orgStore, events, logs, configWrites,
-    priv: () => store.get(PRIVATE_KEY),
-    migrated: () => store.get(MIGRATED_KEY),
+    orgStore, events, logs, configWrites, privStore, installStore,
+    priv: () => privStore.get(PRIVATE_KEY),
+    migrated: () => installStore.get(MIGRATED_KEY),
+    ported: () => privStore.get(PORTED_KEY),
     shared: () => config.get(SHARED),
     sharedWrites: () => configWrites.filter(w => w.key === SHARED),
     /** Someone else (a sibling plugin, or a settings.json edit) moves the family org. */
@@ -249,6 +267,107 @@ check('migration: the marker is stamped UNCONDITIONALLY, even with the shared se
   assert.deepStrictEqual(later.events, []);
 });
 
+// ------------------------------------------------- per-window store isolation
+check('the org lives ONLY in the window memento and the marker ONLY in globalState', async () => {
+  // The bug this split fixes: a machine-wide org meant window B deployed to the
+  // org last picked in window A. Every write path is exercised here — migration,
+  // a user pick, a programmatic set — each landing on a DIFFERENT org, so the
+  // final value can only come from the last write; sync is off, so nothing here
+  // leans on adoptShared happening to be a no-op.
+  const w = world({ shared: QA, sync: false });
+  await w.orgStore.migrate();            // migration adopts QA whatever the toggle says
+  await w.orgStore.setFromUserPick(DEV);
+  await w.orgStore.set(OPS);
+  assert.strictEqual(w.priv(), OPS);
+  assert.strictEqual(w.orgStore.get(), OPS);
+  assert.strictEqual(w.installStore.get(PRIVATE_KEY), undefined,
+    'the target org must never reach globalState — that is what leaked between windows');
+  assert.strictEqual(w.installStore.get(MIGRATED_KEY), true);
+  assert.strictEqual(w.privStore.get(MIGRATED_KEY), undefined,
+    'the migration marker is once per install, not once per window');
+});
+
+// ------------------------------------------------------ legacy port-forward
+check('a window with no org of its own opens on the legacy globalState org', async () => {
+  // Without this the upgrade would drop every window onto the CLI default org —
+  // which may be production — with nothing on screen to say so.
+  const w = world({ legacy: LEGACY, sync: false });
+  await w.orgStore.migrate();
+  assert.strictEqual(w.orgStore.get(), LEGACY, 'the upgrade must not silently retarget the window');
+  assert.strictEqual(w.priv(), LEGACY, 'the ported value has to LAND in the window store');
+  assert.deepStrictEqual(w.events, [LEGACY], 'the status bar has to hear about it');
+  assert.strictEqual(w.installStore.get(PRIVATE_KEY), LEGACY,
+    'the legacy value is read once and left alone — other open windows still need it');
+  assert.deepStrictEqual(w.sharedWrites(), []);
+
+  assert.strictEqual(w.ported(), true, 'the hop is stamped in the window store');
+
+  // Read side: once this window has an org of its own — "no org" included —
+  // globalState is out of the picture. A `?? legacy` fallback anywhere in the
+  // read path would resurrect the machine-wide org right here, and so would an
+  // unstamped port-forward on the next activation, which is where it really bit:
+  // clearing is exactly what reconciliation does when the org's auth expires.
+  await w.orgStore.setFromUserPick(undefined);
+  await w.orgStore.migrate();
+  assert.strictEqual(w.orgStore.get(), undefined,
+    'a cleared org must not come back — not from a read fallback, not from a second port');
+  assert.deepStrictEqual(w.events, [LEGACY, undefined], 'and nothing re-fires');
+  assert.strictEqual(w.installStore.get(PRIVATE_KEY), LEGACY);
+});
+
+check('the port-forward is once per WINDOW: a reload after a clear stays cleared', async () => {
+  // The cycle to prevent: auth expires, reconciliation clears the org, the next
+  // window reload ports the dead legacy org straight back in, every session.
+  const first = world({ legacy: LEGACY, sync: false });
+  await first.orgStore.migrate();
+  await first.orgStore.set(undefined);          // the org-list reconciliation clears it
+  const carried = Object.fromEntries(first.privStore);
+
+  const reload = world({ legacy: LEGACY, sync: false, state: { ...carried, [MIGRATED_KEY]: true } });
+  await reload.orgStore.migrate();
+  assert.strictEqual(reload.orgStore.get(), undefined,
+    'the same window store reopened must not resurrect the legacy org');
+  assert.deepStrictEqual(reload.events, []);
+});
+
+check('the port-forward stamp is per window and stamped even with nothing to port', async () => {
+  const w = world({ sync: false });
+  await w.orgStore.migrate();
+  assert.strictEqual(w.ported(), true, 'an empty hop still counts as the window\'s one hop');
+  assert.strictEqual(w.installStore.get(PORTED_KEY), undefined,
+    'the stamp is per window — it must never reach globalState');
+  assert.strictEqual(w.orgStore.get(), undefined);
+});
+
+check('a legacy value that is not a usable username is ignored, not thrown on', async () => {
+  // Storage from an older release, editable by hand: a non-string there must not
+  // reject migrate() and leave the window with no org at all.
+  for (const junk of [42, { username: DEV }, ['x'], true, '   ']) {
+    const w = world({ legacy: junk, sync: false });
+    await w.orgStore.migrate();
+    assert.strictEqual(w.orgStore.get(), undefined, `legacy ${JSON.stringify(junk)} must be ignored`);
+    assert.strictEqual(w.ported(), true, 'and the window is still stamped');
+  }
+});
+
+check('a window that already has its own org ignores the legacy globalState value', async () => {
+  const w = world({ legacy: LEGACY, sync: false, state: { [PRIVATE_KEY]: DEV, [MIGRATED_KEY]: true } });
+  await w.orgStore.migrate();
+  assert.strictEqual(w.orgStore.get(), DEV, 'the window store wins over the legacy machine-wide org');
+  assert.deepStrictEqual(w.events, []);
+});
+
+check('port-forward runs BEFORE the once-per-install migration, which still wins', async () => {
+  // A flag-unset install upgrading straight from the always-shared releases: the
+  // legacy org lands first (so nothing is ever org-less), then the family org is
+  // adopted on top exactly as it was before this change.
+  const w = world({ legacy: LEGACY, shared: QA, sync: false });
+  await w.orgStore.migrate();
+  assert.strictEqual(w.orgStore.get(), QA);
+  assert.deepStrictEqual(w.events, [LEGACY, QA]);
+  assert.strictEqual(w.migrated(), true);
+});
+
 check('activation with sync ON adopts a family switch missed while shut down', async () => {
   const w = world({ shared: QA, sync: true, state: { [PRIVATE_KEY]: DEV, [MIGRATED_KEY]: true } });
   await w.orgStore.migrate();
@@ -336,6 +455,13 @@ check('source: activation only migrates — it never seeds the shared setting', 
   assert.ok(extSrc.includes('void orgStore.migrate()'));
   assert.ok(!extSrc.includes('setSharedOrg'));
   assert.ok(!storeSrc.includes('migrateToSharedOrg'));
+});
+
+check('source: the store is wired window-first at its only call site', () => {
+  assert.ok(extSrc.includes('new OrgStore(context.workspaceState, context.globalState,'),
+    'extension.ts must pass the WINDOW memento (workspaceState) first and globalState second');
+  assert.ok(!extSrc.includes('new OrgStore(context.globalState'),
+    'extension.ts must not hand globalState to OrgStore as the private org store — that is exactly the cross-window leak this split removed');
 });
 
 check('package.json: the toggle is contributed, boolean, default off, machine scope', () => {

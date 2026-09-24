@@ -1,11 +1,19 @@
 import * as vscode from 'vscode';
 import { getSharedOrg, setSharedOrg, SHARED_ORG_SETTING } from './kit/orgs';
 
-/** This plugin's OWN remembered org — the source of truth. Same globalState key
- *  the plugin has always used, so an existing selection survives this change. */
+/** This plugin's OWN remembered org — the source of truth. Lives in the WINDOW's
+ *  workspaceState, so two windows on two projects deploy to two different orgs.
+ *  The key NAME is unchanged, which is what lets `migrate` port the value older
+ *  releases wrote under it in globalState forward into each window once (see
+ *  there); globalState is a separate memento, so the two never collide. */
 const PRIVATE_KEY = 'sfOrgDeployWrapper.selectedOrg.v1';
-/** One-shot marker for the shared → private adoption below (see `migrate`). */
+/** One-shot marker for the shared → private adoption below (see `migrate`). Stays
+ *  in globalState: that adoption is once per INSTALL, not once per window. */
 const MIGRATED_KEY = 'sfOrgDeployWrapper.orgSyncMigrated.v1';
+/** Per-WINDOW marker: this window has had its one shot at the legacy globalState
+ *  org (see `migrate`). Lives in workspaceState beside the org it guards, and is
+ *  stamped whether or not anything moved. */
+const PORTED_KEY = 'sfOrgDeployWrapper.orgPortedFromGlobal.v1';
 
 const SYNC_SECTION = 'sfOrgDeployWrapper';
 const SYNC_KEY = 'syncOrgWithFamily';
@@ -28,10 +36,11 @@ function normalize(username: string | undefined): string | undefined {
 }
 
 /**
- * Target-org store. The org lives in this plugin's private globalState key and is
- * written on EVERY applied change (user pick, adopted family switch, startup
+ * Target-org store. The org lives in this plugin's private workspaceState key and
+ * is written on EVERY applied change (user pick, adopted family switch, startup
  * fallback) — so the plugin remembers its own org even when nothing else in the
- * family agrees.
+ * family agrees. workspaceState is per window and VS Code never propagates it
+ * between windows, so each open project keeps its own target org.
  *
  * The family-shared setting `skrety.salesforce.targetOrg` is opt-in via
  * `sfOrgDeployWrapper.syncOrgWithFamily` (default OFF):
@@ -50,11 +59,16 @@ export class OrgStore {
   readonly onDidChange: vscode.Event<string | undefined> = this.emitter.event;
   private readonly watcher: vscode.Disposable;
 
-  /** `log` receives the reason a background (event-driven) write failed; those
+  /** `privateState` is the window-scoped memento (`context.workspaceState`) that
+   *  holds the target org; `installState` is `context.globalState` and holds only
+   *  the one-time migration marker.
+   *
+   *  `log` receives the reason a background (event-driven) write failed; those
    *  paths have no caller to reject to, and dropping them silently would leave the
    *  org quietly out of sync with the family with no trace anywhere. */
   constructor(
-    private readonly memento: vscode.Memento,
+    private readonly privateState: vscode.Memento,
+    private readonly installState: vscode.Memento,
     private readonly log: (message: string) => void = () => { /* no sink */ }
   ) {
     this.watcher = vscode.workspace.onDidChangeConfiguration(e => {
@@ -73,27 +87,51 @@ export class OrgStore {
   /**
    * Activation sequence. Call once, before the first `get()`.
    *
+   * (a0) Port forward the legacy org, at most ONCE per window: releases before
+   *     the per-window split kept the target in globalState under the SAME key. A
+   *     window whose own store is still empty adopts it, so an upgrade changes
+   *     nothing the user can see — without this every window would silently fall
+   *     back to the CLI default, which may well be production. The hop is stamped
+   *     in the window store, and stamped even when there was nothing to port,
+   *     because "empty" is also what an org cleared on purpose looks like: once
+   *     the auth expires or the org leaves the list, reconciliation clears the
+   *     target, and an unstamped port would drag the dead org back in on every
+   *     reload. The org is written BEFORE the stamp, so a crash between the two
+   *     costs nothing but another attempt next time. The global value is only ever
+   *     READ: other windows of this install need it too.
    * (a) One-time adoption, regardless of the opt-in: while the family shared a
    *     single setting this plugin stopped writing its private key, so on the
    *     first run after the toggle shipped that key is stale and the shared value
    *     is the user's actual last choice. The marker is then set unconditionally —
    *     once it is set, a sibling's later switch must not leak in behind a
-   *     disabled toggle.
+   *     disabled toggle. The marker is install-wide while the org is per window,
+   *     so this adoption lands in the FIRST window that activates; every later
+   *     window opens on the org (a0) ported forward, or on its own last pick.
    * (b) With sync ON, adopt a shared org that drifted while we weren't running.
    *
    * Never writes the shared setting: activation is not a user pick.
    */
   async migrate(): Promise<void> {
-    if (!this.memento.get<boolean>(MIGRATED_KEY)) {
+    if (!this.privateState.get<boolean>(PORTED_KEY)) {
+      if (!this.get()) {
+        // Read defensively: this is storage written by an older release and
+        // editable by hand, so it may hold anything at all — and `normalize`
+        // assumes a string. A rejected `migrate()` would leave the window org-less.
+        const legacy = this.installState.get<unknown>(PRIVATE_KEY);
+        if (typeof legacy === 'string' && legacy.trim()) await this.apply(legacy);
+      }
+      await this.privateState.update(PORTED_KEY, true);
+    }
+    if (!this.installState.get<boolean>(MIGRATED_KEY)) {
       const shared = getSharedOrg();
       if (shared) await this.apply(shared);
-      await this.memento.update(MIGRATED_KEY, true);
+      await this.installState.update(MIGRATED_KEY, true);
     }
     if (isOrgSyncEnabled()) await this.adoptShared();
   }
 
   get(): string | undefined {
-    return normalize(this.memento.get<string>(PRIVATE_KEY));
+    return normalize(this.privateState.get<string>(PRIVATE_KEY));
   }
 
   /**
@@ -138,7 +176,7 @@ export class OrgStore {
   private async apply(username: string | undefined): Promise<void> {
     const next = normalize(username);
     if (next === this.get()) return;
-    await this.memento.update(PRIVATE_KEY, next);
+    await this.privateState.update(PRIVATE_KEY, next);
     this.emitter.fire(next);
   }
 

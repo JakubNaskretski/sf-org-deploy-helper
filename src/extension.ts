@@ -6,7 +6,7 @@ import { DeployPanelProvider } from './panelProvider';
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('SF Org Deploy Wrapper');
   const sf = new SfCliService();
-  const orgStore = new OrgStore(context.globalState, msg => output.appendLine(msg));
+  const orgStore = new OrgStore(context.workspaceState, context.globalState, msg => output.appendLine(msg));
   const provider = new DeployPanelProvider(context, orgStore, sf, output);
 
   // Status bar org indicator (T13)
