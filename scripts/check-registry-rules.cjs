@@ -178,6 +178,30 @@ const FIXTURE = {
     fs.rmSync(proj, { recursive: true, force: true });
   });
 
+  await check('scanWorkspace: an untrusted repo cannot point a static resource at the rest of the disk', async () => {
+    // `<Name>` symlinked to a folder outside the project must not be walked: its
+    // files would be listed, backed up before a retrieve, and deployed as content.
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-static-link-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-outside-'));
+    fs.writeFileSync(path.join(outside, 'id_acme'), 'secret');
+    const dir = path.join(proj, 'force-app', 'main', 'default', 'staticresources');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(proj, 'sfdx-project.json'), JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }] }));
+    fs.writeFileSync(path.join(dir, 'AcmeLink.resource-meta.xml'), '<x/>');
+    fs.symlinkSync(outside, path.join(dir, 'AcmeLink'));
+    // Names that are not resource names name nothing — `..` would reach the folder above.
+    fs.writeFileSync(path.join(dir, '...resource-meta.xml'), '<x/>');
+    fs.writeFileSync(path.join(dir, '.hidden.resource-meta.xml'), '<x/>');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'static-link', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const { items } = await scanWorkspace([]);
+    assert.deepStrictEqual(items.map(i => `${i.type}:${i.name}`), ['StaticResource:AcmeLink']);
+    assert.deepStrictEqual(items[0].files.map(f => path.basename(f)), ['AcmeLink.resource-meta.xml'], 'nothing behind the link');
+    assert.strictEqual(inferItemForPath(path.join(dir, '.DS_Store')), undefined, 'a dotfile is no component');
+    fs.rmSync(proj, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
   // ---- locateRegistry against a fake CLI install ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-registry-'));
   const REL = ['node_modules', '@salesforce', 'source-deploy-retrieve', 'lib', 'src', 'registry', 'metadataRegistry.json'];
