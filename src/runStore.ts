@@ -6,7 +6,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import {
-  NOTICES_MAX, RunRecord, RunRow, RunStatus, TestRow, clampRunCap, interruptedRun, migrateCardHistory,
+  INTERRUPTED_NOTES, NOTICES_MAX, RunRecord, RunRow, RunStatus, TestRow, clampRunCap, interruptedRun, migrateCardHistory,
   noticeFromCard, normalizeRows, normalizeTests, summarizeRun, trimRuns
 } from './runRecords';
 
@@ -174,8 +174,11 @@ export class RunStore {
     this.load();
     const at = this.list.findIndex(r => r.id === id);
     if (at < 0) return false;
-    const { finishedAt: _finished, ...rest } = this.list[at];
-    this.list[at] = { ...rest, status: 'running' };
+    const { finishedAt: _finished, notes, ...rest } = this.list[at];
+    // A run marked interrupted while its job waited is running again: that
+    // note no longer holds.
+    const kept = (notes ?? []).filter(n => !INTERRUPTED_NOTES.includes(n));
+    this.list[at] = { ...rest, ...(kept.length ? { notes: kept } : {}), status: 'running' };
     this.persistRuns();
     this.post(true);
     return true;
@@ -218,12 +221,6 @@ export class RunStore {
     return this.fileChain;
   }
 
-  /** Post the history as it stands, e.g. after a live payload changed. */
-  postRuns(): void {
-    this.load();
-    this.post(false);
-  }
-
   /** A rebuilt webview: the history, with the newest run's full list read back
    *  from the rows file when this window does not hold it — only if it belongs
    *  to that same run and passes its guard. */
@@ -247,7 +244,9 @@ export class RunStore {
       if (at < 0 && this.list[0]) this.list[0] = summarizeRun(this.list[0], { latest: false });
       if (at === 0) this.list[0] = summarizeRun(run, { latest: true });
       else this.list.unshift(summarizeRun(run, { latest: true }));
-      this.full = { runId: run.id, rows: run.rows, tests: run.tests };
+      // Only a complete list is the full list: a run picked up again with just
+      // the rows its summary kept must still say it holds only those.
+      this.full = run.rowsComplete ? { runId: run.id, rows: run.rows, tests: run.tests } : undefined;
     }
     this.list = trimRuns(this.list, this.host.cap());
     if (this.full && this.list[0]?.id !== this.full.runId) this.full = undefined;
@@ -315,6 +314,8 @@ export class RunStore {
     this.fileChain = this.fileChain.then(async () => {
       try {
         await fs.rm(file, { force: true });
+        // A write cut off before its rename leaves the temp file behind.
+        await fs.rm(`${file}.tmp`, { force: true });
       } catch (err) {
         this.host.log(`[history] rows file delete failed: ${err instanceof Error ? err.message : String(err)}`);
       }

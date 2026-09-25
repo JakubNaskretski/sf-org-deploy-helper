@@ -485,6 +485,25 @@ check('Copy: the verdict, then one block per type with name, outcome, file:line,
 });
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+check('an error after the org had the job reads as "no result", never "didn\'t start"; a cancelling retrieve never says rolled back', () => {
+  const pending = [{ k: 'ApexClass:AcmeA', o: 'pending', s: 1 }, { k: 'ApexClass:AcmeB', o: 'pending', s: 1 }];
+  const early = base({ status: 'error', counts: { pending: 2, sent: 2 }, rows: pending, message: 'Unexpected end of JSON input' });
+  const submitted = Object.assign({}, early, { jobId: '0AfAc000001kQ9zSAE' });
+  assert.strictEqual(title(submitted), 'Deploy to acme-dev — no result');
+  assert.ok(plain(submitted).some(t => /Check Deployment Status in the org/.test(t)), plain(submitted).join(' | '));
+  assert.strictEqual(RV.outcomeLabel('pending', submitted), 'No result');
+  assert.ok(!/nothing from this run was applied/.test(RV.explainFor(submitted, 'pending').text), RV.explainFor(submitted, 'pending').text);
+  assert.strictEqual(RV.histLabel(submitted).text, 'Deploy: no result → acme-dev');
+  // Before the org had it, it really did not start.
+  assert.strictEqual(title(early), "Deploy to acme-dev didn't start");
+  assert.strictEqual(RV.outcomeLabel('pending', early), 'Not deployed');
+  assert.strictEqual(RV.histLabel(early).text, "Deploy didn't start → acme-dev");
+  const retrieving = base({ op: 'retrieve', status: 'running', finishedAt: undefined, counts: { pending: 2, sent: 2 }, rows: pending });
+  const said = plain(retrieving, { cancelRequested: true }).join(' ');
+  assert.ok(!/rolled back/.test(said) && /files it already wrote stay as they are/.test(said), said);
+  assert.ok(/rolled back/.test(plain(base({ status: 'running', finishedAt: undefined }), { cancelRequested: true }).join(' ')), 'a deploy\'s cancel still says it');
+});
+
 check('this harness is registered in package.json "check"', () => {
   assert.ok(pkg.scripts.check.includes('node ./scripts/check-run-view.cjs'));
 });

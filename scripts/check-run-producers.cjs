@@ -100,6 +100,8 @@ function provider(extra = {}) {
     learnedRules: () => [],
     orgStore: { get: () => ORG, set: async () => {}, setFromUserPick: async () => {} },
     loadFiles: async () => {}, maybeBackupBeforeRetrieve: async () => undefined,
+    // `ready`-only neighbours: the scan and the org list are not what this is about.
+    loadOrgs: async () => {}, sendActiveFile: () => {}, maybeAutoFetchOrg: () => {},
     output: { appendLine: () => {} },
     context: {
       workspaceState: { get: k => kept[k], update: async (k, v) => { kept[k] = v === undefined ? undefined : JSON.parse(JSON.stringify(v)); } },
@@ -251,9 +253,11 @@ check('a validation refused the same way offers no overwrite (it writes nothing)
 check('a submit that timed out: a "timeout" run that says the org may still finish it', async () => {
   const p = provider({ submitError: new SfCliError('Command timed out after 180000ms') });
   await deploy(p);
-  const run = last(p).runs[0];
+  const { runs: [run], latestRows } = last(p);
   assert.strictEqual(run.status, 'timeout');
   assert.ok(/commandTimeoutMs/.test(run.hint), run.hint);
+  const ids = RV.actionsFor(run, { isLatest: true, complete: true, sent: RR.sentKeys({ rows: latestRows.rows }) }).buttons.map(b => b.id);
+  assert.ok(!ids.includes('retry'), 'the org may still be deploying it: no Retry that would deploy it twice');
 });
 
 check('a submit killed by Cancel: the run says the org may still have taken it', async () => {
@@ -304,6 +308,20 @@ check('a validation that ran tests offers Quick Deploy live — the offer is nev
   const run = last(p).runs[0];
   assert.strictEqual(run.quick.jobId, JOB);
   assert.ok(!('quick' in p.kept.statusRuns.runs[0]));
+});
+
+check('a newer validation without tests never carries an older validation\'s Quick Deploy offer', async () => {
+  const p = provider({ report: VALIDATED });
+  await deploy(p, KEYS, { validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.strictEqual(last(p).runs[0].quick.jobId, JOB);
+  const JOB2 = '0AfAc000001kT2dSAE';
+  p.s.sf.deployMetadata = () => ({ promise: Promise.resolve({ result: { id: JOB2 }, cmd: 'sf project deploy start --json' }), cancel: () => undefined });
+  p.s.sf.deployReport = reportOnce({ id: JOB2, status: 'Succeeded', success: true, done: true });
+  await deploy(p, KEYS, { validateOnly: true, testLevel: 'NoTestRun' });
+  const run = last(p).runs[0];
+  assert.strictEqual(run.jobId, JOB2);
+  assert.strictEqual(run.quick, undefined, 'the offer belongs to the other validation\'s job');
+  assert.ok(!RV.actionsFor(run, { isLatest: true, complete: true, quick: run.quick }).buttons.some(b => b.id === 'quickDeploy'));
 });
 
 check('Quick Deploy is a run from its confirm: the validated set, its validation named, the org\'s report as its rows', async () => {
@@ -416,7 +434,33 @@ check('a job too old to pick up again: cleared without a report call, and its ru
   assert.strictEqual(reports, 0);
 });
 
-check('the slot is busy when the panel opens: the job waits for the next ready, its run stops claiming to run — and a later reattach still finishes it', async () => {
+check('a ready while THIS window polls the job (the view opened, rebuilt or moved mid-deploy): the run stays live — never "interrupted"', async () => {
+  const statuses = [];
+  const p = provider({ poll: async function (_jobId, _org, _root, progress) {
+    await proto.handleMessage.call(p.s, { type: 'ready' });
+    statuses.push(p.s.runStore.runs()[0].status, p.kept.statusRuns.runs[0].status);
+    progress({ status: 'InProgress', numberComponentsDeployed: 1, numberComponentsTotal: 3 });
+    return { kind: 'lost' };
+  } });
+  await deploy(p);
+  assert.deepStrictEqual(statuses, ['running', 'running']);
+  assert.ok(p.posted.some(m => m.type === 'runProgress'), 'its bars keep moving');
+  // Even a ready that finds no project (discovery lost it mid-deploy) leaves
+  // the job this window polls alone.
+  const q = provider({ poll: async function () {
+    q.s.workspaceRoot = undefined;
+    await proto.handleMessage.call(q.s, { type: 'ready' });
+    statuses.push(q.s.runStore.runs()[0].status);
+    return { kind: 'terminal', result: { id: JOB, status: 'Succeeded', success: true, done: true } };
+  } });
+  await deploy(q);
+  assert.strictEqual(statuses[2], 'running');
+  const run = last(p).runs[0];
+  assert.strictEqual(run.status, 'lost');
+  assert.ok(!(run.notes || []).some(n => RR.INTERRUPTED_NOTES.includes(n)), JSON.stringify(run.notes));
+});
+
+check('the slot is busy with something else when the panel opens (the job is from before the reload): the job waits, its run stops claiming to run — and a later reattach still finishes it', async () => {
   const { state, id } = await stateMidRun();
   const p = provider({ state, fields: { orgMembers: MEMBERS } });
   assert.strictEqual(p.s.runStore.runs()[0].status, 'running');
@@ -426,9 +470,40 @@ check('the slot is busy when the panel opens: the job waits for the next ready, 
   assert.strictEqual(p.kept.statusRuns.runs[0].status, 'interrupted');
   assert.ok(p.kept.activeDeployJob && p.kept.activeDeployJob.runId === id, 'the job is kept for the next ready');
   p.s.busy = false;
+  const posts = runsPosts(p).length;
   await proto.reattachDeployJob.call(p.s, proto.readActiveJob.call(p.s));
+  const resumed = runsPosts(p).slice(posts).find(m => m.runs[0].status === 'running');
+  assert.ok(resumed && !(resumed.runs[0].notes || []).some(n => RR.INTERRUPTED_NOTES.includes(n)), 'running again, without the "wasn\'t recorded" note');
   assert.deepStrictEqual(last(p).runs.map(r => [r.id, r.status]), [[id, 'succeeded']]);
   assert.ok(last(p).runs[0].notes.some(n => n.startsWith('Re-attached after a window reload')));
+});
+
+check('a reattach that loses contact again, after a reload: the summary\'s 50 skipped rows are never posted as the full list', async () => {
+  const { state, id } = await stateMidRun();
+  const p = provider({ state, fields: { orgMembers: MEMBERS }, poll: async () => ({ kind: 'lost' }) });
+  await proto.reattachDeployJob.call(p.s, proto.readActiveJob.call(p.s));
+  const m = last(p);
+  assert.deepStrictEqual([m.runs[0].id, m.runs[0].status, m.runs[0].rowsComplete], [id, 'lost', false]);
+  assert.ok(!('latestRows' in m), 'no full list to post');
+  const notes = RV.buildRows(m.runs[0], m.runs[0].rows, m.runs[0].tests, { filter: 'all', folds: {} }, { complete: false }).rows.filter(r => r.k === 'note');
+  assert.ok(notes.length && /not listed/.test(notes[0].text), JSON.stringify(notes));
+});
+
+check('a reattach retries with everything the run ran with: its test classes, its source folder', async () => {
+  const specified = await stateMidRun({ validateOnly: true, testLevel: 'RunSpecifiedTests', runTests: ['AcmeOrderServiceTest'] });
+  const a = provider({ state: specified.state, fields: { orgMembers: MEMBERS }, report: FAILED_VALIDATION });
+  await proto.reattachDeployJob.call(a.s, proto.readActiveJob.call(a.s));
+  const ra = last(a);
+  const retryA = RV.actionsFor(ra.runs[0], { isLatest: true, complete: true, sent: RR.sentKeys({ rows: ra.latestRows.rows }) }).buttons.find(b => b.id === 'retry');
+  assert.deepStrictEqual(retryA.message.request.runTests, ['AcmeOrderServiceTest']);
+  assert.strictEqual(retryA.message.request.testLevel, 'RunSpecifiedTests');
+  const dir = '/ws/force-app/main/default/classes';
+  const pinned = await stateMidRun({ sourceDir: dir });
+  const b = provider({ state: pinned.state, fields: { orgMembers: MEMBERS }, report: { ...FAILED_VALIDATION, runTestsEnabled: false } });
+  await proto.reattachDeployJob.call(b.s, proto.readActiveJob.call(b.s));
+  const rb = last(b);
+  const retryB = RV.actionsFor(rb.runs[0], { isLatest: true, complete: true, sent: RR.sentKeys({ rows: rb.latestRows.rows }) }).buttons.find(b2 => b2.id === 'retry');
+  assert.strictEqual(retryB.message.request.sourceDir, dir);
 });
 
 check('no project to pick the job up in: the persisted job\'s run is "interrupted" on ready', async () => {
@@ -570,6 +645,16 @@ check('a retrieve cancelled or timed out after its backup keeps the backup on it
     assert.ok(ids.includes('restore') && ids.includes('discard'), ids.join(','));
     assert.strictEqual(p.kept.statusRuns.runs[0].backupDir, BACKUP.dir, 'and a reload keeps it');
   }
+});
+
+check('a retrieve that failed after its backup keeps the backup on record but offers no Restore / Discard — nothing was retrieved', async () => {
+  const p = provider({ retrieveError: new SfCliError('INVALID_SESSION_ID: Session expired or invalid'), fields: { maybeBackupBeforeRetrieve: async () => BACKUP } });
+  await retrieve(p);
+  const run = last(p).runs[0];
+  assert.deepStrictEqual([run.status, run.backupDir], ['error', BACKUP.dir]);
+  const ids = RV.actionsFor(run, { isLatest: true, complete: true }).buttons.map(b => b.id);
+  assert.ok(!ids.includes('restore') && !ids.includes('discard'), ids.join(','));
+  assert.ok(run.notes.includes(BACKUP.note), 'the palette route is still named');
 });
 
 check('a package.xml retrieve: its named members are asked for, a wildcard never goes "missing", and an empty answer says so', async () => {

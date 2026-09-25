@@ -239,6 +239,32 @@ check('localKeyOf maps a bundle file failure onto its component, which becomes t
   assert.strictEqual(run.rows[0].f, 'acmeCard.js');
 });
 
+check('a run from the org\'s report (a reattach, a quick deploy) maps a bundle file failure onto its local component too', () => {
+  const B = 'LightningComponentBundle';
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false, files: [
+    { type: B, fullName: 'acmeCard/acmeCard.js', state: 'Failed', error: 'Unexpected token', lineNumber: 3, columnNumber: 7, filePath: 'lwc/acmeCard/acmeCard.js' },
+    { type: 'ApexClass', fullName: 'AcmeOrderService', state: 'Changed' }
+  ] }, BASE({ target: 'report', items: undefined, localKeyOf: (f) => (f.fullName.startsWith('acmeCard') ? `${B}:acmeCard` : undefined) }));
+  assert.deepStrictEqual(outcomes(run), { [`${B}:acmeCard`]: 'failed', 'ApexClass:AcmeOrderService': 'rolledback' });
+  const row = run.rows.find(r => r.k === `${B}:acmeCard`);
+  assert.deepStrictEqual([row.l, row.c, row.f, row.s], [3, 7, 'acmeCard.js', 1], 'the row keeps its file:line, on the key the workspace has');
+});
+
+check('thousands of failures on one component, and a pathological stack trace, stay fast (no copy per failure, no unbounded scan)', () => {
+  const many = Array.from({ length: 100000 }, (_, i) => ({ componentType: 'ApexClass', fullName: 'AcmeInvoiceService', problem: `Problem ${i % 50}`, lineNumber: 1 + (i % 9) }));
+  let t0 = Date.now();
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { componentFailures: many } }, BASE());
+  assert.ok(Date.now() - t0 < 1500, `grouping took ${Date.now() - t0} ms`);
+  assert.strictEqual(run.rows.filter(r => r.o === 'failed').length, 1);
+  const stack = 'Class.AcmeOrderServiceTest.run'.repeat(20000);
+  t0 = Date.now();
+  const tr = RR.deployRunFromResult({ status: 'Failed', success: false, details: { runTestResult: { failures: [
+    { name: 'AcmeOrderServiceTest', methodName: 'run', message: 'boom', stackTrace: stack }
+  ] } } }, BASE());
+  assert.ok(Date.now() - t0 < 1500, `the stack scan took ${Date.now() - t0} ms`);
+  assert.strictEqual(tr.tests[0].l, undefined);
+});
+
 check('an unmapped failure is its own failed row (Type:Name as the org spelled it) and is NOT sent', () => {
   const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { componentFailures: [
     { componentType: 'ApexClass', fullName: 'AcmeDependent', problem: 'Dependent class is invalid and needs recompilation' }

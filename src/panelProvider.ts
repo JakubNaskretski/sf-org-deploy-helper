@@ -3764,25 +3764,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private maybeReattachDeploy(): void {
     const job = this.readActiveJob();
     if (!job) return;
+    // This window is polling that job right now (the view was opened, rebuilt or
+    // moved mid-deploy): its run is live, and the ready replay just posted it.
+    if (job.jobId === this.currentDeployJobId) return;
     if (Date.now() - job.startedAt > ACTIVE_JOB_MAX_AGE_MS) {
       this.clearActiveJob();
       // Nothing will ever report on its run now.
       if (job.runId) this.runStore.interrupt(job.runId);
       return;
     }
-    // An op holds the slot: leave the job for the next ready.
+    // Another op holds the slot: leave the job for the next ready. Until then
+    // its run stops claiming to run (the reattach resumes the same run).
     if (this.busy || !this.reserveBusy(job.verb)) {
-      this.interruptPersistedRun();
+      if (job.runId) this.runStore.interrupt(job.runId);
       return;
     }
     void this.reattachDeployJob(job);
   }
 
-  /** The persisted job's run, when this window is not picking the job up now:
-   *  it stops claiming to run (a later reattach resumes the same run). */
+  /** The persisted job's run, when there is no project to pick the job up in:
+   *  it stops claiming to run (a later reattach resumes the same run). Never the
+   *  job this window is polling itself. */
   private interruptPersistedRun(): void {
-    const runId = this.readActiveJob()?.runId;
-    if (runId) this.runStore.interrupt(runId);
+    const job = this.readActiveJob();
+    if (job?.runId && job.jobId !== this.currentDeployJobId) this.runStore.interrupt(job.runId);
   }
 
   /** User-triggered counterpart to maybeReattachDeploy, reached from a lost-contact

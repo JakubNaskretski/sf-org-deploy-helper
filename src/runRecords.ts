@@ -263,9 +263,18 @@ function failedRow(k: string, failures: DeployFileResult[], sent: boolean): RunR
   return row;
 }
 
+/** Collect `v` under `k`, in place. */
+function group<V>(into: Map<string, V[]>, k: string, v: V): void {
+  const list = into.get(k);
+  if (list) list.push(v);
+  else into.set(k, [v]);
+}
+
 /** A test failure row. The link opens the test class, so the position is the
  *  first stack frame INSIDE that class when there is one (the top frame is often
  *  the class under test), else the top frame. */
+const STACK_SCAN_MAX = 4000;
+
 function testRow(t: DeployTestFailure): TestRow {
   const cls = typeof t.name === 'string' && t.name ? t.name : '?';
   const row: TestRow = {
@@ -273,7 +282,9 @@ function testRow(t: DeployTestFailure): TestRow {
     method: typeof t.methodName === 'string' && t.methodName ? t.methodName : '?',
     m: orgText(t.message ?? '', ROW_MESSAGE_MAX) || 'failed'
   };
-  const stack = typeof t.stackTrace === 'string' ? t.stackTrace : '';
+  // Capped before matching: the frame patterns scan to the end of a line, which
+  // is quadratic on a pathological one.
+  const stack = typeof t.stackTrace === 'string' ? t.stackTrace.slice(0, STACK_SCAN_MAX) : '';
   const own = new RegExp(`Class\\.${cls.replace(/[^A-Za-z0-9_]/g, '')}\\.[^:\\n]*: line (\\d+)(?:, column (\\d+))?`).exec(stack);
   const pos = own ?? /line (\d+)(?:, column (\d+))?/.exec(stack);
   if (pos) {
@@ -352,20 +363,26 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
 
   if (input.target === 'report' || input.target === 'manifest') {
     // No selection to lean on: the org's own rows are the run, and every one of
-    // them was part of what it deployed.
+    // them was part of what it deployed. A failure is keyed by the local
+    // component it belongs to when there is one (a bundle's file, say), so its
+    // row links to the source; only failures are looked up — they are few.
+    const failKey = (f: DeployFileResult): string => input.localKeyOf?.(f) ?? keyOf(f);
     const failed = new Map<string, DeployFileResult[]>();
+    const keyOfFailure = new Map<DeployFileResult, string>();
     for (const f of failures) {
-      const k = keyOf(f);
-      failed.set(k, [...(failed.get(k) ?? []), f]);
+      const k = failKey(f);
+      keyOfFailure.set(f, k);
+      group(failed, k, f);
     }
     const reported = [...(result.details?.componentSuccesses ?? []), ...detailFailures, ...(result.files ?? [])];
     for (const r of reported) {
       if (!r?.fullName || fileType(r) === '?') continue;
       if (fileType(r) === 'package.xml' || r.fullName === 'package.xml') continue;
-      const k = keyOf(r);
       // A failed file row counts even when the detail failure that stands for
-      // it spells the component differently (a bundle file, say).
-      const fails = failed.get(k) ?? (r.state === 'Failed' || fileProblem(r) ? [r] : undefined);
+      // it spells the component differently.
+      const fileFailed = r.state === 'Failed' || !!fileProblem(r);
+      const k = keyOfFailure.get(r) ?? (fileFailed ? failKey(r) : keyOf(r));
+      const fails = failed.get(k) ?? (fileFailed ? [r] : undefined);
       add(fails ? failedRow(k, fails, true) : { k, o: okOutcome, s: 1 });
     }
   } else {
@@ -374,10 +391,7 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
     // Failures first, grouped by the component they belong to — two errors in
     // one class are one row.
     const failed = new Map<string, DeployFileResult[]>();
-    for (const f of failures) {
-      const k = input.localKeyOf?.(f) ?? keyOf(f);
-      failed.set(k, [...(failed.get(k) ?? []), f]);
-    }
+    for (const f of failures) group(failed, input.localKeyOf?.(f) ?? keyOf(f), f);
     for (const i of items) {
       const k = `${i.type}:${i.name}`;
       const fails = failed.get(k);
@@ -628,10 +642,14 @@ export function summarizeRun(run: RunRecord, opts: { latest: boolean }): RunReco
 
 /** A run found still `running` when the window starts again, with no job of
  *  this window polling it: its result was never recorded. */
+/** What an interrupted run says, deploy family first — resume() drops it again. */
+export const INTERRUPTED_NOTES: readonly string[] = [
+  "The window closed while this ran; its result wasn't recorded. Check Deployment Status in the org.",
+  "The window closed while this ran; its result wasn't recorded, and files may be partly written."
+];
+
 export function interruptedRun(run: RunRecord): RunRecord {
-  const note = run.op === 'retrieve'
-    ? "The window closed while this ran; its result wasn't recorded, and files may be partly written."
-    : "The window closed while this ran; its result wasn't recorded. Check Deployment Status in the org.";
+  const note = INTERRUPTED_NOTES[run.op === 'retrieve' ? 1 : 0];
   return { ...run, status: 'interrupted', notes: [note, ...(run.notes ?? [])].slice(0, NOTES_MAX) };
 }
 

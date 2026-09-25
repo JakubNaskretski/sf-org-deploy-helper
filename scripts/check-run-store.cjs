@@ -303,6 +303,38 @@ check('Clear drops notices, finished runs and the rows file; a running run stays
     assert.deepStrictEqual(lastRuns(x).runs.map(r => r.id), ['runclr02']);
     await s.clear();
     assert.deepStrictEqual(x.state[RUNS_KEY].runs.map(r => r.id), ['runclr02'], 'Clear never drops the running run');
+    // A write cut off before its rename leaves a temp file: Clear takes it too.
+    fs.writeFileSync(path.join(dir, `${ROWS_FILE}.tmp`), '{"v":1');
+    await s.clear();
+    assert.ok(!fs.existsSync(path.join(dir, `${ROWS_FILE}.tmp`)), 'the leftover temp file is deleted');
+  } finally { await fsp.rm(dir, { recursive: true, force: true }); }
+});
+
+check('resume: an interrupted run runs again without the "wasn\'t recorded" note, and keeps its other notes', () => {
+  const r = run('runres01', { status: 'running' });
+  r.notes = ['Re-attached after a window reload: only what acme-dev\'s report contains.'];
+  const x = host({ state: { [RUNS_KEY]: { v: 1, runs: [r] }, [NOTICES_KEY]: [] } });
+  const s = x.store();
+  assert.strictEqual(s.runs()[0].status, 'interrupted');
+  assert.ok(RR.INTERRUPTED_NOTES.includes(s.runs()[0].notes[0]));
+  assert.strictEqual(s.resume('runres01'), true);
+  assert.strictEqual(s.runs()[0].status, 'running');
+  assert.deepStrictEqual(s.runs()[0].notes, r.notes);
+  assert.deepStrictEqual(lastRuns(x).runs[0].notes, r.notes, 'and the pane is told');
+});
+
+check('a run with only its summary\'s rows is never posted or written as the full list', async () => {
+  const dir = await tmpDir();
+  try {
+    const x = host({ dir });
+    const s = x.store();
+    const partial = Object.assign(run('runprt01', { skipped: 60 }), { rowsComplete: false });
+    partial.rows = partial.rows.slice(0, 50);
+    s.finish(partial);
+    await s.whenWritten();
+    assert.ok(!('latestRows' in lastRuns(x)), 'no full list to post');
+    assert.ok(!fs.existsSync(path.join(dir, ROWS_FILE)), 'and none written');
+    assert.strictEqual(lastRuns(x).runs[0].rowsComplete, false);
   } finally { await fsp.rm(dir, { recursive: true, force: true }); }
 });
 

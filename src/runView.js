@@ -93,7 +93,8 @@
    *  deployed when the run stopped before reaching it, and as no result when
    *  the org may still be working on it. */
   function outcomeLabel(o, run) {
-    if (o === 'pending' && run && run.status === 'error') return run.op === 'validate' ? 'Not validated' : run.op === 'retrieve' ? 'Not retrieved' : 'Not deployed';
+    // An error after the org had the job leaves its outcome unknown, not undone.
+    if (o === 'pending' && run && run.status === 'error' && !run.jobId) return run.op === 'validate' ? 'Not validated' : run.op === 'retrieve' ? 'Not retrieved' : 'Not deployed';
     if (o === 'pending' && run && run.status === 'running') return run.op === 'retrieve' ? 'Requested' : 'Sent';
     return (OUTCOMES[o] || { label: o }).label;
   }
@@ -118,7 +119,11 @@
       out.kind = 'run'; out.glyph = null;
       out.title = ctx.cancelRequested ? ['Cancelling on ', ORG, '…'] : [v.ing + ' ', ORG, '…'];
       out.sub = 'started ' + when;
-      if (ctx.cancelRequested) out.plain.push({ kind: 'warn', text: 'The org was asked to stop; whatever it already processed is rolled back.' });
+      if (ctx.cancelRequested) {
+        out.plain.push({ kind: 'warn', text: run.op === 'retrieve'
+          ? 'Stopping the retrieve — files it already wrote stay as they are.'
+          : 'The org was asked to stop; whatever it already processed is rolled back.' });
+      }
       return withNotes(out, run);
     }
     subParts.push(when);
@@ -200,7 +205,12 @@
         break;
       case 'error':
         out.kind = 'err'; out.glyph = '✗';
-        out.title = run.op === 'retrieve' ? ['Retrieve from ', ORG, ' failed — nothing was retrieved'] : [v.Noun + ' ' + v.prep + ' ', ORG, " didn't start"];
+        if (run.op === 'retrieve') out.title = ['Retrieve from ', ORG, ' failed — nothing was retrieved'];
+        else if (run.jobId) {
+          // The org had the job before this went wrong: its outcome is unknown.
+          out.title = [v.Noun + ' ' + v.prep + ' ', ORG, ' — no result'];
+          out.plain.push({ kind: 'warn', text: 'The org had the job, but its result could not be read here. Check Deployment Status in the org.' });
+        } else out.title = [v.Noun + ' ' + v.prep + ' ', ORG, " didn't start"];
         if (message) out.plain.push(message);
         if (run.hint) out.plain.push({ kind: 'warn', text: 'Hint: ' + run.hint });
         for (const a of run.cliActions || []) out.plain.push({ kind: 'muted', text: 'Try: ' + a });
@@ -303,7 +313,7 @@
           if (run.status === 'running') return { lead: '', text: 'Requested from ' + org + '; the files arrive when the retrieve finishes.' };
           return { lead: '', text: 'Requested from ' + org + ', but no result came back — files may be partly written. Check your working tree.' };
         }
-        if (run.status === 'error') return { lead: '', text: 'The ' + v.noun + ' stopped before reaching ' + org + ' — nothing from this run was applied.' };
+        if (run.status === 'error' && !run.jobId) return { lead: '', text: 'The ' + v.noun + ' stopped before reaching ' + org + ' — nothing from this run was applied.' };
         if (run.status === 'running') return { lead: '', text: 'Sent to ' + org + '; each component\'s result arrives when the org finishes.' };
         return { lead: '', text: 'Sent to ' + org + ', but no result came back — the org may still apply them. Check Deployment Status in the org.' };
       case 'changed': return { lead: '', text: 'Local files overwritten with the ' + org + ' version.' + (run.backupDir ? ' The old copies were backed up first.' : '') };
@@ -337,7 +347,7 @@
       case 'lost': return { kind: 'warn', glyph: '⚠', text: 'Lost contact' + arrow + org };
       case 'timeout': return { kind: 'warn', glyph: '⚠', text: 'Timed out' + arrow + org };
       case 'interrupted': return { kind: 'skip', glyph: '⊘', text: 'Interrupted ' + v.noun + arrow + org };
-      case 'error': return { kind: 'err', glyph: '✗', text: v.Noun + (run.op === 'retrieve' ? ' failed' : ' didn\'t start') + arrow + org };
+      case 'error': return { kind: 'err', glyph: '✗', text: v.Noun + (run.op === 'retrieve' ? ' failed' : run.jobId ? ': no result' : ' didn\'t start') + arrow + org };
     }
     if (run.op === 'retrieve') {
       const got = cnt(run, 'changed') + cnt(run, 'created') + cnt(run, 'unchanged');
