@@ -1,6 +1,8 @@
 // @ts-nocheck
 (function () {
   const vscode = acquireVsCodeApi();
+  // Run-card view logic (src/runView.js), loaded by its own script tag first.
+  const RV = window.RunView;
 
   // Cap on status cards kept in the webview — mirrors the provider's
   // CARD_HISTORY_MAX (panelProvider.ts) so the live view and the persisted history
@@ -63,6 +65,24 @@
     progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
+    // Deploy / validate / quick-deploy / retrieve runs, newest first, exactly as
+    // the provider keeps them. With none, the Status pane is the card list above
+    // it always was; with some, the newest run is drawn in full and everything
+    // else — older runs and statusCards alike — is a one-liner.
+    runs: [],
+    runCap: 3,
+    // The newest run's full row list, when the provider sent it; the run itself
+    // may carry only a summary (failures and a few skipped rows).
+    latestRows: null,
+    // The running run's live counts (runProgress): five numbers, never rows.
+    runProgress: null,
+    // How the newest run's list is being looked at: chip filter, search, folds,
+    // keyboard focus. In memory only, and reset when another run becomes newest.
+    runUi: { runId: null, filter: 'all', q: '', folds: {}, openAll: undefined, focus: -1 },
+    // Per run id: Quick Deploy used, the suggestion view's state, and whether an
+    // older run is expanded in the Earlier block.
+    runLocal: {},
+    earlierOpen: false,
     cmdLog: [],
     // Collapsed unless the user opened it. A new key: the old `cmdLogCollapsed`
     // was written as false on every save, so it would keep the log open for
@@ -312,6 +332,9 @@
     state.cancelRequested = true;
     send('cancel');
     renderActions();
+    // A running run's card says "Cancelling…" too — the provider's confirming
+    // `busy` post changes nothing it would repaint for.
+    if (state.runs.length && state.runs[0].status === 'running') renderStatus();
   });
   $('useActive').addEventListener('click', () => send('useActiveFile'));
   $('useOpenTabs').addEventListener('click', () => send('useOpenTabs'));
@@ -328,9 +351,23 @@
   renderCmdLog(); // the markup's default must not win until the first command
   $('clearStatus').addEventListener('click', () => {
     state.statusCards = [];
+    // A run still running stays: its result is on its way and lands on it.
+    state.runs = state.runs.filter(r => r.status === 'running');
+    if (!state.runs.length) state.latestRows = null;
+    state.runLocal = {};
     send('clearStatusHistory'); // also drop the persisted history, or it resurrects on reload
     renderStatus();
   });
+  // Earlier (k): older runs and notices, one line each, above the newest run.
+  if ($('statusEarlier')) {
+    $('statusEarlier').addEventListener('click', () => {
+      state.earlierOpen = !state.earlierOpen;
+      renderStatus();
+    });
+  }
+  // The run list is virtual and the whole pane is its scroller: every scroll
+  // repaints the rows in view (once per frame).
+  $('status').addEventListener('scroll', () => { if (runList) scheduleRunPaint(); });
   $('clearCmdLog').addEventListener('click', (e) => {
     e.stopPropagation();   // don't also toggle the log's collapse
     state.cmdLog = [];
@@ -710,7 +747,59 @@
             c.suggestOpen = false;
           }
         }
+        const latest = state.runs[0];
+        if (latest && latest.suggest && latest.suggest.id === msg.id) {
+          const local = runLocalFor(latest.id);
+          local.suggestDone = undefined;
+          local.suggestOpen = false;
+        }
         renderStatus();
+        return;
+      }
+      case 'runs': {
+        // The provider's run history, newest first. `latestRows` (the newest
+        // run's full list) comes with a run's result and on a rebuild; any other
+        // post keeps the list already here — but only while the same run is
+        // still the newest one.
+        const runs = (Array.isArray(msg.runs) ? msg.runs : []).filter(r => r && typeof r === 'object'
+          && typeof r.id === 'string' && typeof r.op === 'string' && typeof r.status === 'string'
+          && typeof r.orgLabel === 'string' && typeof r.startedAt === 'number');
+        for (const r of runs) {
+          if (!Array.isArray(r.rows)) r.rows = [];
+          if (!Array.isArray(r.tests)) r.tests = [];
+          if (!r.counts || typeof r.counts !== 'object') r.counts = {};
+        }
+        state.runs = runs;
+        if (typeof msg.cap === 'number') state.runCap = msg.cap;
+        const latest = runs[0];
+        const lr = msg.latestRows;
+        if (latest && lr && lr.runId === latest.id && Array.isArray(lr.rows)) {
+          state.latestRows = { runId: lr.runId, rows: lr.rows, tests: Array.isArray(lr.tests) ? lr.tests : [] };
+        } else if (!latest || !state.latestRows || state.latestRows.runId !== latest.id) {
+          state.latestRows = null;
+        }
+        if (!latest || latest.status !== 'running' || !state.runProgress || state.runProgress.id !== latest.id) state.runProgress = null;
+        const ids = new Set(runs.map(r => r.id));
+        for (const id of Object.keys(state.runLocal)) if (!ids.has(id)) delete state.runLocal[id];
+        renderStatus();
+        return;
+      }
+      case 'runProgress': {
+        // A poll tick of the running run: counts only, drawn in place.
+        const latest = state.runs[0];
+        if (!latest || latest.status !== 'running' || msg.id !== latest.id) return;
+        const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+        state.runProgress = {
+          id: msg.id, orgStatus: typeof msg.orgStatus === 'string' ? msg.orgStatus : '',
+          compDone: num(msg.compDone), compTotal: num(msg.compTotal),
+          testDone: num(msg.testDone), testTotal: num(msg.testTotal), errors: num(msg.errors)
+        };
+        if (runProg && runProg.parentNode) {
+          const fresh = runProgressEl(latest);
+          runProg.parentNode.insertBefore(fresh, runProg);
+          runProg.remove();
+          runProg = fresh;
+        } else renderStatus();
         return;
       }
       case 'suggestionRestore': {
@@ -2003,31 +2092,14 @@
   }
 
   function renderStatus() {
+    if (RV && state.runs.length) { renderRunStatus(); return; }
+    // No run history: the pane is the plain card list, newest first.
+    releaseRunList();
     const st = $('status');
     st.innerHTML = '';
     const csBtn = $('clearStatus'); if (csBtn) csBtn.style.display = state.statusCards.length ? '' : 'none';
-    if (state.progress) {
-      const el = document.createElement('div');
-      el.className = 'status-card progress';
-      const t = document.createElement('div');
-      t.className = 'title';
-      const sp = document.createElement('span');
-      sp.className = 'spinner';
-      t.appendChild(sp);
-      const txt = document.createElement('span');
-      txt.textContent = state.progress.text;
-      t.appendChild(txt);
-      el.appendChild(t);
-      const m = document.createElement('div');
-      m.className = 'meta';
-      m.append('elapsed ');
-      const es = document.createElement('span');
-      es.id = 'progressElapsed';
-      es.textContent = fmtElapsed(Date.now() - state.progress.startedAt);
-      m.appendChild(es);
-      el.appendChild(m);
-      st.appendChild(el);
-    }
+    const earlierBtn = $('statusEarlier'); if (earlierBtn) earlierBtn.style.display = 'none';
+    if (state.progress) st.appendChild(progressCardEl());
     if (state.statusCards.length === 0 && !state.progress) {
       const d = document.createElement('div');
       d.className = 'status-empty';
@@ -2035,17 +2107,46 @@
       st.appendChild(d);
       return;
     }
-    for (const card of state.statusCards) {
-      const el = document.createElement('div');
-      el.className = `status-card ${card.kind || 'ok'}`;
-      // Suggestion view (state B): the card keeps its error list (so the
-      // decision has evidence) and swaps its buttons for checkbox rows. Plain
-      // local state, same pattern as card.expanded.
-      if (card.suggest && card.suggestOpen && !card.suggestDone) {
-        renderSuggestOpen(card, el);
-        st.appendChild(el);
-        continue;
-      }
+    for (const card of state.statusCards) st.appendChild(statusCardEl(card, true));
+  }
+
+  /** The generic spinner card of a running operation. */
+  function progressCardEl() {
+    const el = document.createElement('div');
+    el.className = 'status-card progress';
+    const t = document.createElement('div');
+    t.className = 'title';
+    const sp = document.createElement('span');
+    sp.className = 'spinner';
+    t.appendChild(sp);
+    const txt = document.createElement('span');
+    txt.textContent = state.progress.text;
+    t.appendChild(txt);
+    el.appendChild(t);
+    const m = document.createElement('div');
+    m.className = 'meta';
+    m.append('elapsed ');
+    const es = document.createElement('span');
+    es.id = 'progressElapsed';
+    es.textContent = fmtElapsed(Date.now() - state.progress.startedAt);
+    m.appendChild(es);
+    el.appendChild(m);
+    return el;
+  }
+
+  /** One status card. `withTitle` false is a notice expanded under its own
+   *  one-line title, so the body alone follows. */
+  function statusCardEl(card, withTitle) {
+    const el = document.createElement('div');
+    el.className = `status-card ${card.kind || 'ok'}`;
+    // Suggestion view (state B): the card keeps its error list (so the
+    // decision has evidence) and swaps its buttons for checkbox rows. Plain
+    // local state, same pattern as card.expanded.
+    if (card.suggest && card.suggestOpen && !card.suggestDone) {
+      renderSuggestOpen(card, el);
+      return el;
+    }
+    if (withTitle) {
       const t = document.createElement('div');
       t.className = 'title';
       const ic = document.createElement('span');
@@ -2063,153 +2164,159 @@
         t.appendChild(time);
       }
       el.appendChild(t);
-      if (card.meta) {
-        const m = document.createElement('div');
-        m.className = 'meta';
-        m.textContent = card.meta;
-        el.appendChild(m);
+    }
+    if (card.meta) {
+      const m = document.createElement('div');
+      m.className = 'meta';
+      m.textContent = card.meta;
+      el.appendChild(m);
+    }
+    renderCardLines(card, el);
+    if (card.errText) {
+      const e = document.createElement('div');
+      e.className = 'err-text';
+      e.textContent = card.errText;
+      el.appendChild(e);
+    }
+    if (card.actions && card.actions.length) {
+      const tl = document.createElement('div');
+      tl.className = 'try-label';
+      tl.textContent = 'Try:';
+      el.appendChild(tl);
+      const aul = document.createElement('ul');
+      for (const a of card.actions) {
+        const li = document.createElement('li');
+        li.textContent = a;
+        aul.appendChild(li);
       }
-      renderCardLines(card, el);
-      if (card.errText) {
-        const e = document.createElement('div');
-        e.className = 'err-text';
-        e.textContent = card.errText;
-        el.appendChild(e);
-      }
-      if (card.actions && card.actions.length) {
-        const tl = document.createElement('div');
-        tl.className = 'try-label';
-        tl.textContent = 'Try:';
-        el.appendChild(tl);
-        const aul = document.createElement('ul');
-        for (const a of card.actions) {
-          const li = document.createElement('li');
-          li.textContent = a;
-          aul.appendChild(li);
-        }
-        el.appendChild(aul);
-      }
-      if (card.hint) {
-        const h = document.createElement('div');
-        h.className = 'hint';
-        h.textContent = `Hint: ${card.hint}`;
-        el.appendChild(h);
-      }
-      // The card is the durable error record (failures also raise a native VS Code
-      // notification) — give it the Copy affordance the old footer used to carry.
-      if (card.kind === 'err') {
-        const cp = document.createElement('button');
-        cp.className = 'card-copy';
-        cp.textContent = 'Copy';
-        cp.title = 'Copy the full error to the clipboard';
-        cp.addEventListener('click', () => {
-          // Lines can be {text, key, line} objects (clickable error rows) — a raw
-          // join stringifies those to "[object Object]"; copy their text instead.
-          const lineText = (l) => (l && typeof l === 'object' ? l.text || '' : l);
-          const parts = [card.title, card.meta, (card.lines || []).map(lineText).join('\n'), card.errText];
-          if (card.actions && card.actions.length) parts.push('Try:\n' + card.actions.map(a => '• ' + a).join('\n'));
-          if (card.hint) parts.push('Hint: ' + card.hint);
-          send('copyText', { text: parts.filter(Boolean).join('\n\n') });
+      el.appendChild(aul);
+    }
+    if (card.hint) {
+      const h = document.createElement('div');
+      h.className = 'hint';
+      h.textContent = `Hint: ${card.hint}`;
+      el.appendChild(h);
+    }
+    // The card is the durable error record (failures also raise a native VS Code
+    // notification) — give it the Copy affordance the old footer used to carry.
+    if (card.kind === 'err') {
+      const cp = document.createElement('button');
+      cp.className = 'card-copy';
+      cp.textContent = 'Copy';
+      cp.title = 'Copy the full error to the clipboard';
+      cp.addEventListener('click', () => {
+        // Lines can be {text, key, line} objects (clickable error rows) — a raw
+        // join stringifies those to "[object Object]"; copy their text instead.
+        const lineText = (l) => (l && typeof l === 'object' ? l.text || '' : l);
+        const parts = [card.title, card.meta, (card.lines || []).map(lineText).join('\n'), card.errText];
+        if (card.actions && card.actions.length) parts.push('Try:\n' + card.actions.map(a => '• ' + a).join('\n'));
+        if (card.hint) parts.push('Hint: ' + card.hint);
+        send('copyText', { text: parts.filter(Boolean).join('\n\n') });
+      });
+      el.appendChild(cp);
+    }
+    // Quick Deploy affordance on a successful validate-only card: deploy the
+    // already-validated components without re-running validation or tests.
+    if (card.quickDeploy && card.quickDeploy.jobId && !card.quickDeployDone) {
+      const qd = document.createElement('button');
+      qd.className = 'primary quick-deploy';
+      qd.textContent = card.quickDeploy.label || 'Quick Deploy validated components';
+      qd.disabled = state.busy || !!state.pendingAction;
+      qd.title = 'Deploy the validated components — skips validation and the test run.';
+      qd.addEventListener('click', () => {
+        if (state.busy || state.pendingAction) return;
+        card.quickDeployDone = true;   // one-shot: a validation can be quick-deployed once
+        renderStatus();
+        send('quickDeploy', { jobId: card.quickDeploy.jobId });
+      });
+      el.appendChild(qd);
+    }
+    // Card-defined action buttons (e.g. Restore backup… / Discard backup on a
+    // retrieve result) — each posts its own `send` payload verbatim, spread
+    // through the same send() every toolbar/tree control uses. Disabled while
+    // busy, like the toolbar, so a click can't race a running operation.
+    // The suggestion's "Try with dependencies" entry point is independent of
+    // card.buttons — a card can carry a suggestion with no other buttons at
+    // all (an envelope-level failure with no retry key list to extend still
+    // offers one when it resolved locally), so the wrap can't be gated on
+    // card.buttons alone.
+    if ((card.buttons && card.buttons.length) || (card.suggest && !card.suggestDone)) {
+      const bwrap = document.createElement('div');
+      bwrap.className = 'card-buttons';
+      for (const b of card.buttons || []) {
+        const cb = document.createElement('button');
+        cb.className = 'card-btn';
+        cb.textContent = b.label || '';
+        // Retry (plain or +changed-vs-branch) rides the deploy pipeline, which
+        // QUEUES while busy — keeping it clickable matches the Deploy/Validate
+        // buttons. Resume monitoring and the restore/discard actions need the
+        // single operation slot themselves. "Select these N" only ticks tree
+        // rows — no org call, no operation slot — so busy never gates it.
+        const queueable = b.send && (b.send.type === 'retryDeploy' || b.send.type === 'retryDeployChanged');
+        const selectionOnly = b.send && b.send.type === 'selectDeployed';
+        // Everything but the selection-only button also waits for the
+        // provider's answer to the previous click (sendAction).
+        const pending = !!state.pendingAction && !selectionOnly;
+        cb.disabled = (state.busy && !queueable && !selectionOnly) || pending;
+        if (pending) cb.title = 'Sending…';
+        else if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
+        cb.addEventListener('click', () => {
+          if (state.busy && !queueable && !selectionOnly) return;
+          if (selectionOnly) send(b.send.type, b.send);
+          else sendAction(b.send.type, b.send);
         });
-        el.appendChild(cp);
+        bwrap.appendChild(cb);
       }
-      // Quick Deploy affordance on a successful validate-only card: deploy the
-      // already-validated components without re-running validation or tests.
-      if (card.quickDeploy && card.quickDeploy.jobId && !card.quickDeployDone) {
-        const qd = document.createElement('button');
-        qd.className = 'primary quick-deploy';
-        qd.textContent = card.quickDeploy.label || 'Quick Deploy validated components';
-        qd.disabled = state.busy || !!state.pendingAction;
-        qd.title = 'Deploy the validated components — skips validation and the test run.';
-        qd.addEventListener('click', () => {
-          if (state.busy || state.pendingAction) return;
-          card.quickDeployDone = true;   // one-shot: a validation can be quick-deployed once
+      // State-A entry into the suggestion view, alongside the retry buttons.
+      // Opening is purely local (plus a log ping) — nothing deploys yet, so
+      // it stays enabled even while busy.
+      if (card.suggest && !card.suggestDone) {
+        const sb = document.createElement('button');
+        sb.className = 'card-btn suggest-open-btn';
+        sb.textContent = `Try with dependencies (${card.suggest.candidates.length})`;
+        sb.title = 'Review the missing components this failure references and retry with a selection of them.';
+        sb.addEventListener('click', () => {
+          card.suggestOpen = true;
+          // Reopening supersedes an earlier Back — the verdict question would
+          // otherwise linger under a live suggestion view.
+          card.suggestDeclined = false;
+          send('suggestionOpened', { id: card.suggest.id });
           renderStatus();
-          send('quickDeploy', { jobId: card.quickDeploy.jobId });
         });
-        el.appendChild(qd);
+        bwrap.appendChild(sb);
       }
-      // Card-defined action buttons (e.g. Restore backup… / Discard backup on a
-      // retrieve result) — each posts its own `send` payload verbatim, spread
-      // through the same send() every toolbar/tree control uses. Disabled while
-      // busy, like the toolbar, so a click can't race a running operation.
-      // The suggestion's "Try with dependencies" entry point is independent of
-      // card.buttons — a card can carry a suggestion with no other buttons at
-      // all (an envelope-level failure with no retry key list to extend still
-      // offers one when it resolved locally), so the wrap can't be gated on
-      // card.buttons alone.
-      if ((card.buttons && card.buttons.length) || (card.suggest && !card.suggestDone)) {
-        const bwrap = document.createElement('div');
-        bwrap.className = 'card-buttons';
-        for (const b of card.buttons || []) {
-          const cb = document.createElement('button');
-          cb.className = 'card-btn';
-          cb.textContent = b.label || '';
-          // Retry (plain or +changed-vs-branch) rides the deploy pipeline, which
-          // QUEUES while busy — keeping it clickable matches the Deploy/Validate
-          // buttons. Resume monitoring and the restore/discard actions need the
-          // single operation slot themselves. "Select these N" only ticks tree
-          // rows — no org call, no operation slot — so busy never gates it.
-          const queueable = b.send && (b.send.type === 'retryDeploy' || b.send.type === 'retryDeployChanged');
-          const selectionOnly = b.send && b.send.type === 'selectDeployed';
-          // Everything but the selection-only button also waits for the
-          // provider's answer to the previous click (sendAction).
-          const pending = !!state.pendingAction && !selectionOnly;
-          cb.disabled = (state.busy && !queueable && !selectionOnly) || pending;
-          if (pending) cb.title = 'Sending…';
-          else if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
-          cb.addEventListener('click', () => {
-            if (state.busy && !queueable && !selectionOnly) return;
-            if (selectionOnly) send(b.send.type, b.send);
-            else sendAction(b.send.type, b.send);
-          });
-          bwrap.appendChild(cb);
-        }
-        // State-A entry into the suggestion view, alongside the retry buttons.
-        // Opening is purely local (plus a log ping) — nothing deploys yet, so
-        // it stays enabled even while busy.
-        if (card.suggest && !card.suggestDone) {
-          const sb = document.createElement('button');
-          sb.className = 'card-btn suggest-open-btn';
-          sb.textContent = `Try with dependencies (${card.suggest.candidates.length})`;
-          sb.title = 'Review the missing components this failure references and retry with a selection of them.';
-          sb.addEventListener('click', () => {
-            card.suggestOpen = true;
-            // Reopening supersedes an earlier Back — the verdict question would
-            // otherwise linger under a live suggestion view.
-            card.suggestDeclined = false;
-            send('suggestionOpened', { id: card.suggest.id });
-            renderStatus();
-          });
-          bwrap.appendChild(sb);
-        }
-        el.appendChild(bwrap);
+      el.appendChild(bwrap);
+    }
+    renderSuggestAfter(card, card.suggest, el);
+    return el;
+  }
+
+  /** After the suggestion view: the "retrying…" note, or — once, after Back —
+   *  a small in-card question about whether the suggestion was off. `holder`
+   *  keeps the view's state (a card, or a run's local state). */
+  function renderSuggestAfter(holder, suggest, el) {
+    if (holder.suggestDone) {
+      const d = document.createElement('div');
+      d.className = 'suggest-summary';
+      d.textContent = holder.suggestDone;
+      el.appendChild(d);
+    }
+    if (holder.suggestDeclined && !holder.suggestVerdictDone && !holder.suggestDone && suggest) {
+      const fb = document.createElement('div');
+      fb.className = 'suggest-feedback';
+      fb.append('Was this suggestion off? ');
+      for (const [label, bad] of [['Yes — off', true], ['No, made sense', false]]) {
+        const b = document.createElement('button');
+        b.className = 'card-btn small';
+        b.textContent = label;
+        b.addEventListener('click', () => {
+          holder.suggestVerdictDone = true;
+          send('suggestionVerdict', { id: suggest.id, bad });
+          renderStatus();
+        });
+        fb.appendChild(b);
       }
-      if (card.suggestDone) {
-        const d = document.createElement('div');
-        d.className = 'suggest-summary';
-        d.textContent = card.suggestDone;
-        el.appendChild(d);
-      }
-      // Post-decline feedback, one shot: a small in-card question, no popups.
-      if (card.suggestDeclined && !card.suggestVerdictDone && !card.suggestDone) {
-        const fb = document.createElement('div');
-        fb.className = 'suggest-feedback';
-        fb.append('Was this suggestion off? ');
-        for (const [label, bad] of [['Yes — off', true], ['No, made sense', false]]) {
-          const b = document.createElement('button');
-          b.className = 'card-btn small';
-          b.textContent = label;
-          b.addEventListener('click', () => {
-            card.suggestVerdictDone = true;
-            send('suggestionVerdict', { id: card.suggest.id, bad });
-            renderStatus();
-          });
-          fb.appendChild(b);
-        }
-        el.appendChild(fb);
-      }
-      st.appendChild(el);
+      el.appendChild(fb);
     }
   }
 
@@ -2218,10 +2325,6 @@
    *  buttons. Selection state lives on the card object (card.suggestSel),
    *  surviving re-renders exactly like card.expanded. */
   function renderSuggestOpen(card, el) {
-    card.suggestSel = card.suggestSel || {};
-    for (const c of card.suggest.candidates) {
-      if (!(c.key in card.suggestSel)) card.suggestSel[c.key] = true; // pre-checked
-    }
     const t = document.createElement('div');
     t.className = 'title';
     const ic = document.createElement('span');
@@ -2234,26 +2337,36 @@
     el.appendChild(t);
     const m = document.createElement('div');
     m.className = 'meta';
-    m.textContent = 'Referenced by the failed components and present in your workspace — untick any you don\u2019t want.';
+    m.textContent = 'Referenced by the failed components and present in your workspace — untick any you don’t want.';
     el.appendChild(m);
     // The org's own error lines stay visible while deciding — swapping the whole
     // card body for the checkbox list hid exactly the evidence the decision
     // needs. Same list, same cap, as the normal card body (state A).
     renderCardLines(card, el);
+    renderSuggestChoices(card, card.suggest, el, 'result arrives as its own card');
+  }
 
+  /** The suggestion's checkbox rows (pre-checked) and its Deploy with N / Back
+   *  buttons. `holder` keeps the selection and the view state; `doneNote` says
+   *  where the retry's result will show up. */
+  function renderSuggestChoices(holder, suggest, el, doneNote) {
+    holder.suggestSel = holder.suggestSel || {};
+    for (const c of suggest.candidates) {
+      if (!(c.key in holder.suggestSel)) holder.suggestSel[c.key] = true; // pre-checked
+    }
     const ul = document.createElement('ul');
     ul.className = 'suggest-rows';
-    for (const c of card.suggest.candidates) {
+    for (const c of suggest.candidates) {
       const li = document.createElement('li');
       const lbl = document.createElement('label');
       const cb = document.createElement('input');
       cb.type = 'checkbox';
-      cb.checked = !!card.suggestSel[c.key];
-      cb.addEventListener('change', () => { card.suggestSel[c.key] = cb.checked; renderStatus(); });
+      cb.checked = !!holder.suggestSel[c.key];
+      cb.addEventListener('change', () => { holder.suggestSel[c.key] = cb.checked; renderStatus(); });
       lbl.appendChild(cb);
       const txt = document.createElement('span');
       // "OrderSvc -> add CustomObject:Billing__mdt": cause first, fix second.
-      txt.textContent = `${c.from ? c.from + '  \u2192  ' : ''}add ${c.key}`;
+      txt.textContent = `${c.from ? c.from + '  →  ' : ''}add ${c.key}`;
       lbl.appendChild(txt);
       li.appendChild(lbl);
       // The org sentence that produced this candidate — the "why", so a
@@ -2268,14 +2381,14 @@
     }
     el.appendChild(ul);
     // Referents that exist nowhere locally: context, not choices.
-    if (card.suggest.unresolved && card.suggest.unresolved.length) {
+    if (suggest.unresolved && suggest.unresolved.length) {
       const u = document.createElement('div');
       u.className = 'suggest-unresolved';
-      u.textContent = `Not found in your workspace (retrieve it, or its type is not scanned): ${card.suggest.unresolved.join(', ')}`;
+      u.textContent = `Not found in your workspace (retrieve it, or its type is not scanned): ${suggest.unresolved.join(', ')}`;
       el.appendChild(u);
     }
 
-    const n = card.suggest.candidates.filter(c => card.suggestSel[c.key]).length;
+    const n = suggest.candidates.filter(c => holder.suggestSel[c.key]).length;
     const bwrap = document.createElement('div');
     bwrap.className = 'card-buttons';
     const dep = document.createElement('button');
@@ -2288,10 +2401,10 @@
     if (state.busy && n > 0) dep.title = `Wait for ${state.busyAction || 'the running operation'} to finish`;
     dep.addEventListener('click', () => {
       if (n === 0) return;
-      const keys = card.suggest.candidates.map(c => c.key).filter(k => card.suggestSel[k]);
-      card.suggestDone = `Retrying with ${keys.length} added component${keys.length === 1 ? '' : 's'}\u2026 (result arrives as its own card)`;
-      card.suggestOpen = false;
-      send('suggestionDeploy', { id: card.suggest.id, keys });
+      const keys = suggest.candidates.map(c => c.key).filter(k => holder.suggestSel[k]);
+      holder.suggestDone = `Retrying with ${keys.length} added component${keys.length === 1 ? '' : 's'}… (${doneNote})`;
+      holder.suggestOpen = false;
+      send('suggestionDeploy', { id: suggest.id, keys });
       renderStatus();
     });
     bwrap.appendChild(dep);
@@ -2299,13 +2412,695 @@
     back.className = 'card-btn';
     back.textContent = 'Back';
     back.addEventListener('click', () => {
-      card.suggestOpen = false;
-      card.suggestDeclined = true;
-      send('suggestionDeclined', { id: card.suggest.id });
+      holder.suggestOpen = false;
+      holder.suggestDeclined = true;
+      send('suggestionDeclined', { id: suggest.id });
       renderStatus();
     });
     bwrap.appendChild(back);
     el.appendChild(bwrap);
+  }
+
+  // ---- Run cards ----
+  // With a run history the pane shows the newest deploy / validation / quick
+  // deploy / retrieve in full — verdict, count chips that filter, its actions,
+  // and every component in a virtual list — and everything older (runs and
+  // notices alike) as one-liners behind the header's Earlier toggle. What to
+  // say and which rows exist is src/runView.js (window.RunView); this is only
+  // the DOM, and every org-derived string reaches it as textContent.
+  const RUN_OVERSCAN = 6;      // rows kept in the DOM beyond each edge of the view
+  const NEWER_NOTICES_SHOWN = 3;
+  const OLDER_FAILURES_SHOWN = 25;
+  const OLDER_TESTS_SHOWN = 10;
+  let runList = null;          // the newest run's list (role=tree), a child of #status
+  let runHead = null;          // everything above the list: its height moves the list
+  let runActs = null;
+  let runProg = null;
+  let runElapsed = null;
+  let runSearch = null;
+  let runModel = null;         // RV.buildRows for the newest run
+  let runSrc = null;           // { rows, tests, complete } that list is built from
+  let runGroupCache = {};
+  let runPaintQueued = false;
+  let runResize = null;
+  let runClock = null;
+  let runSearchTimer = null;
+  const runTiming = { build: 0, paint: 0 };
+
+  function mk(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function runLocalFor(id) { return (state.runLocal[id] ||= {}); }
+  /** The newest run's view state, reset when another run becomes the newest. */
+  function runUiFor(run) {
+    if (state.runUi.runId !== run.id) {
+      state.runUi = { runId: run.id, filter: 'all', q: '', folds: {}, openAll: undefined, focus: -1 };
+      runGroupCache = {};
+    }
+    return state.runUi;
+  }
+  /** What the newest run's list is built from: its full rows when the provider
+   *  sent them for THIS run, else the summary the run itself carries. */
+  function runSource(run) {
+    const lr = state.latestRows;
+    if (lr && lr.runId === run.id) return { rows: lr.rows, tests: lr.tests, complete: true };
+    return { rows: run.rows, tests: run.tests, complete: run.rowsComplete === true };
+  }
+  function releaseRunList() {
+    runList = runHead = runActs = runProg = runElapsed = runSearch = null;
+    runModel = runSrc = null;
+    if (runResize) runResize.disconnect();
+    syncRunClock(null);
+  }
+
+  function renderRunStatus() {
+    const st = $('status');
+    const latest = state.runs[0];
+    const ui = runUiFor(latest);
+    // A re-render replaces the pane's content; where it was scrolled to, and
+    // which of its controls had the keyboard, carry over.
+    const scroll = st.scrollTop;
+    const listFocused = !!runList && document.activeElement === runList;
+    const searchCaret = runSearch && document.activeElement === runSearch ? [runSearch.selectionStart, runSearch.selectionEnd] : null;
+    releaseRunList();
+    st.innerHTML = '';
+    // Notices since the newest run lead, a few at most, so the run stays in
+    // reach of a short pane; the rest join the older entries behind Earlier.
+    const newer = state.statusCards.filter(c => (c.at || 0) > latest.startedAt).slice(0, NEWER_NOTICES_SHOWN);
+    const earlier = [
+      ...state.runs.slice(1).map(run => ({ run, at: run.startedAt })),
+      ...state.statusCards.filter(c => !newer.includes(c)).map(card => ({ card, at: card.at || 0 }))
+    ].sort((a, b) => b.at - a.at);
+    const csBtn = $('clearStatus');
+    if (csBtn) csBtn.style.display = state.statusCards.length || state.runs.some(r => r.status !== 'running') ? '' : 'none';
+    const earlierBtn = $('statusEarlier');
+    if (earlierBtn) {
+      earlierBtn.style.display = earlier.length ? '' : 'none';
+      earlierBtn.textContent = `Earlier (${earlier.length}) ${state.earlierOpen ? '▾' : '▸'}`;
+      earlierBtn.setAttribute('aria-expanded', state.earlierOpen ? 'true' : 'false');
+      earlierBtn.title = state.earlierOpen ? 'Hide older runs and notices' : 'Show older runs and notices';
+    }
+    // The generic spinner card is for everything that isn't a run; a running
+    // run shows its own progress.
+    if (state.progress && latest.status !== 'running') st.appendChild(progressCardEl());
+    if (state.earlierOpen && earlier.length) {
+      const box = mk('div', 'run-earlier');
+      for (const e of earlier) box.appendChild(e.run ? olderRunEl(e.run) : noticeEl(e.card));
+      st.appendChild(box);
+    }
+    for (const card of newer) st.appendChild(noticeEl(card));
+    st.appendChild(runHeroEl(latest, ui));
+    st.scrollTop = scroll;
+    paintRunList();
+    if (listFocused) runList.focus();
+    if (searchCaret && runSearch) {
+      runSearch.focus();
+      try { runSearch.setSelectionRange(searchCaret[0], searchCaret[1]); } catch (_) { /* not a text input any more */ }
+    }
+    if (typeof ResizeObserver === 'function') {
+      // The pane resizing (splitter, sidebar width) or anything above the list
+      // changing height moves the window the list must paint.
+      if (!runResize) runResize = new ResizeObserver(() => { if (runList) scheduleRunPaint(); });
+      runResize.observe(st);
+      if (runHead) runResize.observe(runHead);
+    }
+    syncRunClock(latest);
+  }
+
+  /** A one-line entry (older run or notice) that expands in place. */
+  function hrowEl(kind, glyph, text, when, open) {
+    const b = mk('button', 'run-hrow');
+    b.type = 'button';
+    b.setAttribute('aria-expanded', open ? 'true' : 'false');
+    b.title = text;
+    b.appendChild(mk('span', 'run-caret', open ? '▾' : '▸'));
+    const g = mk('span', `run-rglyph g-${kind}`, glyph);
+    g.setAttribute('aria-hidden', 'true');
+    b.appendChild(g);
+    b.appendChild(mk('span', 'run-htxt', text));
+    b.appendChild(mk('span', 'run-when', when));
+    return b;
+  }
+
+  function noticeEl(card) {
+    const wrap = mk('div', 'run-notice');
+    const b = hrowEl(card.kind || 'ok', CARD_ICONS[card.kind] || CARD_ICONS.ok, card.title || '', card.at ? fmtCardTime(card.at) : '', !!card.noticeOpen);
+    b.addEventListener('click', () => { card.noticeOpen = !card.noticeOpen; renderStatus(); });
+    wrap.appendChild(b);
+    if (card.noticeOpen) wrap.appendChild(statusCardEl(card, false));
+    return wrap;
+  }
+
+  /** An older run: its one-line summary, and when expanded a read-only record —
+   *  verdict, counts, message, the failures it kept, and Copy. */
+  function olderRunEl(run) {
+    const local = runLocalFor(run.id);
+    const wrap = mk('div', 'run-older');
+    const l = RV.histLabel(run);
+    const b = hrowEl(l.kind, l.glyph, l.text, RV.fmtWhen(run.startedAt), !!local.open);
+    b.addEventListener('click', () => { local.open = !local.open; renderStatus(); });
+    wrap.appendChild(b);
+    if (!local.open) return wrap;
+    const ctx = { now: Date.now(), fromRun: run.fromRunId ? state.runs.find(r => r.id === run.fromRunId) : null };
+    const v = RV.verdictFor(run, ctx);
+    const body = mk('div', 'run-older-body');
+    body.appendChild(runVerdictEl(run, v));
+    const counts = RV.chipDefs(run).filter(c => c.id !== 'all' && c.n > 0).map(c => `${RV.fmtN(c.n)} ${c.label.toLowerCase()}`);
+    if (counts.length) body.appendChild(mk('div', 'run-sub', counts.join(' · ')));
+    const failures = run.rows.filter(r => r.o === 'failed').slice(0, OLDER_FAILURES_SHOWN);
+    const tests = run.tests.slice(0, OLDER_TESTS_SHOWN);
+    if (failures.length || tests.length) {
+      const ul = mk('ul', 'run-older-rows');
+      for (const r of failures) ul.appendChild(olderRowEl(r.k, `${r.k}${r.m ? ' — ' + r.m.split('\n')[0] : ''}`, r.l, r.c));
+      for (const t of tests) ul.appendChild(olderRowEl(`ApexClass:${t.cls}`, `${t.cls}.${t.method} — ${t.m.split('\n')[0]}`, t.l, t.c));
+      body.appendChild(ul);
+    }
+    const acts = mk('div', 'run-acts');
+    for (const a of RV.actionsFor(run, { isLatest: false }).buttons) {
+      const btn = mk('button', 'run-btn', a.label);
+      btn.type = 'button';
+      btn.title = a.title || '';
+      btn.addEventListener('click', () => send('copyText', { text: RV.copyText(run, run.rows, run.tests, ctx) }));
+      acts.appendChild(btn);
+    }
+    body.appendChild(acts);
+    body.appendChild(mk('div', 'run-foot', 'Actions are on the newest run only.'));
+    wrap.appendChild(body);
+    return wrap;
+  }
+  function olderRowEl(key, text, line, column) {
+    const li = mk('li', '', text);
+    li.title = text;
+    // Only a component with local source opens — org-only rows name nothing
+    // the editor could show.
+    if (state.localKeys.has(key)) {
+      li.classList.add('nav');
+      li.addEventListener('click', () => openRunKey(key, line, column));
+    }
+    return li;
+  }
+  /** Open a row's source: only for a key the workspace scan has. */
+  function openRunKey(key, line, column) {
+    if (!state.localKeys.has(key)) return;
+    send('openFile', { key, line, column });
+  }
+
+  function runOrgEl(run) {
+    const s = mk('span', 'run-org', run.orgLabel);
+    const pill = run.orgKind === 'prod' ? ['prod', 'PROD'] : run.orgKind === 'sandbox' ? ['sandbox', 'sandbox'] : run.orgKind === 'scratch' ? ['scratch', 'scratch'] : null;
+    if (pill) {
+      const p = mk('span', `run-pill ${pill[0]}`, pill[1]);
+      p.title = pill[0] === 'prod' ? 'Production org' : `${pill[1]} org`;
+      s.appendChild(p);
+    }
+    return s;
+  }
+
+  function runVerdictEl(run, v) {
+    const box = mk('div', 'run-verdict');
+    const g = mk('span', `run-glyph ${v.kind}`);
+    g.setAttribute('aria-hidden', 'true');
+    if (v.glyph === null) g.appendChild(mk('span', 'spinner')); else g.textContent = v.glyph;
+    box.appendChild(g);
+    const text = mk('div', 'run-vtext');
+    const title = mk('div', 'run-title');
+    for (const p of v.title) title.append(p === RV.ORG ? runOrgEl(run) : p);
+    text.appendChild(title);
+    const sub = mk('div', 'run-sub', v.sub);
+    sub.title = new Date(run.startedAt).toLocaleString();
+    text.appendChild(sub);
+    for (const p of v.plain) {
+      const line = mk('div', `run-plain${p.kind ? ' ' + p.kind : ''}`, p.text);
+      line.title = p.text;
+      text.appendChild(line);
+    }
+    box.appendChild(text);
+    return box;
+  }
+
+  /** Components and tests bars, the elapsed clock, and errors so far. */
+  function runProgressEl(run) {
+    const p = state.runProgress && state.runProgress.id === run.id ? state.runProgress : null;
+    const box = mk('div', 'run-prog');
+    const bar = (label, done, total, waiting, note) => {
+      const row = mk('div', 'run-prow');
+      row.appendChild(mk('span', 'run-plbl', label));
+      const track = mk('span', 'run-bar' + (waiting ? ' indet' : ''));
+      track.setAttribute('role', 'progressbar');
+      track.setAttribute('aria-label', label);
+      const fill = mk('i');
+      if (!waiting && total) {
+        fill.style.width = `${Math.min(100, (100 * done) / total)}%`;
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', String(total));
+        track.setAttribute('aria-valuenow', String(done));
+      }
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(mk('span', 'run-pn', note));
+      return row;
+    };
+    if (!p) box.appendChild(bar('Components', 0, 0, true, 'waiting for the org'));
+    else {
+      box.appendChild(bar('Components', p.compDone, p.compTotal, !p.compTotal, `${RV.fmtN(p.compDone)}/${RV.fmtN(p.compTotal)}`));
+      // Tests run after the components are in, so until then they are queued.
+      if (p.testTotal) {
+        const queued = p.testDone === 0 && p.compDone < p.compTotal;
+        box.appendChild(bar('Tests', p.testDone, p.testTotal, queued, queued ? `${RV.fmtN(p.testTotal)} queued` : `${RV.fmtN(p.testDone)}/${RV.fmtN(p.testTotal)}`));
+      }
+    }
+    const foot = mk('div', 'run-prow');
+    foot.appendChild(mk('span', 'run-plbl', 'Elapsed'));
+    runElapsed = mk('span', 'run-pn', RV.fmtElapsed(Date.now() - run.startedAt));
+    foot.appendChild(runElapsed);
+    if (p && p.errors) foot.appendChild(mk('span', 'run-perr', `${RV.fmtN(p.errors)} ${RV.plural(p.errors, 'error')} so far`));
+    box.appendChild(foot);
+    return box;
+  }
+  /** The running run's clock ticks once a second; nothing else runs a timer. */
+  function syncRunClock(run) {
+    const want = !!run && run.status === 'running';
+    if (!want) { if (runClock) { clearInterval(runClock); runClock = null; } return; }
+    if (!runClock) {
+      runClock = setInterval(() => {
+        const r = state.runs[0];
+        if (runElapsed && r && r.status === 'running') runElapsed.textContent = RV.fmtElapsed(Date.now() - r.startedAt);
+      }, 1000);
+    }
+  }
+
+  function runHeroEl(run, ui) {
+    const local = runLocalFor(run.id);
+    const ctx = {
+      // The offer is one-shot: once used, "available until" has nothing left to say.
+      now: Date.now(), quick: local.quickUsed ? undefined : run.quick,
+      fromRun: run.fromRunId ? state.runs.find(r => r.id === run.fromRunId) : null,
+      cancelRequested: run.status === 'running' && state.cancelRequested
+    };
+    const v = RV.verdictFor(run, ctx);
+    runSrc = runSource(run);
+    const chips = RV.chipDefs(run);
+    // A filter whose rows are gone (a chip now at 0, or absent) falls back to All.
+    const active = chips.find(c => c.id === ui.filter);
+    if (!active || active.disabled) ui.filter = 'all';
+    buildRunModel(run, ui);
+
+    const card = mk('div', `run-card ${v.kind}`);
+    runHead = mk('div', 'run-head');
+    runHead.appendChild(runVerdictEl(run, v));
+    if (run.status === 'running') { runProg = runProgressEl(run); runHead.appendChild(runProg); }
+
+    const chipBox = mk('div', 'run-chips');
+    chipBox.setAttribute('role', 'group');
+    chipBox.setAttribute('aria-label', 'Filter the list by outcome');
+    for (const c of chips) {
+      const b = mk('button', `run-chip k-${c.kind}`);
+      b.type = 'button';
+      b.dataset.chip = c.id;
+      b.setAttribute('aria-pressed', ui.filter === c.id ? 'true' : 'false');
+      b.disabled = !!c.disabled;
+      b.title = c.id === 'all' ? 'Everything this run reported'
+        : c.disabled ? `None ${c.label.toLowerCase()} in this run`
+          : RV.explainFor(run, c.id, runSrc.rows).text || `Show only ${c.label.toLowerCase()}`;
+      const dot = mk('span', 'run-dot');
+      dot.setAttribute('aria-hidden', 'true');
+      b.appendChild(dot);
+      b.append(c.label);
+      b.appendChild(mk('span', 'run-n', RV.fmtN(c.n)));
+      b.addEventListener('click', () => {
+        if (b.disabled) return;
+        ui.filter = c.id;
+        ui.focus = -1;
+        ui.openAll = undefined;
+        renderStatus();
+      });
+      chipBox.appendChild(b);
+    }
+    runHead.appendChild(chipBox);
+
+    const ex = RV.explainFor(run, ui.filter, runSrc.rows);
+    if (ex.text) {
+      const kind = ui.filter === 'all' ? '' : (chips.find(c => c.id === ui.filter) || {}).kind || '';
+      const line = mk('div', `run-explain${kind ? ' k-' + kind : ''}`);
+      if (ex.lead) line.appendChild(mk('b', '', ex.lead));
+      line.append(ex.text);
+      runHead.appendChild(line);
+    }
+
+    runActs = mk('div', 'run-acts');
+    renderRunActs(run);
+    runHead.appendChild(runActs);
+
+    // Suggestion state B: the choices sit between the actions and the list,
+    // and the failures stay in view below them as the evidence.
+    if (run.suggest && local.suggestOpen && !local.suggestDone) {
+      const box = mk('div', 'run-suggest');
+      box.appendChild(mk('div', 'run-suggest-title', 'Retry with missing dependencies?'));
+      box.appendChild(mk('div', 'run-sub', 'Referenced by the failed components and present in your workspace — untick any you don’t want.'));
+      renderSuggestChoices(local, run.suggest, box, 'the retry becomes the newest run');
+      runHead.appendChild(box);
+    } else {
+      const after = mk('div', 'run-suggest-after');
+      renderSuggestAfter(local, run.suggest, after);
+      if (after.children.length) runHead.appendChild(after);
+    }
+
+    if (runSrc.rows.length + runSrc.tests.length > RV.SEARCH_MIN_ROWS) runHead.appendChild(runToolsEl(ui));
+    card.appendChild(runHead);
+
+    runList = mk('div', 'run-list');
+    runList.setAttribute('role', 'tree');
+    runList.setAttribute('aria-label', 'Run results');
+    runList.tabIndex = 0;
+    runList.style.height = `${runModel.rows.length ? runModel.totalH : 0}px`;
+    runList.addEventListener('keydown', onRunListKey);
+    runList.addEventListener('focus', () => {
+      // Tabbing in lands on the first row in view — never a jump back to the top.
+      if (state.runUi.focus >= 0 || !runModel || !runModel.rows.length) return;
+      const st = $('status');
+      const [lo] = RV.visibleRange(runModel.offsets, runModel.rows.length, st.scrollTop - runList.offsetTop, st.clientHeight, 0);
+      setRunFocus(runStep(lo - 1, 1), false);
+    });
+    card.appendChild(runList);
+    return card;
+  }
+
+  function buildRunModel(run, ui) {
+    const t0 = performance.now();
+    runModel = RV.buildRows(run, runSrc.rows, runSrc.tests, ui, { cache: runGroupCache, complete: runSrc.complete });
+    runTiming.build = performance.now() - t0;
+    if (ui.focus >= runModel.rows.length) ui.focus = -1;
+  }
+
+  /** The newest run's buttons (RV.actionsFor) for what the list shows now. */
+  function renderRunActs(run) {
+    if (!runActs) return;
+    runActs.replaceChildren();
+    const local = runLocalFor(run.id);
+    const ui = state.runUi;
+    const chip = ui.filter === 'all' ? null : RV.chipDefs(run).find(c => c.id === ui.filter);
+    const selectKeys = [...new Set(runModel.visible.map(r => r.k).filter(k => state.localKeys.has(k)))];
+    const { buttons, why } = RV.actionsFor(run, {
+      isLatest: true, busy: state.busy, pending: !!state.pendingAction, busyAction: state.busyAction,
+      complete: runSrc.complete, sent: runSrc.rows.filter(r => r.s === 1).map(r => r.k), selectKeys,
+      filterLabel: chip ? chip.label.toLowerCase() : '',
+      quick: run.quick, suggest: run.suggest, quickUsed: !!local.quickUsed, suggestDone: !!local.suggestDone
+    });
+    for (const b of buttons) {
+      const btn = mk('button', `run-btn${b.primary ? ' primary' : ''}`, b.label);
+      btn.type = 'button';
+      btn.dataset.act = b.id;
+      btn.title = b.title || '';
+      btn.disabled = !!b.disabled;
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        if (b.via === 'copy') send('copyText', { text: RV.copyText(run, runModel.visible, runModel.visibleTests, { now: Date.now(), quick: run.quick }) });
+        else if (b.via === 'send') send(b.message.type, b.message);
+        else if (b.via === 'open') {
+          local.suggestOpen = true;
+          // Reopening supersedes an earlier Back.
+          local.suggestDeclined = false;
+          send('suggestionOpened', { id: run.suggest.id });
+          renderStatus();
+        } else if (sendAction(b.message.type, b.message) && b.id === 'quickDeploy') {
+          local.quickUsed = true; // one-shot: a validation can be quick-deployed once
+        }
+      });
+      runActs.appendChild(btn);
+    }
+    if (why) runActs.appendChild(mk('div', 'run-why', why));
+    runActs.style.display = buttons.length || why ? '' : 'none';
+  }
+
+  function runToolsEl(ui) {
+    const box = mk('div', 'run-tools');
+    const input = mk('input', 'run-search');
+    input.type = 'search';
+    input.placeholder = 'Filter by name, type, message or file…';
+    input.setAttribute('aria-label', 'Filter the run results');
+    input.spellcheck = false;
+    input.value = ui.q;
+    input.addEventListener('input', () => {
+      if (runSearchTimer) clearTimeout(runSearchTimer);
+      runSearchTimer = setTimeout(() => {
+        // A new search opens its own matches: folds made under the last one go.
+        ui.q = input.value;
+        ui.focus = -1;
+        ui.folds = {};
+        ui.openAll = undefined;
+        refreshRunList();
+      }, 100);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || !input.value) return;
+      input.value = '';
+      ui.q = '';
+      ui.folds = {};
+      refreshRunList();
+    });
+    runSearch = input;
+    box.appendChild(input);
+    for (const [label, open] of [['Expand', true], ['Collapse', false]]) {
+      const b = mk('button', 'run-btn', label);
+      b.type = 'button';
+      b.title = `${label} every group`;
+      b.addEventListener('click', () => { ui.openAll = open; ui.folds = {}; ui.focus = -1; refreshRunList(); });
+      box.appendChild(b);
+    }
+    return box;
+  }
+
+  /** Rebuild the list (and the buttons that count it) after a search, fold or
+   *  Expand/Collapse, leaving the rest of the card — and the search box's
+   *  caret — alone. */
+  function refreshRunList() {
+    const run = state.runs[0];
+    if (!run || !runList || !RV) return;
+    buildRunModel(run, state.runUi);
+    renderRunActs(run);
+    runList.style.height = `${runModel.rows.length ? runModel.totalH : 0}px`;
+    paintRunList();
+  }
+
+  function scheduleRunPaint() {
+    if (runPaintQueued) return;
+    runPaintQueued = true;
+    deferRender(paintRunList);
+  }
+
+  /** Put the rows in view (plus RUN_OVERSCAN either side) into the DOM. The
+   *  list scrolls with the whole pane, so the view is the pane's viewport in
+   *  list coordinates; offsetTop is read on every paint because anything
+   *  above the list can move it. */
+  function paintRunList() {
+    runPaintQueued = false;
+    if (!runList || !runModel) return;
+    const t0 = performance.now();
+    const rows = runModel.rows;
+    if (!rows.length) {
+      const ui = state.runUi;
+      const run = state.runs[0];
+      runList.replaceChildren(mk('div', 'run-empty', ui.q.trim() ? `No row matches "${ui.q.trim()}".`
+        : run && run.status === 'running' ? 'Results land here when the org finishes.' : 'Nothing in this view.'));
+      runList.removeAttribute('aria-activedescendant');
+      return;
+    }
+    const st = $('status');
+    const [lo, hi] = RV.visibleRange(runModel.offsets, rows.length, st.scrollTop - runList.offsetTop, st.clientHeight, RUN_OVERSCAN);
+    const nodes = [];
+    for (let i = lo; i < hi; i++) nodes.push(runRowEl(rows[i], i));
+    runList.replaceChildren(...nodes);
+    const focus = state.runUi.focus;
+    if (focus >= 0) runList.setAttribute('aria-activedescendant', `run-row-${focus}`); else runList.removeAttribute('aria-activedescendant');
+    runTiming.paint = performance.now() - t0;
+    if (debugTiming) console.log(`[timing] runs: build ${runTiming.build.toFixed(1)}ms (${rows.length} rows) · paint ${runTiming.paint.toFixed(1)}ms (${hi - lo} nodes)`);
+  }
+
+  function runRowEl(r, i) {
+    const row = mk('div', `run-row ${r.k}${(r.k === 'leaf' && r.row.m) || r.k === 'test' ? ' tall' : ''}${i === state.runUi.focus ? ' focused' : ''}`);
+    row.id = `run-row-${i}`;
+    row.style.top = `${runModel.offsets[i]}px`;
+    row.style.height = `${r.h}px`;
+    const run = state.runs[0];
+    const glyph = (kind) => { const g = mk('span', `run-rglyph g-${kind}`, RV.GLYPH[kind] || '•'); g.setAttribute('aria-hidden', 'true'); return g; };
+    const copyBtn = (text) => {
+      const b = mk('button', 'run-mini', 'copy');
+      b.type = 'button';
+      b.tabIndex = -1;
+      b.title = 'Copy this row (c)';
+      b.addEventListener('click', (e) => { e.stopPropagation(); send('copyText', { text }); });
+      return b;
+    };
+    const location = (key, text, line, column) => {
+      // A link only for a component with local source — the same gate the old
+      // cards used; anything else is plain text.
+      if (!state.localKeys.has(key)) return mk('span', 'run-loc', text);
+      const a = mk('button', 'run-link', text);
+      a.type = 'button';
+      a.tabIndex = -1;
+      a.title = `Open ${key}${line ? ` at line ${line}` : ''}`;
+      a.addEventListener('click', (e) => { e.stopPropagation(); setRunFocus(i, false); openRunKey(key, line, column); });
+      return a;
+    };
+    switch (r.k) {
+      case 'section':
+      case 'note':
+        row.setAttribute('role', 'presentation');
+        row.appendChild(mk('span', r.k === 'note' ? 'run-note' : 'run-name', r.k === 'note' ? r.text : r.label));
+        if (r.k === 'section') row.appendChild(mk('span', 'run-cnt', RV.fmtN(r.n)));
+        return row;
+      case 'group':
+      case 'tgroup': {
+        row.setAttribute('role', 'treeitem');
+        row.setAttribute('aria-level', '1');
+        row.setAttribute('aria-expanded', r.open ? 'true' : 'false');
+        row.title = `${r.open ? 'Collapse' : 'Expand'} ${r.label}`;
+        row.appendChild(mk('span', 'run-caret', r.open ? '▾' : '▸'));
+        const kinds = r.k === 'tgroup' ? ['failed'] : Object.keys(r.counts);
+        row.appendChild(glyph(r.failed ? 'err' : kinds.length === 1 ? RV.outcomeKind(kinds[0]) : 'ok'));
+        row.appendChild(mk('span', 'run-name', r.label));
+        const n = mk('span', 'run-cnt');
+        const parts = [];
+        let told = 0;
+        if (r.failed) { parts.push(mk('span', 'bad', `${RV.fmtN(r.failed)} failed`)); told += r.failed; }
+        if (r.k === 'group' && state.runUi.filter === 'all') {
+          for (const o of ['skipped', 'rolledback', 'passed']) {
+            if (r.counts[o]) { parts.push(`${RV.fmtN(r.counts[o])} ${RV.outcomeLabel(o, run).toLowerCase()}`); told += r.counts[o]; }
+          }
+        }
+        // The size, unless the parts already add up to it.
+        if (r.k === 'group' && told !== r.n) parts.push(RV.fmtN(r.n));
+        parts.forEach((p, k) => { if (k) n.append(' · '); n.append(p); });
+        row.appendChild(n);
+        row.addEventListener('click', () => { setRunFocus(i, false); toggleRunGroup(i); });
+        return row;
+      }
+      case 'leaf': {
+        const x = r.row;
+        row.setAttribute('role', 'treeitem');
+        row.setAttribute('aria-level', '2');
+        row.appendChild(glyph(RV.outcomeKind(x.o)));
+        const body = mk('div', 'run-body');
+        const l1 = mk('div', 'run-l1');
+        const name = mk('span', 'run-name', r.name);
+        name.title = `${x.k} — ${RV.outcomeLabel(x.o, run)}`;
+        l1.appendChild(name);
+        if (x.f || x.l) l1.appendChild(location(x.k, `${x.f || r.name}${x.l ? `:${x.l}${x.c ? `:${x.c}` : ''}` : ''}`, x.l, x.c));
+        const why = RV.whyText(x);
+        if (why) l1.appendChild(mk('span', 'run-why-col', why));
+        l1.appendChild(copyBtn(RV.rowCopyText(x, run)));
+        body.appendChild(l1);
+        if (x.m) {
+          const m = mk('div', 'run-msg', x.m);
+          m.title = x.m;
+          body.appendChild(m);
+        }
+        row.appendChild(body);
+        if (state.localKeys.has(x.k)) row.title = `Open ${x.k}`;
+        row.addEventListener('click', () => { setRunFocus(i, false); openRunKey(x.k, x.l, x.c); });
+        return row;
+      }
+      case 'test': {
+        const t = r.test;
+        const key = `ApexClass:${t.cls}`;
+        row.setAttribute('role', 'treeitem');
+        row.setAttribute('aria-level', '2');
+        row.appendChild(glyph('err'));
+        const body = mk('div', 'run-body');
+        const l1 = mk('div', 'run-l1');
+        const name = mk('span', 'run-name', `${t.cls}.${t.method}`);
+        name.title = name.textContent;
+        l1.appendChild(name);
+        if (t.l) l1.appendChild(location(key, `${t.cls}:${t.l}`, t.l, t.c));
+        l1.appendChild(copyBtn(RV.testCopyText(t)));
+        body.appendChild(l1);
+        const m = mk('div', 'run-msg', t.m);
+        m.title = t.m;
+        body.appendChild(m);
+        row.appendChild(body);
+        row.addEventListener('click', () => { setRunFocus(i, false); openRunKey(key, t.l, t.c); });
+        return row;
+      }
+    }
+    return row;
+  }
+
+  function toggleRunGroup(i) {
+    const r = runModel && runModel.rows[i];
+    if (!r || (r.k !== 'group' && r.k !== 'tgroup')) return;
+    state.runUi.folds[r.id] = !r.open;
+    state.runUi.focus = i; // rows above a group never move when it folds
+    refreshRunList();
+  }
+
+  const runFocusable = (i) => !!runModel && i >= 0 && i < runModel.rows.length && runModel.rows[i].k !== 'section' && runModel.rows[i].k !== 'note';
+  function runStep(from, dir) {
+    let j = from + dir;
+    while (j >= 0 && j < runModel.rows.length && !runFocusable(j)) j += dir;
+    return j >= 0 && j < runModel.rows.length ? j : from;
+  }
+  /** Move the keyboard focus to row i, scrolling the pane just enough to show it. */
+  function setRunFocus(i, scroll) {
+    if (!runFocusable(i)) return;
+    state.runUi.focus = i;
+    if (scroll !== false) {
+      const st = $('status');
+      const top = runList.offsetTop + runModel.offsets[i];
+      const bottom = top + runModel.rows[i].h;
+      if (top < st.scrollTop) st.scrollTop = top;
+      else if (bottom > st.scrollTop + st.clientHeight) st.scrollTop = bottom - st.clientHeight;
+    }
+    paintRunList();
+  }
+  function activateRunRow(i) {
+    const r = runModel.rows[i];
+    if (!r) return;
+    if (r.k === 'group' || r.k === 'tgroup') toggleRunGroup(i);
+    else if (r.k === 'leaf') openRunKey(r.row.k, r.row.l, r.row.c);
+    else if (r.k === 'test') openRunKey(`ApexClass:${r.test.cls}`, r.test.l, r.test.c);
+  }
+  function copyRunRow(i) {
+    const r = runModel.rows[i];
+    const run = state.runs[0];
+    if (!r || !run) return;
+    const text = r.k === 'leaf' ? RV.rowCopyText(r.row, run)
+      : r.k === 'test' ? RV.testCopyText(r.test)
+        : r.k === 'group' || r.k === 'tgroup' ? `${r.label} (${r.n})` : '';
+    if (text) send('copyText', { text });
+  }
+  /** Tree keyboard: ↑↓ Home End PgUp PgDn move, ← → fold, Enter opens, c copies. */
+  function onRunListKey(e) {
+    if (!runModel || !runModel.rows.length) return;
+    const i = state.runUi.focus;
+    if (i < 0) {
+      if (['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter', ' '].includes(e.key)) { setRunFocus(runStep(-1, 1)); e.preventDefault(); }
+      return;
+    }
+    const r = runModel.rows[i];
+    const isGroup = (x) => x && (x.k === 'group' || x.k === 'tgroup');
+    const page = Math.max(1, Math.floor($('status').clientHeight / RV.ROW_H.leaf));
+    switch (e.key) {
+      case 'ArrowDown': setRunFocus(runStep(i, 1)); break;
+      case 'ArrowUp': setRunFocus(runStep(i, -1)); break;
+      case 'PageDown': { let n = i; for (let k = 0; k < page; k++) n = runStep(n, 1); setRunFocus(n); break; }
+      case 'PageUp': { let n = i; for (let k = 0; k < page; k++) n = runStep(n, -1); setRunFocus(n); break; }
+      case 'Home': setRunFocus(runStep(-1, 1)); break;
+      case 'End': setRunFocus(runStep(runModel.rows.length, -1)); break;
+      case 'ArrowRight':
+        if (isGroup(r)) { if (!r.open) toggleRunGroup(i); else setRunFocus(runStep(i, 1)); }
+        break;
+      case 'ArrowLeft':
+        if (isGroup(r) && r.open) toggleRunGroup(i);
+        else { let p = i - 1; while (p >= 0 && !isGroup(runModel.rows[p])) p--; if (p >= 0) setRunFocus(p); }
+        break;
+      case 'Enter': case ' ': activateRunRow(i); break;
+      case 'c': case 'C': copyRunRow(i); break;
+      default: return;
+    }
+    e.preventDefault();
   }
 
   function renderCmdLog() {

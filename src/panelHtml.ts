@@ -8,6 +8,7 @@ export function generateNonce(): string {
 
 export function getPanelHtml(webview: vscode.Webview, extensionUri: vscode.Uri, nonce: string): string {
   const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'out', 'panel.js'));
+  const runViewUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'out', 'runView.js'));
   const csp = [
     `default-src 'none'`,
     `img-src ${webview.cspSource} https: data:`,
@@ -324,6 +325,8 @@ body.resizing { cursor: row-resize; user-select: none; }
 .status {
   flex: 1; overflow-y: auto; padding: 8px;
   display: flex; flex-direction: column; gap: 8px;
+  /* The run list's offsetTop is measured against this box (panel.js paintRunList). */
+  position: relative;
 }
 .status-card {
   border: 1px solid var(--border); border-radius: 3px;
@@ -401,25 +404,174 @@ body.resizing { cursor: row-resize; user-select: none; }
 
 /* Card-defined action buttons (Restore backup…/Discard backup on a retrieve result)
    — same small secondary treatment as .card-copy, laid out in a row. */
-.status-card .card-buttons { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
-.status-card .card-btn {
+.status-card .card-buttons, .run-card .card-buttons { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.status-card .card-btn, .run-card .card-btn {
   background: transparent; border: 1px solid var(--border); color: var(--fg);
   border-radius: 2px; padding: 1px 7px; cursor: pointer; font-size: 11px; font-family: inherit;
 }
-.status-card .card-btn:hover:not(:disabled) { background: var(--row-hover); }
-.status-card .card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.status-card .card-btn:hover:not(:disabled), .run-card .card-btn:hover:not(:disabled) { background: var(--row-hover); }
+.status-card .card-btn:disabled, .run-card .card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 /* Failure-card dependency suggestions (state B adds these below the error list). */
-.status-card .suggest-rows { list-style: none; margin: 6px 0 0; padding: 0; }
-.status-card .suggest-rows li { padding: 2px 0; }
-.status-card .suggest-rows label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-.status-card .suggest-rows input[type="checkbox"] { margin: 0; }
-.status-card .suggest-why { margin: 0 0 0 22px; opacity: 0.65; font-size: 11px; }
-.status-card .suggest-unresolved { margin-top: 6px; opacity: 0.65; font-size: 11px; }
-.status-card .suggest-summary { margin-top: 6px; opacity: 0.8; font-style: italic; }
-.status-card .suggest-feedback { margin-top: 6px; display: flex; align-items: center; gap: 6px; opacity: 0.9; }
-.status-card .card-btn.small { padding: 1px 6px; font-size: 11px; }
-.status-card .card-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
-.status-card .card-btn.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+.status-card .suggest-rows, .run-card .suggest-rows { list-style: none; margin: 6px 0 0; padding: 0; }
+.status-card .suggest-rows li, .run-card .suggest-rows li { padding: 2px 0; }
+.status-card .suggest-rows label, .run-card .suggest-rows label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.status-card .suggest-rows input[type="checkbox"], .run-card .suggest-rows input[type="checkbox"] { margin: 0; }
+.status-card .suggest-why, .run-card .suggest-why { margin: 0 0 0 22px; opacity: 0.65; font-size: 11px; }
+.status-card .suggest-unresolved, .run-card .suggest-unresolved { margin-top: 6px; opacity: 0.65; font-size: 11px; }
+.status-card .suggest-summary, .run-card .suggest-summary { margin-top: 6px; opacity: 0.8; font-style: italic; }
+.status-card .suggest-feedback, .run-card .suggest-feedback { margin-top: 6px; display: flex; align-items: center; gap: 6px; opacity: 0.9; }
+.status-card .card-btn.small, .run-card .card-btn.small { padding: 1px 6px; font-size: 11px; }
+.status-card .card-btn.primary, .run-card .card-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+.status-card .card-btn.primary:hover:not(:disabled), .run-card .card-btn.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+
+/* Run cards: the newest deploy / validation / quick deploy / retrieve in full
+   (panel.js renderRunStatus), older runs and notices as one-liners. Sized for a
+   pane about 200px tall: the list rows are virtual, with fixed heights that
+   runView.js ROW_H mirrors — change one, change both. */
+.run-card {
+  flex: none; border: 1px solid var(--border); border-left: 3px solid var(--muted);
+  border-radius: 3px; background: var(--vscode-editor-background);
+}
+.run-card.ok { border-left-color: var(--ok); }
+.run-card.err { border-left-color: var(--err); }
+.run-card.warn { border-left-color: var(--warn); }
+.run-card.run { border-left-color: var(--accent); }
+.run-head { padding: 6px 8px 6px; }
+.run-verdict { display: flex; align-items: flex-start; gap: 6px; }
+.run-glyph { flex: none; width: 14px; text-align: center; font-weight: 700; line-height: 18px; }
+.run-glyph .spinner { margin: 0; }
+.run-glyph.ok { color: var(--ok); } .run-glyph.err { color: var(--err); } .run-glyph.warn { color: var(--warn); } .run-glyph.neutral { color: var(--muted); }
+.run-vtext { flex: 1; min-width: 0; }
+.run-title { font-weight: 600; line-height: 18px; overflow-wrap: anywhere; }
+.run-org { font-family: var(--vscode-editor-font-family); }
+.run-pill {
+  display: inline-block; margin-left: 4px; padding: 0 4px; border-radius: 8px;
+  border: 1px solid currentColor; font-family: var(--vscode-font-family); font-size: 9px;
+  font-weight: 700; line-height: 13px; letter-spacing: .04em; vertical-align: 1px;
+}
+.run-pill.prod {
+  color: var(--vscode-statusBarItem-errorForeground, #fff);
+  background: var(--vscode-statusBarItem-errorBackground, #c72e0f); border-color: transparent;
+}
+.run-pill.sandbox, .run-pill.scratch { color: var(--muted); font-weight: 400; }
+.run-sub { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.run-plain {
+  margin-top: 2px; font-size: 11px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.run-plain.err { color: var(--err); } .run-plain.warn { color: var(--warn); } .run-plain.muted { color: var(--muted); }
+.run-prog { margin-top: 5px; }
+.run-prow { display: flex; align-items: center; gap: 6px; font-size: 11px; min-height: 16px; }
+.run-plbl { flex: none; width: 70px; color: var(--muted); }
+.run-bar { flex: 1; min-width: 30px; height: 4px; border-radius: 2px; overflow: hidden; background: rgba(128, 128, 128, .25); }
+.run-bar i { display: block; height: 100%; width: 0; background: var(--vscode-progressBar-background, var(--accent)); transition: width .5s linear; }
+.run-bar.indet i { width: 35%; animation: run-indet 1.4s ease-in-out infinite; }
+@keyframes run-indet { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+.run-pn { flex: none; font-family: var(--vscode-editor-font-family); font-variant-numeric: tabular-nums; }
+.run-perr { flex: none; color: var(--err); }
+.run-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.run-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 0 7px; border-radius: 9px;
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+  font-family: inherit; font-size: 11px; line-height: 16px; cursor: pointer; white-space: nowrap;
+}
+.run-chip:hover:not(:disabled) { background: var(--row-hover); color: var(--fg); }
+.run-chip[aria-pressed="true"] { color: var(--fg); background: var(--row-active); border-color: var(--vscode-focusBorder, var(--accent)); font-weight: 600; }
+.run-chip:disabled { opacity: .45; cursor: default; }
+.run-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--muted); }
+.run-chip.k-ok .run-dot { background: var(--ok); }
+.run-chip.k-err .run-dot { background: var(--err); }
+.run-chip.k-warn .run-dot { background: var(--warn); }
+.run-chip.k-info .run-dot { background: var(--vscode-textLink-foreground, #3794ff); }
+.run-chip.k-all .run-dot { background: var(--fg); opacity: .5; }
+.run-n { font-family: var(--vscode-editor-font-family); font-variant-numeric: tabular-nums; }
+.run-explain { margin-top: 4px; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.run-explain b { color: var(--fg); font-weight: 600; }
+.run-explain.k-err { color: var(--err); } .run-explain.k-warn { color: var(--warn); }
+.run-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
+.run-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--fg); border-radius: 2px;
+  padding: 1px 7px; cursor: pointer; font-family: inherit; font-size: 11px; white-space: nowrap;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+}
+.run-btn:hover:not(:disabled) { background: var(--row-hover); }
+.run-btn.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.run-btn.primary:hover:not(:disabled) { filter: brightness(1.12); }
+.run-btn:disabled { opacity: .5; cursor: not-allowed; }
+.run-why { flex-basis: 100%; font-size: 11px; color: var(--muted); }
+.run-suggest { margin-top: 6px; padding-top: 5px; border-top: 1px solid var(--border); }
+.run-suggest-title { font-weight: 600; }
+.run-tools { display: flex; gap: 4px; margin-top: 5px; }
+.run-search {
+  flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 2px;
+  padding: 1px 6px; font-family: inherit; font-size: 12px;
+}
+.run-list { position: relative; border-top: 1px solid var(--border); outline: none; }
+.run-list:focus-visible { outline: 1px solid var(--vscode-focusBorder, var(--accent)); outline-offset: -1px; }
+.run-row {
+  position: absolute; left: 0; right: 0; box-sizing: border-box; overflow: hidden;
+  display: flex; align-items: center; gap: 6px; padding: 0 8px; font-size: 12px; cursor: default;
+}
+.run-row:hover { background: var(--row-hover); }
+.run-row.focused { background: var(--row-active); }
+.run-row.section {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.run-row.section:hover, .run-row.note:hover { background: transparent; }
+.run-row.group, .run-row.tgroup { cursor: pointer; }
+.run-row.leaf, .run-row.test { padding-left: 22px; cursor: pointer; }
+.run-row.tall { align-items: flex-start; padding-top: 3px; }
+.run-caret { flex: none; width: 10px; font-size: 9px; color: var(--muted); }
+.run-rglyph { flex: none; width: 12px; text-align: center; font-size: 11px; }
+.g-ok { color: var(--ok); } .g-err { color: var(--err); } .g-warn { color: var(--warn); } .g-skip { color: var(--muted); }
+.g-info { color: var(--vscode-textLink-foreground, #3794ff); }
+.run-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family); }
+.run-row.group .run-name, .run-row.tgroup .run-name, .run-row.section .run-name { font-family: inherit; }
+.run-row.group .run-name, .run-row.tgroup .run-name { font-weight: 600; }
+.run-cnt { flex: none; font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.run-cnt .bad { color: var(--err); font-weight: 600; }
+.run-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.run-l1 { display: flex; align-items: center; gap: 6px; min-height: 16px; }
+.run-why-col { flex: none; max-width: 45%; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-link, .run-loc {
+  flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--vscode-editor-font-family); font-size: 11px;
+}
+.run-link { background: transparent; border: 0; padding: 0; color: var(--vscode-textLink-foreground, #3794ff); cursor: pointer; }
+.run-link:hover { text-decoration: underline; }
+.run-loc { color: var(--muted); }
+.run-mini {
+  flex: none; visibility: hidden; background: transparent; border: 1px solid transparent; border-radius: 2px;
+  color: var(--muted); cursor: pointer; padding: 0 4px; font-family: inherit; font-size: 10px; line-height: 14px;
+}
+.run-row:hover .run-mini, .run-row.focused .run-mini, .run-mini:focus-visible { visibility: visible; }
+.run-mini:hover { color: var(--fg); border-color: var(--border); }
+.run-msg {
+  font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 15px; color: var(--err);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere;
+}
+.run-note { flex: 1; min-width: 0; color: var(--muted); font-size: 11px; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-empty { padding: 8px; color: var(--muted); font-size: 12px; font-style: italic; }
+.run-earlier, .run-notice, .run-older { flex: none; display: flex; flex-direction: column; }
+.run-hrow {
+  display: flex; align-items: center; gap: 6px; width: 100%; min-height: 22px; padding: 2px 4px;
+  background: transparent; border: 0; border-radius: 2px; color: var(--fg); text-align: left;
+  cursor: pointer; font-family: inherit; font-size: 12px;
+}
+.run-hrow:hover { background: var(--row-hover); }
+.run-htxt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-when { flex: none; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.run-older-body { margin: 2px 0 4px 16px; padding: 4px 8px; border-left: 2px solid var(--border); font-size: 12px; }
+.run-older-rows { margin: 4px 0 0; padding-left: 16px; font-size: 11px; }
+.run-older-rows li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-older-rows li.nav { cursor: pointer; }
+.run-older-rows li.nav:hover { text-decoration: underline; }
+.run-foot { margin-top: 4px; font-size: 10px; color: var(--muted); font-style: italic; }
+.run-notice > .status-card { margin: 2px 0 4px 16px; }
+/* Too narrow for the reason column: the Skipped chip's line says it instead. */
+@media (max-width: 359px) { .run-why-col { display: none; } }
 
 .spinner {
   display: inline-block; width: 10px; height: 10px;
@@ -561,7 +713,10 @@ body.resizing { cursor: row-resize; user-select: none; }
     <div class="right">
       <div class="section-header" id="statusHeader">
         <span>Status</span>
-        <button id="clearStatus" class="section-clear" title="Clear status cards" style="display:none;">Clear</button>
+        <span class="hdr-actions">
+          <button id="statusEarlier" class="section-clear" type="button" aria-expanded="false" style="display:none;">Earlier</button>
+          <button id="clearStatus" class="section-clear" title="Clear status cards" style="display:none;">Clear</button>
+        </span>
       </div>
       <div id="status" class="status">
         <div class="status-empty">No operations yet.</div>
@@ -580,6 +735,7 @@ body.resizing { cursor: row-resize; user-select: none; }
     <div class="cmdlog-body" id="cmdlogBody"></div>
   </div>
 
+  <script nonce="${nonce}" src="${runViewUri}"></script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

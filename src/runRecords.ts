@@ -12,8 +12,10 @@ export type RunStatus = 'running' | 'succeeded' | 'failed' | 'partial'
   | 'cancelled' | 'cancelUnconfirmed' | 'lost' | 'error' | 'timeout' | 'interrupted';
 /** What happened to one component. The deploy family and retrieve share
  *  `failed`; `rolledback` and `passed` exist because a failed deploy undoes
- *  everything, so a component that was fine on its own was still not applied. */
-export type Outcome = 'deployed' | 'validated' | 'rolledback' | 'passed' | 'failed' | 'skipped'
+ *  everything, so a component that was fine on its own was still not applied.
+ *  `pending` is a sent component the org never gave a verdict on: the run
+ *  stopped before reaching it, or contact was lost. */
+export type Outcome = 'deployed' | 'validated' | 'rolledback' | 'passed' | 'failed' | 'skipped' | 'pending'
   | 'changed' | 'created' | 'unchanged' | 'missing';
 export type OrgKind = 'prod' | 'sandbox' | 'scratch' | 'other';
 /** Where the rows came from: the user's selection (or a single pointed-at
@@ -24,7 +26,7 @@ export type RunTarget = 'selection' | 'sourceDir' | 'manifest' | 'report';
 export const RUN_OPS: readonly RunOp[] = ['deploy', 'validate', 'quickDeploy', 'retrieve'];
 export const RUN_STATUSES: readonly RunStatus[] = ['running', 'succeeded', 'failed', 'partial',
   'cancelled', 'cancelUnconfirmed', 'lost', 'error', 'timeout', 'interrupted'];
-export const OUTCOMES: readonly Outcome[] = ['deployed', 'validated', 'rolledback', 'passed', 'failed', 'skipped',
+export const OUTCOMES: readonly Outcome[] = ['deployed', 'validated', 'rolledback', 'passed', 'failed', 'skipped', 'pending',
   'changed', 'created', 'unchanged', 'missing'];
 const ORG_KINDS: readonly OrgKind[] = ['prod', 'sandbox', 'scratch', 'other'];
 const TARGETS: readonly RunTarget[] = ['selection', 'sourceDir', 'manifest', 'report'];

@@ -473,6 +473,14 @@ check('normalize repairs what it can: junk rows, a sent flag on a skipped row, j
   assert.strictEqual(back.rowsComplete, false, 'rows were dropped, so the list is not complete any more');
 });
 
+check('a sent row the org never gave a verdict on (pending) survives storage and stays part of a Retry', () => {
+  const run = { ...GOOD(), status: 'error', rows: [{ k: 'ApexClass:A', o: 'pending', s: 1 }, { k: 'Report:R', o: 'skipped', why: 'org' }], counts: { pending: 1, skipped: 1, sent: 1 }, rowsComplete: true };
+  const [back] = RR.normalizeRunsState(state(run)).runs;
+  assert.deepStrictEqual(back.rows, run.rows);
+  assert.deepStrictEqual(back.counts, { pending: 1, skipped: 1, sent: 1 });
+  assert.deepStrictEqual(RR.sentKeys(back), ['ApexClass:A']);
+});
+
 check('normalize keeps the first of two runs with one id, sorts newest first, keeps at most 10', () => {
   const runs = [];
   for (let i = 0; i < 14; i++) runs.push({ ...GOOD(), id: `run${String(i).padStart(4, '0')}`, startedAt: T0 + i * 1000 });
