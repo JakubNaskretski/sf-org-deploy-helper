@@ -8,6 +8,9 @@ This file starts at the current release; earlier history predates it.
 - **Select all in the All view.** A "Select all (N)" button left of Expand all / Collapse all
   ticks every component the list shows — filters and a pasted list of names included, org-only
   rows too, the same set ticking each group would. It adds to what is already selected.
+- **"In project (local)" in the source filter.** Everything you have locally — on the org too or
+  not — which no single option showed before. With it, Select all takes exactly what a deploy
+  can send, so nothing is skipped.
 - **Validate runs the tests you pick — none included.** A Validate used to turn NoTestRun into
   RunLocalTests and say a validation always runs tests. It doesn't have to: with no tests it now
   runs as a check-only `sf project deploy start --dry-run`, and "Tests: default" on a sandbox

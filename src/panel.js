@@ -89,7 +89,7 @@
     // the prune in the `files` handler.
     scannedOnce: false,
     orgAsOf: null,           // ms — when the membership on screen was listed (snapshot stamp, or now)
-    sourceFilter: 'all',     // 'all' | 'local-only' | 'org-only' | 'both'
+    sourceFilter: 'all',     // 'all' | 'local' | 'local-only' | 'org-only' | 'both'
     // View mode: one tree, three lenses. 'selected' shows only checked items
     // (replaces the old chip tray), 'changed' only git-modified components.
     viewMode: ['all', 'selected', 'changed'].includes(persisted.viewMode) ? persisted.viewMode : 'all',
@@ -986,6 +986,7 @@
 
   function isSourceAllowed(source) {
     if (!state.orgLoaded || state.sourceFilter === 'all') return true;
+    if (state.sourceFilter === 'local') return source !== 'org'; // everything in the project
     if (state.sourceFilter === 'local-only') return source === 'local';
     if (state.sourceFilter === 'org-only') return source === 'org';
     if (state.sourceFilter === 'both') return source === 'both';

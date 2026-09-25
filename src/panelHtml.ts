@@ -507,6 +507,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         <div id="sourceFilterRow" style="display:none;">
           <select id="sourceFilter">
             <option value="all">All sources</option>
+            <option value="local">In project (local)</option>
             <option value="local-only">Local only (not on org)</option>
             <option value="org-only">Org only (not local)</option>
             <option value="both">In both</option>

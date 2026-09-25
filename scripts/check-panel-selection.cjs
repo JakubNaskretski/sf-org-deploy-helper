@@ -1900,6 +1900,19 @@ check('the filters decide what Select all takes, and it adds to the selection', 
   assert.deepStrictEqual(q.persisted().selected, ['Flow:AcmeF']);
 });
 
+check('the "In project (local)" source filter keeps every local row and drops org-only ones', () => {
+  // Local-only + in-both, which no single option used to show: with it, Select
+  // all ticks exactly what a deploy can send — nothing to skip.
+  assert.ok(/<option value="local">In project \(local\)<\/option>/.test(HTML_TS));
+  const p = panel(BASE);
+  p.deliver(TFILES([item('ApexClass', 'AcmeA'), item('ApexClass', 'AcmeB')]));
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeA' }, { type: 'ApexClass', name: 'AcmeOrgOnly' }] });
+  p.el('sourceFilter').value = 'local'; p.el('sourceFilter').fire('change');
+  assert.strictEqual(selectAll(p).textContent, 'Select all (2)', 'AcmeA (in both) and AcmeB (local only), not AcmeOrgOnly');
+  selectAll(p).fire('click');
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), ['ApexClass:AcmeA', 'ApexClass:AcmeB']);
+});
+
 check('Select all shows in the All view only', () => {
   const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeA'] });
   p.deliver(TFILES(THREE_TYPES));
