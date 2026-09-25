@@ -305,6 +305,13 @@
           "maximum": 200,
           "markdownDescription": "Cap on how many components **SF Deploy: Deploy File + Dependencies** may auto-include on top of the file(s) you picked. VS Code doesn't enforce the `minimum`/`maximum` below at runtime, so the extension itself clamps whatever you set here. Past this size \"deploy N components?\" stops being an informed yes — the confirm modal and the result card both say when the scan hit this cap and that the included set may be incomplete."
         },
+        "sfOrgDeployWrapper.statusHistoryRuns": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "markdownDescription": "How many deploy/validate/quick-deploy/retrieve runs the Status pane keeps across reloads. The newest is the full result; older ones are one-line summaries. VS Code doesn't enforce the `minimum`/`maximum` below at runtime, so the extension itself clamps whatever you set here."
+        },
         "skrety.salesforce.targetOrg": {
           "type": "string",
           "default": "",
@@ -317,7 +324,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-registry-names.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-registry-names.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs && node ./scripts/check-run-records.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },

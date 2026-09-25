@@ -81,3 +81,4 @@ the component whose source pulled it in. `sfOrgDeployWrapper.dependencyMaxDepth`
 - `sfOrgDeployWrapper.debugTiming` — log click-to-modal timing to the **SF Deploy** Output channel, to diagnose a slow confirmation dialog (default off).
 - `sfOrgDeployWrapper.dependencyMaxDepth` — how many reference layers **Deploy File + Dependencies** follows below the file(s) you picked (default 2, 1–3).
 - `sfOrgDeployWrapper.dependencyMaxComponents` — cap on how many components **Deploy File + Dependencies** may auto-include (default 40, 5–200).
+- `sfOrgDeployWrapper.statusHistoryRuns` — how many deploy/validate/quick-deploy/retrieve runs the Status pane keeps across reloads (default 3, 1–10). The newest is the full result; older ones are one-line summaries.

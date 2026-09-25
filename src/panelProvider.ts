@@ -17,6 +17,10 @@ import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from '.
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
+import { deploySuccessRows, envelopeProblem } from './runRecords';
+// The deploy-result readers live with the run records (no vscode there);
+// re-exported so everything that imports them from here keeps working.
+export { deploySuccessRows, envelopeProblem };
 
 type Inbound =
   | { type: 'ready' }
@@ -6999,24 +7003,6 @@ export function verbModes(verb: DeployVerb): { validateOnly: boolean } {
   return { validateOnly: verb === 'Validate' };
 }
 
-/** Cap on the request-level failure text echoed into a card line and fed to the
- *  dependency detector. Org-controlled, so bounded like every other such string;
- *  400 leaves room for the sentence that names the type ("Invalid type: Foo__mdt")
- *  without pasting a whole stack of platform prose into the card. */
-const ENVELOPE_PROBLEM_MAX = 400;
-
-/** The org's REQUEST-level failure text (`errorMessage` on the Metadata API deploy
- *  status), flattened and length-bounded; '' when the org didn't send one.
- *  It matters because a deploy CAN fail with no per-component rows at all — the
- *  card then had nothing but "no per-component details" and dependency detection
- *  never ran, even though this string routinely carries the same parseable
- *  "Invalid type: X" wording the per-component problems do. */
-export function envelopeProblem(result: DeployResult): string {
-  const raw = typeof result.errorMessage === 'string' ? result.errorMessage : '';
-  const flat = stripAnsi(raw).replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
-  return flat.length > ENVELOPE_PROBLEM_MAX ? `${flat.slice(0, ENVELOPE_PROBLEM_MAX - 1)}…` : flat;
-}
-
 /** Terminal Metadata API deploy statuses — the poll loop stops on any of these.
  *  (`Pending`/`Queued`/`InProgress`/`Canceling` are the non-terminal ones.) */
 const TERMINAL_DEPLOY_STATUSES = new Set(['Succeeded', 'SucceededPartial', 'Failed', 'Canceled', 'Error']);
@@ -7026,19 +7012,6 @@ const TERMINAL_DEPLOY_STATUSES = new Set(['Succeeded', 'SucceededPartial', 'Fail
 function isTerminalDeploy(result: DeployResult): boolean {
   const status = typeof result.status === 'string' ? result.status : '';
   return TERMINAL_DEPLOY_STATUSES.has(status) || result.done === true;
-}
-
-/** Per-component success rows of a deploy result across both CLI shapes: prefer
- *  `details.componentSuccesses` when it has rows, else the filtered `files` list.
- *  `.length ?`, not `??` — an empty-but-present detail array must fall through to
- *  `files`, or a shape carrying both silently reports zero successes. Note the
- *  files filter admits any non-Failed state; if a destructive-changes flag is
- *  ever added to deployMetadata, `state: 'Deleted'` rows would count as present
- *  here and need excluding. */
-export function deploySuccessRows(result: DeployResult): DeployFileResult[] {
-  const detail = result.details?.componentSuccesses ?? [];
-  if (detail.length) return detail;
-  return (result.files ?? []).filter(f => f.state && f.state !== 'Failed' && !fileProblem(f));
 }
 
 /** The `Type:Name` components a delete (or its dry-run) reports as removed. The shape
