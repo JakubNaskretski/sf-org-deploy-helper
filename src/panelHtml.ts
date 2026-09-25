@@ -358,13 +358,6 @@ body.resizing { cursor: row-resize; user-select: none; }
   color: var(--vscode-textLink-foreground, #3794ff);
   cursor: pointer; font-size: 11px; font-family: inherit;
 }
-.status-card .quick-deploy {
-  margin-top: 8px; padding: 4px 10px; border: none; border-radius: 3px;
-  background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-  cursor: pointer; font-size: 12px; font-family: inherit;
-}
-.status-card .quick-deploy:hover:not(:disabled) { filter: brightness(1.12); }
-.status-card .quick-deploy:disabled { opacity: 0.5; cursor: not-allowed; }
 .status-empty { color: var(--muted); font-style: italic; text-align: center; padding: 16px 8px; }
 
 /* Cap the command log so a growing history can't crowd out the tree — it scrolls
@@ -402,27 +395,27 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .status-card .card-copy:hover { background: var(--row-hover); }
 
-/* Card-defined action buttons (Restore backup…/Discard backup on a retrieve result)
-   — same small secondary treatment as .card-copy, laid out in a row. */
-.status-card .card-buttons, .run-card .card-buttons { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
-.status-card .card-btn, .run-card .card-btn {
+/* The dependency suggestion inside a failed run's card: its Deploy with N / Back
+   buttons (same small secondary treatment as .card-copy, laid out in a row) and
+   the checkbox rows above them. */
+.run-card .card-buttons { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.run-card .card-btn {
   background: transparent; border: 1px solid var(--border); color: var(--fg);
   border-radius: 2px; padding: 1px 7px; cursor: pointer; font-size: 11px; font-family: inherit;
 }
-.status-card .card-btn:hover:not(:disabled), .run-card .card-btn:hover:not(:disabled) { background: var(--row-hover); }
-.status-card .card-btn:disabled, .run-card .card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-/* Failure-card dependency suggestions (state B adds these below the error list). */
-.status-card .suggest-rows, .run-card .suggest-rows { list-style: none; margin: 6px 0 0; padding: 0; }
-.status-card .suggest-rows li, .run-card .suggest-rows li { padding: 2px 0; }
-.status-card .suggest-rows label, .run-card .suggest-rows label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-.status-card .suggest-rows input[type="checkbox"], .run-card .suggest-rows input[type="checkbox"] { margin: 0; }
-.status-card .suggest-why, .run-card .suggest-why { margin: 0 0 0 22px; opacity: 0.65; font-size: 11px; }
-.status-card .suggest-unresolved, .run-card .suggest-unresolved { margin-top: 6px; opacity: 0.65; font-size: 11px; }
-.status-card .suggest-summary, .run-card .suggest-summary { margin-top: 6px; opacity: 0.8; font-style: italic; }
-.status-card .suggest-feedback, .run-card .suggest-feedback { margin-top: 6px; display: flex; align-items: center; gap: 6px; opacity: 0.9; }
-.status-card .card-btn.small, .run-card .card-btn.small { padding: 1px 6px; font-size: 11px; }
-.status-card .card-btn.primary, .run-card .card-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
-.status-card .card-btn.primary:hover:not(:disabled), .run-card .card-btn.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+.run-card .card-btn:hover:not(:disabled) { background: var(--row-hover); }
+.run-card .card-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.run-card .suggest-rows { list-style: none; margin: 6px 0 0; padding: 0; }
+.run-card .suggest-rows li { padding: 2px 0; }
+.run-card .suggest-rows label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.run-card .suggest-rows input[type="checkbox"] { margin: 0; }
+.run-card .suggest-why { margin: 0 0 0 22px; opacity: 0.65; font-size: 11px; }
+.run-card .suggest-unresolved { margin-top: 6px; opacity: 0.65; font-size: 11px; }
+.run-card .suggest-summary { margin-top: 6px; opacity: 0.8; font-style: italic; }
+.run-card .suggest-feedback { margin-top: 6px; display: flex; align-items: center; gap: 6px; opacity: 0.9; }
+.run-card .card-btn.small { padding: 1px 6px; font-size: 11px; }
+.run-card .card-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+.run-card .card-btn.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
 
 /* Run cards: the newest deploy / validation / quick deploy / retrieve in full
    (panel.js renderRunStatus), older runs and notices as one-liners. Sized for a

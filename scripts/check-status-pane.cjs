@@ -401,6 +401,20 @@ check('with no runs the pane is the plain card list: no run card, no Earlier tog
   assert.strictEqual(sent(p, 'clearStatusHistory').length, 1);
 });
 
+check('the pane keeps the provider\'s 10 newest notices — replayed or live — and a notice has no buttons', () => {
+  const RR_NOTICES = RR.NOTICES_MAX;
+  assert.strictEqual(RR_NOTICES, 10);
+  const cards = Array.from({ length: 12 }, (_, i) => ({ kind: 'ok', title: `Diff ${i}`, at: NOW - i * 1000 }));
+  const p = boot({ notices: cards });
+  const shown = () => p.el('status').children.filter(e => has(e, 'status-card')).map(e => text(e));
+  assert.strictEqual(shown().length, 10);
+  assert.ok(shown()[0].includes('Diff 0') && shown()[9].includes('Diff 9'));
+  p.deliver({ type: 'status', card: { kind: 'warn', title: 'Diff new', at: NOW + 1000, buttons: [{ label: 'Stale', send: { type: 'retryDeploy' } }] } });
+  assert.strictEqual(shown().length, 10);
+  assert.ok(shown()[0].includes('Diff new') && shown()[9].includes('Diff 8'));
+  assert.ok(!p.el('status').find(e => e.tagName === 'BUTTON' && e.textContent === 'Stale'), 'a card\'s buttons are never drawn');
+});
+
 check('Clear keeps a run that is still running', () => {
   const p = boot({ scenario: 'fxrunning', notices: F.buildNotices(NOW) });
   assert.strictEqual(p.el('clearStatus').style.display, '');

@@ -4,17 +4,16 @@
   // Run-card view logic (src/runView.js), loaded by its own script tag first.
   const RV = window.RunView;
 
-  // Cap on status cards kept in the webview — mirrors the provider's
-  // CARD_HISTORY_MAX (panelProvider.ts) so the live view and the persisted history
-  // trim to the same length. Used by both the live 'status' unshift and the
-  // 'statusHistory' replay below.
-  const STATUS_HISTORY_MAX = 50;
+  // Cap on the notices (status cards that are not runs) kept in the webview —
+  // mirrors the provider's NOTICES_MAX (runRecords.ts) so the live view and the
+  // persisted history trim to the same length. Used by both the live 'status'
+  // unshift and the 'statusHistory' replay below.
+  const STATUS_HISTORY_MAX = 10;
 
   // Cap on the SELECTION copy written to webview state. One click on the Objects
   // group checkbox ticks every field of every object, and this object is
-  // re-serialized on every subsequent toggle — an unbounded key list is the same
-  // state weight the provider refuses for card buttons (HISTORY_BUTTON_KEYS_MAX,
-  // panelProvider.ts). Past the cap the key list is OMITTED rather than trimmed:
+  // re-serialized on every subsequent toggle, so an unbounded key list would be
+  // written again on each click. Past the cap the key list is OMITTED rather than trimmed:
   // restoring a silently smaller selection than the user ticked is worse than
   // restoring none, and the in-memory Set is untouched either way.
   const PERSISTED_SELECTION_MAX = 2000;
@@ -192,7 +191,7 @@
   let debugTiming = false;
 
   // The funnel for every click that takes (or asks for) the operation slot —
-  // toolbar, context menu and card buttons alike. The provider answers EVERY
+  // toolbar, context menu and run-card buttons alike. The provider answers EVERY
   // message with a `busy` post once its handler is done (reserved, refused,
   // invalid, or thrown), and until that lands the clicked control stays locked:
   // without it the second click of a double-click sent a twin — a second modal,
@@ -738,15 +737,9 @@
         return;
       case 'suggestionReset': {
         // The provider refused or the confirm modal was dismissed — nothing ran.
-        // Un-fold the card so the suggestion stays actionable instead of lying
+        // Un-fold the run's suggestion so it stays actionable instead of lying
         // "Retrying…" forever.
         if (typeof msg.id !== 'string') return;
-        for (const c of state.statusCards) {
-          if (c.suggest && c.suggest.id === msg.id) {
-            c.suggestDone = undefined;
-            c.suggestOpen = false;
-          }
-        }
         const latest = state.runs[0];
         if (latest && latest.suggest && latest.suggest.id === msg.id) {
           const local = runLocalFor(latest.id);
@@ -2039,10 +2032,7 @@
       : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hm}`;
   }
 
-  /** A card's `lines` list (capped at MAX_CARD_LINES with a "Show all" button) —
-   *  shared by the normal card body and renderSuggestOpen (state B), so the org's
-   *  own error text stays visible while the user is deciding on the suggestion
-   *  instead of being replaced wholesale by the checkbox list. */
+  /** A notice's `lines` list, capped at MAX_CARD_LINES with a "Show all" button. */
   function renderCardLines(card, el) {
     if (!card.lines || !card.lines.length) return;
     const ul = document.createElement('ul');
@@ -2120,18 +2110,12 @@
     return el;
   }
 
-  /** One status card. `withTitle` false is a notice expanded under its own
-   *  one-line title, so the body alone follows. */
+  /** One notice: a status card with no buttons (the actions of a deploy,
+   *  validation or retrieve live on its run). `withTitle` false is a notice
+   *  expanded under its own one-line title, so the body alone follows. */
   function statusCardEl(card, withTitle) {
     const el = document.createElement('div');
     el.className = `status-card ${card.kind || 'ok'}`;
-    // Suggestion view (state B): the card keeps its error list (so the
-    // decision has evidence) and swaps its buttons for checkbox rows. Plain
-    // local state, same pattern as card.expanded.
-    if (card.suggest && card.suggestOpen && !card.suggestDone) {
-      renderSuggestOpen(card, el);
-      return el;
-    }
     if (withTitle) {
       const t = document.createElement('div');
       t.className = 'title';
@@ -2201,85 +2185,12 @@
       });
       el.appendChild(cp);
     }
-    // Quick Deploy affordance on a successful validate-only card: deploy the
-    // already-validated components without re-running validation or tests.
-    if (card.quickDeploy && card.quickDeploy.jobId && !card.quickDeployDone) {
-      const qd = document.createElement('button');
-      qd.className = 'primary quick-deploy';
-      qd.textContent = card.quickDeploy.label || 'Quick Deploy validated components';
-      qd.disabled = state.busy || !!state.pendingAction;
-      qd.title = 'Deploy the validated components — skips validation and the test run.';
-      qd.addEventListener('click', () => {
-        if (state.busy || state.pendingAction) return;
-        card.quickDeployDone = true;   // one-shot: a validation can be quick-deployed once
-        renderStatus();
-        send('quickDeploy', { jobId: card.quickDeploy.jobId });
-      });
-      el.appendChild(qd);
-    }
-    // Card-defined action buttons (e.g. Restore backup… / Discard backup on a
-    // retrieve result) — each posts its own `send` payload verbatim, spread
-    // through the same send() every toolbar/tree control uses. Disabled while
-    // busy, like the toolbar, so a click can't race a running operation.
-    // The suggestion's "Try with dependencies" entry point is independent of
-    // card.buttons — a card can carry a suggestion with no other buttons at
-    // all (an envelope-level failure with no retry key list to extend still
-    // offers one when it resolved locally), so the wrap can't be gated on
-    // card.buttons alone.
-    if ((card.buttons && card.buttons.length) || (card.suggest && !card.suggestDone)) {
-      const bwrap = document.createElement('div');
-      bwrap.className = 'card-buttons';
-      for (const b of card.buttons || []) {
-        const cb = document.createElement('button');
-        cb.className = 'card-btn';
-        cb.textContent = b.label || '';
-        // Retry (plain or +changed-vs-branch) rides the deploy pipeline, which
-        // QUEUES while busy — keeping it clickable matches the Deploy/Validate
-        // buttons. Resume monitoring and the restore/discard actions need the
-        // single operation slot themselves. "Select these N" only ticks tree
-        // rows — no org call, no operation slot — so busy never gates it.
-        const queueable = b.send && (b.send.type === 'retryDeploy' || b.send.type === 'retryDeployChanged');
-        const selectionOnly = b.send && b.send.type === 'selectDeployed';
-        // Everything but the selection-only button also waits for the
-        // provider's answer to the previous click (sendAction).
-        const pending = !!state.pendingAction && !selectionOnly;
-        cb.disabled = (state.busy && !queueable && !selectionOnly) || pending;
-        if (pending) cb.title = 'Sending…';
-        else if (state.busy && queueable) cb.title = `Will queue behind ${state.busyAction || 'the running operation'}`;
-        cb.addEventListener('click', () => {
-          if (state.busy && !queueable && !selectionOnly) return;
-          if (selectionOnly) send(b.send.type, b.send);
-          else sendAction(b.send.type, b.send);
-        });
-        bwrap.appendChild(cb);
-      }
-      // State-A entry into the suggestion view, alongside the retry buttons.
-      // Opening is purely local (plus a log ping) — nothing deploys yet, so
-      // it stays enabled even while busy.
-      if (card.suggest && !card.suggestDone) {
-        const sb = document.createElement('button');
-        sb.className = 'card-btn suggest-open-btn';
-        sb.textContent = `Try with dependencies (${card.suggest.candidates.length})`;
-        sb.title = 'Review the missing components this failure references and retry with a selection of them.';
-        sb.addEventListener('click', () => {
-          card.suggestOpen = true;
-          // Reopening supersedes an earlier Back — the verdict question would
-          // otherwise linger under a live suggestion view.
-          card.suggestDeclined = false;
-          send('suggestionOpened', { id: card.suggest.id });
-          renderStatus();
-        });
-        bwrap.appendChild(sb);
-      }
-      el.appendChild(bwrap);
-    }
-    renderSuggestAfter(card, card.suggest, el);
     return el;
   }
 
   /** After the suggestion view: the "retrying…" note, or — once, after Back —
    *  a small in-card question about whether the suggestion was off. `holder`
-   *  keeps the view's state (a card, or a run's local state). */
+   *  keeps the view's state (the run's local state). */
   function renderSuggestAfter(holder, suggest, el) {
     if (holder.suggestDone) {
       const d = document.createElement('div');
@@ -2304,32 +2215,6 @@
       }
       el.appendChild(fb);
     }
-  }
-
-  /** State B of a failure card: the org's error lines stay up (renderCardLines),
-   *  with checkbox rows for the suggested components below them, replacing the
-   *  buttons. Selection state lives on the card object (card.suggestSel),
-   *  surviving re-renders exactly like card.expanded. */
-  function renderSuggestOpen(card, el) {
-    const t = document.createElement('div');
-    t.className = 'title';
-    const ic = document.createElement('span');
-    ic.className = `card-icon ${card.kind || 'ok'}`;
-    ic.textContent = CARD_ICONS[card.kind] || CARD_ICONS.ok;
-    t.appendChild(ic);
-    const ttxt = document.createElement('span');
-    ttxt.textContent = 'Retry with missing dependencies?';
-    t.appendChild(ttxt);
-    el.appendChild(t);
-    const m = document.createElement('div');
-    m.className = 'meta';
-    m.textContent = 'Referenced by the failed components and present in your workspace — untick any you don’t want.';
-    el.appendChild(m);
-    // The org's own error lines stay visible while deciding — swapping the whole
-    // card body for the checkbox list hid exactly the evidence the decision
-    // needs. Same list, same cap, as the normal card body (state A).
-    renderCardLines(card, el);
-    renderSuggestChoices(card, card.suggest, el, 'result arrives as its own card');
   }
 
   /** The suggestion's checkbox rows (pre-checked) and its Deploy with N / Back

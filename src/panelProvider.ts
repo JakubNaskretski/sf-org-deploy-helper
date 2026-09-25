@@ -1036,7 +1036,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (this.workspaceRoot) {
           this.maybeReattachDeploy();
           this.maybeAutoFetchOrg();
-        }
+        } else this.interruptPersistedRun();
         return;
       case 'setTestLevel':
         this.testLevel = msg.testLevel;
@@ -3531,15 +3531,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /**
    * Drive an already-submitted async job to completion: poll for progress (mirrored
-   * to the notification + the in-panel card), then dispatch the outcome. Terminal →
-   * `onTerminal(result)` renders the caller's result card. Lost contact → the
-   * lost-contact card, and returns `keepPersisted: true` so the caller KEEPS the
-   * persisted job for reattach. Cancelled-but-unconfirmed → an honest cancelled card.
+   * to the notification + the run's bars), then dispatch the outcome. Terminal →
+   * `onTerminal(result)` finishes the caller's run. Lost contact → a "lost" run, and
+   * returns `keepPersisted: true` so the caller KEEPS the persisted job for reattach.
+   * Cancelled-but-unconfirmed → an honest cancelled run.
    * Never throws (pollDeployJob owns its own errors), so the caller's catch is left
    * for the SUBMIT only.
    */
   private async drivePolledDeploy(
-    args: { jobId: string; org: string; orgLabel: string; root: string; verb: DeployVerb; noun: string; cmdId: string; start: number; progressTitle: string; runId?: string },
+    args: { jobId: string; org: string; orgLabel: string; root: string; verb: DeployVerb; noun: string; cmdId: string; start: number; progressTitle: string; runId: string },
     report: (message: string) => void,
     onTerminal: (result: DeployResult) => void
   ): Promise<{ keepPersisted: boolean }> {
@@ -3549,14 +3549,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       report(msg);
       this.postProgress(`${progressTitle}: ${msg}`);
       // The running run's bars: the org's counts, never its rows.
-      if (runId) {
-        this.runStore.progress(runId, {
-          orgStatus: typeof result.status === 'string' ? result.status : undefined,
-          compDone: result.numberComponentsDeployed, compTotal: result.numberComponentsTotal,
-          testDone: result.numberTestsCompleted, testTotal: result.numberTestsTotal,
-          errors: result.numberComponentErrors
-        });
-      }
+      this.runStore.progress(runId, {
+        orgStatus: typeof result.status === 'string' ? result.status : undefined,
+        compDone: result.numberComponentsDeployed, compTotal: result.numberComponentsTotal,
+        testDone: result.numberTestsCompleted, testTotal: result.numberTestsTotal,
+        errors: result.numberComponentErrors
+      });
     });
     const prep = orgPrep(verb);
     if (outcome.kind === 'lost') {
@@ -3687,32 +3685,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return this.reportDeployResult(result, ctx);
   }
 
-  /** Honest card when we lose contact with a running job (5 failed polls in a row):
-   *  it may still be running, the job is kept persisted, and reopening the panel
-   *  reattaches. */
-  private reportDeployLostContact(jobId: string, orgLabel: string, verb: DeployVerb, runId?: string): void {
+  /** We lost contact with a running job (5 failed polls in a row): it may still be
+   *  running, so its run turns "lost" — Resume monitoring checks the same job —
+   *  the job stays persisted, and reopening the panel reattaches. */
+  private reportDeployLostContact(jobId: string, orgLabel: string, verb: DeployVerb, runId: string): void {
     const prep = verb === 'Validate' ? 'against' : 'to';
-    // A begun run turns into a "lost" run, whose Resume monitoring checks the
-    // same job; anything else (a reattached job, a quick deploy) keeps its card.
-    const ended = runId !== undefined && this.runStore.end(runId, { status: 'lost', jobId });
-    if (!ended) {
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'err',
-          title: `Lost contact with ${verb.toLowerCase()} ${prep} ${orgLabel}`,
-          meta: `Job ${jobId} may still be running on the org`,
-          hint: 'Resume monitoring checks the existing job — it does not submit the deployment again.',
-          buttons: [{ label: 'Resume monitoring', send: { type: 'resumeDeploy', jobId } }]
-        }
-      });
-    }
+    this.runStore.end(runId, { status: 'lost', jobId });
     this.failureToast(`Lost contact with the ${verb.toLowerCase()} ${prep} ${orgLabel} — it may still be running. Open the panel and choose Resume monitoring.`);
   }
 
   /** Synthesize a MetadataItem list from a deploy report's per-component rows, so a
-   *  REATTACHED deploy (whose original selection is gone after a reload) still gets a
-   *  populated result card. The `package.xml` pseudo-row is skipped. */
+   *  REATTACHED deploy (whose original selection is gone after a reload) still has
+   *  one to report with. The `package.xml` pseudo-row is skipped. */
   private itemsFromReport(result: DeployResult): MetadataItem[] {
     const rows = [
       ...(result.details?.componentSuccesses ?? []),
@@ -3737,6 +3721,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Persist the in-flight async job so a reload can reattach. Fire-and-forget like
    *  the other workspaceState writes — a lost write only forgoes one reattach. */
   private persistActiveJob(job: ActiveDeployJob): void {
+    // The job this one replaces can never be reattached now, so its run can't
+    // finish: it stops claiming to run.
+    const replaced = this.readActiveJob()?.runId;
+    if (replaced && replaced !== job.runId) this.runStore.interrupt(replaced);
     void Promise.resolve(this.context.workspaceState.update(ACTIVE_JOB_KEY, job))
       .catch(err => this.output.appendLine(`[activeJob] persist failed: ${err instanceof Error ? err.message : String(err)}`));
   }
@@ -3782,9 +3770,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (job.runId) this.runStore.interrupt(job.runId);
       return;
     }
-    if (this.busy) return; // an op holds the slot — leave the job for the next ready
-    if (!this.reserveBusy(job.verb)) return;
+    // An op holds the slot: leave the job for the next ready.
+    if (this.busy || !this.reserveBusy(job.verb)) {
+      this.interruptPersistedRun();
+      return;
+    }
     void this.reattachDeployJob(job);
+  }
+
+  /** The persisted job's run, when this window is not picking the job up now:
+   *  it stops claiming to run (a later reattach resumes the same run). */
+  private interruptPersistedRun(): void {
+    const runId = this.readActiveJob()?.runId;
+    if (runId) this.runStore.interrupt(runId);
   }
 
   /** User-triggered counterpart to maybeReattachDeploy, reached from a lost-contact
@@ -4033,6 +4031,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.reportError(`Backup before retrieve from ${orgLabel}`, err, runId);
         return; // releaseBusy() in the outer finally frees the slot
       }
+      this.keepBackupOnRun(runId, backupDir, backupNote);
 
       // A confirmed retrieve IS an overwrite: the modal said so, and when a backup
       // was actually written above it is undoable. Then the CLI's source-tracking
@@ -4291,6 +4290,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.reportError(`Backup before retrieve from ${orgLabel}`, err, runId);
         return; // releaseBusy() in the outer finally frees the slot
       }
+      this.keepBackupOnRun(runId, backupDir, backupNote);
 
       // Same rule as runRetrieve: a confirmed retrieve with a backup on disk skips
       // the CLI's conflict check; without one the CLI check stays. One more guard
@@ -5665,35 +5665,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'orgs', orgs: payload, selected: this.orgStore.get() ?? null });
   }
 
-  /** The persisted-history copy of a card carrying a live suggestion payload.
-   *  The payload itself never survives into storage (see the comment at the call
-   *  site), but without it a card restored after a reload used to say NOTHING
-   *  about what was found — silently dropping guidance the live card had shown.
-   *  This folds that guidance back in as plain `lines` text (the same wording
-   *  reportDeployResult's guidanceLines would have used had there been no
-   *  suggestion UI to carry it), and keeps the suggestion's id under a separate
-   *  `suggestId` field — inert on its own, but a later 'ready' can match it
-   *  against `liveSuggestions` and re-attach the button (see the 'ready' handler)
-   *  if the suggestion is still alive when the webview rebuilds. */
-  private stripSuggestForHistory(card: Record<string, unknown>): Record<string, unknown> {
-    const suggest = card.suggest as { id?: string; candidates?: SuggestionCandidateInfo[]; unresolved?: string[] };
-    const candidates = suggest.candidates ?? [];
-    const unresolved = suggest.unresolved ?? [];
-    const guidanceLines = [
-      ...(candidates.length ? [`Missing but available locally: ${candidates.map(c => c.key).join(', ')} — add them to the deploy by hand.`] : []),
-      ...(unresolved.length
-        ? [`Referenced but not found in your workspace: ${unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
-        : [])
-    ];
-    const existingLines = Array.isArray(card.lines) ? card.lines : [];
-    return {
-      ...card,
-      suggest: undefined,
-      ...(typeof suggest.id === 'string' ? { suggestId: suggest.id } : {}),
-      lines: [...guidanceLines, ...existingLines]
-    };
-  }
-
   private post(msg: unknown): void {
     const m = msg as { type?: string; card?: Record<string, unknown> } | null;
     if (m?.type === 'status' && m.card) {
@@ -5701,10 +5672,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // deployment history, surviving webview rebuilds AND window reloads (so a
       // failed context-menu deploy with the sidebar closed leaves a durable trace).
       m.card.at ??= Date.now();
-      // The suggestion UI is live-only: a card restored after a reload renders
-      // without it (inert), so stale checkboxes can't deploy through an expired
-      // liveSuggestions entry. History gets a copy WITHOUT the payload.
-      this.pushCardHistory(m.card.suggest ? this.stripSuggestForHistory(m.card) : m.card);
+      this.pushCardHistory(m.card);
     }
     this.view?.webview.postMessage(msg);
   }
@@ -6023,6 +5991,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private workspaceBackupKey(root: string): string {
     const hash = crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 8);
     return `${sanitizeSegment(path.basename(root))}-${hash}`;
+  }
+
+  /** A retrieve's backup belongs to its run from the moment it exists, however
+   *  the retrieve ends: a cancel or a timeout can leave files partly written,
+   *  which is when Restore matters most. */
+  private keepBackupOnRun(runId: string, dir: string | undefined, note: string | undefined): void {
+    if (dir || note) this.runStore.update(runId, { ...(dir ? { backupDir: dir } : {}), ...(note ? { notes: [note] } : {}) });
   }
 
   /**

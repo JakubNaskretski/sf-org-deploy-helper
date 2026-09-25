@@ -29,7 +29,7 @@
   };
   // Chip order, fixed per family: what landed first, then what didn't.
   const DEPLOY_CHIPS = ['deployed', 'validated', 'failed', 'rolledback', 'passed', 'pending', 'skipped'];
-  const RETRIEVE_CHIPS = ['changed', 'created', 'unchanged', 'missing', 'failed'];
+  const RETRIEVE_CHIPS = ['changed', 'created', 'unchanged', 'missing', 'failed', 'pending'];
   /** Fixed row heights (px) — the list is virtual, so every row's place is
    *  computed, never measured. A row with a message shows it on two lines. */
   const ROW_H = { section: 22, group: 24, leaf: 22, tall: 54, test: 54, note: 22 };
@@ -298,6 +298,11 @@
       case 'passed': return { lead: '', text: 'Checked fine on their own. A validation applies nothing, and this one failed, so there is nothing to quick-deploy.' };
       case 'skipped': return { lead: '', text: skippedSentences(run, rows) };
       case 'pending':
+        if (run.op === 'retrieve') {
+          if (run.status === 'error') return { lead: '', text: 'The retrieve stopped before ' + org + ' returned anything — nothing was written.' };
+          if (run.status === 'running') return { lead: '', text: 'Requested from ' + org + '; the files arrive when the retrieve finishes.' };
+          return { lead: '', text: 'Requested from ' + org + ', but no result came back — files may be partly written. Check your working tree.' };
+        }
         if (run.status === 'error') return { lead: '', text: 'The ' + v.noun + ' stopped before reaching ' + org + ' — nothing from this run was applied.' };
         if (run.status === 'running') return { lead: '', text: 'Sent to ' + org + '; each component\'s result arrives when the org finishes.' };
         return { lead: '', text: 'Sent to ' + org + ', but no result came back — the org may still apply them. Check Deployment Status in the org.' };
@@ -339,8 +344,8 @@
       const failed = cnt(run, 'failed');
       const missing = cnt(run, 'missing');
       return {
-        kind: failed ? 'err' : 'ok', glyph: '↓',
-        text: 'Retrieved ' + fmtN(got) + arrow + org + (failed ? ' · ' + fmtN(failed) + ' failed' : '') + (missing ? ' · ' + fmtN(missing) + ' not on org' : '')
+        kind: failed ? 'err' : got ? 'ok' : 'warn', glyph: '↓',
+        text: (got || failed ? 'Retrieved ' + fmtN(got) : 'Nothing retrieved') + arrow + org + (failed ? ' · ' + fmtN(failed) + ' failed' : '') + (missing ? ' · ' + fmtN(missing) + ' not on org' : '')
       };
     }
     if (run.status === 'succeeded') {

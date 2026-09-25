@@ -416,6 +416,39 @@ check('a job too old to pick up again: cleared without a report call, and its ru
   assert.strictEqual(reports, 0);
 });
 
+check('the slot is busy when the panel opens: the job waits for the next ready, its run stops claiming to run — and a later reattach still finishes it', async () => {
+  const { state, id } = await stateMidRun();
+  const p = provider({ state, fields: { orgMembers: MEMBERS } });
+  assert.strictEqual(p.s.runStore.runs()[0].status, 'running');
+  p.s.busy = true;
+  proto.maybeReattachDeploy.call(p.s);
+  assert.strictEqual(p.s.runStore.runs()[0].status, 'interrupted');
+  assert.strictEqual(p.kept.statusRuns.runs[0].status, 'interrupted');
+  assert.ok(p.kept.activeDeployJob && p.kept.activeDeployJob.runId === id, 'the job is kept for the next ready');
+  p.s.busy = false;
+  await proto.reattachDeployJob.call(p.s, proto.readActiveJob.call(p.s));
+  assert.deepStrictEqual(last(p).runs.map(r => [r.id, r.status]), [[id, 'succeeded']]);
+  assert.ok(last(p).runs[0].notes.some(n => n.startsWith('Re-attached after a window reload')));
+});
+
+check('no project to pick the job up in: the persisted job\'s run is "interrupted" on ready', async () => {
+  const { state, id } = await stateMidRun();
+  const p = provider({ state, fields: { workspaceRoot: undefined, loadOrgs: async () => {}, sendActiveFile: () => {} } });
+  await proto.handleMessage.call(p.s, { type: 'ready' });
+  const run = p.s.runStore.runs().find(r => r.id === id);
+  assert.strictEqual(run.status, 'interrupted');
+});
+
+check('a new deploy replacing a persisted job (from the Explorer, before the panel opened): the old job\'s run is "interrupted"', async () => {
+  const { state, id } = await stateMidRun();
+  const p = provider({ state });
+  await deploy(p, KEYS);
+  const runs = last(p).runs;
+  assert.deepStrictEqual(runs.map(r => r.status), ['succeeded', 'interrupted']);
+  assert.strictEqual(runs[1].id, id);
+  assert.strictEqual(p.kept.statusRuns.runs.find(r => r.id === id).status, 'interrupted');
+});
+
 check('lost contact, then Resume monitoring: the SAME run goes back to running and finishes, every skipped row kept', async () => {
   const p = provider({ fields: { orgMembers: MEMBERS }, poll: async () => ({ kind: 'lost' }), report: { id: JOB, status: 'Succeeded', success: true, done: true, details: {
     componentSuccesses: KEYS.map(k => ({ componentType: 'ApexClass', fullName: k.split(':')[1] }))
@@ -476,6 +509,7 @@ check('a retrieve is a run from its confirm: what it asks for, then one row per 
   assert.deepStrictEqual([begun.runs[0].op, begun.runs[0].status, begun.runs[0].target], ['retrieve', 'running', 'selection']);
   assert.deepStrictEqual(begun.latestRows.rows.map(r => [r.k, r.o]), KEYS.map(k => [k, 'pending']));
   assert.strictEqual(RV.outcomeLabel('pending', begun.runs[0]), 'Requested');
+  assert.deepStrictEqual(RV.chipDefs(begun.runs[0]).map(c => [c.label, c.n, c.disabled]), [['All', 3, false], ['Requested', 3, false]], 'what it asks for is counted while it runs');
   const { runs: [run], latestRows } = last(p);
   assert.strictEqual(run.id, begun.runs[0].id);
   assert.strictEqual(run.status, 'succeeded');
@@ -516,6 +550,26 @@ check('a cancelled retrieve is "cancelled" — the local command stopped, not a 
   const run = last(p).runs[0];
   assert.deepStrictEqual([run.op, run.status], ['retrieve', 'cancelled']);
   assert.strictEqual(RV.titleText(run, { now: Date.now() }), 'Retrieve from acme-dev cancelled');
+  assert.deepStrictEqual(RV.chipDefs(run).map(c => [c.label, c.n]), [['All', 3], ['No result', 3]]);
+  assert.strictEqual(RV.explainFor(run, 'pending').text, 'Requested from acme-dev, but no result came back — files may be partly written. Check your working tree.');
+});
+
+check('a retrieve cancelled or timed out after its backup keeps the backup on its run — Restore / Discard still offered, across a reload too', async () => {
+  const cases = [
+    [new SfCliCancelledError(), 'cancelled', p => retrieve(p)],
+    [new SfCliError('sf project retrieve start timed out after 180000ms'), 'timeout', p => retrieve(p)],
+    [new SfCliCancelledError(), 'cancelled', p => proto.runManifestRetrieve.call(p.s, '/ws/manifest/package.xml', [{ type: 'ApexClass', members: ['AcmeOrderService'] }])]
+  ];
+  for (const [err, status, go] of cases) {
+    const p = provider({ retrieveError: err, fields: { maybeBackupBeforeRetrieve: async () => BACKUP } });
+    await go(p);
+    const run = last(p).runs[0];
+    assert.deepStrictEqual([run.status, run.backupDir], [status, BACKUP.dir]);
+    assert.ok(run.notes.includes(BACKUP.note), JSON.stringify(run.notes));
+    const ids = RV.actionsFor(run, { isLatest: true, complete: true }).buttons.map(b => b.id);
+    assert.ok(ids.includes('restore') && ids.includes('discard'), ids.join(','));
+    assert.strictEqual(p.kept.statusRuns.runs[0].backupDir, BACKUP.dir, 'and a reload keeps it');
+  }
 });
 
 check('a package.xml retrieve: its named members are asked for, a wildcard never goes "missing", and an empty answer says so', async () => {
@@ -533,6 +587,7 @@ check('a package.xml retrieve: its named members are asked for, a wildcard never
   const only = last(w);
   assert.deepStrictEqual(only.latestRows.rows, []);
   assert.strictEqual(RV.titleText(only.runs[0], { now: Date.now() }), 'Nothing retrieved from acme-dev');
+  assert.strictEqual(RV.histLabel(only.runs[0]).text, 'Nothing retrieved ← acme-dev', 'and the same once it is an older run');
 });
 
 // ============================================================ runs nothing began

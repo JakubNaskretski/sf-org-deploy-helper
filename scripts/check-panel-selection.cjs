@@ -1167,26 +1167,35 @@ check('Deploy queues while busy but never sends while its previous click is unan
   assert.strictEqual(p.el('retrieveBtn').style.display, 'none', 'Retrieve stays hidden while busy');
 });
 
-const CARD = (buttons) => ({ type: 'status', card: { kind: 'ok', title: 'Retrieved 2 components', buttons } });
-const CARD_BTNS = [
-  ['Retry deploy', { type: 'retryDeploy', request: { keys: DC.selected } }, 1],
-  ['Resume monitoring', { type: 'resumeDeploy', jobId: '0Af000000000001AAA' }, 1],
-  ['Restore backup…', { type: 'restoreBackup', dir: '/backups/x' }, 1],
-  ['Discard backup', { type: 'discardBackup', dir: '/backups/x' }, 1],
-  ['Select these 2', { type: 'selectDeployed', keys: DC.selected }, 2] // selection-only: never gated
+// The newest run's buttons go through the same guards (a notice carries none).
+/** A `runs` post with one finished run over the two local classes. */
+function RUN(fields) {
+  const rows = fields.rows || DC.selected.map(k => ({ k, o: fields.o || 'deployed', s: 1 }));
+  const run = Object.assign({
+    v: 1, id: 'rbtn00001', op: 'deploy', status: 'succeeded', org: 'acme-dev-user', orgLabel: 'acme-dev', orgKind: 'sandbox',
+    startedAt: 1, finishedAt: 2, target: 'selection', counts: { sent: rows.length }, rows, rowsComplete: true, tests: []
+  }, fields.run || {});
+  return { type: 'runs', runs: [run], cap: 3, latestRows: { runId: run.id, rows, tests: [] } };
+}
+const RUN_BTNS = [
+  ['Retry deploy', 'retryDeploy', RUN({ o: 'rolledback', run: { status: 'failed', retry: { validateOnly: false, testLevel: 'NoTestRun' } } }), 1],
+  ['Resume monitoring', 'resumeDeploy', RUN({ o: 'pending', run: { status: 'lost', jobId: '0Af000000000001AAA' } }), 1],
+  ['Restore backup…', 'restoreBackup', RUN({ o: 'changed', run: { op: 'retrieve', backupDir: '/backups/x' } }), 1],
+  ['Discard backup', 'discardBackup', RUN({ o: 'changed', run: { op: 'retrieve', backupDir: '/backups/x' } }), 1],
+  ['Select 2 in tree', 'selectDeployed', RUN({}), 2] // selection-only: never gated
 ];
-for (const [label, send, expect] of CARD_BTNS) {
-  check(`card "${label}": two clicks send ${expect} ${send.type}`, () => {
+for (const [label, type, msg, expect] of RUN_BTNS) {
+  check(`run card "${label}": two clicks send ${expect} ${type}`, () => {
     const p = armed();
-    p.deliver(CARD([{ label, send }]));
+    p.deliver(msg);
     click(findBtn(p, label));
     click(findBtn(p, label)); // re-found: a render replaces the element under the cursor
-    assert.strictEqual(sent(p, send.type), expect);
+    assert.strictEqual(sent(p, type), expect);
     p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
     if (expect === 1) {
       assert.strictEqual(findBtn(p, label).disabled, true);
       assert.strictEqual(findBtn(p, label).title, 'Sending…');
-      assert.strictEqual(p.el('deployBtn').disabled, true, 'the toolbar locks with the card');
+      assert.strictEqual(p.el('deployBtn').disabled, true, 'the toolbar locks with the run card');
       p.deliver({ type: 'busy', busy: false });
       assert.strictEqual(findBtn(p, label).disabled, false);
       assert.strictEqual(p.el('deployBtn').disabled, false);
@@ -1194,9 +1203,9 @@ for (const [label, send, expect] of CARD_BTNS) {
   });
 }
 
-check('card Retry queues while busy, not while pending', () => {
+check('run card Retry queues while busy, not while pending', () => {
   const p = armed({ busy: 'Deploy' });
-  p.deliver(CARD([{ label: 'Retry deploy', send: { type: 'retryDeploy', request: { keys: DC.selected } } }]));
+  p.deliver(RUN_BTNS[0][2]);
   assert.ok(click(findBtn(p, 'Retry deploy')));
   assert.strictEqual(sent(p, 'retryDeploy'), 1);
   p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
@@ -1209,9 +1218,12 @@ check('card Retry queues while busy, not while pending', () => {
 
 check('Quick Deploy stays one-shot', () => {
   const p = armed();
-  p.deliver({ type: 'status', card: { kind: 'ok', title: 'Validation succeeded', quickDeploy: { jobId: '0Af000000000001AAA', label: 'Quick Deploy 2' } } });
-  assert.ok(click(findBtn(p, 'Quick Deploy 2')));
-  assert.strictEqual(findBtn(p, 'Quick Deploy 2'), null, 'the button must vanish on its one click');
+  p.deliver(RUN({ o: 'validated', run: { op: 'validate', jobId: '0Af000000000001AAA', testsRan: true, counts: { validated: 2, sent: 2 }, quick: { jobId: '0Af000000000001AAA', until: Date.now() + 864e5 } } }));
+  assert.ok(click(findBtn(p, 'Quick Deploy 2 to acme-dev')));
+  p.flush(); // renderStatus is deferred (sendAction) — flush before reading DOM state
+  assert.strictEqual(findBtn(p, 'Quick Deploy 2 to acme-dev'), null, 'the button must vanish on its one click');
+  p.deliver({ type: 'busy', busy: false });
+  assert.strictEqual(findBtn(p, 'Quick Deploy 2 to acme-dev'), null, 'and stays gone once the provider answers');
   assert.strictEqual(sent(p, 'quickDeploy'), 1);
 });
 
@@ -1265,56 +1277,62 @@ check('the context-menu paths and the provider\'s Rescan reply share the same gu
 // webview-only half — panel.js is a browser IIFE with no exports of its own, so
 // it can only be driven the way check-panel-selection.cjs already does, by
 // delivering messages and reading back the DOM/state.
-const suggestCard = (overrides = {}) => ({
-  type: 'status',
-  card: {
-    kind: 'err', title: 'Deploy failed', at: 1,
-    lines: ['ApexClass:MyThing — Invalid type: smth__mdt'],
-    suggest: {
+/** A failed run whose live payload carries a dependency suggestion — the only
+ *  place a suggestion shows (a notice never carries one). */
+const suggestRun = (suggest = {}) => {
+  const rows = [{ k: 'ApexClass:MyThing', o: 'failed', s: 1, m: 'Invalid type: smth__mdt' }];
+  const run = {
+    v: 1, id: 'rsug00001', op: 'deploy', status: 'failed', org: 'acme-dev-user', orgLabel: 'acme-dev', orgKind: 'sandbox',
+    startedAt: 1, finishedAt: 2, target: 'selection', counts: { failed: 1, rolledback: 0, sent: 1 }, rows, rowsComplete: true, tests: [],
+    suggestId: 'sug-1000-0',
+    suggest: Object.assign({
       id: 'sug-1000-0',
       candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing', why: 'Invalid type: smth__mdt' }],
       unresolved: ['Ghost__mdt']
-    },
-    ...overrides
-  }
-});
+    }, suggest)
+  };
+  return { type: 'runs', runs: [run], cap: 3, latestRows: { runId: run.id, rows, tests: [] } };
+};
 const openSuggestBtn = (p) => p.el('status').find(e => e.tagName === 'BUTTON' && /^Try with dependencies/.test(e.textContent));
 const statusLines = (p) => { const o = []; p.el('status').find(e => { if (e.tagName === 'LI') o.push(e.textContent); return false; }); return o; };
 const suggestWhys = (p) => { const o = []; p.el('status').find(e => { if (e.className === 'suggest-why') o.push(e.textContent); return false; }); return o; };
 const suggestRows = (p) => p.el('status').find(e => e.className === 'suggest-rows');
 const suggestUnresolved = (p) => p.el('status').find(e => e.className === 'suggest-unresolved');
 
-check('B11: the "Try with dependencies" button renders even with no other card.buttons', () => {
+check('B11: the "Try with dependencies" button renders even when the run offers no Retry', () => {
   const p = panel(null);
-  p.deliver(suggestCard()); // no `buttons` field at all
-  assert.ok(openSuggestBtn(p), 'the button must not be gated behind card.buttons');
+  p.deliver(suggestRun()); // no `retry` on the run at all
+  assert.ok(openSuggestBtn(p), 'the button must not be gated behind Retry');
 });
 
-check('B8: opening the suggestion keeps the org error lines visible above the checkbox rows', () => {
+check('B8: opening the suggestion keeps the org error visible below the checkbox rows', () => {
   const p = panel(null);
-  p.deliver(suggestCard());
+  p.el('status').clientHeight = 400;
+  p.deliver(suggestRun());
   openSuggestBtn(p).fire('click');
   assert.ok(suggestRows(p), 'checkbox rows did not render');
-  assert.ok(statusLines(p).some(l => l.includes('smth__mdt')), `expected the org error line to stay visible: ${JSON.stringify(statusLines(p))}`);
+  const listed = p.el('status').find(e => e._classes && e._classes.has('run-list'));
+  const text = (e) => (e ? [e.textContent, ...e.children.map(text)].join('') : '');
+  assert.ok(text(listed).includes('Invalid type: smth__mdt'), 'expected the failed row to stay listed');
 });
 
 check('B8: the "why" reason renders under its checkbox', () => {
   const p = panel(null);
-  p.deliver(suggestCard());
+  p.deliver(suggestRun());
   openSuggestBtn(p).fire('click');
   assert.deepStrictEqual(suggestWhys(p), ['Invalid type: smth__mdt']);
 });
 
 check('B8: a candidate with no why renders no suggest-why row (field is optional)', () => {
   const p = panel(null);
-  p.deliver(suggestCard({ suggest: { id: 'sug-1000-1', candidates: [{ key: 'CustomObject:smth__mdt' }], unresolved: [] } }));
+  p.deliver(suggestRun({ candidates: [{ key: 'CustomObject:smth__mdt' }], unresolved: [] }));
   openSuggestBtn(p).fire('click');
   assert.deepStrictEqual(suggestWhys(p), []);
 });
 
 check('B11: the unresolved wording says "Not found in your workspace (retrieve it, or its type is not scanned)"', () => {
   const p = panel(null);
-  p.deliver(suggestCard());
+  p.deliver(suggestRun());
   openSuggestBtn(p).fire('click');
   const el = suggestUnresolved(p);
   assert.ok(el, 'no suggest-unresolved element');

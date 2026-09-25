@@ -1,5 +1,5 @@
 // Runnable contract test for the large-selection manifest path (panelProvider.ts
-// runDeploy/runRetrieve, MANIFEST_THRESHOLD/CARD_LINE_CAP/capLines/capForCard;
+// runDeploy/runRetrieve, MANIFEST_THRESHOLD/CARD_LINE_CAP/capLines;
 // metadataScanner.ts buildManifestXml/resolveApiVersion). No framework.
 //   1) npm run compile   2) node scripts/check-large-selection.cjs
 //

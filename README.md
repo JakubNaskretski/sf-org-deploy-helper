@@ -25,7 +25,7 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
 - One-click **Deploy**, **Retrieve**, **Diff** against the selected org.
 - Modal confirms before destructive ops, plus a hard **PROD** guard.
 - Right-click any metadata file in the explorer for Deploy / Retrieve / Diff.
-- Status-bar org indicator, status card history, command log with timings.
+- Status-bar org indicator, a Status pane with your last runs (see below), command log with timings.
 - Progress in the status bar and the panel — no notification pinned over the editor — and a Cancel button in the panel for long-running deploys/retrieves.
 - **Validate** runs the test level you pick, none included: with no tests it is a check-only `sf project deploy start --dry-run`; with tests it is `sf project deploy validate`, the kind that can be quick-deployed.
 
@@ -55,6 +55,28 @@ usual failure card. The confirm modal names how many components were auto-includ
 what you picked (and why, for the first few); the result card lists every one of them with
 the component whose source pulled it in. `sfOrgDeployWrapper.dependencyMaxDepth` and
 `sfOrgDeployWrapper.dependencyMaxComponents` bound how far and how wide the scan goes.
+
+## Status pane
+
+Every deploy, validation, quick deploy and retrieve is a **run** in the Status pane from the
+moment you confirm it: what it sends, what it skips and why, and progress bars for components
+and tests while the org works. The org's answer lands on the same card — every component
+deployed, failed, rolled back, validated or retrieved, with file:line links to the failures.
+The counts above the list filter it, a search box narrows a long one, and a run of ten
+thousand components stays quick to scroll.
+
+The newest run carries the actions: Retry (and Retry + overwrite after a source conflict), Try
+with dependencies, Quick Deploy after a validation that ran tests, Resume monitoring after lost
+contact, Restore / Discard backup after a retrieve, Select (ticks the listed rows in the tree)
+and Copy. Older runs are one-line summaries under **Earlier** in the pane's header — you can
+open and copy them, but they have no buttons; an older retrieve's backup is still restorable
+with **SF Deploy: Restore Retrieve Backup**. Other results (diff, delete, Fetch Org…) are short
+notices in the same history.
+
+The pane keeps your last `sfOrgDeployWrapper.statusHistoryRuns` runs (default 3) and 10
+notices across reloads, the newest run with its full list. Quick Deploy is offered until the
+window reloads. If the window reloads while a deploy runs, the panel picks the job up again and
+finishes the same run.
 
 ## Requirements
 

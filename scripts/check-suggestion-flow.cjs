@@ -117,7 +117,7 @@ function provider(extra = {}) {
       }
     },
     // No `post` override here — the REAL prototype method runs (pushCardHistory
-    // /stripSuggestForHistory included), so its persisted-history side effects
+    // included), so its persisted-history side effects
     // are genuinely exercised. Captured one layer down, at the webview boundary.
     view: { visible: true, webview: { postMessage: (m) => posted.push(m) } },
     // 'ready'-only stubs — no-ops so handleMessage({type:'ready'}) can run without
