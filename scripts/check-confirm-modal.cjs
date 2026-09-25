@@ -541,6 +541,11 @@ check('the confirm says how many selected rows will be skipped, and why', () => 
   assert.ok(SKIP.test(modal({ skipped: 1200 }, true).options.detail), 'and when queued');
   assert.deepStrictEqual(modal({ skipped: 0 }).options, { modal: true }, 'nothing skipped, nothing said');
   assert.ok(/1 more selected exists only on the org — no local file to deploy, so it is skipped\./.test(modal({ skipped: 1 }).options.detail));
+  const both = modal({ skipped: 3, unread: { count: 2, types: ['Bot', 'CustomObjectTranslation'] } }).options.detail.split('\n');
+  assert.deepStrictEqual(both, [
+    "2 more are of types this panel can't read from your project (Bot, CustomObjectTranslation) — skipped; if you have them locally, deploy their folder via right-click.",
+    '3 more selected exist only on the org — no local file to deploy, so they are skipped.'
+  ], 'the unread ones first: they are the ones that may be yours');
 });
 
 // ------------------------------------ what a no-test validation actually sends
@@ -577,6 +582,8 @@ check('`deploy validate` never gets --ignore-conflicts (it has no such flag); th
     'sf rejects the flag on validate ("Nonexistent flag"), which then read as an outdated CLI');
   assert.ok(argvFor({ validateOnly: true, testLevel: 'NoTestRun', ignoreConflicts: true }).includes('--ignore-conflicts'), 'a dry-run start takes it');
   assert.ok(argvFor({ ignoreConflicts: true }).includes('--ignore-conflicts'), 'a deploy takes it');
+  assert.ok(argvFor({ validateOnly: true }).includes('--ignore-conflicts'), 'a dry-run validation ignores conflicts like `deploy validate` does — it writes nothing');
+  assert.ok(!argvFor({}).includes('--ignore-conflicts'), 'a real deploy only with Overwrite on');
 });
 
 check('NoTestRun never reaches sf as a flag (production refuses it for every payload)', () => {

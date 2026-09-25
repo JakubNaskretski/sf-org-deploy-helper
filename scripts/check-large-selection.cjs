@@ -181,6 +181,7 @@ function provider(items, extra = {}) {
     items, workspaceRoot: '/ws', liveSuggestions: new Map(), suggestionSeq: 0,
     testLevel: undefined, runTests: undefined,
     orgs: [{ username: ORG, alias: ORG_LABEL, instanceUrl: 'https://acme-dev.example.invalid' }],
+    learnedRules: () => [], // no type cache here; the static and registry rules still count
     orgStore: { get: () => ORG, set: async () => {}, setFromUserPick: async () => {} },
     output: { appendLine: l => outputLines.push(l) },
     context: {
@@ -232,6 +233,25 @@ check('thousands of org-only rows cannot push the deployed ones off the card', a
   for (const k of orgOnly) assert.ok(p.outputLines.some(l => l.includes(k)), `Output channel missing ${k}`);
 });
 
+check('a type this panel never reads locally is not called "only on the org"', async () => {
+  // Bots, object translations… are listed from the org but never from the project,
+  // so a local one shows as org-only, gets skipped, and must not be waved through.
+  const items = makeItems(3);
+  const skipped = ['Bot:AcmeBot', 'ApexClass:AcmeOrgOnly'];
+  const p = provider(items, { fields: { orgMembers: new Map(skipped.map(k => [k, {}])), orgMembersOrg: ORG } });
+  warns.length = 0;
+  await runDeploy(p, [...keysOf(items), ...skipped]);
+  const confirm = warns.find(w => w.modal);
+  assert.ok(/1 more is a type this panel can't read from your project \(Bot\) — skipped; if you have them locally, deploy their folder via right-click\./.test(confirm.detail), confirm.detail);
+  assert.ok(/1 more selected exists only on the org/.test(confirm.detail), confirm.detail);
+  const card = statusCards(p).find(c => c.kind === 'warn');
+  assert.ok(/ · 1 skipped \(org only\) · 1 skipped \(not read locally\)$/.test(card.meta), card.meta);
+  assert.ok(/^1 skipped — this panel can't read Bot from your project: if you have it locally, it was NOT deployed/.test(card.lines[0]), card.lines[0]);
+  assert.strictEqual(card.lines[1], '— Bot:AcmeBot — not read from your project, skipped (deploy its folder via right-click)');
+  assert.ok(/^1 skipped — selected, but it exists only on the org/.test(card.lines[2]), card.lines[2]);
+  assert.deepStrictEqual(card.lines.slice(4), keysOf(items));
+});
+
 check('eleven skipped rows: the one the card hides is still in the Output channel', async () => {
   // Swapping the 11th name for the "… and 1 more" line keeps the line count equal,
   // which a count comparison would mistake for "nothing dropped".
@@ -264,7 +284,7 @@ check('validate: the echoed command matches the argv it runs', async () => {
   const items = makeItems(3);
   const none = provider(items);
   await runDeploy(none, keysOf(items), { validateOnly: true, testLevel: 'NoTestRun' });
-  assert.ok(/^sf project deploy start --dry-run .* --target-org acme-dev-user$/.test(firstEchoedCmd(none)), firstEchoedCmd(none));
+  assert.ok(/^sf project deploy start --dry-run .* --target-org acme-dev-user --ignore-conflicts$/.test(firstEchoedCmd(none)), firstEchoedCmd(none));
   assert.strictEqual(none.calls.deployMetadata[0].opts.testLevel, undefined, 'NoTestRun is left out — production refuses it outright');
   assert.strictEqual(none.calls.deployMetadata[0].opts.validateOnly, true);
   const tested = provider(items);

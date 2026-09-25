@@ -213,8 +213,9 @@ export class SfCliService extends KitSfCliService {
     else if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
     else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
-    // `deploy validate` ignores conflicts itself and has no such flag.
-    if (opts.ignoreConflicts && verb !== 'validate') args.push('--ignore-conflicts');
+    // `deploy validate` ignores conflicts itself and has no such flag; its dry-run
+    // twin does the same — a check-only run writes nothing to conflict with.
+    if ((opts.ignoreConflicts || dryRun) && verb !== 'validate') args.push('--ignore-conflicts');
     if (opts.testLevel) args.push('--test-level', opts.testLevel);
     if (opts.testLevel === 'RunSpecifiedTests') for (const t of opts.runTests ?? []) args.push('--tests', t);
     // `--async` returns once the org has enqueued the job (id + `Queued`), so the

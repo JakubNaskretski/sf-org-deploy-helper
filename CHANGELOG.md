@@ -17,7 +17,8 @@ This file starts at the current release; earlier history predates it.
   means no tests here too, as the picker says. Quick Deploy needs a validation that ran tests,
   so it is offered only after one — pick a test level when you want it. On production a
   NoTestRun pick means the org's own default (local tests when the payload has Apex), and the
-  confirm now says that instead of promising a rejection.
+  confirm now says that instead of promising a rejection. A validation without tests ignores
+  source-tracking conflicts, as sf's own validate does — it writes nothing to the org.
 - **The command log starts collapsed**, and stays open once you open it.
 - **Long operations no longer pin a notification over the editor.** Deploy, validate, retrieve
   and the rest show their progress in the status bar and the panel's progress card. The
@@ -33,7 +34,9 @@ This file starts at the current release; earlier history predates it.
   group checkbox ticks them too) have no local file, so a deploy leaves them out — not deployed,
   not failed, untouched on the org. The card used to list them after every deployed row, where
   its 100-line cap cut them off, leaving a bare "N skipped". The confirm now says how many
-  will be skipped and why, and the card leads with them.
+  will be skipped and why, and the card leads with them. Types this panel can't read from your
+  project (bots, object translations, Experience bundles…) are called out separately: if you have
+  them locally they were not deployed — deploy their folder via right-click.
 - Fixed: **Validate with "Overwrite org changes" on.** `sf project deploy validate` has no
   `--ignore-conflicts` flag — it ignores conflicts on its own — so every Validate that ran tests
   failed with "Nonexistent flag", and the hint blamed an outdated CLI.
@@ -41,8 +44,7 @@ This file starts at the current release; earlier history predates it.
   sf error quoting the file — an unset `replaceWithEnv` variable, a missing package directory —
   got the hint "This workspace is not a Salesforce DX project". That hint now shows only when sf
   says so, and an unset replacement variable gets its own: sf runs with VS Code's environment,
-  so set the variable where VS Code inherits it (your shell profile, then restart VS Code), or
-  give the replacement `"allowUnsetEnvVariable": true`.
+  so set the variable where VS Code inherits it (your shell profile), then restart VS Code.
 
 ## 0.27.0
 

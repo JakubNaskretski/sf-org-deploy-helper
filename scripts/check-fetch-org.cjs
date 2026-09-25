@@ -383,6 +383,7 @@ check('hintForError: "not a DX project" only when there is none', () => {
   const env = sfErr('ConversionError', 'Component conversion failed: "ACME_ENDPOINT" is in sfdx-project.json as a value for "replaceWithEnv" property, but it\'s not set in your environment.');
   assert.ok(!NO_PROJECT.test(hintForError(env) ?? ''), 'an unset replaceWithEnv variable is not a missing project');
   assert.ok(/VS Code's environment/.test(hintForError(env) ?? ''), 'and it gets its own hint');
+  assert.ok(!/allowUnsetEnvVariable/.test(hintForError(env) ?? ''), 'which never suggests deploying an empty value');
   for (const m of [
     'The path "force-app", specified in sfdx-project.json, does not exist. Be sure this directory is included in your project root.',
     'The file "replacements.txt" specified in the "replacements" property of sfdx-project.json could not be read.',

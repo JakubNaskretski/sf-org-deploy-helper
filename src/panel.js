@@ -2477,7 +2477,7 @@
     const queueTip = state.busy ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
     const items = [
       { label: 'Deploy', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : queueTip), run: () => runKeys('deploy', arr) },
-      { label: 'Validate', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : (queueTip || 'Check-only deploy: validates and runs tests without deploying')), run: () => runKeys('validate', arr) },
+      { label: 'Validate', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : (queueTip || 'Check-only deploy: nothing is deployed; tests run only with a test level picked')), run: () => runKeys('validate', arr) },
       { label: 'Retrieve', disabled: !base, title: orgTip, run: () => runKeys('retrieve', arr) },
       { label: 'Diff', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to diff' : ''), run: () => runKeys('diff', arr) },
     ];

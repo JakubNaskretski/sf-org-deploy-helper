@@ -7,7 +7,7 @@ import { execFile } from 'child_process';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
@@ -2803,7 +2803,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           {
             noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
             instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, useManifest,
-            skipped: orgOnlySkipped.length
+            ...this.skipCounts(orgOnlySkipped)
           },
           false
         );
@@ -2846,7 +2846,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      const cmdId = this.beginCmd(`sf project deploy ${cmdVerb} ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts && cmdVerb !== 'validate' ? ' --ignore-conflicts' : ''}${testArg}`);
+      const cmdId = this.beginCmd(`sf project deploy ${cmdVerb} ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${(ignoreConflicts || cmdVerb === 'start --dry-run') && cmdVerb !== 'validate' ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
       // owns releasing it, so stop the early-return releaser from double-firing.
       reserved = false;
@@ -3081,11 +3081,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
       instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: AutoIncludedInfo;
-      useManifest?: boolean; skipped?: number;
+      useManifest?: boolean; skipped?: number; unread?: { count: number; types: string[] };
     },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest, skipped } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest, skipped, unread } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
@@ -3094,7 +3094,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const manifestLine = manifestNotice(useManifest);
     // Said BEFORE the run: selected org-only rows (a group checkbox ticks them)
     // have no local file, and "N skipped" on the card explained nothing.
-    const skipLine = skipped ? `${skipped} more selected ${skipped === 1 ? 'exists' : 'exist'} only on the org — no local file to deploy, so ${skipped === 1 ? 'it is' : 'they are'} skipped.` : undefined;
+    const skipLine = [
+      unread?.count ? `${unread.count} more ${unread.count === 1 ? 'is a type' : 'are of types'} this panel can't read from your project (${unread.types.join(', ')}) — skipped; if you have them locally, deploy their folder via right-click.` : '',
+      skipped ? `${skipped} more selected ${skipped === 1 ? 'exists' : 'exist'} only on the org — no local file to deploy, so ${skipped === 1 ? 'it is' : 'they are'} skipped.` : ''
+    ].filter(Boolean).join('\n') || undefined;
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
@@ -3191,7 +3194,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       {
         noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
         instanceUrl: orgInfo?.instanceUrl, ignoreConflicts,
-        autoIncluded: opts.autoIncluded, useManifest, skipped: resolved.length - items.length
+        autoIncluded: opts.autoIncluded, useManifest, ...this.skipCounts(resolved.filter(i => !i.filePath))
       },
       true
     );
@@ -3322,12 +3325,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       && failures.length === 0
       && testFailures.length === 0;
     const lines = items.map(i => `${i.type}:${i.name}`);
-    const skipLines = orgOnlySkipped.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`);
     // Headed and listed FIRST on a success card: below thousands of deployed rows
     // the card's line cap cut every skipped one off, leaving a bare "N skipped".
-    const skipHead = orgOnlySkipped.length
-      ? [`${orgOnlySkipped.length} skipped — selected, but ${orgOnlySkipped.length === 1 ? 'it exists' : 'they exist'} only on the org, so there was no local file to deploy:`]
-      : [];
+    // A type this panel never reads locally comes first: it may be in the project
+    // and was not deployed, which "only on the org" would wrongly rule out.
+    const { orgOnly, unread } = this.splitSkipped(orgOnlySkipped);
+    const unreadTypes = [...new Set(unread.map(i => i.type))].sort();
+    const skipGroups = [
+      ...(unread.length ? [{
+        head: `${unread.length} skipped — this panel can't read ${unreadTypes.join(', ')} from your project: if you have ${unread.length === 1 ? 'it' : 'them'} locally, ${unread.length === 1 ? 'it was' : 'they were'} NOT deployed — deploy the folder via right-click:`,
+        rows: unread.map(i => `— ${i.type}:${i.name} — not read from your project, skipped (deploy its folder via right-click)`)
+      }] : []),
+      ...(orgOnly.length ? [{
+        head: `${orgOnly.length} skipped — selected, but ${orgOnly.length === 1 ? 'it exists' : 'they exist'} only on the org, so there was no local file to deploy:`,
+        rows: orgOnly.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`)
+      }] : [])
+    ];
+    const skipLines = skipGroups.flatMap(g => g.rows);
+    const skipMeta = `${orgOnly.length ? ` · ${orgOnly.length} skipped (org only)` : ''}${unread.length ? ` · ${unread.length} skipped (not read locally)` : ''}`;
     const testMeta = result.numberTestsTotal
       ? ` · ${(result.numberTestsTotal ?? 0) - (result.numberTestErrors ?? 0)}/${result.numberTestsTotal} tests passed`
       : '';
@@ -3356,8 +3371,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           title: validateOnly
             ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
             : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
-          meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped (org only)` : ''}`,
-          lines: this.cardWithSkips(`Deployed to ${orgLabel} — full component list`, skipHead, skipLines, lines),
+          meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${skipMeta}`,
+          lines: this.cardWithSkips(`Deployed to ${orgLabel} — full component list`, skipGroups, lines),
           // Built from the ITEMS, not from the display lines: a manifest deploy
           // synthesizes its items straight from <members> (wildcards and all) and
           // a reattached job synthesizes them from the org's own report, so those
@@ -5852,13 +5867,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  lead, the deployed rows follow — thousands of skipped rows (a Select all on a
    *  fetched org) must not push every deployed one off the card. The full list,
    *  skipped rows included, goes to the Output channel whenever the card drops any. */
-  private cardWithSkips(header: string, head: string[], skips: string[], lines: string[]): Array<string | { text: string }> {
+  private cardWithSkips(header: string, groups: Array<{ head: string; rows: string[] }>, lines: string[]): Array<string | { text: string }> {
     const SHOWN = 10;
-    const shown = skips.length > SHOWN ? [...skips.slice(0, SHOWN), `… and ${skips.length - SHOWN} more skipped — full list in the Output channel`] : skips;
-    const full = [...head, ...skips, ...lines];
-    const card = [...head, ...shown, ...lines];
-    if (skips.length > SHOWN || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
+    const full = [...groups.flatMap(g => [g.head, ...g.rows]), ...lines];
+    const card = [...groups.flatMap(g => [g.head, ...(g.rows.length > SHOWN
+      ? [...g.rows.slice(0, SHOWN), `… and ${g.rows.length - SHOWN} more skipped — full list in the Output channel`]
+      : g.rows)]), ...lines];
+    if (groups.some(g => g.rows.length > SHOWN) || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
     return capLines(card);
+  }
+
+  /** Selected rows with no local file, split by whether this panel can list their
+   *  type from the project at all. A readable type with no local file really is on
+   *  the org only; any other type (bots, object translations…) may be in the
+   *  project unseen, so "only on the org" would be a guess. */
+  private splitSkipped(skipped: MetadataItem[]): { orgOnly: MetadataItem[]; unread: MetadataItem[] } {
+    if (!skipped.length) return { orgOnly: [], unread: [] };
+    const readable = new Set<string>([...RULES.map(r => r.type), ...this.ruleSet(true).map(r => r.type), 'CustomObject', ...OBJECT_CHILD_TYPES]);
+    return { orgOnly: skipped.filter(i => readable.has(i.type)), unread: skipped.filter(i => !readable.has(i.type)) };
+  }
+
+  /** The confirm modal's view of splitSkipped. */
+  private skipCounts(skipped: MetadataItem[]): { skipped: number; unread: { count: number; types: string[] } } {
+    const { orgOnly, unread } = this.splitSkipped(skipped);
+    return { skipped: orgOnly.length, unread: { count: unread.length, types: [...new Set(unread.map(i => i.type))].sort() } };
   }
 
   /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
@@ -7058,7 +7090,7 @@ export function hintForError(err: unknown): string | undefined {
     return 'This workspace is not a Salesforce DX project (sfdx-project.json not found).';
   }
   if (txt.includes('replacewithenv')) {
-    return 'sf runs with VS Code\'s environment, not your terminal\'s: set the variable where VS Code inherits it (shell profile, then restart VS Code), or give that replacement "allowUnsetEnvVariable": true.';
+    return 'sf runs with VS Code\'s environment, not your terminal\'s: set the variable where VS Code inherits it (your shell profile), then restart VS Code.';
   }
   if (/nonexistent flag|is not a sf command|command [^\s]+ not found/.test(txt)) {
     return 'Your sf CLI looks outdated for this command — run `sf update` (or reinstall @salesforce/cli), then reload VS Code.';
