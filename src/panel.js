@@ -64,7 +64,10 @@
     activeFileKey: null,
     statusCards: [],
     cmdLog: [],
-    cmdLogCollapsed: !!persisted.cmdLogCollapsed,
+    // Collapsed unless the user opened it. A new key: the old `cmdLogCollapsed`
+    // was written as false on every save, so it would keep the log open for
+    // everyone who never touched it.
+    cmdLogCollapsed: !persisted.cmdLogOpen,
     // Fraction of the body given to the Status pane (right/bottom). null = CSS default.
     statusRatio: typeof persisted.statusRatio === 'number' ? persisted.statusRatio : null,
     banner: '',
@@ -138,7 +141,7 @@
       filter: state.filter,
       typeFilter: Array.from(state.typeFilter),
       seenTypes: Array.from(state.seenTypes),
-      cmdLogCollapsed: state.cmdLogCollapsed,
+      cmdLogOpen: !state.cmdLogCollapsed,
       statusRatio: state.statusRatio,
       scanBannerDismissed: state.scanBannerDismissed,
       viewMode: state.viewMode,
@@ -322,6 +325,7 @@
     savePersisted();
     renderCmdLog();
   });
+  renderCmdLog(); // the markup's default must not win until the first command
   $('clearStatus').addEventListener('click', () => {
     state.statusCards = [];
     send('clearStatusHistory'); // also drop the persisted history, or it resurrects on reload

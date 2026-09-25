@@ -569,12 +569,12 @@ body.resizing { cursor: row-resize; user-select: none; }
     </div>
   </div>
 
-  <div id="cmdlog" class="cmdlog">
+  <div id="cmdlog" class="cmdlog collapsed">
     <div class="section-header" id="cmdlogHeader">
       <span>Command log</span>
       <span class="hdr-actions">
         <button id="clearCmdLog" class="section-clear" title="Clear command log" style="display:none;">Clear</button>
-        <span class="caret" id="cmdlogCaret">▼</span>
+        <span class="caret" id="cmdlogCaret">▸</span>
       </span>
     </div>
     <div class="cmdlog-body" id="cmdlogBody"></div>

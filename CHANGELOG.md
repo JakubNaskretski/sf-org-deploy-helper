@@ -18,6 +18,7 @@ This file starts at the current release; earlier history predates it.
   so it is offered only after one — pick a test level when you want it. A NoTestRun pick now
   reaches sf as `--test-level NoTestRun` on a deploy too: it used to be dropped, so a production
   org ran local tests while the confirm said it would refuse.
+- **The command log starts collapsed**, and stays open once you open it.
 - **Long operations no longer pin a notification over the editor.** Deploy, validate, retrieve
   and the rest show their progress in the status bar and the panel's progress card. The
   notification had no close button while it ran, and its Cancel stopped the job on the org — a

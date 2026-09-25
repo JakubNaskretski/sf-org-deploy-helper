@@ -1913,6 +1913,18 @@ check('the "In project (local)" source filter keeps every local row and drops or
   assert.deepStrictEqual(p.persisted().selected.slice().sort(), ['ApexClass:AcmeA', 'ApexClass:AcmeB']);
 });
 
+check('the command log starts collapsed, and stays open once opened', () => {
+  const folded = (p) => p.el('cmdlog').classList.contains('collapsed');
+  assert.ok(/<div id="cmdlog" class="cmdlog collapsed">/.test(HTML_TS), 'no flash of an open log before the script runs');
+  assert.ok(folded(panel(BASE)), 'a fresh panel');
+  assert.ok(folded(panel({ ...BASE, cmdLogCollapsed: false })), 'an old state that only ever wrote the default');
+  const p = panel(BASE);
+  p.el('cmdlogHeader').fire('click');
+  assert.ok(!folded(p), 'one click opens it');
+  assert.strictEqual(p.persisted().cmdLogOpen, true);
+  assert.ok(!folded(panel(p.persisted())), 'and a reload keeps it open');
+});
+
 check('Select all shows in the All view only', () => {
   const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeA'] });
   p.deliver(TFILES(THREE_TYPES));
