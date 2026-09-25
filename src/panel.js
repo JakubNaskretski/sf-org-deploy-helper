@@ -2941,7 +2941,6 @@
     while (j >= 0 && j < runModel.rows.length && !runFocusable(j)) j += dir;
     return j >= 0 && j < runModel.rows.length ? j : from;
   }
-  /** Move the keyboard focus to row i, scrolling the pane just enough to show it. */
   /** Move the keyboard focus to row i without rebuilding a single row. */
   function markRunFocus(i) {
     if (!runFocusable(i)) return;
@@ -2949,6 +2948,7 @@
     for (const c of runList.children) c.classList.toggle('focused', c.id === `run-row-${i}`);
     runList.setAttribute('aria-activedescendant', `run-row-${i}`);
   }
+  /** Move the keyboard focus to row i, scrolling the pane just enough to show it. */
   function setRunFocus(i, scroll) {
     if (!runFocusable(i)) return;
     state.runUi.focus = i;

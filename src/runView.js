@@ -258,7 +258,9 @@
 
   /** Why skipped rows were skipped, in the words the result card has used: a
    *  type this panel cannot read from the project may be there unseen, so it
-   *  is never called org-only. Counts come from the rows (unread ones lead). */
+   *  is never called org-only. The split comes from the run's counts — made
+   *  when the run was, since a summary keeps only some rows — and the types
+   *  named from the rows it holds (unread ones lead). */
   function skippedSentences(run, rows) {
     const total = cnt(run, 'skipped');
     const unreadRows = (rows || []).filter((r) => r.o === 'skipped' && r.why === 'unread');

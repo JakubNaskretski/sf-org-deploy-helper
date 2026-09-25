@@ -250,6 +250,29 @@ check('a run from the org\'s report (a reattach, a quick deploy) maps a bundle f
   assert.deepStrictEqual([row.l, row.c, row.f, row.s], [3, 7, 'acmeCard.js', 1], 'the row keeps its file:line, on the key the workspace has');
 });
 
+check('a deep recursion trace still links the test to its own frame, which Apex lists last', () => {
+  const frames = Array.from({ length: 400 }, () => 'Class.AcmeService.recurse: line 12, column 1').join('\n');
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { runTestResult: { failures: [
+    { name: 'AcmeServiceTest', methodName: 'testDeep', message: 'System.LimitException: Maximum stack depth reached: 1001', stackTrace: `${frames}\nClass.AcmeServiceTest.testDeep: line 40, column 1` }
+  ] } } }, BASE());
+  assert.deepStrictEqual([run.tests[0].l, run.tests[0].c], [40, 1]);
+});
+
+check('a report run with both component failures and a failed row for the same bundle\'s file: one failed row, on the local component', () => {
+  const B = 'LightningComponentBundle';
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false,
+    details: { componentFailures: [{ componentType: B, fullName: 'acmeCard', problem: 'Unexpected token', lineNumber: 3, filePath: 'lwc/acmeCard/acmeCard.js' }] },
+    files: [
+      { type: B, fullName: 'acmeCard/acmeCard.js', state: 'Failed', error: 'Unexpected token', lineNumber: 3, filePath: 'lwc/acmeCard/acmeCard.js' },
+      { type: 'ApexClass', fullName: 'AcmeOrderService', state: 'Changed' }
+    ] }, BASE({ target: 'report', items: undefined, localKeyOf: (f) => (String(f.filePath || '').includes('/acmeCard/') ? `${B}:acmeCard` : undefined) }));
+  assert.deepStrictEqual(outcomes(run), { [`${B}:acmeCard`]: 'failed', 'ApexClass:AcmeOrderService': 'rolledback' });
+});
+
+check('counts in host-side text read like the pane\'s: 2,535', () => {
+  assert.deepStrictEqual([RR.fmtCount(2535), RR.fmtCount(60), RR.fmtCount(1234567)], ['2,535', '60', '1,234,567']);
+});
+
 check('thousands of failures on one component, and a pathological stack trace, stay fast (no copy per failure, no unbounded scan)', () => {
   const many = Array.from({ length: 100000 }, (_, i) => ({ componentType: 'ApexClass', fullName: 'AcmeInvoiceService', problem: `Problem ${i % 50}`, lineNumber: 1 + (i % 9) }));
   let t0 = Date.now();

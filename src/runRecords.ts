@@ -269,6 +269,11 @@ function failedRow(k: string, failures: DeployFileResult[], sent: boolean): RunR
   return row;
 }
 
+/** A count as the Status pane writes every number: 2,535, never 2535. */
+export function fmtCount(n: number): string {
+  return Number(n || 0).toLocaleString('en-US');
+}
+
 /** Collect `v` under `k`, in place. */
 function group<V>(into: Map<string, V[]>, k: string, v: V): void {
   const list = into.get(k);
@@ -276,11 +281,14 @@ function group<V>(into: Map<string, V[]>, k: string, v: V): void {
   else into.set(k, [v]);
 }
 
+/** Longest stack-trace line looked at: the frame patterns scan to the end of a
+ *  line, which is quadratic on a pathological one. Apex lists the test class's
+ *  own frame last, so the trace itself is never cut short. */
+const STACK_LINE_MAX = 500;
+
 /** A test failure row. The link opens the test class, so the position is the
  *  first stack frame INSIDE that class when there is one (the top frame is often
  *  the class under test), else the top frame. */
-const STACK_SCAN_MAX = 4000;
-
 function testRow(t: DeployTestFailure): TestRow {
   const cls = typeof t.name === 'string' && t.name ? t.name : '?';
   const row: TestRow = {
@@ -288,9 +296,9 @@ function testRow(t: DeployTestFailure): TestRow {
     method: typeof t.methodName === 'string' && t.methodName ? t.methodName : '?',
     m: orgText(t.message ?? '', ROW_MESSAGE_MAX) || 'failed'
   };
-  // Capped before matching: the frame patterns scan to the end of a line, which
-  // is quadratic on a pathological one.
-  const stack = typeof t.stackTrace === 'string' ? t.stackTrace.slice(0, STACK_SCAN_MAX) : '';
+  const stack = typeof t.stackTrace === 'string'
+    ? t.stackTrace.split('\n').map(line => line.slice(0, STACK_LINE_MAX)).join('\n')
+    : '';
   const own = new RegExp(`Class\\.${cls.replace(/[^A-Za-z0-9_]/g, '')}\\.[^:\\n]*: line (\\d+)(?:, column (\\d+))?`).exec(stack);
   const pos = own ?? /line (\d+)(?:, column (\d+))?/.exec(stack);
   if (pos) {
@@ -652,14 +660,14 @@ export function summarizeRun(run: RunRecord, opts: { latest: boolean }): RunReco
   return out;
 }
 
-/** A run found still `running` when the window starts again, with no job of
- *  this window polling it: its result was never recorded. */
 /** What an interrupted run says, deploy family first — resume() drops it again. */
 export const INTERRUPTED_NOTES: readonly string[] = [
   "The window closed while this ran; its result wasn't recorded. Check Deployment Status in the org.",
   "The window closed while this ran; its result wasn't recorded, and files may be partly written."
 ];
 
+/** A run found still `running` when the window starts again, with no job of
+ *  this window polling it: its result was never recorded. */
 export function interruptedRun(run: RunRecord): RunRecord {
   const note = INTERRUPTED_NOTES[run.op === 'retrieve' ? 1 : 0];
   return { ...run, status: 'interrupted', notes: [note, ...(run.notes ?? [])].slice(0, NOTES_MAX) };

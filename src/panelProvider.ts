@@ -17,7 +17,7 @@ import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from '.
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
-import { DeployRunInput, OrgKind, RUN_ID_RE, RunItem, RunRecord, RunRow, RunTarget, beginRun, deployRunFromResult, deploySuccessRows, envelopeProblem, newRunId, retrieveRunFromResult, runRetryFrom } from './runRecords';
+import { DeployRunInput, OrgKind, RUN_ID_RE, RunItem, RunRecord, RunRow, RunTarget, beginRun, deployRunFromResult, deploySuccessRows, envelopeProblem, fmtCount, newRunId, retrieveRunFromResult, runRetryFrom } from './runRecords';
 import { RunLive, RunStore } from './runStore';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
@@ -3860,7 +3860,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
     const kept = prior ? this.keptSkipped(prior) : undefined;
     const known = prior
-      ? `${prior.status === 'lost' ? 'Picked up again after contact was lost' : 'Re-attached after a window reload'}: rows are what ${job.orgLabel} reported${kept?.count ? `; ${kept.count} skipped row${kept.count === 1 ? ' is' : 's are'} from when it started` : ''}.`
+      ? `${prior.status === 'lost' ? 'Picked up again after contact was lost' : 'Re-attached after a window reload'}: rows are what ${job.orgLabel} reported${kept?.count ? `; ${fmtCount(kept.count)} skipped row${kept.count === 1 ? ' is' : 's are'} from when it started` : ''}.`
       : `Re-attached after a window reload: only what ${job.orgLabel}'s report contains. Rows skipped before the deploy started aren't known.`;
     this.currentDeployJobId = job.jobId;
     this.currentDeployOrg = job.org;
