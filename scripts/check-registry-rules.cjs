@@ -35,7 +35,7 @@ const vscodeStub = {
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const { rulesFromRegistry, locateRegistry, loadRegistryRules, nonDerivableFolders, registryNonDerivable } = require(path.join(__dirname, '..', 'out', 'registryRules.js'));
-const { STATIC_RULE_FOLDERS, inferItemForPath, scanWorkspace } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
+const { STATIC_RULE_FOLDERS, inferItemForPath, scanWorkspace, findItemForPath } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 const { DeployPanelProvider } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 
 let failed = 0;
@@ -139,6 +139,42 @@ const FIXTURE = {
     assert.deepStrictEqual(full.items.map(i => `${i.type}:${i.name}`).sort(), ['ApexClass:Acme', 'WaveDashboard:Board', 'WaveDataset:Sales']);
     const none = await scanWorkspace([]);
     assert.deepStrictEqual(none.unknownFolders.map(f => path.basename(f)), ['wave'], 'no rule at all → unknown, classes (static) never');
+    fs.rmSync(proj, { recursive: true, force: true });
+  });
+
+  await check('scanWorkspace: a StaticResource is found by its meta, whatever shape sf wrote its content in', async () => {
+    // Up to 0.27.0 only `<Name>.resource` content was scanned — but sf writes the
+    // content with its MIME extension (.js, .txt…) or unzips it to `<Name>/`, so
+    // most static resources never reached the tree, a Select all, or a deploy.
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-static-'));
+    const dir = path.join(proj, 'force-app', 'main', 'default', 'staticresources');
+    fs.mkdirSync(path.join(dir, 'AcmeZip', 'js'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'sfdx-project.json'), JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }] }));
+    for (const n of ['AcmeText', 'AcmeZip', 'AcmeLegacy']) fs.writeFileSync(path.join(dir, `${n}.resource-meta.xml`), '<x/>');
+    fs.writeFileSync(path.join(dir, 'AcmeText.txt'), 'x');
+    fs.writeFileSync(path.join(dir, 'AcmeZip', 'js', 'a.js'), 'x');
+    fs.writeFileSync(path.join(dir, 'AcmeLegacy.resource'), 'x');
+    ws.folders = [{ uri: { fsPath: proj }, name: 'static', index: 0 }];
+    ws.projectFiles = [path.join(proj, 'sfdx-project.json')];
+    const { items } = await scanWorkspace([]);
+    const by = Object.fromEntries(items.map(i => [`${i.type}:${i.name}`, i]));
+    assert.deepStrictEqual(Object.keys(by).sort(), ['StaticResource:AcmeLegacy', 'StaticResource:AcmeText', 'StaticResource:AcmeZip']);
+    // The meta is what opens: content is often binary (an image, a zip), which a
+    // text editor refuses. The content rides in `files`.
+    for (const n of ['AcmeText', 'AcmeLegacy', 'AcmeZip']) {
+      assert.strictEqual(path.basename(by[`StaticResource:${n}`].filePath), `${n}.resource-meta.xml`, n);
+    }
+    assert.ok(by['StaticResource:AcmeText'].files.some(f => path.basename(f) === 'AcmeText.txt'));
+    assert.ok(by['StaticResource:AcmeLegacy'].files.some(f => path.basename(f) === 'AcmeLegacy.resource'));
+    assert.strictEqual(findItemForPath(items, path.join(dir, 'AcmeText.txt'))?.name, 'AcmeText');
+    // An edited file inside the resource maps back to it (Changed view, Use active file).
+    assert.strictEqual(findItemForPath(items, path.join(dir, 'AcmeZip', 'js', 'a.js'))?.name, 'AcmeZip');
+    assert.strictEqual(findItemForPath(items, path.join(dir, 'AcmeText.resource-meta.xml'))?.name, 'AcmeText');
+    // …and so does the no-scan path (active editor, Explorer right-click).
+    for (const [rel, name] of [['AcmeZip/js/a.js', 'AcmeZip'], ['AcmeText.txt', 'AcmeText'], ['AcmeText.resource-meta.xml', 'AcmeText'], ['AcmeLegacy.resource', 'AcmeLegacy']]) {
+      const hit = inferItemForPath(path.join(dir, ...rel.split('/')));
+      assert.strictEqual(hit && `${hit.type}:${hit.name}`, `StaticResource:${name}`, rel);
+    }
     fs.rmSync(proj, { recursive: true, force: true });
   });
 

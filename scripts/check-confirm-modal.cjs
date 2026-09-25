@@ -297,29 +297,29 @@ check('nothing dropped: no ignored-names line at all', () => {
   assert.ok(!p.testNote.includes('Ignored'), p.testNote);
 });
 
-// ------------------------------------------- validate cannot skip tests
-// `sf project deploy validate` has no NoTestRun option at all; its --test-level
-// defaults to RunLocalTests. Omitting the flag and letting the CLI decide is what
-// made the modal silent about tests on exactly the run that ran them.
-check('validate + NoTestRun pick → RunLocalTests, and the note says why', () => {
+// ------------------------------------------- validate honours NoTestRun
+// A validation does not have to run tests: `deploy validate` has no NoTestRun,
+// but a check-only `deploy start --dry-run` does (sfCliService). Up to 0.27.0
+// this upgraded the level to RunLocalTests and told the user a validation
+// always runs tests — false, and the Tests selector's own "sandbox: none" lied.
+check('validate + NoTestRun pick stays NoTestRun, and the note says Quick Deploy is off', () => {
   const p = plan({ pick: 'NoTestRun', opts: { validateOnly: true } });
-  assert.strictEqual(p.testLevel, 'RunLocalTests');
+  assert.strictEqual(p.testLevel, 'NoTestRun');
   assert.strictEqual(
     p.testNote,
-    '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
+    '\n\nTests: none (NoTestRun) — no Quick Deploy afterwards; that needs a validation that ran tests.'
   );
-  assert.ok(!/none \(NoTestRun\)/.test(p.testNote), p.testNote);
 });
 
 check('validate + NoTestRun from the settings default → same resolution', () => {
   const p = plan({ configured: 'NoTestRun', opts: { validateOnly: true } });
-  assert.strictEqual(p.testLevel, 'RunLocalTests');
-  assert.ok(p.testNote.includes('a validation always runs tests'), p.testNote);
+  assert.strictEqual(p.testLevel, 'NoTestRun');
 });
 
-check('validate on a sandbox with nothing picked → RunLocalTests, not NoTestRun', () => {
+check('validate on a sandbox with nothing picked → no tests, like the selector says', () => {
   const p = plan({ isProd: false, opts: { validateOnly: true } });
-  assert.strictEqual(p.testLevel, 'RunLocalTests');
+  assert.strictEqual(p.testLevel, 'NoTestRun');
+  assert.strictEqual(plan({ isProd: true, opts: { validateOnly: true } }).testLevel, 'RunLocalTests', 'production still defaults to tests');
 });
 
 check('a validate that already names a level is left alone', () => {
@@ -380,17 +380,13 @@ check('no other prod level collects the warning', () => {
   assert.strictEqual(noteFor({ isProd: true }), '\n\nTests: RunLocalTests');
 });
 
-check('prod validate + NoTestRun keeps the upgrade sentence and gains no warning', () => {
-  // The level in force is RunLocalTests, so a rejection warning would describe a
-  // deploy that isn't happening — and a validate never writes to the org anyway.
+check('prod validate + NoTestRun warns like the deploy it predicts', () => {
+  // The dry run sends the org the same NoTestRun a deploy would, and production
+  // refuses it the same way when the payload has Apex.
   for (const source of [{ pick: 'NoTestRun' }, { configured: 'NoTestRun' }]) {
     const p = plan({ ...source, isProd: true, opts: { validateOnly: true } });
-    assert.strictEqual(p.testLevel, 'RunLocalTests');
-    assert.strictEqual(
-      p.testNote,
-      '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
-    );
-    assert.ok(!warnsAboutProd(p.testNote), p.testNote);
+    assert.strictEqual(p.testLevel, 'NoTestRun');
+    assert.ok(warnsAboutProd(p.testNote), p.testNote);
   }
 });
 
@@ -400,7 +396,7 @@ check('the warning appears ONLY on prod + NoTestRun, across every combination', 
       for (const isProd of [false, true]) {
         for (const validateOnly of [false, true]) {
           const p = plan({ pick, configured, isProd, classes: ['AcmeTest'], opts: { validateOnly } });
-          const expected = isProd && !validateOnly && p.testLevel === 'NoTestRun';
+          const expected = isProd && p.testLevel === 'NoTestRun';
           assert.strictEqual(
             warnsAboutProd(p.testNote), expected,
             `pick=${pick} configured=${configured} prod=${isProd} validate=${validateOnly} → ${JSON.stringify(p.testNote)}`
@@ -461,12 +457,12 @@ check('a queued prod deploy carries the same warning', () => {
   assert.ok(/Salesforce rejects this for a production deploy that contains Apex\.$/.test(out.message), out.message);
 });
 
-check('validate confirm states the tests it cannot skip', () => {
+check('validate confirm states that no tests run', () => {
   const out = modal({ validateOnly: true, testNote: noteFor({ pick: 'NoTestRun', opts: { validateOnly: true } }) });
   assert.strictEqual(
     out.message,
     'Validate 3 components against acme-dev? (check-only — nothing is deployed)'
-    + '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
+    + '\n\nTests: none (NoTestRun) — no Quick Deploy afterwards; that needs a validation that ran tests.'
   );
   assert.strictEqual(out.confirmLabel, 'Validate');
 });
@@ -533,6 +529,90 @@ check('without the field the non-prod modal still omits `detail` entirely', () =
   // The pre-existing shape, re-pinned: adding an optional line must not turn the
   // plainest modal into one carrying an empty detail block.
   assert.deepStrictEqual(modal().options, { modal: true });
+});
+
+// ------------------------------------------ org-only rows in the selection
+// A group checkbox ticks org-only rows too; they have no local file, so a deploy
+// leaves them out. That used to surface only as a bare "N skipped" afterwards.
+check('the confirm says how many selected rows will be skipped, and why', () => {
+  const SKIP = /1200 more selected exist only on the org — no local file to deploy, so they are skipped\./;
+  assert.ok(SKIP.test(modal({ skipped: 1200 }).options.detail), JSON.stringify(modal({ skipped: 1200 }).options));
+  assert.ok(SKIP.test(modal({ skipped: 1200, isProd: true, instanceUrl: INSTANCE_URL }).options.detail), 'on PROD too');
+  assert.ok(SKIP.test(modal({ skipped: 1200 }, true).options.detail), 'and when queued');
+  assert.deepStrictEqual(modal({ skipped: 0 }).options, { modal: true }, 'nothing skipped, nothing said');
+});
+
+// ------------------------------------ what a no-test validation actually sends
+// The plan is only half of it: the argv is where "validate honours NoTestRun"
+// either happens or doesn't, and the card is where Quick Deploy is offered.
+const { SfCliService } = require(path.join(__dirname, '..', 'out', 'sfCliService.js'));
+const argvFor = (opts) => {
+  const real = new SfCliService();
+  const seen = [];
+  real.runJsonCancellable = (args) => { seen.push(args); return { promise: new Promise(() => undefined), cancel: () => undefined }; };
+  real.deployMetadata(['ApexClass:AcmeService'], 'acme-dev-user', '/ws', opts);
+  return seen[0];
+};
+
+check('a validation without tests is a dry-run deploy; with tests it is `deploy validate`', () => {
+  const none = argvFor({ validateOnly: true });
+  assert.deepStrictEqual(none.slice(0, 4), ['project', 'deploy', 'start', '--dry-run'], none.join(' '));
+  assert.ok(!none.includes('--test-level'), none.join(' '));
+  const local = argvFor({ validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.deepStrictEqual(local.slice(0, 3), ['project', 'deploy', 'validate'], local.join(' '));
+  assert.ok(!local.includes('--dry-run'));
+  assert.strictEqual(local[local.indexOf('--test-level') + 1], 'RunLocalTests');
+  const deploy = argvFor({});
+  assert.deepStrictEqual(deploy.slice(0, 3), ['project', 'deploy', 'start']);
+  assert.ok(!deploy.includes('--dry-run'), 'a real deploy is never a dry run');
+  // NoTestRun is passed, not dropped: omitted, a production org runs local tests
+  // on an Apex payload whatever the user picked.
+  const explicit = argvFor({ validateOnly: true, testLevel: 'NoTestRun' });
+  assert.deepStrictEqual(explicit.slice(0, 4), ['project', 'deploy', 'start', '--dry-run'], explicit.join(' '));
+  assert.strictEqual(explicit[explicit.indexOf('--test-level') + 1], 'NoTestRun');
+});
+
+check('`deploy validate` never gets --ignore-conflicts (it has no such flag); the others keep it', () => {
+  assert.ok(!argvFor({ validateOnly: true, testLevel: 'RunLocalTests', ignoreConflicts: true }).includes('--ignore-conflicts'),
+    'sf rejects the flag on validate ("Nonexistent flag"), which then read as an outdated CLI');
+  assert.ok(argvFor({ validateOnly: true, testLevel: 'NoTestRun', ignoreConflicts: true }).includes('--ignore-conflicts'), 'a dry-run start takes it');
+  assert.ok(argvFor({ ignoreConflicts: true }).includes('--ignore-conflicts'), 'a deploy takes it');
+});
+
+check('runDeploy passes the level it resolved, NoTestRun included', () => {
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
+  assert.ok(!/testLevel === 'NoTestRun' \? undefined : testLevel/.test(src), 'a NoTestRun pick must reach the CLI, not the org default');
+});
+
+function validatedCard(retry, extra = {}) {
+  const posted = [];
+  const stub = Object.create(DeployPanelProvider.prototype);
+  stub.items = [];
+  stub.liveSuggestions = new Map();
+  stub.post = (m) => posted.push(m);
+  stub.endCmd = () => undefined;
+  stub.notifySuccessIfPanelHidden = () => undefined;
+  stub.output = { appendLine: () => undefined };
+  DeployPanelProvider.prototype.reportDeployResult.call(stub, { id: '0Af000000000001AAA', success: true, status: 'Succeeded', numberComponentErrors: 0, ...extra }, {
+    items: [{ type: 'ApexClass', name: 'AcmeService', filePath: '/ws/force-app/main/default/classes/AcmeService.cls', files: [] }],
+    orgOnlySkipped: [], orgLabel: 'acme-dev', org: 'acme-dev-user', noun: '1 component', cmdId: 'c1', start: Date.now(),
+    validateOnly: true, retry
+  });
+  return { card: posted.find(m => m.type === 'status').card, lastValidated: stub.lastValidated };
+}
+
+check('Quick Deploy is offered only for a validation that ran tests', () => {
+  const none = validatedCard({ keys: ['ApexClass:AcmeService'], validateOnly: true, testLevel: 'NoTestRun' });
+  assert.ok(!none.card.quickDeploy, 'the org refuses to quick-deploy a validation without tests');
+  assert.strictEqual(none.lastValidated, undefined);
+  const local = validatedCard({ keys: ['ApexClass:AcmeService'], validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.strictEqual(local.card.quickDeploy.jobId, '0Af000000000001AAA');
+  assert.strictEqual(local.lastValidated.jobId, '0Af000000000001AAA');
+  assert.ok(validatedCard(undefined).card.quickDeploy, 'a reattached job (no retry request) is offered when the org does not say otherwise');
+  for (const v of [false, 'false']) {
+    assert.ok(!validatedCard(undefined, { runTestsEnabled: v }).card.quickDeploy, `the org's runTestsEnabled=${JSON.stringify(v)} wins for a reattached job`);
+  }
+  assert.ok(validatedCard({ testLevel: 'RunLocalTests' }, { runTestsEnabled: true }).card.quickDeploy);
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

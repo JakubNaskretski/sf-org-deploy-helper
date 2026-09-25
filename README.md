@@ -19,14 +19,15 @@ A convenient sidebar for deploying, retrieving, and diffing Salesforce metadata 
   exactly those, so nothing needs ticking one by one; a single line is read the same way,
   alongside the ordinary search — plus the
   type-filter dropdown, with persisted state across reloads — All / None buttons stay
-  above the list, each row has an *only* shortcut, and Expand all / Collapse all sit
-  above the tree. OmniStudio types answer to their designer names too (`flexcard`,
+  above the list, each row has an *only* shortcut, and Select all / Expand all /
+  Collapse all sit above the tree. OmniStudio types answer to their designer names too (`flexcard`,
   `dataraptor`, `integration procedure`).
 - One-click **Deploy**, **Retrieve**, **Diff** against the selected org.
 - Modal confirms before destructive ops, plus a hard **PROD** guard.
 - Right-click any metadata file in the explorer for Deploy / Retrieve / Diff.
 - Status-bar org indicator, status card history, command log with timings.
-- Cancel button for long-running deploys/retrieves.
+- Progress in the status bar and the panel — no notification pinned over the editor — and a Cancel button in the panel for long-running deploys/retrieves.
+- **Validate** runs the test level you pick, none included: with no tests it is a check-only `sf project deploy start --dry-run`; with tests it is `sf project deploy validate`, the kind that can be quick-deployed.
 
 ## OmniStudio
 

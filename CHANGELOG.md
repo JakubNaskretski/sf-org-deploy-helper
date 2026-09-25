@@ -3,6 +3,43 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.28.0
+
+- **Select all in the All view.** A "Select all (N)" button left of Expand all / Collapse all
+  ticks every component the list shows — filters and a pasted list of names included, org-only
+  rows too, the same set ticking each group would. It adds to what is already selected.
+- **Validate runs the tests you pick — none included.** A Validate used to turn NoTestRun into
+  RunLocalTests and say a validation always runs tests. It doesn't have to: with no tests it now
+  runs as a check-only `sf project deploy start --dry-run`, and "Tests: default" on a sandbox
+  means no tests here too, as the picker says. Quick Deploy needs a validation that ran tests,
+  so it is offered only after one — pick a test level when you want it. A NoTestRun pick now
+  reaches sf as `--test-level NoTestRun` on a deploy too: it used to be dropped, so a production
+  org ran local tests while the confirm said it would refuse.
+- **Long operations no longer pin a notification over the editor.** Deploy, validate, retrieve
+  and the rest show their progress in the status bar and the panel's progress card. The
+  notification had no close button while it ran, and its Cancel stopped the job on the org — a
+  30-minute validate sat on screen one misclick away from being cancelled. Cancel is in the
+  panel; the browser login keeps its notification.
+- Fixed: **Static resources are listed.** Only resources stored as `Name.resource` were found,
+  but sf writes most with their real extension (`.js`, `.css`, `.txt`…) or unzips them to a
+  folder, so those never reached the tree, a Select all or a deploy. They are found by their
+  `.resource-meta.xml` now (which is what a double-click opens — the content is often binary),
+  and an edit inside an unzipped resource maps back to it, a deleted file included.
+- Fixed: **"N skipped" says what it means.** Rows you tick that exist only on the org (a
+  group checkbox ticks them too) have no local file, so a deploy leaves them out — not deployed,
+  not failed, untouched on the org. The card used to list them after every deployed row, where
+  its 100-line cap cut them off, leaving a bare "N skipped". The confirm now says how many
+  will be skipped and why, and the card leads with them.
+- Fixed: **Validate with "Overwrite org changes" on.** `sf project deploy validate` has no
+  `--ignore-conflicts` flag — it ignores conflicts on its own — so every Validate that ran tests
+  failed with "Nonexistent flag", and the hint blamed an outdated CLI.
+- Fixed: **An error that mentions sfdx-project.json no longer says there is no project.** Any
+  sf error quoting the file — an unset `replaceWithEnv` variable, a missing package directory —
+  got the hint "This workspace is not a Salesforce DX project". That hint now shows only when sf
+  says so, and an unset replacement variable gets its own: sf runs with VS Code's environment,
+  so set the variable where VS Code inherits it (your shell profile, then restart VS Code), or
+  give the replacement `"allowUnsetEnvVariable": true`.
+
 ## 0.27.0
 
 - **Your target org is now per window.** Each VS Code window remembers its own target org, so

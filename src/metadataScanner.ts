@@ -49,6 +49,9 @@ export interface FolderRule {
   /** flat rule whose fullName keeps the path below the type folder (a nested
    *  ReportFolder `reports/Parent/Child.reportFolder-meta.xml` is `Parent/Child`). */
   relName?: boolean;
+  /** the `-meta.xml` is the anchor and the content sits beside it with any
+   *  extension, or unzipped into a folder of the same name (StaticResource). */
+  content?: boolean;
 }
 
 /** Static folder rules. Every folder/suffix here is pinned to the sf CLI's own
@@ -64,7 +67,9 @@ export const RULES: FolderRule[] = [
   { folder: 'layouts', type: 'Layout', primaryExt: ['.layout-meta.xml'] },
   { folder: 'permissionsets', type: 'PermissionSet', primaryExt: ['.permissionset-meta.xml'] },
   { folder: 'profiles', type: 'Profile', primaryExt: ['.profile-meta.xml'] },
-  { folder: 'staticresources', type: 'StaticResource', primaryExt: ['.resource'], metaSuffix: '.resource-meta.xml' },
+  // sf writes the content as `<Name>.<mime ext>` (.js, .css, .zip…) or unzips it
+  // to `<Name>/` — only an octet-stream is `.resource` — so the meta is the anchor.
+  { folder: 'staticresources', type: 'StaticResource', primaryExt: ['.resource-meta.xml'], content: true },
   { folder: 'tabs', type: 'CustomTab', primaryExt: ['.tab-meta.xml'] },
   { folder: 'labels', type: 'CustomLabels', primaryExt: ['.labels-meta.xml'] },
   { folder: 'customMetadata', type: 'CustomMetadata', primaryExt: ['.md-meta.xml'] },
@@ -413,6 +418,14 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
             ? [...path.relative(dir, filePath).split(path.sep).slice(0, -1), stem].join('/')
             : stem;
           const parentDir = path.dirname(filePath);
+          if (rule.content) {
+            // The meta stays the primary: content is often binary (an image, a zip),
+            // which a text editor refuses to open. The content rides in `files`.
+            const content = (await fs.readdir(parentDir).catch(() => [] as string[])).filter(f => f !== baseName && f.startsWith(stem + '.')).map(f => path.join(parentDir, f));
+            if (await isDirectory(path.join(parentDir, stem))) content.push(...await listAllFiles(path.join(parentDir, stem)));
+            items.push({ type: rule.type, name, filePath, metaPath: filePath, files: [filePath, ...content] });
+            continue;
+          }
           const metaPath = rule.metaSuffix ? path.join(parentDir, name + rule.metaSuffix) : undefined;
           const files = [filePath];
           const metaExists = !!(metaPath && (await pathExists(metaPath)));
@@ -621,6 +634,15 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
     for (const suffix of ['.email-meta.xml', '.email']) {
       if (base.endsWith(suffix)) return item('EmailTemplate', `${segs[ei + 1]}/${base.slice(0, -suffix.length)}`);
     }
+  }
+
+  // 3b. Content types (StaticResource): the meta, `<Name>.<any ext>` beside it, or
+  // any file inside the unzipped `<Name>/`. Resource names carry no dots.
+  for (const rule of rules) {
+    const ci = rule.content ? lastSeg(rule.folder) : -1;
+    if (ci < 0 || ci + 1 >= segs.length) continue;
+    const anchor = (rule.primaryExt ?? []).find(ext => base.endsWith(ext));
+    return item(rule.type, anchor ? base.slice(0, -anchor.length) : ci + 2 === segs.length ? base.split('.')[0] : segs[ci + 1]);
   }
 
   // 4. Regular single-/per-file types — matched by the type's folder plus extension.

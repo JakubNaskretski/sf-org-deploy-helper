@@ -48,7 +48,7 @@ const vscodeStub = {
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { DeployPanelProvider, isUnsupportedTypeError, managedHiddenLine, OMNI_UNSUPPORTED_HINT } =
+const { DeployPanelProvider, isUnsupportedTypeError, managedHiddenLine, OMNI_UNSUPPORTED_HINT, hintForError } =
   require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 const { SfCliService, SfCliError } = require(path.join(__dirname, '..', 'out', 'sfCliService.js'));
 const proto = DeployPanelProvider.prototype;
@@ -373,6 +373,23 @@ check('source: every per-type listing failure goes through the unsupported class
 check('source: hintForError explains INVALID_TYPE', () => {
   assert.ok(src.includes('if (/invalid_type|cannot use: /.test(txt))'));
   assert.ok(src.includes('This metadata type is not available on this org (feature not enabled or wrong runtime).'));
+});
+
+// A project sf DID find, quoted by name in its own error, is not "no project".
+// Messages verbatim from sf 2.137 (SDR, @salesforce/core, sf-plugins-core).
+check('hintForError: "not a DX project" only when there is none', () => {
+  const NO_PROJECT = /not a Salesforce DX project/;
+  const sfErr = (name, message) => Object.assign(new SfCliError(message), { errorName: name });
+  const env = sfErr('ConversionError', 'Component conversion failed: "ACME_ENDPOINT" is in sfdx-project.json as a value for "replaceWithEnv" property, but it\'s not set in your environment.');
+  assert.ok(!NO_PROJECT.test(hintForError(env) ?? ''), 'an unset replaceWithEnv variable is not a missing project');
+  assert.ok(/VS Code's environment/.test(hintForError(env) ?? ''), 'and it gets its own hint');
+  for (const m of [
+    'The path "force-app", specified in sfdx-project.json, does not exist. Be sure this directory is included in your project root.',
+    'The file "replacements.txt" specified in the "replacements" property of sfdx-project.json could not be read.',
+    'In sfdx-project.json, indicate only one package directory (path) as the default.'
+  ]) assert.ok(!NO_PROJECT.test(hintForError(new Error(m)) ?? ''), m);
+  assert.ok(NO_PROJECT.test(hintForError(sfErr('RequiresProjectError', 'This command is required to run from within a Salesforce project directory.'))));
+  assert.ok(NO_PROJECT.test(hintForError(sfErr('InvalidProjectWorkspaceError', '/ws does not contain a valid Salesforce DX project.'))));
 });
 
 check('source: FETCH_ORG_TYPES keeps the four OmniStudio types', () => {

@@ -525,7 +525,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         </div>
       </div>
       <div id="treeTools" class="mode-head tree-tools" style="display:none;">
-        <span></span>
+        <span><button id="selectAllRows" type="button" style="display:none;" title="Tick every component this list shows — filters apply">Select all</button></span>
         <button id="expandAll" type="button" title="Expand every group">Expand all</button>
         <button id="collapseAll" type="button" title="Collapse every group">Collapse all</button>
       </div>
@@ -536,7 +536,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         <span class="spacer"></span>
         <span id="selCount" class="selected-count">0 selected</span>
         <button id="clearSel" class="subtle" style="display:none;" title="Clear selection">✕</button>
-        <select id="testLevel" class="org" title="Apex test level for deploy/validate. 'Tests: default' is resolved from the target org — sandbox: no tests (NoTestRun), production: RunLocalTests — unless the Default Test Level setting names one. Validate always runs tests, so NoTestRun becomes RunLocalTests there. The confirm dialog names the level that will actually run.">
+        <select id="testLevel" class="org" title="Apex test level for deploy/validate. 'Tests: default' is resolved from the target org — sandbox: no tests (NoTestRun), production: RunLocalTests — unless the Default Test Level setting names one. A Validate with no tests is a check-only deploy that can't be quick-deployed — pick a level for that. The confirm dialog names the level that will actually run.">
           <option value="" title="Resolved from the target org: sandbox runs no tests (NoTestRun), production runs RunLocalTests. The Default Test Level setting, when set, takes precedence.">Tests: default (sandbox: none, prod: RunLocalTests)</option>
           <option value="NoTestRun">NoTestRun</option>
           <option value="RunSpecifiedTests">RunSpecifiedTests</option>

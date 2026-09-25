@@ -304,6 +304,17 @@ check('a component reverted later still belongs to the commit that touched it', 
   assert.deepStrictEqual(p.last().uncommitted, ['ApexClass:AcmeA']);
 });
 
+check('a file deleted inside an unzipped static resource marks the resource changed', async () => {
+  // Its filePath is the meta, not the folder, so the folder is registered on its own.
+  const SR = `${WS}/force-app/main/default/staticresources`;
+  const zip = { type: 'StaticResource', name: 'AcmeZip', filePath: `${SR}/AcmeZip.resource-meta.xml`, files: [`${SR}/AcmeZip.resource-meta.xml`, `${SR}/AcmeZip/js/a.js`] };
+  config = { changedBaseRef: '' };
+  git = { repositories: [repo({ working: [`${SR}/AcmeZip/js/gone.js`] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };
+  const p = provider([...ITEMS, zip]);
+  await p.s.postChangedComponents();
+  assert.deepStrictEqual(p.last().uncommitted, ['StaticResource:AcmeZip']);
+});
+
 check('staged and unstaged edits to one component are one entry', async () => {
   config = { changedBaseRef: '' };
   git = { repositories: [repo({ working: [A_CLS], index: [A_CLS, `${WS}/${CLASSES}/AcmeA.cls-meta.xml`] })], onDidOpenRepository: () => ({ dispose() {} }), git: GIT_BIN };

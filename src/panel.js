@@ -230,6 +230,13 @@
   // Tree Expand all / Collapse all (static row above the tree, panelHtml.ts).
   $('expandAll').addEventListener('click', () => setAllGroups(true));
   $('collapseAll').addEventListener('click', () => setAllGroups(false));
+  // Select all (All view): additive, like the Changed header's — every row the
+  // filters leave, org-only included, the same keys ticking each group would.
+  $('selectAllRows').addEventListener('click', () => {
+    const { objectMap, flatGroups } = buildGroups();
+    for (const k of keysInGroups(objectMap, flatGroups)) state.selected.add(k);
+    selectionChanged();
+  });
   document.querySelectorAll('#viewModes button').forEach((btn) => {
     btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
   });
@@ -1426,16 +1433,13 @@
   // GROUP data rather than the DOM, so the render's NODE_CAP doesn't silently
   // shrink the set the button promises.
   function localKeysInGroups(objectMap, flatGroups) {
+    return keysInGroups(objectMap, flatGroups).filter(k => state.localKeys.has(k));
+  }
+
+  function keysInGroups(objectMap, flatGroups) {
     const keys = [];
-    for (const o of objectMap.values()) {
-      for (const k of keysUnderObject(o)) if (state.localKeys.has(k)) keys.push(k);
-    }
-    for (const arr of flatGroups.values()) {
-      for (const it of arr) {
-        const k = `${it.type}:${it.name}`;
-        if (state.localKeys.has(k)) keys.push(k);
-      }
-    }
+    for (const o of objectMap.values()) keys.push(...keysUnderObject(o));
+    for (const arr of flatGroups.values()) for (const it of arr) keys.push(`${it.type}:${it.name}`);
     return keys;
   }
 
@@ -1500,6 +1504,11 @@
     co.disabled = false;
     ex.title = 'Expand every group';
     co.title = state.viewMode === 'changed' && changedSections() ? 'Collapse every section' : 'Collapse every group';
+    // All view only: Changed has its own in its header, Selected is the selection.
+    const sa = $('selectAllRows');
+    const n = state.viewMode === 'all' ? keysInGroups(objectMap, flatGroups).length : 0;
+    sa.style.display = n ? '' : 'none';
+    sa.textContent = `Select all (${n})`;
   }
 
   function renderTree() {

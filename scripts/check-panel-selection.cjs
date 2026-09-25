@@ -149,7 +149,7 @@ const IDS = [
   'selCount', 'sourceFilter', 'sourceFilterRow', 'splitter', 'status', 'statusHeader', 'testClasses',
   'testLevel', 'tree', 'typeFilterDetails', 'typeFilterLabel', 'typeFilterList', 'typeFilterRow',
   'useActive', 'useOpenTabs', 'validateBtn', 'viewModes',
-  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll', 'orgAsOf'
+  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll', 'orgAsOf', 'selectAllRows'
 ];
 
 /** Boot one panel instance over the given persisted webview state. */
@@ -1858,6 +1858,59 @@ check('the search box grows with a pasted list and shrinks when it is cleared', 
   q.deliver({ type: 'selectKeys', keys: ['ApexClass:AcmeA'], scroll: true });
   assert.strictEqual(q.el('search').value, '');
   assert.strictEqual(q.el('search').rows, 1);
+});
+
+// ------------------------------------------------ 6f) Select all in the All view
+// "Paste a list, ready to tick" had nothing to tick the whole list with: only the
+// Changed header had a Select all. It reads the GROUP data like that one does, so
+// collapsed groups and the render cap don't shrink it, but in All it takes the
+// org-only rows too — they are listed here to be retrieved, and a group's own
+// checkbox ticks them.
+const selectAll = (p) => p.el('selectAllRows');
+const tabBtn = (p, mode) => p.el('viewModes').children.find(b => b.dataset.mode === mode);
+
+check('the Select all button sits in the tools row, left of Expand all', () => {
+  assert.ok(/<div id="treeTools" class="mode-head tree-tools"[^>]*>\s*<span><button id="selectAllRows"[^>]*>[^<]*<\/button><\/span>\s*<button id="expandAll"/.test(HTML_TS));
+});
+
+check('Select all ticks every row the All view lists, org-only and collapsed ones included', () => {
+  const p = panel(BASE);
+  p.deliver(TFILES(NESTED, ['CustomField']));
+  p.deliver({ type: 'orgMetadata', orgLabel: 'acme-dev', orgItems: [{ type: 'ApexClass', name: 'AcmeOrgOnly' }] });
+  assert.deepStrictEqual(names(p), [], 'fixture: every group starts collapsed, so no row is painted');
+  assert.strictEqual(selectAll(p).style.display, '');
+  assert.strictEqual(selectAll(p).textContent, 'Select all (4)');
+  selectAll(p).fire('click');
+  assert.strictEqual(p.liveCount(), 4);
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(),
+    ['ApexClass:AcmeA', 'ApexClass:AcmeOrgOnly', 'CustomField:Acme__c.Foo__c', 'CustomObject:Acme__c']);
+});
+
+check('the filters decide what Select all takes, and it adds to the selection', () => {
+  const p = panel({ ...BASE, filter: 'AcmeA, AcmeF', selected: ['ApexTrigger:AcmeT'] });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.strictEqual(selectAll(p).textContent, 'Select all (2)', 'a pasted list names two');
+  selectAll(p).fire('click');
+  assert.deepStrictEqual(p.persisted().selected.slice().sort(), ['ApexClass:AcmeA', 'ApexTrigger:AcmeT', 'Flow:AcmeF'],
+    'the list is added; the tick it hid is kept');
+  const q = panel({ ...BASE, typeFilter: ['Flow'] });
+  q.deliver(TFILES(THREE_TYPES));
+  assert.strictEqual(selectAll(q).textContent, 'Select all (1)', 'the type filter narrows it');
+  selectAll(q).fire('click');
+  assert.deepStrictEqual(q.persisted().selected, ['Flow:AcmeF']);
+});
+
+check('Select all shows in the All view only', () => {
+  const p = panel({ ...BASE, viewMode: 'selected', selected: ['ApexClass:AcmeA'] });
+  p.deliver(TFILES(THREE_TYPES));
+  assert.strictEqual(selectAll(p).style.display, 'none', 'the Selected lens is the selection already');
+  tabBtn(p, 'all').fire('click');
+  assert.strictEqual(selectAll(p).style.display, '');
+  assert.strictEqual(selectAll(p).textContent, 'Select all (3)');
+  tabBtn(p, 'changed').fire('click');
+  p.deliver({ type: 'changed', keys: ['ApexClass:AcmeA'] });
+  assert.strictEqual(selectAll(p).style.display, 'none', 'Changed keeps its own, in its header');
+  assert.ok(p.el('tree').find(e => /^Select all/.test(e.textContent)), 'and that one is still there');
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

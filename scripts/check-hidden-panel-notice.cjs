@@ -683,58 +683,31 @@ check('notify: the visible-panel path never counts against the toast rate limit'
 });
 
 // ---------------------------------------------------- quiet progress (Window vs Notification)
-check('withWindowProgress: the default is a cancellable Notification', () => {
+check('withWindowProgress: the default is the status-bar spinner, no Cancel of its own', () => {
+  // A progress toast has no close button in VS Code: a 30-minute validate pinned
+  // one on screen with an org-side Cancel one misclick away.
   resetUi();
   const p = Object.assign(Object.create(DeployPanelProvider.prototype), { cancelCurrent: () => {} });
-  withWindowProgress.call(p, 'Doing a thing', () => Promise.resolve('ok'));
-  assert.strictEqual(ui.notices[0].options.location, vscodeStub.ProgressLocation.Notification);
-  assert.strictEqual(ui.notices[0].options.cancellable, true);
-});
-
-check('withWindowProgress: quiet uses the status-bar spinner, no Cancel button', () => {
-  resetUi();
-  const p = Object.assign(Object.create(DeployPanelProvider.prototype), { cancelCurrent: () => {} });
-  withWindowProgress.call(p, 'Fetching metadata from acme-dev', () => Promise.resolve('ok'), { quiet: true });
+  withWindowProgress.call(p, 'Validating 9000 components against acme-dev', () => Promise.resolve('ok'));
   assert.strictEqual(ui.notices[0].options.location, vscodeStub.ProgressLocation.Window);
   assert.strictEqual(ui.notices[0].options.cancellable, false);
 });
 
-// The two places quiet must reach, and nowhere else — source-pinned, since driving
-// loadOrgMetadata for real needs the full sf.listMetadata/org-store rig that
-// check-fetch-org.cjs already owns (its `run()` calls it with no args, so the new
-// `quiet = false` default leaves every one of its checks exactly as before).
-check('source: exactly one call site passes { quiet } — loadOrgMetadata\'s own progress', () => {
-  const count = (providerSrc.match(/\}, \{ quiet \}\);/g) || []).length;
-  assert.strictEqual(count, 1, 'loadOrgMetadata must pass quiet to its own withWindowProgress call, and nowhere else');
-  const i = providerSrc.indexOf('`Fetching metadata from ${orgLabel}`');
-  assert.ok(i > 0 && providerSrc.slice(i, i + 3000).includes('}, { quiet });'),
-    'the quiet flag must reach the Fetch Org progress notification');
+check('withWindowProgress: toast is a cancellable Notification', () => {
+  resetUi();
+  const p = Object.assign(Object.create(DeployPanelProvider.prototype), { cancelCurrent: () => {} });
+  withWindowProgress.call(p, 'Waiting for browser login…', () => Promise.resolve('ok'), { toast: true });
+  assert.strictEqual(ui.notices[0].options.location, vscodeStub.ProgressLocation.Notification);
+  assert.strictEqual(ui.notices[0].options.cancellable, true);
 });
 
-check('source: exactly two call sites hardcode { quiet: true } — the two registry resolutions', () => {
-  const count = (providerSrc.match(/, \{ quiet: true \}\);/g) || []).length;
-  assert.strictEqual(count, 2, 'only the two registry resolutions may hardcode quiet');
-  const i = providerSrc.indexOf("'Resolving metadata types (sf registry)'");
-  assert.ok(i > 0 && providerSrc.slice(i, i + 300).includes('{ quiet: true }'),
-    'the ordinary-scan type-resolution progress must be quiet, not a Notification');
-  // The single-file resolution (0.23.1) runs BEFORE the slot is reserved: a
-  // cancellable toast there could only ever cancel whatever OTHER op was running.
-  const j = providerSrc.indexOf("'Resolving metadata type (sf registry)'");
-  assert.ok(j > 0 && providerSrc.slice(j, j + 200).includes('{ quiet: true }'),
-    'the per-file type resolution must be quiet — its Cancel reached an unrelated running op');
-});
-
-check('source: the automatic Fetch Org on open requests quiet; a manual click does not', () => {
-  const autoIdx = providerSrc.indexOf('private maybeAutoFetchOrg');
-  assert.ok(autoIdx > 0, 'maybeAutoFetchOrg not found');
-  assert.ok(/this\.loadOrgMetadata\(true\)/.test(providerSrc.slice(autoIdx, autoIdx + 1400)),
-    'maybeAutoFetchOrg must fetch quietly — a Notification firing unasked at panel open is the flood itself');
-  const manualIdx = providerSrc.indexOf("case 'fetchOrgMetadata':");
-  assert.ok(manualIdx > 0, "'fetchOrgMetadata' case not found");
-  // 500, not 400: the debugTiming receive-stamp (logReceiveTiming) added one more
-  // line ahead of the call this pin is looking for.
-  assert.ok(/this\.loadOrgMetadata\(\);/.test(providerSrc.slice(manualIdx, manualIdx + 500)),
-    'a manual Fetch Org click must keep the full cancellable Notification');
+check('source: only the browser login asks for a toast', () => {
+  assert.strictEqual((providerSrc.match(/\{ toast: true \}/g) || []).length, 1, 'one toast, and only one');
+  const i = providerSrc.indexOf("'Waiting for browser login…', async () => {");
+  assert.ok(i > 0 && providerSrc.slice(i, i + 900).includes('}, { toast: true });'),
+    'the login wait keeps its Cancel: the user is in the browser, and it only stops a local wait');
+  assert.ok(!/quiet/.test(providerSrc.slice(providerSrc.indexOf('private withWindowProgress'), providerSrc.indexOf('private withWindowProgress') + 1500)),
+    'the old quiet flag is gone — status bar is the default now');
 });
 
 void (async () => {

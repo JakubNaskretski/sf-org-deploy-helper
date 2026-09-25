@@ -62,7 +62,7 @@ const warns = [];
 const vscodeStub = {
   window: {
     showWarningMessage: (message, options, ...items) => {
-      warns.push({ message, modal: !!(options && options.modal) });
+      warns.push({ message, modal: !!(options && options.modal), detail: options && options.detail });
       // Every confirm in these paths is auto-accepted — the double-click/queue
       // harness already covers the modal machinery itself; here only the
       // resulting TEXT (for the "via package.xml" note) and the fact that the
@@ -199,6 +199,49 @@ const runDeploy = (p, keys, opts = {}) => proto.runDeploy.call(p.s, keys, opts);
 const runRetrieve = (p, keys, opts = {}) => proto.runRetrieve.call(p.s, keys, opts);
 const statusCards = p => p.posted.filter(m => m.type === 'status').map(m => m.card);
 const firstEchoedCmd = p => p.posted.find(m => m.type === 'cmd' && m.entry.status === 'run')?.entry.command;
+
+// ---------------------------------------------- org-only rows in a big deploy
+// Thousands deployed + thousands org-only: the card listed the deployed rows first and
+// its 100-line cap cut every skipped one off, leaving a bare "N skipped".
+check('deploy with org-only rows: the confirm says so, and the card leads with them', async () => {
+  const items = makeItems(150);
+  const orgOnly = ['ApexClass:AcmeOrgOnlyA', 'ApexClass:AcmeOrgOnlyB'];
+  const p = provider(items, { fields: { orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
+  warns.length = 0;
+  await runDeploy(p, [...keysOf(items), ...orgOnly]);
+  const confirm = warns.find(w => w.modal);
+  assert.ok(/2 more selected exist only on the org/.test(confirm.detail || ''), JSON.stringify(confirm));
+  const card = statusCards(p).find(c => c.kind === 'warn' || c.kind === 'ok');
+  assert.ok(/ · 2 skipped \(org only\)$/.test(card.meta), card.meta);
+  assert.ok(/^2 skipped — selected, but they exist only on the org/.test(card.lines[0]), card.lines[0]);
+  assert.deepStrictEqual(card.lines.slice(1, 3), orgOnly.map(k => `— ${k} — no local source, skipped (retrieve first)`));
+  assert.strictEqual(p.calls.deployMetadata[0].opts.manifest !== undefined, true, 'only the 150 local ones are sent');
+});
+
+check('a deploy queued behind a running op says the same before it waits', async () => {
+  const items = makeItems(3);
+  const orgOnly = ['ApexClass:AcmeOrgOnlyA'];
+  const p = provider(items, { fields: { busy: true, orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
+  warns.length = 0;
+  await proto.enqueueDeploy.call(p.s, [...keysOf(items), ...orgOnly], {});
+  const confirm = warns.find(w => w.modal);
+  assert.ok(confirm && /^Queue: /.test(confirm.message), JSON.stringify(warns));
+  assert.ok(/1 more selected exist only on the org/.test(confirm.detail || ''), JSON.stringify(confirm));
+});
+
+// ------------------------------------------ the command log names what runs
+// A no-test validate is a dry-run `start`; `validate` takes no --ignore-conflicts.
+check('validate: the echoed command matches the argv it runs', async () => {
+  const items = makeItems(3);
+  const none = provider(items);
+  await runDeploy(none, keysOf(items), { validateOnly: true, testLevel: 'NoTestRun' });
+  assert.ok(/^sf project deploy start --dry-run .* --test-level NoTestRun$/.test(firstEchoedCmd(none)), firstEchoedCmd(none));
+  assert.strictEqual(none.calls.deployMetadata[0].opts.testLevel, 'NoTestRun', 'the pick reaches the CLI');
+  const tested = provider(items);
+  await runDeploy(tested, keysOf(items), { validateOnly: true, testLevel: 'RunLocalTests', ignoreConflictsOverride: true });
+  assert.ok(/^sf project deploy validate .* --test-level RunLocalTests$/.test(firstEchoedCmd(tested)), firstEchoedCmd(tested));
+  assert.ok(!firstEchoedCmd(tested).includes('--ignore-conflicts'), firstEchoedCmd(tested));
+});
 
 // ------------------------------------------------------------- (a) threshold
 check('deploy: 31 items go via manifest, 30 go via --metadata', async () => {
