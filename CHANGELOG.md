@@ -3,7 +3,7 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
-## Unreleased
+## 0.29.0
 
 - **The Status pane shows runs.** A deploy, validation, quick deploy or retrieve appears the
   moment you confirm it — what it sends, what it skips and why, and progress bars while the org
