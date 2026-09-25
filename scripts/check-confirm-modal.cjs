@@ -386,6 +386,7 @@ check('prod validate + NoTestRun warns like the deploy it predicts', () => {
     const p = plan({ ...source, isProd: true, opts: { validateOnly: true } });
     assert.strictEqual(p.testLevel, 'NoTestRun');
     assert.ok(warnsAboutProd(p.testNote), p.testNote);
+    assert.ok(/Without Apex none run, and there is no Quick Deploy\.$/.test(p.testNote), 'a validate says what an Apex-free payload loses');
   }
 });
 

@@ -232,6 +232,21 @@ check('thousands of org-only rows cannot push the deployed ones off the card', a
   for (const k of orgOnly) assert.ok(p.outputLines.some(l => l.includes(k)), `Output channel missing ${k}`);
 });
 
+check('eleven skipped rows: the one the card hides is still in the Output channel', async () => {
+  // Swapping the 11th name for the "… and 1 more" line keeps the line count equal,
+  // which a count comparison would mistake for "nothing dropped".
+  const items = makeItems(3);
+  const orgOnly = Array.from({ length: 11 }, (_, i) => `ApexClass:AcmeOrgOnly${i}`);
+  const p = provider(items, { fields: { orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
+  await runDeploy(p, [...keysOf(items), ...orgOnly]);
+  const card = statusCards(p).find(c => c.kind === 'warn' || c.kind === 'ok');
+  assert.strictEqual(card.lines[11], '… and 1 more skipped — full list in the Output channel');
+  for (const k of orgOnly) assert.ok(p.outputLines.some(l => l.includes(k)), `Output channel missing ${k}`);
+  const one = provider(items, { fields: { orgMembers: new Map([['ApexClass:AcmeLone', {}]]), orgMembersOrg: ORG } });
+  await runDeploy(one, [...keysOf(items), 'ApexClass:AcmeLone']);
+  assert.ok(/^1 skipped — selected, but it exists only on the org/.test(statusCards(one).find(c => c.kind === 'warn').lines[0]));
+});
+
 check('a deploy queued behind a running op says the same before it waits', async () => {
   const items = makeItems(3);
   const orgOnly = ['ApexClass:AcmeOrgOnlyA'];

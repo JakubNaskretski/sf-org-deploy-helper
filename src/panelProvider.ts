@@ -3061,7 +3061,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // does, and the note says what will really happen.
     const testNote = (testLevel === 'NoTestRun'
         ? (isProd
-          ? '\n\nTests: none requested — production applies its own default, so local tests run if the payload contains Apex.'
+          ? `\n\nTests: none requested — production applies its own default, so local tests run if the payload contains Apex.${opts.validateOnly ? ' Without Apex none run, and there is no Quick Deploy.' : ''}`
           : opts.validateOnly
             ? '\n\nTests: none (NoTestRun) — no Quick Deploy afterwards; that needs a validation that ran tests.'
             : '\n\nTests: none (NoTestRun)')
@@ -3326,7 +3326,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Headed and listed FIRST on a success card: below thousands of deployed rows
     // the card's line cap cut every skipped one off, leaving a bare "N skipped".
     const skipHead = orgOnlySkipped.length
-      ? [`${orgOnlySkipped.length} skipped — selected, but they exist only on the org, so there was no local file to deploy:`]
+      ? [`${orgOnlySkipped.length} skipped — selected, but ${orgOnlySkipped.length === 1 ? 'it exists' : 'they exist'} only on the org, so there was no local file to deploy:`]
       : [];
     const testMeta = result.numberTestsTotal
       ? ` · ${(result.numberTestsTotal ?? 0) - (result.numberTestErrors ?? 0)}/${result.numberTestsTotal} tests passed`
@@ -5848,10 +5848,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
-   *  list into the Output channel first when it's about to be cut — a deploy/
-   *  retrieve over a few thousand components is inconvenient to scroll in a
-   *  card, but the full list must never simply be gone. */
   /** A success card with skipped rows: their explanation and the first few names
    *  lead, the deployed rows follow — thousands of skipped rows (a Select all on a
    *  fetched org) must not push every deployed one off the card. The full list,
@@ -5861,10 +5857,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const shown = skips.length > SHOWN ? [...skips.slice(0, SHOWN), `… and ${skips.length - SHOWN} more skipped — full list in the Output channel`] : skips;
     const full = [...head, ...skips, ...lines];
     const card = [...head, ...shown, ...lines];
-    if (card.length !== full.length || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
+    if (skips.length > SHOWN || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
     return capLines(card);
   }
 
+  /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
+   *  list into the Output channel first when it's about to be cut — a deploy/
+   *  retrieve over a few thousand components is inconvenient to scroll in a
+   *  card, but the full list must never simply be gone. */
   private capForCard(header: string, lines: Array<string | { text: string }>): Array<string | { text: string }> {
     if (lines.length > CARD_LINE_CAP) this.logResultLines(header, lines);
     return capLines(lines);
