@@ -401,6 +401,49 @@ check('with no runs the pane is the plain card list: no run card, no Earlier tog
   assert.strictEqual(sent(p, 'clearStatusHistory').length, 1);
 });
 
+check('focusing the list — what a click does on mousedown — marks the first row in view in place, so the click itself still lands', () => {
+  const p = boot({ scenario: 'fxdeployfail' });
+  const list = listOf(p);
+  const before = rowNodes(p);
+  assert.ok(!before.some(e => has(e, 'focused')), 'no row has the focus yet');
+  list.fire('focus');
+  const after = rowNodes(p);
+  assert.ok(after.length === before.length && after.every((e, i) => e === before[i]), 'the rows under the pointer were rebuilt, which drops the click');
+  const focused = after.filter(e => has(e, 'focused'));
+  assert.strictEqual(focused.length, 1);
+  assert.strictEqual(list.getAttribute('aria-activedescendant'), focused[0].id);
+  // The click that follows the mousedown hits that same row: its group folds.
+  assert.strictEqual(focused[0].getAttribute('aria-expanded'), 'true');
+  focused[0].fire('click');
+  const row = rowNodes(p).find(e => e.id === focused[0].id);
+  assert.strictEqual(row.getAttribute('aria-expanded'), 'false');
+});
+
+check('a different run becoming the newest starts the pane at its top; the same run re-posted keeps the scroll', () => {
+  const p = boot({ scenario: 'fxbigdeploy' });
+  scrollTo(p, 3000);
+  p.deliver(runsMsg('fxbigdeploy'));
+  assert.strictEqual(p.el('status').scrollTop, 3000);
+  p.deliver(runsMsg('fxdeployfail'));
+  assert.strictEqual(p.el('status').scrollTop, 0);
+});
+
+check('a poll tick never rebuilds the card, and a rebuild keeps what was typed in the search box', () => {
+  const p = boot({ scenario: 'fxrunning' });
+  p.deliver({ type: 'busy', busy: true, action: 'Deploy' });
+  const input = p.el('status').find(e => has(e, 'run-search'));
+  input.value = 'acme ord';
+  input.fire('input');
+  const card = p.el('status').find(e => has(e, 'run-card'));
+  for (let i = 0; i < 3; i++) p.deliver({ type: 'progress', text: `Deploying 900 components: ${i * 300}/900` });
+  assert.strictEqual(p.el('status').find(e => has(e, 'run-card')), card, 'a progress tick rebuilt the card');
+  assert.strictEqual(p.el('status').find(e => has(e, 'run-search')).value, 'acme ord');
+  p.deliver({ type: 'status', card: { kind: 'ok', title: 'No differences with acme-dev', at: Date.now() } });
+  const again = p.el('status').find(e => has(e, 'run-search'));
+  assert.notStrictEqual(again, input, 'a notice does rebuild the card');
+  assert.strictEqual(again.value, 'acme ord', 'half-typed text survives the rebuild');
+});
+
 check('the pane keeps the provider\'s 10 newest notices — replayed or live — and a notice has no buttons', () => {
   const RR_NOTICES = RR.NOTICES_MAX;
   assert.strictEqual(RR_NOTICES, 10);

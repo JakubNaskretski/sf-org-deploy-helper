@@ -833,7 +833,9 @@
       case 'progress':
         if (state.progress && msg.text) {
           state.progress.text = msg.text;
-          renderStatus();
+          // In place: a poll ticks every few seconds, and rebuilding the pane
+          // each time would drop clicks and half-typed search text.
+          if (progressTextEl) progressTextEl.textContent = msg.text;
         }
         return;
       case 'status':
@@ -2087,6 +2089,7 @@
   }
 
   /** The generic spinner card of a running operation. */
+  let progressTextEl = null;
   function progressCardEl() {
     const el = document.createElement('div');
     el.className = 'status-card progress';
@@ -2097,6 +2100,7 @@
     t.appendChild(sp);
     const txt = document.createElement('span');
     txt.textContent = state.progress.text;
+    progressTextEl = txt;
     t.appendChild(txt);
     el.appendChild(t);
     const m = document.createElement('div');
@@ -2350,10 +2354,12 @@
   function renderRunStatus() {
     const st = $('status');
     const latest = state.runs[0];
-    const ui = runUiFor(latest);
     // A re-render replaces the pane's content; where it was scrolled to, and
-    // which of its controls had the keyboard, carry over.
-    const scroll = st.scrollTop;
+    // which of its controls had the keyboard, carry over — unless a different
+    // run became the newest, which starts at the top.
+    const fresh = state.runUi.runId !== latest.id;
+    const ui = runUiFor(latest);
+    const scroll = fresh ? 0 : st.scrollTop;
     const listFocused = !!runList && document.activeElement === runList;
     const searchCaret = runSearch && document.activeElement === runSearch ? [runSearch.selectionStart, runSearch.selectionEnd] : null;
     releaseRunList();
@@ -2656,10 +2662,12 @@
     runList.addEventListener('keydown', onRunListKey);
     runList.addEventListener('focus', () => {
       // Tabbing in lands on the first row in view — never a jump back to the top.
+      // Marked in place: a click focuses the list on mousedown, and rebuilding
+      // the rows under the pointer then would swallow the click itself.
       if (state.runUi.focus >= 0 || !runModel || !runModel.rows.length) return;
       const st = $('status');
       const [lo] = RV.visibleRange(runModel.offsets, runModel.rows.length, st.scrollTop - runList.offsetTop, st.clientHeight, 0);
-      setRunFocus(runStep(lo - 1, 1), false);
+      markRunFocus(runStep(lo - 1, 1));
     });
     card.appendChild(runList);
     return card;
@@ -2720,8 +2728,11 @@
     input.placeholder = 'Filter by name, type, message or file…';
     input.setAttribute('aria-label', 'Filter the run results');
     input.spellcheck = false;
-    input.value = ui.q;
+    // What was typed, even before the pause applies it: a rebuild of the card
+    // (a notice arriving, the busy state changing) must not eat it.
+    input.value = ui.qTyped !== undefined ? ui.qTyped : ui.q;
     input.addEventListener('input', () => {
+      ui.qTyped = input.value;
       if (runSearchTimer) clearTimeout(runSearchTimer);
       runSearchTimer = setTimeout(() => {
         // A new search opens its own matches: folds made under the last one go.
@@ -2736,6 +2747,7 @@
       if (e.key !== 'Escape' || !input.value) return;
       input.value = '';
       ui.q = '';
+      ui.qTyped = '';
       ui.folds = {};
       refreshRunList();
     });
@@ -2921,6 +2933,13 @@
     return j >= 0 && j < runModel.rows.length ? j : from;
   }
   /** Move the keyboard focus to row i, scrolling the pane just enough to show it. */
+  /** Move the keyboard focus to row i without rebuilding a single row. */
+  function markRunFocus(i) {
+    if (!runFocusable(i)) return;
+    state.runUi.focus = i;
+    for (const c of runList.children) c.classList.toggle('focused', c.id === `run-row-${i}`);
+    runList.setAttribute('aria-activedescendant', `run-row-${i}`);
+  }
   function setRunFocus(i, scroll) {
     if (!runFocusable(i)) return;
     state.runUi.focus = i;
