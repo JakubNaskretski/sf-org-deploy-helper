@@ -93,7 +93,7 @@ function provider(extra = {}) {
   Object.assign(s, {
     busy: false, confirmOpen: false, deployQueue: [], cmdSeq: 0,
     orgMembers: new Map(), orgMembersOrg: undefined,
-    items: ITEMS, workspaceRoot: '/ws', cardHistoryCache: [],
+    items: ITEMS, workspaceRoot: '/ws',
     liveSuggestions: new Map(), suggestionSeq: 0,
     testLevel: undefined, runTests: undefined,
     orgs: [DEV, UAT],
@@ -332,7 +332,7 @@ check('a hidden/rebuilt panel: the persisted history card carries the guidance l
   reset();
   const p = provider();
   const { card } = seedSuggestion(p);
-  const persisted = p.s.cardHistoryCache[0];
+  const persisted = proto.cardHistory.call(p.s)[0];
   assert.strictEqual(persisted.suggest, undefined, 'the live payload must never be persisted');
   assert.strictEqual(persisted.suggestId, card.suggest.id, 'the id must survive so a later ready can restore it');
   assert.ok(Array.isArray(persisted.lines) && persisted.lines.length > 0, 'no lines at all on the persisted card');
@@ -346,7 +346,7 @@ check('the ORIGINAL error lines still follow the guidance line — nothing is dr
   reset();
   const p = provider();
   seedSuggestion(p);
-  const persisted = p.s.cardHistoryCache[0];
+  const persisted = proto.cardHistory.call(p.s)[0];
   assert.ok(persisted.lines.some(l => (typeof l === 'string' ? l : l.text || '').includes('smth__mdt') && !l.toString().includes('Missing but available')),
     `expected an original error line naming smth__mdt too: ${JSON.stringify(persisted.lines)}`);
 });

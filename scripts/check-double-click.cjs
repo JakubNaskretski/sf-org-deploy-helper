@@ -108,7 +108,7 @@ function provider(extra = {}) {
   const s = Object.create(proto);
   Object.assign(s, {
     busy: false, confirmOpen: false, deployQueue: [], cmdSeq: 0, orgMembers: new Map(), orgMembersOrg: undefined,
-    items: [cls('AcmeA'), cls('AcmeB')], workspaceRoot: '/ws', autoFetchDone: true, cardHistoryCache: [],
+    items: [cls('AcmeA'), cls('AcmeB')], workspaceRoot: '/ws', autoFetchDone: true,
     liveSuggestions: new Map(), testLevel: undefined, runTests: undefined,
     orgs: [{ username: 'acme-dev-user', alias: 'acme-dev', instanceUrl: 'https://acme-dev.example.invalid' }],
     orgStore: { get: () => 'acme-dev-user', set: async () => {}, setFromUserPick: async () => {} },

@@ -570,6 +570,15 @@ export function summarizeRun(run: RunRecord, opts: { latest: boolean }): RunReco
   return out;
 }
 
+/** A run found still `running` when the window starts again, with no job of
+ *  this window polling it: its result was never recorded. */
+export function interruptedRun(run: RunRecord): RunRecord {
+  const note = run.op === 'retrieve'
+    ? "The window closed while this ran; its result wasn't recorded, and files may be partly written."
+    : "The window closed while this ran; its result wasn't recorded. Check Deployment Status in the org.";
+  return { ...run, status: 'interrupted', notes: [note, ...(run.notes ?? [])].slice(0, NOTES_MAX) };
+}
+
 /** The newest `cap` runs (the setting, clamped). A run still `running` is never
  *  evicted — its result is on its way and has nowhere else to land. */
 export function trimRuns(runs: RunRecord[], cap: unknown): RunRecord[] {
@@ -585,6 +594,16 @@ function cappedText(v: unknown, max: number): string | undefined {
   if (typeof v !== 'string' || !v) return undefined;
   const s = v.replace(/\0/g, '');
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+/** Rows read back from storage, junk dropped (see normalizeRun). */
+export function normalizeRows(raw: unknown): RunRow[] {
+  return Array.isArray(raw) ? raw.map(normalizeRow).filter((x): x is RunRow => !!x) : [];
+}
+
+/** Test rows read back from storage, junk dropped. */
+export function normalizeTests(raw: unknown): TestRow[] {
+  return Array.isArray(raw) ? raw.map(normalizeTest).filter((x): x is TestRow => !!x) : [];
 }
 
 function normalizeRow(raw: unknown): RunRow | undefined {
@@ -729,10 +748,25 @@ export function normalizeRunsState(raw: unknown): RunsState {
   return { v: 1, runs: runs.slice(0, RUN_CAP_MAX) };
 }
 
-/** A persisted status card kept as a notice: no buttons, no Quick Deploy — the
- *  actions of a run live on the newest run alone, and a notice is only a record. */
+/** Bounds on a notice kept across reloads: a card's error text can carry a full
+ *  CLI stderr, and its lines can list hundreds of components. */
+const NOTICE_ERRTEXT_MAX = 8_000;
+const NOTICE_LINES_MAX = 100;
+
+/** A status card as it is kept: no buttons, no Quick Deploy — the actions of a
+ *  run live on the newest run alone, and a notice is only a record — and bounded.
+ *  The live card posted to the webview keeps everything. */
 export function noticeFromCard(card: Record<string, unknown>): Record<string, unknown> {
   const { buttons: _buttons, quickDeploy: _quick, ...rest } = card;
+  if (typeof rest.errText === 'string' && rest.errText.length > NOTICE_ERRTEXT_MAX) {
+    rest.errText = `${rest.errText.slice(0, NOTICE_ERRTEXT_MAX)}\n… (truncated in history)`;
+  }
+  // > max + 1: a card whose own list was capped already ends in a one-line
+  // summary of the rest; re-cutting at the plain max would replace that
+  // summary with this less useful one.
+  if (Array.isArray(rest.lines) && rest.lines.length > NOTICE_LINES_MAX + 1) {
+    rest.lines = [...rest.lines.slice(0, NOTICE_LINES_MAX), `… ${rest.lines.length - NOTICE_LINES_MAX} more (truncated in history)`];
+  }
   return rest;
 }
 

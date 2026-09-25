@@ -18,6 +18,7 @@ import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAUL
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
 import { deploySuccessRows, envelopeProblem } from './runRecords';
+import { RunStore } from './runStore';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
 export { deploySuccessRows, envelopeProblem };
@@ -127,12 +128,8 @@ interface OrgPayload { username: string; alias?: string; label: string; kind: 'p
 
 /** globalState key for folder→type rules learned from the sf CLI registry. */
 const LEARNED_RULES_KEY = 'learnedTypeRules';
-/** workspaceState key for the status-card history (newest first) — the Status
- *  pane doubles as a per-workspace deployment history across window reloads. */
-const CARD_HISTORY_KEY = 'statusCardHistory';
 /** globalState key for the dependency-suggestion feedback log. */
 const SUGGESTION_LOG_KEY = 'sfOrgDeployWrapper.suggestionLog';
-const CARD_HISTORY_MAX = 50;
 
 /** Command-log entries kept for the `ready` replay — the webview's own cap, so a
  *  rebuilt panel is handed exactly the list it would have kept. */
@@ -147,9 +144,6 @@ interface CmdLogEntry {
   durationMs?: number;
 }
 
-/** Longest key list a card BUTTON may carry into the persisted history (see
- *  pushCardHistory) — matches the 100-line cap applied to `lines` there. */
-const HISTORY_BUTTON_KEYS_MAX = 100;
 /**
  * Every `send.type` a card button may name today — i.e. the message types the
  * card-building code above still EMITS, which is a narrower thing than the set
@@ -160,8 +154,8 @@ const HISTORY_BUTTON_KEYS_MAX = 100;
  *
  * A button naming anything outside this set is dead weight by definition — either
  * the provider would ignore the message, or, as here, it advertises a feature that
- * no longer exists. Pruning happens on BOTH read and write of the history, so
- * cards persisted by an older version heal on their first restore.
+ * no longer exists. (Kept status cards carry no buttons at all any more — see
+ * runRecords.noticeFromCard — so this only describes the live cards.)
  *
  * check-card-buttons.cjs re-derives this set from the button literals the code in
  * this file builds, and fails on any drift — so removing the next feature's
@@ -337,10 +331,10 @@ const DELETE_ARGV_LIMIT = 6000;
 const ECHO_METADATA_CAP = 20;
 
 /** Cap on a status card's `lines` — a deploy/retrieve over a few thousand
- *  components would otherwise render (and persist) every single one. Shared
- *  with pushCardHistory's own bound below, so a card capLines already trimmed
- *  to CARD_LINE_CAP+1 (the summary tail counts as one line) isn't re-truncated
- *  a second time on the way into history. */
+ *  components would otherwise render (and persist) every single one. The kept
+ *  copy (runRecords.noticeFromCard) bounds at the same 100, so a card capLines
+ *  already trimmed to CARD_LINE_CAP+1 (the summary tail counts as one line)
+ *  isn't re-truncated a second time on the way into history. */
 const CARD_LINE_CAP = 100;
 
 /** Cap on how many explorer-selected files "Deploy File + Dependencies" (A11)
@@ -550,6 +544,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration('sfOrgDeployWrapper.changedBaseRef')) void this.postChangedComponents();
       if (e.affectsConfiguration('sfOrgDeployWrapper.ignoreDeployConflicts')) this.postIgnoreDeployConflicts();
       if (e.affectsConfiguration('sfOrgDeployWrapper.debugTiming')) this.postDebugTiming();
+      if (e.affectsConfiguration('sfOrgDeployWrapper.statusHistoryRuns')) this.runStore.setCap();
     }));
     // Files created or deleted OUTSIDE the panel's own operations (a new Apex
     // class, a branch switch, a deleted component) used to be invisible until a
@@ -1035,9 +1030,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.postIgnoreDeployConflicts();
         // Tell the webview whether to stamp/log click timings — see debugTiming.
         this.postDebugTiming();
-        // Replay the persisted card history into the freshly-built webview — the
-        // Status pane is the deployment history (survives reloads, newest first).
+        // Replay the Status history into the freshly-built webview — it survives
+        // reloads, newest first: the notices, then the runs (with the newest run's
+        // full list, from this window or the rows file).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        await this.runStore.postReady();
         // Re-attach the "Try with dependencies" button for any suggestion still
         // alive server-side: the persisted copy above dropped the live payload
         // (stripSuggestForHistory), so a webview rebuilt after that — sidebar
@@ -1434,8 +1431,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.postQueue();
         return;
       case 'clearStatusHistory':
-        this.cardHistoryCache = [];
-        await this.context.workspaceState.update(CARD_HISTORY_KEY, []);
+        await this.runStore.clear();
         return;
       case 'restoreBackup':
         await this.restoreRetrieveBackup(msg.dir);
@@ -2584,8 +2580,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /** Persist the panel's test-level pick (+ RunSpecifiedTests classes) so it
-   *  survives a window reload. Fire-and-forget like pushCardHistory's history
-   *  write — a lost write only costs one stale default next session, never worth
+   *  survives a window reload. Fire-and-forget like the Status history's own
+   *  writes — a lost write only costs one stale default next session, never worth
    *  failing the message handler over. */
   private persistTestLevelState(): void {
     void Promise.resolve(this.context.workspaceState.update(TEST_LEVEL_KEY, this.testLevel))
@@ -5732,66 +5728,31 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage(msg);
   }
 
-  /** In-memory mirror of the persisted card history (newest first, capped). */
-  private cardHistoryCache?: Array<Record<string, unknown>>;
-
-  /** Persisted history, shape-guarded (a corrupted workspaceState value must
-   *  degrade to an empty history, never throw scans down). */
-  private cardHistory(): Array<Record<string, unknown>> {
-    if (!this.cardHistoryCache) {
-      const raw = this.context.workspaceState.get<unknown>(CARD_HISTORY_KEY, []);
-      this.cardHistoryCache = Array.isArray(raw)
-        ? raw
-          .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
-          // Cards outlive the features that made them. A history entry written
-          // while "Retry + changed vs branch" existed still carries that button,
-          // so prune on the way OUT of storage too — pruning only on write would
-          // leave every already-persisted card advertising the removed feature
-          // until it aged off the 50-card cap.
-          .map(c => pruneCardButtons(c))
-        : [];
-    }
-    return this.cardHistoryCache;
+  /** The Status history: the last runs and the notices, created on first use —
+   *  the harnesses drive this class on a bare prototype, where field
+   *  initializers never ran. */
+  private runStoreInstance?: RunStore;
+  private get runStore(): RunStore {
+    return (this.runStoreInstance ??= new RunStore({
+      memento: this.context?.workspaceState,
+      storageDir: this.context?.storageUri?.fsPath,
+      post: m => this.post(m),
+      log: line => this.output?.appendLine(line),
+      cap: () => {
+        try { return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('statusHistoryRuns'); } catch { return undefined; }
+      }
+    }));
   }
 
+  /** The kept notices, newest first (see RunStore.notices). */
+  private cardHistory(): Array<Record<string, unknown>> {
+    return this.runStore.notices();
+  }
+
+  /** Keep a posted card as a notice: bounded, and without its buttons — a notice
+   *  is a record; only the newest run acts. */
   private pushCardHistory(card: Record<string, unknown>): void {
-    // Strip the quickDeploy affordance from the persisted copy: its validation
-    // anchor (`lastValidated`) is in-memory, so after a reload the button would
-    // be dead. The LIVE card posted to the webview keeps it.
-    const { quickDeploy: _dropped, ...kept } = card;
-    // Then drop any button naming a message the provider no longer offers —
-    // before the size rule below, which only ever asks whether a button is too
-    // heavy, never whether it still means anything.
-    const persistable = pruneCardButtons(kept);
-    // Bound the persisted copy: errText can carry full CLI stderr and a card can
-    // list hundreds of components — 50 unbounded cards would bloat the state DB.
-    if (typeof persistable.errText === 'string' && persistable.errText.length > 8_000) {
-      persistable.errText = `${persistable.errText.slice(0, 8_000)}\n… (truncated in history)`;
-    }
-    // > CARD_LINE_CAP + 1, not just > CARD_LINE_CAP: capForCard/capLines already
-    // trims a live card to at most CARD_LINE_CAP real lines plus its own summary
-    // tail (one extra line) — re-slicing at the plain cap would chop that tail
-    // off and replace it with this less useful generic note.
-    if (Array.isArray(persistable.lines) && persistable.lines.length > CARD_LINE_CAP + 1) {
-      persistable.lines = [...persistable.lines.slice(0, CARD_LINE_CAP), `… ${persistable.lines.length - CARD_LINE_CAP} more (truncated in history)`];
-    }
-    // Same bloat bound for a button that carries a key list ("Select these N"):
-    // 50 cards × an unbounded deploy set is state-DB weight nobody asked for.
-    // Truncating the list would leave a restored button promising N while
-    // selecting fewer, so the oversized BUTTON is dropped from the persisted copy
-    // instead — the live card, which is where the click normally happens, keeps it.
-    const buttons = persistable.buttons;
-    if (Array.isArray(buttons)) {
-      const kept = buttons.filter(b => {
-        const keys = (b as { send?: { keys?: unknown } } | null)?.send?.keys;
-        return !Array.isArray(keys) || keys.length <= HISTORY_BUTTON_KEYS_MAX;
-      });
-      if (kept.length !== buttons.length) persistable.buttons = kept;
-    }
-    this.cardHistoryCache = [persistable, ...this.cardHistory()].slice(0, CARD_HISTORY_MAX);
-    // A lost write costs one history entry — log, don't surface.
-    void Promise.resolve(this.context.workspaceState.update(CARD_HISTORY_KEY, this.cardHistoryCache))
-      .catch(err => this.output.appendLine(`[history] card-history write failed: ${err instanceof Error ? err.message : String(err)}`));
+    this.runStore.pushNotice(card);
   }
 
   // command log helpers

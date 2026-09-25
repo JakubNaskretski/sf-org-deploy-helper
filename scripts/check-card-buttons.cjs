@@ -18,8 +18,10 @@
 //   3. Drift: the list is re-derived from the `send: { type: '…' }` literals in
 //      panelProvider.ts and compared, so deleting the next feature's
 //      button-builder fails this check until the entry goes too.
-//   4. The wiring, through the real pushCardHistory/cardHistory: a card persisted
-//      by an older version heals on restore, not only on write.
+//   4. The wiring, through the real pushCardHistory/cardHistory: a kept card is
+//      a notice and carries NO button at all — every action of a deploy,
+//      validation or retrieve lives on the newest run — and a card persisted by
+//      an older version heals on restore, not only on write.
 //   5. isConflictFailure + deployFailureButtons (Feature: conflict-blocked
 //      deploy retry) — the pure functions behind the "Retry + overwrite"
 //      button: what counts as a client-side conflict failure (bounded, never a
@@ -146,13 +148,14 @@ function providerWith(stored) {
 const readHistory = (prov) => DeployPanelProvider.prototype.cardHistory.call(prov);
 const pushHistory = (prov, card) => DeployPanelProvider.prototype.pushCardHistory.call(prov, card);
 
-check('a card persisted while the feature existed heals on RESTORE', () => {
+check('a card persisted while the feature existed heals on RESTORE — every button goes', () => {
   // The reported bug: this entry was written by 0.15.0 and is still in the store.
   const prov = providerWith([
     { kind: 'err', title: 'Deploy failed against acme-dev', buttons: [btn('retryDeploy'), btn('retryDeployChanged')] }
   ]);
   const restored = readHistory(prov);
-  assert.deepStrictEqual(restored[0].buttons.map(b => b.send.type), ['retryDeploy']);
+  assert.ok(!('buttons' in restored[0]), JSON.stringify(restored[0]));
+  assert.strictEqual(restored[0].title, 'Deploy failed against acme-dev', 'the record itself survives');
 });
 
 check('the healed history is what gets written back on the next push', () => {
@@ -163,19 +166,19 @@ check('the healed history is what gets written back on the next push', () => {
   assert.ok(!('buttons' in persisted[1]), JSON.stringify(persisted[1]));
 });
 
-check('the legitimate persisted buttons all still survive a reload', () => {
+check('a restored notice carries no button, even one the provider still routes — actions live on the newest run', () => {
   const prov = providerWith([
     { kind: 'err', buttons: [btn('retryDeploy')] },
     { kind: 'warn', buttons: [btn('resumeDeploy', { jobId: '0Af' })] },
     { kind: 'ok', buttons: [btn('restoreBackup', { dir: '/b' }), btn('discardBackup', { dir: '/b' })] },
     { kind: 'ok', buttons: [btn('selectDeployed', { keys: ['ApexClass:A'] })] }
   ]);
-  assert.deepStrictEqual(readHistory(prov).map(c => c.buttons.map(b => b.send.type)), [
-    ['retryDeploy'], ['resumeDeploy'], ['restoreBackup', 'discardBackup'], ['selectDeployed']
-  ]);
+  const restored = readHistory(prov);
+  assert.strictEqual(restored.length, 4);
+  assert.ok(restored.every(c => !('buttons' in c)), JSON.stringify(restored));
 });
 
-check('both persistence rules apply — an unsupported button and an oversized one', () => {
+check('a pushed card is kept without any of its buttons — the removed one, an oversized one, a plain Retry', () => {
   const prov = providerWith([]);
   pushHistory(prov, {
     kind: 'ok',
@@ -185,7 +188,7 @@ check('both persistence rules apply — an unsupported button and an oversized o
       btn('retryDeploy')
     ]
   });
-  assert.deepStrictEqual(prov._state[HISTORY_KEY][0].buttons.map(b => b.send.type), ['retryDeploy']);
+  assert.ok(!('buttons' in prov._state[HISTORY_KEY][0]), JSON.stringify(prov._state[HISTORY_KEY][0]));
 });
 
 check('quickDeploy is still stripped, and the live card keeps everything', () => {
@@ -318,16 +321,16 @@ check('both buttons use send.type retryDeploy — no new message type needed, an
   assert.strictEqual(pruneCardButtons(card), card, 'a conflict-failure card must not be rebuilt by pruning');
 });
 
-check('a conflict-failure card with both buttons survives a full persist/restore round trip', () => {
-  // The same 0.12.0 (persisted Retry) / 0.17.0 (stale-button pruning) guarantees
-  // the plain Retry button already had — proven here through the REAL
-  // pushCardHistory/cardHistory, not just pruneCardButtons in isolation.
+check('a conflict-failure card keeps both buttons live, and neither survives a persist/restore round trip', () => {
+  // A kept card is a record; a Retry from it would re-send a request from a run
+  // that is no longer the newest one.
   const prov = providerWith([]);
   const live = { kind: 'err', title: 'Deploy failed against acme-dev', buttons: deployFailureButtons(RETRY, true) };
   pushHistory(prov, live);
+  assert.deepStrictEqual(live.buttons.map(b => b.label), ['Retry deploy', 'Retry + overwrite'], 'the live card was mutated');
   const restored = readHistory(prov)[0];
-  assert.deepStrictEqual(restored.buttons.map(b => b.label), ['Retry deploy', 'Retry + overwrite']);
-  assert.deepStrictEqual(restored.buttons[1].send.request, { ...RETRY, ignoreConflicts: true });
+  assert.ok(!('buttons' in restored));
+  assert.strictEqual(restored.title, 'Deploy failed against acme-dev');
 });
 
 (async () => {
