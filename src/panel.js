@@ -802,20 +802,6 @@
         } else renderStatus();
         return;
       }
-      case 'suggestionRestore': {
-        // Sent on 'ready' for every suggestion still alive server-side: the
-        // persisted history copy this card came back as dropped the live payload
-        // (provider's stripSuggestForHistory) and carries only `suggestId` — merge
-        // the payload back in so the "Try with dependencies" button reappears.
-        if (typeof msg.id !== 'string') return;
-        for (const c of state.statusCards) {
-          if (c.suggestId === msg.id && !c.suggest) {
-            c.suggest = { id: msg.id, candidates: msg.candidates || [], unresolved: msg.unresolved || [] };
-          }
-        }
-        renderStatus();
-        return;
-      }
       case 'busy': {
         // Every `busy` post answers an outstanding click (sendAction): the
         // provider re-syncs after each handled message, so this is where the
@@ -2694,9 +2680,11 @@
 
   function runHeroEl(run, ui) {
     const local = runLocalFor(run.id);
+    // The Quick Deploy offer is one-shot: once used — here, or as the provider
+    // reports — "available until" has nothing left to say.
+    const quickUsed = !!local.quickUsed || !!(run.quick && run.quick.used);
     const ctx = {
-      // The offer is one-shot: once used, "available until" has nothing left to say.
-      now: Date.now(), quick: local.quickUsed ? undefined : run.quick,
+      now: Date.now(), quick: quickUsed ? undefined : run.quick,
       fromRun: run.fromRunId ? state.runs.find(r => r.id === run.fromRunId) : null,
       cancelRequested: run.status === 'running' && state.cancelRequested
     };
@@ -2745,8 +2733,11 @@
     if (ex.text) {
       const kind = ui.filter === 'all' ? '' : (chips.find(c => c.id === ui.filter) || {}).kind || '';
       const line = mk('div', `run-explain${kind ? ' k-' + kind : ''}`);
-      if (ex.lead) line.appendChild(mk('b', '', ex.lead));
-      line.append(ex.text);
+      [ex, ...(ex.more || [])].forEach((part, i) => {
+        if (i) line.append(' ');
+        if (part.lead) line.appendChild(mk('b', '', part.lead));
+        line.append(part.text);
+      });
       runHead.appendChild(line);
     }
 
@@ -2807,7 +2798,8 @@
       isLatest: true, busy: state.busy, pending: !!state.pendingAction, busyAction: state.busyAction,
       complete: runSrc.complete, sent: runSrc.rows.filter(r => r.s === 1).map(r => r.k), selectKeys,
       filterLabel: chip ? chip.label.toLowerCase() : '',
-      quick: run.quick, suggest: run.suggest, quickUsed: !!local.quickUsed, suggestDone: !!local.suggestDone
+      quick: run.quick && !run.quick.used ? run.quick : undefined, suggest: run.suggest,
+      quickUsed: !!local.quickUsed || !!(run.quick && run.quick.used), suggestDone: !!local.suggestDone
     });
     for (const b of buttons) {
       const btn = mk('button', `run-btn${b.primary ? ' primary' : ''}`, b.label);

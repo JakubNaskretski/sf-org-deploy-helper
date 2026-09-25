@@ -1260,7 +1260,7 @@ check('the context-menu paths and the provider\'s Rescan reply share the same gu
 
 // ---------------------------------- 10) B1/B8: dependency-suggestion rendering
 // The provider-side contract (liveSuggestions, orgOverride, transient selectKeys,
-// suggestionRestore payload shape) is covered end to end in
+// the live payload merged into the newest run) is covered end to end in
 // check-suggestion-flow.cjs against the REAL provider; this section is the
 // webview-only half — panel.js is a browser IIFE with no exports of its own, so
 // it can only be driven the way check-panel-selection.cjs already does, by
@@ -1322,10 +1322,11 @@ check('B11: the unresolved wording says "Not found in your workspace (retrieve i
   assert.ok(el.textContent.includes('Ghost__mdt'), el.textContent);
 });
 
-check('B1: suggestionRestore merges the payload into the matching history card by suggestId, and the button reappears', () => {
+check('B1: the old suggestionRestore message is inert — a suggestion now comes back with its run', () => {
+  // A kept card is a record with no buttons; the provider merges a still-live
+  // suggestion into the newest run whenever it posts the runs (see
+  // check-status-pane.cjs), so nothing may re-attach one to a card.
   const p = panel(null);
-  // What a webview rebuild actually receives: the STRIPPED persisted copy —
-  // `suggest` is gone, `suggestId` is what correlates a later restore.
   p.deliver({
     type: 'statusHistory',
     cards: [{
@@ -1333,27 +1334,9 @@ check('B1: suggestionRestore merges the payload into the matching history card b
       lines: ['Missing but available locally: CustomObject:smth__mdt — add them to the deploy by hand.', 'ApexClass:MyThing — Invalid type: smth__mdt']
     }]
   });
-  assert.ok(!openSuggestBtn(p), 'a stripped history card must not show the button before restore');
   p.deliver({ type: 'suggestionRestore', id: 'sug-2000-0', candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing' }], unresolved: [] });
-  const btn = openSuggestBtn(p);
-  assert.ok(btn, 'suggestionRestore did not bring the button back');
-  assert.strictEqual(btn.textContent, 'Try with dependencies (1)');
-  // And it is fully live — opening it works exactly like a fresh suggestion.
-  btn.fire('click');
-  assert.ok(suggestRows(p), 'the restored suggestion cannot be opened');
-});
-
-check('B1: suggestionRestore for an id with no matching card, or already carrying a live suggest, is a no-op', () => {
-  const p = panel(null);
-  p.deliver({ type: 'statusHistory', cards: [{ kind: 'err', title: 'X', at: 1, suggestId: 'sug-3000-0', lines: [] }] });
-  p.deliver({ type: 'suggestionRestore', id: 'sug-nonexistent', candidates: [{ key: 'CustomObject:X' }], unresolved: [] });
-  assert.ok(!openSuggestBtn(p), 'restore attached to the wrong card');
-  // A card that already has a live suggest (e.g. the session's own posted card,
-  // never stripped) must not be clobbered by a stale restore for the same id.
-  const q = panel(null);
-  q.deliver(suggestCard({ suggestId: 'sug-1000-0' }));
-  q.deliver({ type: 'suggestionRestore', id: 'sug-1000-0', candidates: [{ key: 'CustomObject:different' }], unresolved: [] });
-  assert.strictEqual(openSuggestBtn(q).textContent, 'Try with dependencies (1)', 'a live suggest was overwritten by a restore');
+  assert.ok(!openSuggestBtn(p), 'nothing re-attaches a suggestion to a kept card');
+  assert.ok(statusLines(p).some(l => l.startsWith('Missing but available locally')), 'the card still reads as it did');
 });
 
 // ---------------------------------- 10) the Changed view's commit sections ----

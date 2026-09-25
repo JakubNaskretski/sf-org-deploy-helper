@@ -181,7 +181,9 @@
       case 'cancelUnconfirmed':
         out.kind = 'warn'; out.glyph = '⊘';
         out.title = ['Cancel requested — ', ORG, ' may still finish'];
-        out.plain.push({ kind: 'warn', text: "The org was asked to stop, but its final state couldn't be confirmed — check Deployment Status in the org." });
+        // A note says it in its own words (the submit was stopped, the cancel is
+        // still finishing…); the general line is for a run without one.
+        if (!(run.notes || []).length) out.plain.push({ kind: 'warn', text: "The org was asked to stop, but its final state couldn't be confirmed — check Deployment Status in the org." });
         break;
       case 'lost':
         out.kind = 'warn'; out.glyph = '⚠';
@@ -193,6 +195,7 @@
         out.title = ['Timed out waiting for ', ORG];
         out.plain.push({ kind: 'warn', text: 'Stopping the wait did not stop the org — it may still finish this. Check Deployment Status in the org.' });
         if (message) out.plain.push(message);
+        if (run.hint) out.plain.push({ kind: 'muted', text: 'Hint: ' + run.hint });
         break;
       case 'error':
         out.kind = 'err'; out.glyph = '✗';
@@ -259,9 +262,10 @@
 
   /**
    * The line under the chips: what the active filter means, or — with no
-   * filter — one legend line when the list holds rows whose label needs words
-   * (skipped, rolled back, passed). '' when there is nothing to say.
-   * Returns { lead, text }: `lead` is drawn bold.
+   * filter — one legend line for the labels that need words: rolled back
+   * first (a failed deploy's most surprising word), then passed, then skipped.
+   * Returns { lead, text, more? }: each `lead` is drawn bold; `more` continues
+   * the same line. An empty `text` means there is nothing to say.
    */
   function explainFor(run, filter, rows) {
     const org = run.orgLabel;
@@ -269,11 +273,14 @@
     const c = run.counts || {};
     const none = { lead: '', text: '' };
     switch (filter || 'all') {
-      case 'all':
-        if (c.skipped) return { lead: 'Skipped', text: ' = selected but never sent, so neither deployed nor failed — the Skipped chip says why.' };
-        if (c.rolledback) return { lead: 'Rolled back', text: ' = fine on its own, but not applied: a deploy is all-or-nothing.' };
-        if (c.passed) return { lead: 'Passed', text: ' = checked fine on its own; a validation applies nothing either way.' };
-        return none;
+      case 'all': {
+        const parts = [];
+        if (c.rolledback) parts.push({ lead: 'Rolled back', text: ' = fine on its own, but not applied: a deploy is all-or-nothing.' });
+        if (c.passed) parts.push({ lead: 'Passed', text: ' = checked fine on its own; a validation applies nothing either way.' });
+        if (c.skipped) parts.push({ lead: 'Skipped', text: ' = never sent, so neither deployed nor failed — the Skipped chip says why.' });
+        if (!parts.length) return none;
+        return parts.length > 1 ? Object.assign({}, parts[0], { more: parts.slice(1) }) : parts[0];
+      }
       case 'deployed': return { lead: '', text: 'Live on ' + org + ' now.' };
       case 'validated': return { lead: '', text: 'Would deploy cleanly. Nothing has been sent to ' + org + ' yet.' };
       case 'failed':

@@ -150,8 +150,8 @@ check('it round-trips every buildRetryRequest shape faithfully', () => {
       testLevel: level,
       runTests: classes.length ? classes : undefined,
       // buildRetryRequest never sets `ignoreConflicts` — only a "Retry +
-      // overwrite" button's own request does (see deployFailureButtons) — so
-      // every card it snapshots reads back with no override at all.
+      // overwrite" button's own request does (see runView.actionsFor) — so
+      // every run it snapshots reads back with no override at all.
       ignoreConflictsOverride: undefined
     }, `run: ${JSON.stringify({ opts, level, classes })}`);
   }
@@ -208,9 +208,9 @@ check('a stale dryRun flag cannot flip the mode a card re-runs in', () => {
 
 // ------------------------------------------------- ignoreConflictsOverride rules
 check('ignoreConflicts: true is the only value that sets an override', () => {
-  // "Retry + overwrite" is the only writer of this field — deployFailureButtons
+  // "Retry + overwrite" is the only writer of this field — runView.actionsFor
   // always sets it to the literal `true`. Everything else a persisted/forged
-  // card could carry must read as "no override" so the machine-scoped setting
+  // request could carry must read as "no override" so the machine-scoped setting
   // decides, exactly like a request that never had the field at all.
   assert.strictEqual(deployOptsFromRetry({ keys: KEYS, ignoreConflicts: true }).ignoreConflictsOverride, true);
   for (const forged of ['true', 1, {}, [], 'yes', false, 0, null, undefined]) {

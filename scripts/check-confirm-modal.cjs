@@ -591,7 +591,9 @@ check('NoTestRun never reaches sf as a flag (production refuses it for every pay
   assert.strictEqual((src.match(/testLevel: testLevel === 'NoTestRun' \? undefined : testLevel,/g) || []).length, 2, 'runDeploy and the manifest deploy');
 });
 
-function validatedCard(retry, extra = {}) {
+/** A successful validation through the real result builder: the run it posts,
+ *  with the live Quick Deploy offer merged in when the provider holds one. */
+function validatedRun(retry, extra = {}) {
   const posted = [];
   const stub = Object.create(DeployPanelProvider.prototype);
   stub.items = [];
@@ -605,23 +607,25 @@ function validatedCard(retry, extra = {}) {
     orgOnlySkipped: [], orgLabel: 'acme-dev', org: 'acme-dev-user', noun: '1 component', cmdId: 'c1', start: Date.now(),
     validateOnly: true, retry
   });
-  return { card: posted.find(m => m.type === 'status').card, lastValidated: stub.lastValidated };
+  return { run: posted.filter(m => m.type === 'runs').slice(-1)[0].runs[0], lastValidated: stub.lastValidated };
 }
 
 check('Quick Deploy is offered only for a validation that ran tests', () => {
-  const none = validatedCard({ keys: ['ApexClass:AcmeService'], validateOnly: true, testLevel: 'NoTestRun' });
-  assert.ok(!none.card.quickDeploy, 'the org refuses to quick-deploy a validation without tests');
+  const none = validatedRun({ keys: ['ApexClass:AcmeService'], validateOnly: true, testLevel: 'NoTestRun' });
+  assert.ok(!none.run.quick, 'the org refuses to quick-deploy a validation without tests');
+  assert.strictEqual(none.run.testsRan, false, 'and the run says why');
   assert.strictEqual(none.lastValidated, undefined);
-  const local = validatedCard({ keys: ['ApexClass:AcmeService'], validateOnly: true, testLevel: 'RunLocalTests' });
-  assert.strictEqual(local.card.quickDeploy.jobId, '0Af000000000001AAA');
+  const local = validatedRun({ keys: ['ApexClass:AcmeService'], validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.strictEqual(local.run.quick.jobId, '0Af000000000001AAA');
+  assert.ok(local.run.quick.until > Date.now() + 9 * 24 * 3600e3, 'the offer names when it runs out');
   assert.strictEqual(local.lastValidated.jobId, '0Af000000000001AAA');
-  assert.ok(validatedCard(undefined).card.quickDeploy, 'a reattached job (no retry request) is offered when the org does not say otherwise');
+  assert.ok(validatedRun(undefined).run.quick, 'a reattached job (no retry request) is offered when the org does not say otherwise');
   for (const v of [false, 'false']) {
-    assert.ok(!validatedCard(undefined, { runTestsEnabled: v }).card.quickDeploy, `the org's runTestsEnabled=${JSON.stringify(v)} wins for a reattached job`);
+    assert.ok(!validatedRun(undefined, { runTestsEnabled: v }).run.quick, `the org's runTestsEnabled=${JSON.stringify(v)} wins for a reattached job`);
   }
-  assert.ok(validatedCard({ testLevel: 'RunLocalTests' }, { runTestsEnabled: true }).card.quickDeploy);
+  assert.ok(validatedRun({ testLevel: 'RunLocalTests' }, { runTestsEnabled: true }).run.quick);
   // A NoTestRun pick on production still ran local tests (the org's default): the org's word wins.
-  assert.ok(validatedCard({ testLevel: 'NoTestRun' }, { runTestsEnabled: true }).card.quickDeploy);
+  assert.ok(validatedRun({ testLevel: 'NoTestRun' }, { runTestsEnabled: true }).run.quick);
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

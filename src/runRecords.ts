@@ -438,6 +438,59 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
   return run;
 }
 
+export interface BeginRunInput {
+  id: string;
+  op: 'deploy' | 'validate';
+  org: string;
+  orgLabel: string;
+  orgKind: OrgKind;
+  startedAt: number;
+  target: RunTarget;
+  /** What the run sends (a package.xml run lets the org name them instead). */
+  items: ReadonlyArray<RunItem>;
+  skipped?: { orgOnly: ReadonlyArray<RunItem>; unread: ReadonlyArray<RunItem> };
+  testLevel?: TestLevel;
+  retry?: RunRetry;
+}
+
+/** A deploy or validation as it starts: every component it sends, still
+ *  without a verdict, and every one it skipped — both known before the org
+ *  answers. If the run ends without a result (lost contact, a refused submit)
+ *  these rows are still what it sent, so a Retry can send them again. */
+export function beginDeployRun(input: BeginRunInput): RunRecord {
+  const rows: RunRow[] = input.items.map(i => ({ k: `${i.type}:${i.name}`, o: 'pending', s: 1 }));
+  const seen = new Set(rows.map(r => r.k));
+  const skip = (i: RunItem, why: 'org' | 'unread'): void => {
+    const k = `${i.type}:${i.name}`;
+    if (!seen.has(k)) { seen.add(k); rows.push({ k, o: 'skipped', why }); }
+  };
+  for (const i of input.skipped?.unread ?? []) skip(i, 'unread');
+  for (const i of input.skipped?.orgOnly ?? []) skip(i, 'org');
+  const counts: RunCounts = { pending: input.items.length, sent: input.items.length };
+  if (input.skipped) counts.skipped = rows.length - input.items.length;
+  const run: RunRecord = {
+    v: 1, id: input.id, op: input.op, status: 'running',
+    org: input.org, orgLabel: input.orgLabel, orgKind: input.orgKind,
+    startedAt: input.startedAt, target: input.target,
+    counts, rows, rowsComplete: true, tests: []
+  };
+  if (isTestLevel(input.testLevel)) run.testLevel = input.testLevel;
+  if (input.retry) run.retry = { ...input.retry };
+  return run;
+}
+
+/** The options a Retry re-runs with, from a run's retry request: never its
+ *  keys (they are the run's own sent rows) and never a one-off overwrite. */
+export function runRetryFrom(r: { validateOnly?: boolean; testLevel?: TestLevel; runTests?: string[]; sourceDir?: string; manifest?: string } | undefined): RunRetry | undefined {
+  if (!r) return undefined;
+  const out: RunRetry = { validateOnly: r.validateOnly === true };
+  if (isTestLevel(r.testLevel)) out.testLevel = r.testLevel;
+  if (r.runTests?.length) out.runTests = [...r.runTests];
+  if (r.sourceDir) out.sourceDir = r.sourceDir;
+  if (r.manifest) out.manifest = r.manifest;
+  return out;
+}
+
 export interface RetrieveRunInput {
   id: string;
   org: string;

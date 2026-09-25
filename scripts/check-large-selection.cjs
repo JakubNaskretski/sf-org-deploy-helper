@@ -33,13 +33,15 @@
 //      short, and the real SfCliService argv (a separate, direct check) carries
 //      no --metadata when a manifest is set;
 //   c) the same, for retrieve;
-//   d) card lines capped at CARD_LINE_CAP with the "and N more" tail, ✗ lines
-//      surviving the cut ahead of ✓ lines, and the Output channel getting the
-//      FULL uncapped list;
+//   d) a deploy's run holds EVERY row (the pane's list is virtual), while the
+//      copy kept across reloads is a bounded summary with exact counts; a
+//      retrieve card's lines are still capped at CARD_LINE_CAP with the "and N
+//      more" tail, ✗ lines surviving the cut ahead of ✓ lines, and the Output
+//      channel getting the FULL uncapped list;
 //   e) the temp manifest dir is gone once the run resolves;
 //   f) buildManifestXml: escaping and deterministic sort, as a pure unit test;
-//   g) a failed 10,000-item deploy's Retry button still carries all 10,000
-//      Type:Name keys — the manifest path must not touch RetryRequest at all;
+//   g) a failed 10,000-item deploy's Retry still sends all 10,000 Type:Name
+//      keys — the manifest path must not touch what a run sent;
 //   h) delete's oversize refusal (no manifest form to fall back to);
 //   i) the generated manifest's `<version>`: present only when the project names
 //      a sourceApiVersion, because a manifest version WINS over sfdx-project.json;
@@ -93,6 +95,8 @@ Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, 
 const { DeployPanelProvider } = require(path.join(ROOT, 'out', 'panelProvider.js'));
 const { SfCliService, SfCliError } = require(path.join(ROOT, 'out', 'sfCliService.js'));
 const { buildManifestXml, resolveApiVersion } = require(path.join(ROOT, 'out', 'metadataScanner.js'));
+const RR = require(path.join(ROOT, 'out', 'runRecords.js'));
+const RV = require(path.join(ROOT, 'src', 'runView.js'));
 const proto = DeployPanelProvider.prototype;
 
 let failed = 0;
@@ -133,6 +137,7 @@ const keysOf = items => items.map(i => `${i.type}:${i.name}`);
 function provider(items, extra = {}) {
   const posted = [];
   const outputLines = [];
+  const kept = {}; // workspaceState
   const calls = { deployMetadata: [], deployReport: [], retrieveMetadata: [], deleteSource: [] };
   const sf = {
     deployMetadata: (metadata, targetOrg, cwd, opts) => {
@@ -185,7 +190,7 @@ function provider(items, extra = {}) {
     orgStore: { get: () => ORG, set: async () => {}, setFromUserPick: async () => {} },
     output: { appendLine: l => outputLines.push(l) },
     context: {
-      workspaceState: { get: () => undefined, update: async () => {} },
+      workspaceState: { get: k => kept[k], update: async (k, v) => { kept[k] = v === undefined ? undefined : JSON.parse(JSON.stringify(v)); } },
       globalState: { get: () => undefined, update: async () => {} }
     },
     view: { visible: true, webview: { postMessage() {} } },
@@ -193,18 +198,26 @@ function provider(items, extra = {}) {
     post: m => posted.push(m),
     ...(extra.fields || {})
   });
-  return { s, posted, outputLines, calls };
+  return { s, posted, outputLines, calls, kept };
 }
 
 const runDeploy = (p, keys, opts = {}) => proto.runDeploy.call(p.s, keys, opts);
 const runRetrieve = (p, keys, opts = {}) => proto.runRetrieve.call(p.s, keys, opts);
 const statusCards = p => p.posted.filter(m => m.type === 'status').map(m => m.card);
+/** The finished run as the webview gets it: the newest run and its full rows. */
+const lastRun = p => {
+  const m = p.posted.filter(x => x.type === 'runs' && x.latestRows).slice(-1)[0];
+  assert.ok(m, 'no run was posted');
+  return { run: m.runs[0], rows: m.latestRows.rows };
+};
+/** What a reload keeps of it. */
+const keptRun = p => p.kept.statusRuns.runs[0];
 const firstEchoedCmd = p => p.posted.find(m => m.type === 'cmd' && m.entry.status === 'run')?.entry.command;
 
 // ---------------------------------------------- org-only rows in a big deploy
 // Thousands deployed + thousands org-only: the card listed the deployed rows first and
 // its 100-line cap cut every skipped one off, leaving a bare "N skipped".
-check('deploy with org-only rows: the confirm says so, and the card leads with them', async () => {
+check('deploy with org-only rows: the confirm says so, and the run lists them as skipped — never sent', async () => {
   const items = makeItems(150);
   const orgOnly = ['ApexClass:AcmeOrgOnlyA', 'ApexClass:AcmeOrgOnlyB'];
   const p = provider(items, { fields: { orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
@@ -212,25 +225,30 @@ check('deploy with org-only rows: the confirm says so, and the card leads with t
   await runDeploy(p, [...keysOf(items), ...orgOnly]);
   const confirm = warns.find(w => w.modal);
   assert.ok(/2 more selected exist only on the org/.test(confirm.detail || ''), JSON.stringify(confirm));
-  const card = statusCards(p).find(c => c.kind === 'warn' || c.kind === 'ok');
-  assert.ok(/ · 2 skipped \(org only\)$/.test(card.meta), card.meta);
-  assert.ok(/^2 skipped — selected, but they exist only on the org/.test(card.lines[0]), card.lines[0]);
-  assert.deepStrictEqual(card.lines.slice(1, 3), orgOnly.map(k => `— ${k} — no local source, skipped (retrieve first)`));
+  const { run, rows } = lastRun(p);
+  assert.strictEqual(run.counts.skipped, 2);
+  assert.strictEqual(run.counts.sent, 150);
+  assert.deepStrictEqual(rows.filter(r => r.o === 'skipped').map(r => [r.k, r.why, r.s]), orgOnly.map(k => [k, 'org', undefined]));
+  // The skipped rows survive a reload even though the deployed ones are only counted.
+  assert.deepStrictEqual(keptRun(p).rows.map(r => r.k), orgOnly);
+  assert.strictEqual(RV.explainFor(run, 'skipped', rows).text, '2 skipped — selected, but they exist only on the org, so there was no local file to deploy.');
   assert.strictEqual(p.calls.deployMetadata[0].opts.manifest !== undefined, true, 'only the 150 local ones are sent');
 });
 
-check('thousands of org-only rows cannot push the deployed ones off the card', async () => {
-  // A Select all on a fetched org: the skipped block is capped, the deployed rows
-  // follow, and the Output channel still gets every row.
+check('thousands of org-only rows cannot push the deployed ones out of the run', async () => {
+  // A Select all on a fetched org: the run holds every row, deployed and
+  // skipped; what a reload keeps is bounded, with exact counts.
   const items = makeItems(5);
   const orgOnly = Array.from({ length: 150 }, (_, i) => `ApexClass:AcmeOrgOnly${i}`);
   const p = provider(items, { fields: { orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
   await runDeploy(p, [...keysOf(items), ...orgOnly]);
-  const card = statusCards(p).find(c => c.kind === 'warn' || c.kind === 'ok');
-  assert.ok(/^150 skipped — /.test(card.lines[0]), card.lines[0]);
-  assert.strictEqual(card.lines[11], '… and 140 more skipped — full list in the Output channel');
-  assert.deepStrictEqual(card.lines.slice(12), keysOf(items), 'every deployed row is on the card');
-  for (const k of orgOnly) assert.ok(p.outputLines.some(l => l.includes(k)), `Output channel missing ${k}`);
+  const { run, rows } = lastRun(p);
+  assert.deepStrictEqual(rows.filter(r => r.o === 'deployed').map(r => r.k), keysOf(items), 'every deployed row is in the run');
+  assert.strictEqual(rows.filter(r => r.o === 'skipped').length, 150, 'every skipped row is in the run');
+  assert.deepStrictEqual([run.counts.deployed, run.counts.skipped], [5, 150]);
+  const kept = keptRun(p);
+  assert.strictEqual(kept.rows.length, 50, 'a reload keeps a taste of the skipped rows');
+  assert.deepStrictEqual([kept.counts.deployed, kept.counts.skipped], [5, 150], 'and the exact counts');
 });
 
 check('a type this panel never reads locally is not called "only on the org"', async () => {
@@ -244,27 +262,25 @@ check('a type this panel never reads locally is not called "only on the org"', a
   const confirm = warns.find(w => w.modal);
   assert.ok(/1 more is of a type this panel can't read from your project \(Bot\) — skipped; if you have it locally, deploy it from the Explorer \(right-click the -meta\.xml\) or with a package\.xml\./.test(confirm.detail), confirm.detail);
   assert.ok(/1 more selected exists only on the org/.test(confirm.detail), confirm.detail);
-  const card = statusCards(p).find(c => c.kind === 'warn');
-  assert.ok(/ · 1 skipped \(org only\) · 1 skipped \(not read locally\)$/.test(card.meta), card.meta);
-  assert.ok(/^1 skipped — this panel can't read Bot from your project: if you have it locally, it was NOT deployed/.test(card.lines[0]), card.lines[0]);
-  assert.strictEqual(card.lines[1], '— Bot:AcmeBot — not read from your project, skipped (right-click its -meta.xml to deploy)');
-  assert.ok(/^1 skipped — selected, but it exists only on the org/.test(card.lines[2]), card.lines[2]);
-  assert.deepStrictEqual(card.lines.slice(4), keysOf(items));
+  const { run, rows } = lastRun(p);
+  assert.deepStrictEqual(rows.filter(r => r.o === 'skipped').map(r => [r.k, r.why]), [['Bot:AcmeBot', 'unread'], ['ApexClass:AcmeOrgOnly', 'org']]);
+  assert.strictEqual(RV.whyText(rows.find(r => r.k === 'Bot:AcmeBot')), 'not read from your project (right-click its -meta.xml to deploy)');
+  assert.strictEqual(RV.explainFor(run, 'skipped', rows).text,
+    "1 skipped — this panel can't read Bot from your project: if you have it locally, it was NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml."
+    + ' 1 skipped — selected, but it exists only on the org, so there was no local file to deploy.');
+  assert.deepStrictEqual(rows.filter(r => r.o === 'deployed').map(r => r.k), keysOf(items));
 });
 
-check('eleven skipped rows: the one the card hides is still in the Output channel', async () => {
-  // Swapping the 11th name for the "… and 1 more" line keeps the line count equal,
-  // which a count comparison would mistake for "nothing dropped".
+check('eleven skipped rows: none is hidden — all eleven are in the run, the wording follows the count', async () => {
   const items = makeItems(3);
   const orgOnly = Array.from({ length: 11 }, (_, i) => `ApexClass:AcmeOrgOnly${i}`);
   const p = provider(items, { fields: { orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
   await runDeploy(p, [...keysOf(items), ...orgOnly]);
-  const card = statusCards(p).find(c => c.kind === 'warn' || c.kind === 'ok');
-  assert.strictEqual(card.lines[11], '… and 1 more skipped — full list in the Output channel');
-  for (const k of orgOnly) assert.ok(p.outputLines.some(l => l.includes(k)), `Output channel missing ${k}`);
+  assert.deepStrictEqual(lastRun(p).rows.filter(r => r.o === 'skipped').map(r => r.k), orgOnly);
   const one = provider(items, { fields: { orgMembers: new Map([['ApexClass:AcmeLone', {}]]), orgMembersOrg: ORG } });
   await runDeploy(one, [...keysOf(items), 'ApexClass:AcmeLone']);
-  assert.ok(/^1 skipped — selected, but it exists only on the org/.test(statusCards(one).find(c => c.kind === 'warn').lines[0]));
+  const lone = lastRun(one);
+  assert.strictEqual(RV.explainFor(lone.run, 'skipped', lone.rows).text, '1 skipped — selected, but it exists only on the org, so there was no local file to deploy.');
 });
 
 check('a deploy queued behind a running op says the same before it waits', async () => {
@@ -416,17 +432,17 @@ check('retrieve: 10,000 items → manifest file on disk, well-formed + grouped, 
 });
 
 // --------------------------------------------------------------- (d) capping
-check('deploy success card: lines capped at 100 with a summary tail, full list mirrored to Output', async () => {
+check('a 150-component deploy: the run holds all 150 rows; a reload keeps the exact count and none of the rows', async () => {
   const items = makeItems(150);
   const p = provider(items);
   await runDeploy(p, keysOf(items));
-  const card = statusCards(p).find(c => c.kind === 'ok');
-  assert.ok(card, 'expected a success card');
-  assert.strictEqual(card.lines.length, 101, String(card.lines.length));
-  assert.ok(/^… and 50 more — full list in the Output channel$/.test(card.lines[100]), card.lines[100]);
-  for (const item of items) {
-    assert.ok(p.outputLines.some(l => l.includes(`${item.type}:${item.name}`)), `Output channel missing ${item.type}:${item.name}`);
-  }
+  const { run, rows } = lastRun(p);
+  assert.strictEqual(run.status, 'succeeded');
+  assert.deepStrictEqual(rows.map(r => r.k), keysOf(items), 'the run lists every component — nothing is cut to fit a card');
+  const kept = keptRun(p);
+  assert.strictEqual(kept.counts.deployed, 150);
+  assert.strictEqual(kept.rows.length, 0, 'deployed rows are counted, not kept, across a reload');
+  assert.strictEqual(kept.rowsComplete, false);
 });
 
 check('retrieve mixed card: ✗ lines survive the cap ahead of ✓ lines, tail present, full list mirrored to Output', async () => {
@@ -452,14 +468,13 @@ check('retrieve mixed card: ✗ lines survive the cap ahead of ✓ lines, tail p
   for (const item of okItems) assert.ok(p.outputLines.some(l => l.includes(`✓ ${item.type}:${item.name}`)));
 });
 
-check('a card at or under CARD_LINE_CAP is not capped and Output stays untouched by capForCard', async () => {
+check('a small successful deploy writes nothing to the Output channel — its run is the record', async () => {
   const items = makeItems(30); // <= MANIFEST_THRESHOLD too, so also exercises the plain --metadata path
   const p = provider(items);
   await runDeploy(p, keysOf(items));
-  const card = statusCards(p).find(c => c.kind === 'ok');
-  assert.strictEqual(card.lines.length, 30);
-  assert.ok(!card.lines.some(l => typeof l === 'string' && l.includes('more — full list')));
-  assert.strictEqual(p.outputLines.length, 0, 'capForCard must not log when nothing was capped');
+  assert.strictEqual(lastRun(p).rows.length, 30);
+  assert.strictEqual(p.outputLines.length, 0, `a success has nothing to mirror: ${p.outputLines.join(' | ')}`);
+  assert.ok(!statusCards(p).length, 'a deploy result is a run, not a card');
 });
 
 // -------------------------------------------------------------- (e) cleanup
@@ -481,17 +496,19 @@ check('the temp manifest dir is removed even when the run fails', async () => {
 });
 
 // -------------------------------------------------------------- (g) retry
-check('a failed 10,000-item deploy still carries all 10,000 Type:Name keys on Retry', async () => {
+check('a failed 10,000-item deploy still sends all 10,000 Type:Name keys on Retry — and what a reload keeps stays small', async () => {
   const items = makeGroupedItems(10_000, TEN_K_TYPES);
   const p = provider(items, { reportResult: { status: 'Failed', success: false, done: true, errorMessage: 'Deploy failed for testing' } });
   await runDeploy(p, keysOf(items));
-  const card = statusCards(p).find(c => c.kind === 'err');
-  assert.ok(card, 'expected a failure card');
-  const retryButton = (card.buttons || []).find(b => b.send && b.send.type === 'retryDeploy');
-  assert.ok(retryButton, 'expected a Retry button');
-  const keys = retryButton.send.request.keys;
+  const { run, rows } = lastRun(p);
+  assert.strictEqual(run.status, 'failed');
+  const retry = RV.actionsFor(run, { isLatest: true, complete: true, sent: RR.sentKeys({ rows }) }).buttons.find(b => b.id === 'retry');
+  assert.ok(retry, 'expected Retry on the run');
+  const keys = retry.message.request.keys;
   assert.strictEqual(keys.length, 10_000);
   assert.deepStrictEqual([...keys].sort(), keysOf(items).sort());
+  assert.ok(RR.packedSize(p.kept.statusRuns) <= RR.LATEST_SUMMARY_MAX_BYTES, `${RR.packedSize(p.kept.statusRuns)} bytes kept`);
+  assert.ok(!('keys' in keptRun(p).retry), 'the 10,000 keys are the run\'s rows, never stored again on its retry');
 });
 
 // ----------------------------------------------------- (f) buildManifestXml

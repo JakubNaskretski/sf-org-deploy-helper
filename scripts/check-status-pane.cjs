@@ -322,6 +322,18 @@ check('a running run: progress ticks redraw the bars in place; the toolbar Cance
   assert.ok(text(p.el('status')).includes('The org was asked to stop'));
 });
 
+check('a rebuilt webview gets a live suggestion back with the newest run — fully live; an expired one is simply gone', () => {
+  const p = boot({ scenario: 'fxdeployfail' });            // the runs post carries the live payload
+  click(actBtn(p, 'suggest'));
+  assert.ok(p.el('status').find(e => has(e, 'run-suggest')), 'the suggestion opens');
+  const q = boot({ scenario: 'fxdeployfail' });
+  const msg = runsMsg('fxdeployfail');
+  delete msg.runs[0].suggest;                                  // the provider no longer holds it
+  q.deliver(msg);
+  assert.ok(!actBtn(q, 'suggest'), 'no button for a suggestion the provider no longer holds');
+  assert.ok(actBtn(q, 'retry'), 'Retry is still there');
+});
+
 // ============================================== 3) Earlier and older runs
 check('Earlier (k) lists the older runs and notices; an older run expands read-only — Copy is its only button', () => {
   const notices = F.buildNotices(NOW);

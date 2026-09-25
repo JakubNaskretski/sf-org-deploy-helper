@@ -216,10 +216,14 @@ check('a count the run cannot know is no chip at all (a reattached report has no
 });
 
 // ============================================================ explain line
-check('with no filter: one legend line — skipped first, then rolled back, then passed; none otherwise', () => {
-  const ex = (r) => { const e = RV.explainFor(r, 'all', r.rows); return e.lead + e.text; };
-  assert.strictEqual(ex(run('fxdeployfail')), 'Skipped = selected but never sent, so neither deployed nor failed — the Skipped chip says why.');
+check('with no filter: one legend line — rolled back first, then passed, then skipped; none otherwise', () => {
+  const ex = (r) => { const e = RV.explainFor(r, 'all', r.rows); return [e, ...(e.more || [])].map(x => x.lead + x.text).join(' '); };
+  // A failed deploy's rolled-back rows are its most surprising word: it is named
+  // even when skipped rows are there too.
+  assert.strictEqual(ex(run('fxdeployfail')),
+    'Rolled back = fine on its own, but not applied: a deploy is all-or-nothing. Skipped = never sent, so neither deployed nor failed — the Skipped chip says why.');
   assert.strictEqual(ex(run('fxtestsfail')), 'Rolled back = fine on its own, but not applied: a deploy is all-or-nothing.');
+  assert.strictEqual(ex(run('fxbigdeploy')), 'Skipped = never sent, so neither deployed nor failed — the Skipped chip says why.');
   assert.strictEqual(ex(base({ op: 'validate', status: 'failed', counts: { failed: 1, passed: 3 } })), 'Passed = checked fine on its own; a validation applies nothing either way.');
   assert.strictEqual(ex(run('fxvalidateqd')), '');
 });
@@ -395,6 +399,8 @@ check('Retry re-sends exactly the sent rows with the run\'s own options; + overw
   assert.deepStrictEqual(retry.message, { type: 'retryDeploy', request: { validateOnly: false, testLevel: 'NoTestRun', keys: RR.sentKeys(r) } });
   assert.strictEqual(retry.label, 'Retry deploy');
   assert.strictEqual(a.buttons.find(b => b.id === 'retryOverwrite').message.request.ignoreConflicts, true);
+  assert.deepStrictEqual(r.retry, { validateOnly: false, testLevel: 'NoTestRun' }, 'the one-off overwrite leaked back onto the run\'s own retry options');
+  assert.ok(!('keys' in r.retry), 'the keys are the run\'s rows, never stored on its retry');
   const f = run('fxdeployfail');
   const keys = RV.actionsFor(f, LATEST(f)).buttons.find(b => b.id === 'retry').message.request.keys;
   assert.strictEqual(keys.length, 3161);

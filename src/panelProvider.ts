@@ -17,8 +17,8 @@ import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from '.
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
-import { deploySuccessRows, envelopeProblem } from './runRecords';
-import { RunStore } from './runStore';
+import { DeployRunInput, OrgKind, RunRecord, RunTarget, beginDeployRun, deployRunFromResult, deploySuccessRows, envelopeProblem, newRunId, runRetryFrom } from './runRecords';
+import { RunLive, RunStore } from './runStore';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
 export { deploySuccessRows, envelopeProblem };
@@ -131,6 +131,10 @@ const LEARNED_RULES_KEY = 'learnedTypeRules';
 /** globalState key for the dependency-suggestion feedback log. */
 const SUGGESTION_LOG_KEY = 'sfOrgDeployWrapper.suggestionLog';
 
+/** How long the org keeps a validation that ran tests available for Quick
+ *  Deploy — shown on the run as "available until". */
+const QUICK_DEPLOY_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
+
 /** Command-log entries kept for the `ready` replay — the webview's own cap, so a
  *  rebuilt panel is handed exactly the list it would have kept. */
 const CMD_LOG_MAX = 50;
@@ -144,26 +148,6 @@ interface CmdLogEntry {
   durationMs?: number;
 }
 
-/**
- * Every `send.type` a card button may name today — i.e. the message types the
- * card-building code above still EMITS, which is a narrower thing than the set
- * handleMessage can route. `retryDeployChanged` is exactly that gap: the handler
- * survives (0.15.0 cards persisted with the button, and it may return in some
- * form), but "Retry + changed vs branch" was removed on user feedback, so a card
- * restored from before then must not resurrect its button.
- *
- * A button naming anything outside this set is dead weight by definition — either
- * the provider would ignore the message, or, as here, it advertises a feature that
- * no longer exists. (Kept status cards carry no buttons at all any more — see
- * runRecords.noticeFromCard — so this only describes the live cards.)
- *
- * check-card-buttons.cjs re-derives this set from the button literals the code in
- * this file builds, and fails on any drift — so removing the next feature's
- * button-builder forces the entry out of here rather than leaving it to rot.
- */
-export const SUPPORTED_CARD_BUTTON_SENDS: ReadonlySet<string> = new Set([
-  'retryDeploy', 'resumeDeploy', 'restoreBackup', 'discardBackup', 'selectDeployed'
-]);
 /** globalState key for folders whose type resolution failed — the negative cache
  *  (same TTL as learned rules). Without it every NEW session re-paid the serial
  *  30s-per-folder registry calls before a context-menu deploy could even confirm. */
@@ -429,8 +413,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentDeployJobId?: string;
   /** The org a `currentDeployJobId` belongs to (for the server-side cancel call). */
   private currentDeployOrg?: string;
-  /** Last successful validate-only deployment, offered for quick-deploy on the card. */
+  /** Last successful validate-only deployment, offered for quick-deploy on its run. */
   private lastValidated?: { jobId: string; org: string; label: string; count: number };
+  /** Validations this window has quick-deployed — their runs say the offer was
+   *  used instead of explaining why there is none. Lazily created. */
+  private quickDeployedJobs?: Set<string>;
   /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
   private orgMembers = new Map<string, true>();
   /** The org username `orgMembers` was fetched from — guards against using a stale
@@ -1034,16 +1021,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // reloads, newest first: the notices, then the runs (with the newest run's
         // full list, from this window or the rows file).
         if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        // A suggestion still alive server-side comes back with the newest run
+        // (liveRunPayload), so a rebuilt webview can act on it again.
         await this.runStore.postReady();
-        // Re-attach the "Try with dependencies" button for any suggestion still
-        // alive server-side: the persisted copy above dropped the live payload
-        // (stripSuggestForHistory), so a webview rebuilt after that — sidebar
-        // collapsed/reopened, window reload — would otherwise show only the
-        // folded-back guidance text with no way to act on it. The webview merges
-        // each payload into the history card carrying the matching `suggestId`.
-        for (const [id, live] of this.liveSuggestions) {
-          this.post({ type: 'suggestionRestore', id, candidates: live.candidates, unresolved: live.unresolved });
-        }
         // Re-sync the deploy-queue strip too — a webview rebuilt mid-session (e.g.
         // sidebar collapsed/reopened) must not show an empty strip while the
         // provider's in-memory queue still has items waiting.
@@ -1442,7 +1422,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       case 'copyText':
         if (msg.text) {
           await vscode.env.clipboard.writeText(msg.text);
-          vscode.window.setStatusBarMessage('$(check) SF Deploy: error copied to clipboard', 2500);
+          vscode.window.setStatusBarMessage('$(check) SF Deploy: copied to clipboard', 2500);
         }
         return;
       case 'cancel':
@@ -2791,7 +2771,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // modal is window-modal, so the setting can't be toggled from the panel or
       // the Settings editor while it's up — what the user reads is what runs.
       // `ignoreConflictsOverride` is the "Retry + overwrite" card button's one-off
-      // per-click flag (see deployFailureButtons) — set ONLY by that button's own
+      // per-click flag (see runView.actionsFor) — set ONLY by that button's own
       // request, never by the machine-scoped setting itself. It wins when present;
       // every other caller leaves it undefined and falls through to the setting.
       const ignoreConflicts = opts.ignoreConflictsOverride ?? this.ignoreDeployConflicts();
@@ -2831,6 +2811,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (buildRetryRequest inlined at the report call, below) would build.
       const retry = buildRetryRequest(opts, items, testLevel, runTests);
 
+      // The run starts now that it is confirmed: the Status pane shows it
+      // running, with what it sends and what it skipped, and every way this
+      // call can end below finishes that same run.
+      const runId = newRunId();
+      const runStartedAt = Date.now();
+      this.runStore.begin(beginDeployRun({
+        id: runId, op: opts.validateOnly ? 'validate' : 'deploy',
+        org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt,
+        target: opts.sourceDir ? 'sourceDir' : 'selection',
+        items, skipped: this.splitSkipped(orgOnlySkipped), testLevel, retry: runRetryFrom(retry)
+      }));
+
       // useManifest: write the temp package.xml now that the run is confirmed —
       // its path feeds both the echoed command below and the real deploy call.
       // Keys/retry/reattach/badge-flip all still key on Type:Name (unchanged
@@ -2840,7 +2832,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         try {
           manifest = await this.writeTempManifest(items);
         } catch (err) {
-          this.reportError(`${verb} ${orgPrep(verb)} ${orgLabel}`, err, retry);
+          this.reportError(`${verb} ${orgPrep(verb)} ${orgLabel}`, err, runId);
           // Past the confirm gate above — the user already said yes (A5).
           return ABORTED_CONFIRMED;
         }
@@ -2890,15 +2882,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // persist it so a window reload can reattach.
           this.currentDeployJobId = jobId;
           this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb, noun });
+          this.runStore.update(runId, { jobId });
           const outcome = await this.drivePolledDeploy(
-            { jobId, org, orgLabel, root, verb, noun, cmdId, start, progressTitle }, report,
+            { jobId, org, orgLabel, root, verb, noun, cmdId, start, progressTitle, runId }, report,
             result => {
               detection = this.reportPolledDeploy(result, {
                 items, orgOnlySkipped, orgLabel, org, noun, cmdId, start, validateOnly: !!opts.validateOnly, verb,
                 // Carries the run's own modes so Retry and an accepted dependency
                 // suggestion re-run as what this was — a validation must never turn
                 // into a deploy on its own.
-                retry
+                retry, runId, runStartedAt
               });
               // Set AFTER the report call: a throw out of reportDeployResult must
               // not leave sawTerminal true with detection unset, which would make
@@ -2913,17 +2906,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
-        // Org-labelled so exception cards stay attributable in the mixed-org history.
+        // Org-labelled so the toast and the Output channel stay attributable; the
+        // run itself carries the details.
         const labeledAction = `${verb} ${orgPrep(verb)} ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
           // A cancel this far out means the ASYNC SUBMIT was killed before it
           // returned a job id — the org may still have enqueued it.
-          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
+          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.', runId);
         } else if (isTimeoutError(err)) {
           // Only the short submit call can time out now (polls are handled inside
           // drivePolledDeploy); killing it does NOT stop an already-enqueued deploy.
-          this.reportDeployTimeout(labeledAction, err);
-        } else this.reportError(labeledAction, err, retry);
+          this.reportDeployTimeout(labeledAction, err, 'deploy', runId);
+        } else this.reportError(labeledAction, err, runId);
       } finally {
         if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
@@ -3293,10 +3287,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** Render the status card for a completed deploy/validate, including Apex test
-   *  failures (surfaced when a test-level ran) and a Quick Deploy affordance for a
-   *  successful validation. Returns the dependency detection for a FAILED deploy
-   *  (undefined on success) so runDeploy's caller can report 'failed' vs 'ok'. */
+  /** Turn a finished deploy/validate into its run — the newest one on the Status
+   *  pane — with the side effects a result has always had: the command log entry,
+   *  org badges for what landed, the Quick Deploy anchor for a validation that
+   *  ran tests, the dependency suggestion for a failure, and the toast/Output
+   *  mirror. Returns the dependency detection for a FAILED deploy (undefined
+   *  otherwise) so runDeploy's caller can report 'failed' vs 'ok'. */
   private reportDeployResult(
     result: DeployResult,
     ctx: {
@@ -3309,6 +3305,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       start: number;
       validateOnly: boolean;
       retry?: RetryRequest;
+      /** The run this result ends. A result nothing began (a reattached job)
+       *  becomes a new run. */
+      runId?: string;
+      runStartedAt?: number;
+      /** Where the rows come from: what the selection sent, or — with no
+       *  selection to go on — the org's own report. */
+      target?: RunTarget;
+      notes?: string[];
     }
   ): MissingDependencies | undefined {
     const { items, orgOnlySkipped, orgLabel, org, cmdId, start, validateOnly } = ctx;
@@ -3324,29 +3328,25 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
       && failures.length === 0
       && testFailures.length === 0;
-    const lines = items.map(i => `${i.type}:${i.name}`);
-    // Headed and listed FIRST on a success card: below thousands of deployed rows
-    // the card's line cap cut every skipped one off, leaving a bare "N skipped".
-    // A type this panel never reads locally comes first: it may be in the project
-    // and was not deployed, which "only on the org" would wrongly rule out.
-    const { orgOnly, unread } = this.splitSkipped(orgOnlySkipped);
-    const unreadTypes = [...new Set(unread.map(i => i.type))].sort();
-    const skipGroups = [
-      ...(unread.length ? [{
-        head: `${unread.length} skipped — this panel can't read ${unreadTypes.join(', ')} from your project: if you have ${unread.length === 1 ? 'it' : 'them'} locally, ${unread.length === 1 ? 'it was' : 'they were'} NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml:`,
-        rows: unread.map(i => `— ${i.type}:${i.name} — not read from your project, skipped (right-click its -meta.xml to deploy)`)
-      }] : []),
-      ...(orgOnly.length ? [{
-        head: `${orgOnly.length} skipped — selected, but ${orgOnly.length === 1 ? 'it exists' : 'they exist'} only on the org, so there was no local file to deploy:`,
-        rows: orgOnly.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`)
-      }] : [])
-    ];
-    const skipLines = skipGroups.flatMap(g => g.rows);
-    const skipMeta = `${orgOnly.length ? ` · ${orgOnly.length} skipped (org only)` : ''}${unread.length ? ` · ${unread.length} skipped (not read locally)` : ''}`;
-    const testMeta = result.numberTestsTotal
-      ? ` · ${(result.numberTestsTotal ?? 0) - (result.numberTestErrors ?? 0)}/${result.numberTestsTotal} tests passed`
-      : '';
     this.endCmd(cmdId, success, Date.now() - start);
+    const target = ctx.target ?? (ctx.retry?.sourceDir ? 'sourceDir' : 'selection');
+    const fromSelection = target === 'selection' || target === 'sourceDir';
+    const runInput: DeployRunInput = {
+      id: ctx.runId ?? newRunId(),
+      op: validateOnly ? 'validate' : 'deploy',
+      org, orgLabel, orgKind: this.orgKindOf(org),
+      startedAt: ctx.runStartedAt ?? start,
+      finishedAt: Date.now(),
+      target,
+      items: fromSelection ? items : undefined,
+      // A run that did not start from a selection cannot know what was skipped.
+      skipped: fromSelection ? this.splitSkipped(orgOnlySkipped) : undefined,
+      localKeyOf: f => this.localFailureKey(f, items),
+      testLevel: ctx.retry?.testLevel,
+      retry: runRetryFrom(ctx.retry),
+      conflict: isConflictFailure(result),
+      notes: ctx.notes
+    };
     if (success) {
       // Only a validation that ran tests can be quick-deployed (the org refuses
       // one that didn't). The org's runTestsEnabled says whether they ran — a
@@ -3355,8 +3355,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const testsRan = result.runTestsEnabled == null ? ctx.retry?.testLevel !== 'NoTestRun' : String(result.runTestsEnabled) !== 'false';
       const quickId = validateOnly && testsRan ? result.id : undefined;
       if (quickId) {
-        // Remember the validated deployment so the card's Quick Deploy button can
-        // deploy it without re-validating / re-running tests.
+        // Remember the validated deployment so the run's Quick Deploy button can
+        // deploy it without re-validating / re-running tests. In memory only: the
+        // offer ends with this window.
         this.lastValidated = { jobId: quickId, org, label: orgLabel, count: items.length };
       }
       // A real deploy landed these on the org — refresh their badges. Validate-only
@@ -3364,174 +3365,138 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (rollbackOnError is never disabled by this extension), so a failed run
       // leaves org membership as it was.
       if (!validateOnly) this.confirmDeployedOnOrg(successes, items, org, orgLabel);
-      this.post({
-        type: 'status',
-        card: {
-          kind: orgOnlySkipped.length > 0 ? 'warn' : 'ok',
-          title: validateOnly
-            ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
-            : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
-          meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${skipMeta}`,
-          lines: this.cardWithSkips(`Deployed to ${orgLabel} — full component list`, skipGroups, lines),
-          // Built from the ITEMS, not from the display lines: a manifest deploy
-          // synthesizes its items straight from <members> (wildcards and all) and
-          // a reattached job synthesizes them from the org's own report, so those
-          // "keys" name nothing the tree could ever tick. selectDeployedButtons
-          // keeps only the rows backed by local source — which for a normal run is
-          // the whole set, so re-selection reproduces the run exactly.
-          ...this.selectDeployedButtons(items),
-          ...(quickId
-            ? { quickDeploy: { jobId: quickId, label: `Quick Deploy ${items.length} validated component${items.length === 1 ? '' : 's'} to ${orgLabel}` } }
-            : {})
-        }
-      });
+      this.runStore.finish(deployRunFromResult(result, runInput));
       this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
-    } else {
-      // The org's request-level message. Read for EVERY failure, not just the
-      // no-rows one: it costs one extra problem string, a duplicate of a
-      // component problem simply dedupes inside the detector, and hard-coding
-      // "only when there are no rows" would be a second rule to keep in sync with
-      // the two result shapes above.
-      const envProblem = envelopeProblem(result);
-      // Structured lines: `key` (+ optional line/column) makes the row clickable
-      // in the panel — it opens the source in a preview tab at the error position.
-      const errLines = failures.length
-        ? failures.map(f => {
-            const key = this.localFailureKey(f, items);
-            return {
-              text: `${fileType(f)}:${f.fullName} — ${fileProblem(f) ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`,
-              ...(key ? { key } : {}),
-              ...(f.lineNumber ? { line: f.lineNumber, ...(f.columnNumber ? { column: f.columnNumber } : {}) } : {})
-            };
-          })
-        : (testFailures.length ? [] : [envProblem
-          // Say WHAT the org rejected instead of only that it rejected something:
-          // with no component rows this is the only text there is, and it is the
-          // same string the detection below parses.
-          ? `Deploy reported failure with no per-component details: ${envProblem}`
-          : 'Deploy reported failure with no per-component details.']);
-      const testLines = testFailures.map(t => {
-        // Apex stack traces read "Class.Foo.testBar: line 12, column 1".
-        const pos = /line (\d+)(?:, column (\d+))?/.exec(t.stackTrace ?? '');
-        const key = t.name
-          ? this.localFailureKey({ type: 'ApexClass', fullName: t.name })
-          : undefined;
-        return {
-          text: `✗ test ${t.name ?? '?'}.${t.methodName ?? '?'} — ${stripAnsi(t.message ?? 'failed').split('\n')[0]}`,
-          ...(key ? { key } : {}),
-          ...(pos ? { line: Number(pos[1]), ...(pos[2] ? { column: Number(pos[2]) } : {}) } : {})
-        };
-      });
-
-      // A failed deploy can reference a component that's missing on the org but
-      // DOES exist locally (e.g. a FlexiPage's QuickAction, or an Apex class
-      // whose dependency didn't make it into this same batch) — offer to retry
-      // WITH it added, instead of making the user hunt it down and re-select it
-      // by hand. Only offered when there's a discrete key list to extend (a
-      // manifest-based retry has none).
-      const retryKeys = ctx.retry?.keys;
-      // Detection runs even without a discrete key list (a manifest retry has
-      // none): the RESOLVED keys can only be offered when there's a list to
-      // extend, but the "referenced but not in your workspace" diagnosis is
-      // useful for every failed deploy, and it's the only feedback the user gets
-      // when the missing dependency isn't in the workspace at all.
-      // Every failure text this result carries: the per-component rows PLUS the
-      // request-level message — which is all there is when the org rejected the
-      // deploy without naming components, the case that used to reach the
-      // detector as an empty list and produce silence. One list feeds both the
-      // diagnosis and the suggestion candidates, so the card can't offer a
-      // suggestion the diagnosis doesn't know about (or the reverse). The
-      // envelope row has no `from` (no component owns it); the card renders that
-      // as a plain "add Type:Name".
-      const problemRows: Array<{ from?: string; problem: string }> = failures.map(f => ({
-        from: `${fileType(f)}:${f.fullName}`,
-        problem: fileProblem(f) ?? ''
-      }));
-      if (envProblem) problemRows.push({ problem: envProblem });
-      // A test-only failure (the deploy itself succeeded, but a test assertion
-      // named a missing dependency — "System.NullPointerException" from a class
-      // referencing a __mdt record the org doesn't have, say) used to never reach
-      // the detector at all: testFailures never joined problemRows.
-      for (const t of testFailures) {
-        if (t.message) problemRows.push({ from: t.name ? `ApexClass:${t.name}` : undefined, problem: t.message });
-      }
-      // Vouches for a missing field's parent object too (detectMissingDependencies'
-      // "No such column" rule) — only when THIS org's membership was actually
-      // fetched; otherwise isLocalOnly stays undefined and the rule no-ops exactly
-      // as it did before it existed.
-      const isLocalOnly = this.orgMembersOrg === org ? (key: string): boolean => !this.orgMembers.has(key) : undefined;
-      const deps = detectMissingDependencies(
-        problemRows.map(row => row.problem),
-        this.items,
-        new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`)),
-        { isLocalOnly }
-      );
-      // "Retry + changed vs branch" was offered here in 0.15.0 and removed on user
-      // feedback — the Changed lens already owns that workflow. The
-      // retryDeployChanged handler stays: persisted 0.15.0 cards still carry the
-      // button, and it may return in some future form. deployFailureButtons adds
-      // "Retry + overwrite" beside the plain Retry when this failure is itself a
-      // client-side conflict (see isConflictFailure) and the run wrote — in
-      // practice a completed DeployResult never carries one (the check throws at
-      // submit, before a job — and a conflict-blocked run reports through
-      // reportError instead, never reaching this function at all), but the same
-      // rule covers a CLI version that ever reports it this way instead.
-      const buttons = deployFailureButtons(ctx.retry, isConflictFailure(result));
-      // Per-row suggestion candidates for the card's "Try with dependencies"
-      // view. Same sourceDir exclusion as above (the retry couldn't carry the
-      // added keys), and only when there's a discrete key list to extend (a
-      // manifest retry has none). The card keeps the suggestion UI; the provider
-      // keeps the authority: liveSuggestions holds the server-side truth the
-      // webview's clicks are validated against.
-      const suggest = retryKeys && !ctx.retry?.sourceDir
-        ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys), { isLocalOnly })
-        : [];
-      let suggestPayload: { id: string; candidates: SuggestionCandidateInfo[]; unresolved: string[] } | undefined;
-      if (suggest.length && ctx.retry) {
-        const id = `sug-${Date.now()}-${this.suggestionSeq++}`;
-        // `org` (the username, not the alias) rides along so an accepted retry
-        // can be PINNED to it — the panel's org selector may have moved on by the
-        // time the user acts on the suggestion.
-        this.rememberSuggestion(id, { candidates: suggest, unresolved: deps.unresolved, retry: ctx.retry, orgLabel, org });
-        suggestPayload = { id, candidates: suggest, unresolved: deps.unresolved };
-      }
-      // The unresolved diagnosis still renders as a guidance line when there is
-      // no suggestion UI to carry it (nothing resolved locally, or manifest/
-      // sourceDir deploys) — it's the only feedback in that case. FIRST, because
-      // panel.js collapses a card past MAX_CARD_LINES.
-      const guidanceLines = suggestPayload ? [] : [
-        // A sourceDir-pinned retry can't be extended automatically (--source-dir
-        // beats --metadata) and a manifest retry has no key list — but the user
-        // still deserves to KNOW what's missing; that's the 0.14.0 behavior.
-        ...(retryKeys && deps.keys.length ? [`Missing but available locally: ${deps.keys.join(', ')} — add them to the deploy by hand.`] : []),
-        ...(deps.unresolved.length
-          ? [`Referenced but not found in your workspace: ${deps.unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
-          : [])
-      ];
-
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'err',
-          title: validateOnly ? `Validation failed against ${orgLabel}` : `Deploy failed against ${orgLabel}`,
-          meta: `${failures.length} component failure${failures.length === 1 ? '' : 's'}, ${successes.length} success${testFailures.length ? ` · ${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}` : ''}`,
-          lines: this.capForCard(`Deploy failed against ${orgLabel} — full detail list`, [
-            ...guidanceLines,
-            ...errLines,
-            ...testLines,
-            ...skipLines
-          ]),
-          ...(buttons ? { buttons } : {}),
-          ...(suggestPayload ? { suggest: suggestPayload } : {})
-        }
-      });
-      const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
-      // Details also mirror into the output channel so "Show Output" opens a log
-      // that actually mentions the failure.
-      this.failureToast(failureSummary, [...errLines, ...testLines]);
-      return deps;
+      return undefined;
     }
-    return undefined;
+    if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
+      // The org stopped it and rolled back whatever it had processed: an honest
+      // "cancelled" run, never a failure to act on.
+      this.runStore.finish(deployRunFromResult(result, runInput));
+      this.notifyIfPanelHidden(`${validateOnly ? 'Validate against' : 'Deploy to'} ${orgLabel} cancelled — The org cancelled the deploy.`, 'warn');
+      return undefined;
+    }
+    // The org's request-level message. Read for EVERY failure, not just the
+    // no-rows one: it costs one extra problem string, a duplicate of a
+    // component problem simply dedupes inside the detector, and hard-coding
+    // "only when there are no rows" would be a second rule to keep in sync with
+    // the two result shapes above.
+    const envProblem = envelopeProblem(result);
+    // What the toast's "Show Output" opens: one line per failure, the org's own
+    // words (the run itself lists them with links).
+    const errLines = failures.length
+      ? failures.map(f => `${fileType(f)}:${f.fullName} — ${fileProblem(f) ?? 'failed'}${f.lineNumber ? ` (line ${f.lineNumber})` : ''}`)
+      : (testFailures.length ? [] : [envProblem
+        ? `Deploy reported failure with no per-component details: ${envProblem}`
+        : 'Deploy reported failure with no per-component details.']);
+    const testLines = testFailures.map(t => `✗ test ${t.name ?? '?'}.${t.methodName ?? '?'} — ${stripAnsi(t.message ?? 'failed').split('\n')[0]}`);
+
+    // A failed deploy can reference a component that's missing on the org but
+    // DOES exist locally (e.g. a FlexiPage's QuickAction, or an Apex class
+    // whose dependency didn't make it into this same batch) — offer to retry
+    // WITH it added, instead of making the user hunt it down and re-select it
+    // by hand. Only offered when there's a discrete key list to extend (a
+    // manifest-based retry has none).
+    const retryKeys = ctx.retry?.keys;
+    // Detection runs even without a discrete key list (a manifest retry has
+    // none): the RESOLVED keys can only be offered when there's a list to
+    // extend, but the "referenced but not in your workspace" diagnosis is
+    // useful for every failed deploy, and it's the only feedback the user gets
+    // when the missing dependency isn't in the workspace at all.
+    // Every failure text this result carries: the per-component rows PLUS the
+    // request-level message — which is all there is when the org rejected the
+    // deploy without naming components, the case that used to reach the
+    // detector as an empty list and produce silence. One list feeds both the
+    // diagnosis and the suggestion candidates, so the run can't offer a
+    // suggestion the diagnosis doesn't know about (or the reverse). The
+    // envelope row has no `from` (no component owns it); the suggestion view
+    // renders that as a plain "add Type:Name".
+    const problemRows: Array<{ from?: string; problem: string }> = failures.map(f => ({
+      from: `${fileType(f)}:${f.fullName}`,
+      problem: fileProblem(f) ?? ''
+    }));
+    if (envProblem) problemRows.push({ problem: envProblem });
+    // A test-only failure (the deploy itself succeeded, but a test assertion
+    // named a missing dependency — "System.NullPointerException" from a class
+    // referencing a __mdt record the org doesn't have, say) used to never reach
+    // the detector at all: testFailures never joined problemRows.
+    for (const t of testFailures) {
+      if (t.message) problemRows.push({ from: t.name ? `ApexClass:${t.name}` : undefined, problem: t.message });
+    }
+    // Vouches for a missing field's parent object too (detectMissingDependencies'
+    // "No such column" rule) — only when THIS org's membership was actually
+    // fetched; otherwise isLocalOnly stays undefined and the rule no-ops exactly
+    // as it did before it existed.
+    const isLocalOnly = this.orgMembersOrg === org ? (key: string): boolean => !this.orgMembers.has(key) : undefined;
+    const deps = detectMissingDependencies(
+      problemRows.map(row => row.problem),
+      this.items,
+      new Set(retryKeys ?? items.map(i => `${i.type}:${i.name}`)),
+      { isLocalOnly }
+    );
+    // Per-row suggestion candidates for the run's "Try with dependencies" view.
+    // Not for a sourceDir retry (it couldn't carry the added keys), and only when
+    // there's a discrete key list to extend (a manifest retry has none). The run
+    // keeps only the suggestion's id; the provider keeps the authority:
+    // liveSuggestions holds the server-side truth the webview's clicks are
+    // validated against, merged into the newest run each time it is posted.
+    const suggest = retryKeys && !ctx.retry?.sourceDir
+      ? buildSuggestionCandidates(problemRows, this.items, new Set(retryKeys), { isLocalOnly })
+      : [];
+    let suggestId: string | undefined;
+    if (suggest.length && ctx.retry) {
+      suggestId = `sug-${Date.now()}-${this.suggestionSeq++}`;
+      // `org` (the username, not the alias) rides along so an accepted retry
+      // can be PINNED to it — the panel's org selector may have moved on by the
+      // time the user acts on the suggestion.
+      this.rememberSuggestion(suggestId, { candidates: suggest, unresolved: deps.unresolved, retry: ctx.retry, orgLabel, org });
+    }
+    // The diagnosis becomes the run's notes when there is no suggestion view to
+    // carry it (nothing resolved locally, or manifest/sourceDir deploys) — it's
+    // the only feedback in that case, and it survives a reload the way the live
+    // suggestion does not.
+    const guidanceLines = suggestId ? [] : [
+      // A sourceDir-pinned retry can't be extended automatically (--source-dir
+      // beats --metadata) and a manifest retry has no key list — but the user
+      // still deserves to KNOW what's missing.
+      ...(retryKeys && deps.keys.length ? [`Missing but available locally: ${deps.keys.join(', ')} — add them to the deploy by hand.`] : []),
+      ...(deps.unresolved.length
+        ? [`Referenced but not found in your workspace: ${deps.unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
+        : [])
+    ];
+    const run = deployRunFromResult(result, { ...runInput, notes: [...guidanceLines, ...(ctx.notes ?? [])] });
+    if (suggestId) run.suggestId = suggestId;
+    this.runStore.finish(run);
+    const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
+    // Details also mirror into the output channel so "Show Output" opens a log
+    // that actually mentions the failure.
+    this.failureToast(failureSummary, [...errLines, ...testLines]);
+    return deps;
+  }
+
+  /** The org's kind for a run's PROD / sandbox / scratch pill; an org this
+   *  window hasn't listed is none of them. */
+  private orgKindOf(org: string): OrgKind {
+    const info = (this.orgs ?? []).find(o => o.username === org);
+    return info ? orgKind(info) : 'other';
+  }
+
+  /** Live additions to the newest run when it is posted: the dependency
+   *  suggestion while the provider still holds it, and the Quick Deploy offer
+   *  while this window still has the validation it would apply (or the note
+   *  that it was already used). Never stored. */
+  private liveRunPayload(run: RunRecord): RunLive | undefined {
+    const out: RunLive = {};
+    const sug = run.suggestId ? this.liveSuggestions?.get(run.suggestId) : undefined;
+    if (sug && run.suggestId && (run.status === 'failed' || run.status === 'error')) {
+      out.suggest = { id: run.suggestId, candidates: sug.candidates, unresolved: sug.unresolved };
+    }
+    if (run.op === 'validate' && run.status === 'succeeded' && run.jobId) {
+      const v = this.lastValidated;
+      if (v && v.jobId === run.jobId) out.quick = { jobId: v.jobId, until: (run.finishedAt ?? Date.now()) + QUICK_DEPLOY_WINDOW_MS };
+      else if (this.quickDeployedJobs?.has(run.jobId)) out.quick = { jobId: run.jobId, until: 0, used: true };
+    }
+    return out.suggest || out.quick ? out : undefined;
   }
 
   // ---- Async deploy: poll / cancel / reattach ----
@@ -3546,25 +3511,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * for the SUBMIT only.
    */
   private async drivePolledDeploy(
-    args: { jobId: string; org: string; orgLabel: string; root: string; verb: DeployVerb; noun: string; cmdId: string; start: number; progressTitle: string },
+    args: { jobId: string; org: string; orgLabel: string; root: string; verb: DeployVerb; noun: string; cmdId: string; start: number; progressTitle: string; runId?: string },
     report: (message: string) => void,
     onTerminal: (result: DeployResult) => void
   ): Promise<{ keepPersisted: boolean }> {
-    const { jobId, org, orgLabel, root, verb, cmdId, start, progressTitle } = args;
+    const { jobId, org, orgLabel, root, verb, cmdId, start, progressTitle, runId } = args;
     const outcome = await this.pollDeployJob(jobId, org, root, result => {
       const msg = this.formatDeployProgress(result);
       report(msg);
       this.postProgress(`${progressTitle}: ${msg}`);
+      // The running run's bars: the org's counts, never its rows.
+      if (runId) {
+        this.runStore.progress(runId, {
+          orgStatus: typeof result.status === 'string' ? result.status : undefined,
+          compDone: result.numberComponentsDeployed, compTotal: result.numberComponentsTotal,
+          testDone: result.numberTestsCompleted, testTotal: result.numberTestsTotal,
+          errors: result.numberComponentErrors
+        });
+      }
     });
     const prep = orgPrep(verb);
     if (outcome.kind === 'lost') {
       this.endCmd(cmdId, false, Date.now() - start);
-      this.reportDeployLostContact(jobId, orgLabel, verb);
+      this.reportDeployLostContact(jobId, orgLabel, verb, runId);
       return { keepPersisted: true };
     }
     if (outcome.kind === 'cancelled') {
       this.endCmd(cmdId, false, Date.now() - start);
-      this.reportCancelled(`${verb} ${prep} ${orgLabel}`, outcome.note);
+      this.reportCancelled(`${verb} ${prep} ${orgLabel}`, outcome.note, runId);
       return { keepPersisted: false };
     }
     onTerminal(outcome.result);
@@ -3671,36 +3645,39 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return parts.length ? `${status} · ${parts.join(' · ')}` : status;
   }
 
-  /** Render the terminal card for a polled deploy/validate. A `Canceled` status gets
-   *  an honest "cancelled" card (the org actually stopped it); everything else goes
-   *  through the normal result renderer. */
+  /** The terminal result of a polled deploy/validate, as its run. A `Canceled`
+   *  status is an honest "cancelled" run (the org actually stopped it), never a
+   *  failure to act on — reportDeployResult tells the two apart. */
   private reportPolledDeploy(
     result: DeployResult,
-    ctx: { items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number; validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest }
-  ): MissingDependencies | undefined {
-    if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
-      this.endCmd(ctx.cmdId, false, Date.now() - ctx.start);
-      this.reportCancelled(`${ctx.verb} ${orgPrep(ctx.verb)} ${ctx.orgLabel}`, 'The org cancelled the deploy.');
-      return undefined;
+    ctx: {
+      items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number;
+      validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest; runId?: string; runStartedAt?: number; target?: RunTarget; notes?: string[];
     }
+  ): MissingDependencies | undefined {
     return this.reportDeployResult(result, ctx);
   }
 
   /** Honest card when we lose contact with a running job (5 failed polls in a row):
    *  it may still be running, the job is kept persisted, and reopening the panel
    *  reattaches. */
-  private reportDeployLostContact(jobId: string, orgLabel: string, verb: DeployVerb): void {
+  private reportDeployLostContact(jobId: string, orgLabel: string, verb: DeployVerb, runId?: string): void {
     const prep = verb === 'Validate' ? 'against' : 'to';
-    this.post({
-      type: 'status',
-      card: {
-        kind: 'err',
-        title: `Lost contact with ${verb.toLowerCase()} ${prep} ${orgLabel}`,
-        meta: `Job ${jobId} may still be running on the org`,
-        hint: 'Resume monitoring checks the existing job — it does not submit the deployment again.',
-        buttons: [{ label: 'Resume monitoring', send: { type: 'resumeDeploy', jobId } }]
-      }
-    });
+    // A begun run turns into a "lost" run, whose Resume monitoring checks the
+    // same job; anything else (a reattached job, a quick deploy) keeps its card.
+    const ended = runId !== undefined && this.runStore.end(runId, { status: 'lost', jobId });
+    if (!ended) {
+      this.post({
+        type: 'status',
+        card: {
+          kind: 'err',
+          title: `Lost contact with ${verb.toLowerCase()} ${prep} ${orgLabel}`,
+          meta: `Job ${jobId} may still be running on the org`,
+          hint: 'Resume monitoring checks the existing job — it does not submit the deployment again.',
+          buttons: [{ label: 'Resume monitoring', send: { type: 'resumeDeploy', jobId } }]
+        }
+      });
+    }
     this.failureToast(`Lost contact with the ${verb.toLowerCase()} ${prep} ${orgLabel} — it may still be running. Open the panel and choose Resume monitoring.`);
   }
 
@@ -3823,9 +3800,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             this.reportPolledDeploy(result, {
               items, orgOnlySkipped: [], orgLabel: job.orgLabel, org: job.org,
               noun: job.noun, cmdId, start, ...modes, verb: job.verb,
-              // Reattached cards synthesize their component list from the report —
+              // Reattached runs take their component list from the report —
               // retry re-deploys that set under the CURRENT panel defaults.
-              retry: { keys: items.map(i => `${i.type}:${i.name}`), ...modes }
+              retry: { keys: items.map(i => `${i.type}:${i.name}`), ...modes },
+              target: 'report', runStartedAt: job.startedAt,
+              notes: [`Re-attached after a window reload: only what ${job.orgLabel}'s report contains. Rows skipped before the deploy started aren't known.`]
             });
           }
         );
@@ -3884,8 +3863,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.currentDeployOrg = org;
           const { result: submit, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
-          // The quick deploy consumes the validation — clear it now we've committed.
+          // The quick deploy consumes the validation — clear it now we've committed,
+          // and let its run say the offer was used rather than missing.
           this.lastValidated = undefined;
+          (this.quickDeployedJobs ??= new Set()).add(jobId);
+          this.runStore.postRuns();
           const quickJobId = submit.id;
           if (!quickJobId) throw new SfCliError('Quick Deploy submitted but the CLI returned no job id to track.');
           this.currentDeployJobId = quickJobId;
@@ -4196,6 +4178,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       reserved = false;
       const start = Date.now();
       const progressTitle = `Deploying ${noun} to ${orgLabel}`;
+      // The run starts empty: the package.xml names the components, the org's
+      // report says what became of each one.
+      const retry: RetryRequest = { manifest: manifestPath, testLevel };
+      const runId = newRunId();
+      this.runStore.begin(beginDeployRun({
+        id: runId, op: 'deploy', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: start,
+        target: 'manifest', items: [], testLevel, retry: runRetryFrom(retry)
+      }));
       let keepPersisted = false;
       try {
         await this.withWindowProgress(progressTitle, async report => {
@@ -4217,11 +4207,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           if (!jobId) throw new SfCliError('Deploy submitted but the CLI returned no job id to track.');
           this.currentDeployJobId = jobId;
           this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb: 'Deploy', noun });
+          this.runStore.update(runId, { jobId });
           const outcome = await this.drivePolledDeploy(
-            { jobId, org, orgLabel, root, verb: 'Deploy', noun, cmdId, start, progressTitle }, report,
+            { jobId, org, orgLabel, root, verb: 'Deploy', noun, cmdId, start, progressTitle, runId }, report,
             result => this.reportPolledDeploy(result, {
               items, orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false, verb: 'Deploy',
-              retry: { manifest: manifestPath, testLevel }
+              retry, runId, runStartedAt: start, target: 'manifest'
             })
           );
           keepPersisted = outcome.keepPersisted;
@@ -4230,10 +4221,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.endCmd(cmdId, false, Date.now() - start);
         const labeledAction = `Deploy to ${orgLabel}`;
         if (err instanceof SfCliCancelledError) {
-          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
+          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.', runId);
         } else if (isTimeoutError(err)) {
-          this.reportDeployTimeout(labeledAction, err);
-        } else this.reportError(labeledAction, err);
+          this.reportDeployTimeout(labeledAction, err, 'deploy', runId);
+        } else this.reportError(labeledAction, err, runId);
       } finally {
         if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
@@ -5662,11 +5653,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(item.filePath), title, { preview: false, viewColumn });
   }
 
-  private reportCancelled(action: string, note?: string): void {
-    this.post({
-      type: 'status',
-      card: { kind: 'warn', title: `${action} cancelled`, ...(note ? { meta: note } : {}) }
-    });
+  /** `runId`: the run this cancel ends — its card says it, instead of a card of
+   *  its own. The org may still finish (the cancel could not be confirmed), so
+   *  the run is marked as such. */
+  private reportCancelled(action: string, note?: string, runId?: string): void {
+    const ended = runId !== undefined && this.runStore.end(runId, { status: 'cancelUnconfirmed', ...(note ? { notes: [note] } : {}) });
+    if (!ended) {
+      this.post({
+        type: 'status',
+        card: { kind: 'warn', title: `${action} cancelled`, ...(note ? { meta: note } : {}) }
+      });
+    }
     // A bare cancel needs no notification — the user pressed Cancel and the progress
     // notification vanishing is the acknowledgment. A NOTE is different: it says
     // something the click does NOT imply (the org-side operation may still be
@@ -5740,7 +5737,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       log: line => this.output?.appendLine(line),
       cap: () => {
         try { return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('statusHistoryRuns'); } catch { return undefined; }
-      }
+      },
+      live: run => this.liveRunPayload(run)
     }));
   }
 
@@ -5826,20 +5824,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       this.output.appendLine(`[logResultLines] failed to log "${message}": ${e instanceof Error ? e.message : String(e)}`);
     }
-  }
-
-  /** A success card with skipped rows: their explanation and the first few names
-   *  lead, the deployed rows follow — thousands of skipped rows (a Select all on a
-   *  fetched org) must not push every deployed one off the card. The full list,
-   *  skipped rows included, goes to the Output channel whenever the card drops any. */
-  private cardWithSkips(header: string, groups: Array<{ head: string; rows: string[] }>, lines: string[]): Array<string | { text: string }> {
-    const SHOWN = 10;
-    const full = [...groups.flatMap(g => [g.head, ...g.rows]), ...lines];
-    const card = [...groups.flatMap(g => [g.head, ...(g.rows.length > SHOWN
-      ? [...g.rows.slice(0, SHOWN), `… and ${g.rows.length - SHOWN} more skipped — full list in the Output channel`]
-      : g.rows)]), ...lines];
-    if (groups.some(g => g.rows.length > SHOWN) || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
-    return capLines(card);
   }
 
   /** Selected rows with no local file, split by whether this panel can list their
@@ -5969,14 +5953,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * `retry` is passed ONLY by callers that can name the exact deploy request
-   * that just failed (today: runDeploy's own catch — the client-side conflict
-   * check throws HERE, from the submit call, before any job id exists, so a
-   * conflict-blocked deploy never reaches reportDeployResult's card at all).
-   * Every other caller (org list, backup, diff, login, …) leaves it undefined
-   * and gets exactly the card this function has always built.
+   * `runId` is passed ONLY by callers whose begun run this error ends (a deploy
+   * or validation refused at submit — the client-side conflict check throws
+   * there, before any job id exists). That run then carries the message, the
+   * hint and, for a conflict, Retry + overwrite. Every other caller (org list,
+   * backup, diff, login, …) gets exactly the card this function has always
+   * built.
    */
-  private reportError(action: string, err: unknown, retry?: RetryRequest): void {
+  private reportError(action: string, err: unknown, runId?: string): void {
     // Belt: reportError is the last line of defense, so a synchronous throw from
     // post()/history persistence here must not cascade into the caller's catch and
     // mask the real error. Fall back to the output channel, never rethrow.
@@ -5984,18 +5968,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const message = err instanceof Error ? err.message : String(err);
       this.handleError(action, err);
       const stderr = err instanceof SfCliError ? err.stderr ?? '' : '';
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'err',
-          title: `${action} failed`,
-          meta: 'See command log / output channel for details',
-          errText: stripAnsi([message, stderr].filter(Boolean).join('\n')).trim(),
-          actions: err instanceof SfCliError ? err.actions : undefined,
-          hint: hintForError(err),
-          buttons: deployFailureButtons(retry, isConflictFailure(err))
-        }
+      const errText = stripAnsi([message, stderr].filter(Boolean).join('\n')).trim();
+      const actions = err instanceof SfCliError ? err.actions : undefined;
+      const hint = hintForError(err);
+      const ended = runId !== undefined && this.runStore.end(runId, {
+        status: 'error', message: errText,
+        ...(hint ? { hint } : {}), ...(actions?.length ? { cliActions: actions } : {}),
+        ...(isConflictFailure(err) ? { conflict: true } : {})
       });
+      if (!ended) {
+        this.post({
+          type: 'status',
+          card: { kind: 'err', title: `${action} failed`, meta: 'See command log / output channel for details', errText, actions, hint }
+        });
+      }
       this.notify('error', `${action} failed. ${message}`, { buttons: ['Show Panel', 'Show Output'] });
     } catch (e) {
       this.output.appendLine(`[reportError] failed to report "${action}": ${e instanceof Error ? e.message : String(e)}`);
@@ -6009,7 +5995,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  first, alongside the raise-timeout hint. A retrieve changes nothing on the org
    *  and wrote nothing locally when it is killed, so its wording says that instead —
    *  there the raise-timeout hint is the whole advice. */
-  private reportDeployTimeout(action: string, err: unknown, kind: 'deploy' | 'retrieve' = 'deploy'): void {
+  private reportDeployTimeout(action: string, err: unknown, kind: 'deploy' | 'retrieve' = 'deploy', runId?: string): void {
     try {
       const message = err instanceof Error ? err.message : String(err);
       this.handleError(action, err);
@@ -6017,16 +6003,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const note = retrieve
         ? 'The org may have completed the retrieve, but the local command was stopped before it finished writing files — check your working tree before retrying.'
         : 'Killing the local command does not stop the deploy on the org — it MAY STILL BE RUNNING. Check the org\'s Deployment Status (Setup) or run `sf project deploy report` before retrying, to avoid deploying twice into a conflict.';
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'err',
-          title: `${action} timed out`,
-          meta: retrieve ? 'Local command timed out — files may not have been written' : 'Local command timed out — the deploy may still be running on the org',
-          errText: stripAnsi(message).trim(),
-          hint: `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large ${retrieve ? 'retrieves' : 'deployments'}.`
-        }
-      });
+      const hint = `${note} Raise sfOrgDeployWrapper.commandTimeoutMs for large ${retrieve ? 'retrieves' : 'deployments'}.`;
+      const ended = runId !== undefined && this.runStore.end(runId, { status: 'timeout', message: stripAnsi(message).trim(), hint });
+      if (!ended) {
+        this.post({
+          type: 'status',
+          card: {
+            kind: 'err',
+            title: `${action} timed out`,
+            meta: retrieve ? 'Local command timed out — files may not have been written' : 'Local command timed out — the deploy may still be running on the org',
+            errText: stripAnsi(message).trim(),
+            hint
+          }
+        });
+      }
       this.notify('warn', retrieve
         ? `${action} timed out — files may not have been written. Raise sfOrgDeployWrapper.commandTimeoutMs and try again.`
         : `${action} timed out — the deploy may still be running on the org. Check the org before retrying.`,
@@ -6444,32 +6434,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  /** Card `buttons` for a SUCCESSFUL deploy/validate: one control that puts exactly
-   *  the components of that run back into the tree selection. Without it a
-   *  follow-up action (diff what just went up, retrieve it back, redeploy after one
-   *  more edit) means ticking the same rows again by hand — the panel otherwise
-   *  keeps no record of a finished run's contents. The keys ride WITH the card
-   *  because the card outlives both the selection and the window; they are
-   *  re-validated against the live scan on click (selectableScannedKeys), never
-   *  trusted back.
-   *  Only items with LOCAL SOURCE qualify, and the filter lives HERE rather than
-   *  at the call site so no caller can bypass it: a manifest deploy's items come
-   *  from <members> (`ApexClass:*` included) and a reattached job's from the org's
-   *  report, so a button built from those promises a selection the tree cannot
-   *  make and lands on "none of those are in your workspace" — while blaming a
-   *  workspace change that never happened. Spreads to nothing when the run
-   *  touched no local source at all. */
-  private selectDeployedButtons(items: MetadataItem[]): { buttons: Array<{ label: string; send: { type: string; keys: string[] } }> } | Record<string, never> {
-    const keys = items.filter(i => !!i.filePath).map(i => `${i.type}:${i.name}`);
-    if (keys.length === 0) return {};
-    return {
-      buttons: [{
-        label: keys.length === 1 ? 'Select this component' : `Select these ${keys.length}`,
-        send: { type: 'selectDeployed', keys }
-      }]
-    };
-  }
-
   /** Keys echoed back from a result card, reduced to what can actually be selected
    *  NOW: strings only, de-duplicated, and present in the current scan WITH local
    *  source. Two reasons, not one: the message round-trips through the webview
@@ -6656,30 +6620,6 @@ export function classifyDiffOutcome(
   const meta = `${opened} opened · ${missing} missing · ${errors} errors${unsupported ? ` · ${unsupported} unsupported` : ''}`;
   const notify = errors > 0 ? 'err' : (opened === 0 && kind === 'warn' ? 'warn' : 'none');
   return { kind, title, meta, notify };
-}
-
-/**
- * Card with every button whose `send.type` is outside `supported` removed (see
- * SUPPORTED_CARD_BUTTON_SENDS). A button with no usable `send.type` at all goes
- * the same way — it could never have posted anything.
- *
- * Returns the card UNCHANGED (same reference) when nothing needed dropping, and
- * omits the `buttons` key entirely rather than leaving an empty array behind, so a
- * pruned card is indistinguishable from one that never had buttons.
- */
-export function pruneCardButtons(
-  card: Record<string, unknown>,
-  supported: ReadonlySet<string> = SUPPORTED_CARD_BUTTON_SENDS
-): Record<string, unknown> {
-  const buttons = card.buttons;
-  if (!Array.isArray(buttons)) return card;
-  const kept = buttons.filter(b => {
-    const type = (b as { send?: { type?: unknown } } | null)?.send?.type;
-    return typeof type === 'string' && supported.has(type);
-  });
-  if (kept.length === buttons.length) return card;
-  const { buttons: _dropped, ...rest } = card;
-  return kept.length ? { ...rest, buttons: kept } : rest;
 }
 
 /** Condensed reason for a diff that had nothing to compare at all. The toast has no
@@ -6931,29 +6871,6 @@ export function isConflictFailure(errOrResult: unknown): boolean {
     if (typeof r.errorMessage === 'string') text = r.errorMessage;
   }
   return !!text && CONFLICT_TEXT_PATTERNS.some(re => re.test(text));
-}
-
-/**
- * Buttons for a failed deploy/validate result card. `undefined` when there's no
- * retry request to carry at all (a manifest retry has none — see
- * buildRetryRequest/RetryRequest). Otherwise the plain Retry, unchanged from
- * before this feature existed, plus — only when the failure is itself a
- * client-side conflict AND the run wrote (never for validateOnly: a check-only
- * run overwrites nothing, so there's nothing for the second button to offer) —
- * "Retry + overwrite", carrying the SAME request with `ignoreConflicts: true`
- * added. That field is NOT folded back into `retry` itself: it's a one-off for
- * this click, and the request object here is only ever read, never mutated, so
- * the plain Retry beside it — and any later card built from this same `retry`
- * value — stays exactly as it was.
- */
-export function deployFailureButtons(
-  retry: RetryRequest | undefined,
-  conflict: boolean
-): Array<{ label: string; send: { type: 'retryDeploy'; request: RetryRequest } }> | undefined {
-  if (!retry) return undefined;
-  const plain = { label: retry.validateOnly ? 'Retry validation' : 'Retry deploy', send: { type: 'retryDeploy' as const, request: retry } };
-  if (!conflict || retry.validateOnly) return [plain];
-  return [plain, { label: 'Retry + overwrite', send: { type: 'retryDeploy' as const, request: { ...retry, ignoreConflicts: true } } }];
 }
 
 /** The check-only mode implied by a persisted job's verb. The verb is the ONLY

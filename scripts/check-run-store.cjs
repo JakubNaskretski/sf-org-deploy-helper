@@ -45,7 +45,7 @@ const check = (name, fn) => queue.push([name, fn]);
 
 // ------------------------------------------------------------------ doubles
 const T0 = 1_750_000_000_000;
-const clone = (v) => JSON.parse(JSON.stringify(v));
+const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 function host(opts = {}) {
   const state = clone(opts.state || {});
   const posted = [];
