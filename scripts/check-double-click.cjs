@@ -108,7 +108,7 @@ function provider(extra = {}) {
   const s = Object.create(proto);
   Object.assign(s, {
     busy: false, confirmOpen: false, deployQueue: [], cmdSeq: 0, orgMembers: new Map(), orgMembersOrg: undefined,
-    items: [cls('AcmeA'), cls('AcmeB')], workspaceRoot: '/ws', autoFetchDone: true, cardHistoryCache: [],
+    items: [cls('AcmeA'), cls('AcmeB')], workspaceRoot: '/ws', autoFetchDone: true,
     liveSuggestions: new Map(), testLevel: undefined, runTests: undefined,
     orgs: [{ username: 'acme-dev-user', alias: 'acme-dev', instanceUrl: 'https://acme-dev.example.invalid' }],
     orgStore: { get: () => 'acme-dev-user', set: async () => {}, setFromUserPick: async () => {} },
@@ -275,6 +275,19 @@ check('a slot-less early return is still answered with a busy re-sync', async ()
   await ticks();
   assert.ok(toasts.some(t => /no longer available/.test(t)));
   assert.deepStrictEqual(p.busyPosts(), [{ busy: false, action: undefined }]);
+});
+
+check('Resume monitoring ×2: one reattach of the persisted job; the twin is told an operation is running', async () => {
+  reset();
+  const job = { jobId: '0Af000000000001AAA', org: 'acme-dev-user', orgLabel: 'acme-dev', startedAt: Date.now() - 60_000, verb: 'Deploy', noun: '2 components' };
+  const p = provider({ activeJob: job });
+  p.send({ type: 'resumeDeploy', jobId: job.jobId });
+  p.send({ type: 'resumeDeploy', jobId: job.jobId });
+  await ticks();
+  assert.strictEqual(p.sfCalls.filter(c => /report/i.test(c.name)).length, 1, JSON.stringify(p.sfCalls.map(c => c.name)));
+  assert.strictEqual(p.s.busy, true);
+  assert.ok(toasts.some(t => /Deploy is already running/.test(t)), JSON.stringify(toasts));
+  assert.ok(p.busyPosts().length >= 2 && p.busyPosts().every(b => b.busy === true), JSON.stringify(p.busyPosts()));
 });
 
 check('a handler that throws before touching the slot is still answered', async () => {

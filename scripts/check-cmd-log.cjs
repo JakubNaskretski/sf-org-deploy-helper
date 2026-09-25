@@ -67,15 +67,16 @@ const render = messages => messages.filter(m => m.type === 'cmd').reduce((log, m
 
 function provider() {
   const posted = [];
+  const kept = {}; // workspaceState
   const s = Object.create(proto);
   Object.assign(s, {
     busy: false, cmdSeq: 0, cmdLog: [], deployQueue: [], liveSuggestions: new Map(),
-    items: [], workspaceRoot: undefined, cardHistoryCache: [],
+    items: [], workspaceRoot: undefined,
     orgs: [], orgMembers: new Map(),
     testLevel: undefined, runTests: undefined,
     output: { appendLine: () => {} },
     context: {
-      workspaceState: { get: () => undefined, update: async () => {} },
+      workspaceState: { get: k => kept[k], update: async (k, v) => { kept[k] = v; } },
       globalState: { get: () => undefined, update: async () => {} }
     },
     view: { visible: true, webview: { postMessage: m => posted.push(m) } },
@@ -88,6 +89,7 @@ function provider() {
   return {
     s,
     posted,
+    kept,
     begin: cmd => proto.beginCmd.call(s, cmd),
     update: (id, cmd) => proto.updateCmd.call(s, id, cmd),
     end: (id, ok, ms) => proto.endCmd.call(s, id, ok, ms),
@@ -152,13 +154,25 @@ check('the replay is the FIRST thing ready posts — before its awaits, so a com
   // before its own replayed row, which then landed ABOVE it: [c1, c2] came back
   // as c1 over c2. Replaying before the first await closes the window.
   const p = provider();
-  p.s.cardHistoryCache = [{ kind: 'ok', title: 'Deployed 1 component', at: 1 }];
+  p.kept.statusCardHistory = [{ kind: 'ok', title: 'Deployed 1 component', at: 1 }];
   p.begin('sf project deploy start --metadata ApexClass:A --target-org acme-dev');
   await p.rebuild();
   const types = p.posted.map(m => m.type);
   assert.ok(types.includes('statusHistory'), 'fixture broken: no status history replayed');
   assert.strictEqual(types[0], 'cmd', types.join(','));
   assert.ok(types.indexOf('cmd') < types.indexOf('statusHistory'), types.join(','));
+});
+
+check('ready replays in order: the command log, the notices, then the runs', async () => {
+  // The runs come last: the webview draws the newest run over the notices it
+  // already has, and the rows it needs arrive with that same post.
+  const p = provider();
+  p.kept.statusCardHistory = [{ kind: 'ok', title: 'Fetched 3 components', at: 1 }];
+  p.begin('sf org list metadata --metadata-type ApexClass --target-org acme-dev');
+  await p.rebuild();
+  const types = p.posted.map(m => m.type).filter(t => ['cmd', 'statusHistory', 'runs'].includes(t));
+  assert.deepStrictEqual([...new Set(types)], ['cmd', 'statusHistory', 'runs'], types.join(','));
+  assert.strictEqual(types.filter(t => t === 'runs').length, 1, 'one runs post per rebuild');
 });
 
 check('an end for an id the cap already evicted is not kept — it would replay as a blank row', async () => {

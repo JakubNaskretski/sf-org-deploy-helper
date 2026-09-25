@@ -141,7 +141,7 @@ check('the gate reads the value maybeBackupBeforeRetrieve returns (dir only when
   assert.ok(/if \(!this\.backupsEnabled\(\)\) return undefined;/.test(fn), 'disabled → undefined');
   assert.ok(/if \(result\.count === 0\) \{/.test(fn), 'count===0 branches (offered vs. nothing) instead of a flat return');
   assert.ok(/if \(result\.offered\) \{/.test(fn), 'candidates offered but none copyable gets its own note');
-  assert.ok(!/note: `backup skipped — none of[^`]*`,\s*\n\s*dir:/.test(fn), 'the nothing-copyable note must never carry a dir');
+  assert.ok(/note: `Backup skipped — none of/.test(fn) && !/note: `Backup skipped — none of[^`]*`,\s*\n\s*dir:/.test(fn), 'the nothing-copyable note must never carry a dir');
   // `dir:` must appear only AFTER the count===0 guard, i.e. never on the over-cap
   // OR nothing-copyable branches.
   const guard = fn.indexOf('if (result.count === 0)');
@@ -191,7 +191,7 @@ check('candidates offered but none copyable (missing + outside workspace) → no
     const result = await maybeBackup(prov, root, [missing, outside], 'acme-dev');
     assert.ok(result, 'a real safety-net gap must not stay silent');
     assert.strictEqual(result.dir, undefined, 'no dir — the CLI conflict check must stay on');
-    assert.strictEqual(result.note, "backup skipped — none of 2 local files could be saved (see Output)");
+    assert.strictEqual(result.note, "Backup skipped — none of 2 local files could be saved (see Output).");
     await fsp.rm(outside, { force: true });
   });
 });
@@ -200,7 +200,7 @@ check('one offered, none copyable → singular wording', async () => {
   await withTmpWorkspace(async (root, storage) => {
     const prov = backupProvider(storage);
     const result = await maybeBackup(prov, root, [path.join(root, 'Gone.cls')], 'acme-dev');
-    assert.strictEqual(result.note, "backup skipped — none of 1 local file could be saved (see Output)");
+    assert.strictEqual(result.note, "Backup skipped — none of 1 local file could be saved (see Output).");
     assert.strictEqual(result.dir, undefined);
   });
 });
@@ -212,7 +212,7 @@ check('a real copyable file still backs up normally — dir present, note unchan
     await fsp.writeFile(real, 'public class Real {}', 'utf8');
     const result = await maybeBackup(prov, root, [real], 'acme-dev');
     assert.ok(result.dir, 'a copied file must still hand back a dir');
-    assert.strictEqual(result.note, "backed up 1 file — restore via 'SF Deploy: Restore Retrieve Backup'");
+    assert.strictEqual(result.note, "Backed up 1 file — restore via 'SF Deploy: Restore Retrieve Backup'.");
     assert.ok(fs.existsSync(path.join(result.dir, 'Real.cls')));
   });
 });
@@ -228,7 +228,7 @@ check('a mix of copyable and non-copyable candidates counts only what was actual
     // "none copyable" branch — the dropped candidate is only logged, since the
     // backup as a whole still succeeded and has a dir to restore from.
     assert.ok(result.dir);
-    assert.strictEqual(result.note, "backed up 1 file — restore via 'SF Deploy: Restore Retrieve Backup'");
+    assert.strictEqual(result.note, "Backed up 1 file — restore via 'SF Deploy: Restore Retrieve Backup'.");
   });
 });
 

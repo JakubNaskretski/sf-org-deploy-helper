@@ -1,33 +1,25 @@
-// Runnable contract test for card buttons that outlive their feature.
+// Runnable contract test for the buttons of the Status pane: which messages a
+// button may post, and where buttons may live at all.
 //   1) npm run compile   2) node scripts/check-card-buttons.cjs
 //
-// Status cards are durable history: they are persisted to workspaceState and
-// replayed into every rebuilt webview, so a card written months ago still renders
-// whatever buttons it carried. "Retry + changed vs branch" was removed in 0.15.1
-// on user feedback, but pushCardHistory only ever stripped `quickDeploy` and
-// oversized key lists — so cards persisted while the feature existed kept
-// advertising it, and the user kept seeing a button for something that no longer
-// exists.
+// Status cards are kept across reloads, and a kept card used to replay whatever
+// buttons it carried — a Retry re-sending a request months old, a button for a
+// feature since removed ("Retry + changed vs branch", 0.15.1). Now the actions of
+// a deploy, validation or retrieve live on the newest RUN alone, and a kept card
+// is a notice: a record with no buttons.
 //
 // Pinned here:
-//   1. pruneCardButtons — the rule itself, including that it drops the button but
-//      leaves everything else about the card untouched.
-//   2. The allow-list is what the provider EMITS, not what it can route. The
-//      retryDeployChanged HANDLER deliberately survives (persisted cards, and it
-//      may return in some form); the BUTTON must not.
-//   3. Drift: the list is re-derived from the `send: { type: '…' }` literals in
-//      panelProvider.ts and compared, so deleting the next feature's
-//      button-builder fails this check until the entry goes too.
-//   4. The wiring, through the real pushCardHistory/cardHistory: a card persisted
-//      by an older version heals on restore, not only on write.
-//   5. isConflictFailure + deployFailureButtons (Feature: conflict-blocked
-//      deploy retry) — the pure functions behind the "Retry + overwrite"
-//      button: what counts as a client-side conflict failure (bounded, never a
-//      generic "conflict" substring) and when the second button appears
-//      (never without a retry request, never on a validate-only run). Reuses
-//      send.type 'retryDeploy' — no new card-button message type — so it rides
-//      the SAME persistence/pruning rules pinned above rather than needing its
-//      own.
+//   1. The wiring, through the real pushCardHistory/cardHistory: a kept card
+//      carries NO button at all, and a card persisted by an older version heals
+//      on restore, not only on write; the live card keeps its own.
+//   2. Drift: every message a run card can post — runView.actionsFor's buttons
+//      and the webview's own sends from the run card (suggestion view, Copy,
+//      file links, Select) — has a `case` in the provider's handleMessage, so a
+//      button can never promise an action nothing performs.
+//   3. isConflictFailure (Feature: conflict-blocked deploy retry) — what counts
+//      as a client-side conflict failure: bounded, never a generic "conflict"
+//      substring. It decides whether the run offers "Retry + overwrite"
+//      (runView.actionsFor, pinned in check-run-view.cjs).
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
@@ -36,13 +28,13 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {
   window: { showInformationMessage: () => Promise.resolve(undefined) },
-  workspace: { getConfiguration: () => ({ get: (_k, f) => f }) },
+  // Ten notices kept (the most the setting allows), so every kind of old button is seen healing.
+  workspace: { getConfiguration: () => ({ get: (k, f) => (k === 'statusHistoryRuns' ? 10 : f) }) },
   commands: { executeCommand: () => Promise.resolve(undefined) },
   Uri: { file: (fsPath) => ({ fsPath }) }
 } : origLoad(req, ...rest));
 
-const { DeployPanelProvider, pruneCardButtons, SUPPORTED_CARD_BUTTON_SENDS, isConflictFailure, deployFailureButtons } =
-  require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+const { DeployPanelProvider, isConflictFailure } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 // Same module the compiled panelProvider.js itself requires (by resolved path,
 // so `instanceof` below sees the identical class), used only to build realistic
 // SfCliError fixtures for isConflictFailure.
@@ -53,80 +45,7 @@ const queue = [];
 function check(name, fn) { queue.push([name, fn]); }
 
 const btn = (type, extra = {}) => ({ label: type, send: { type, ...extra } });
-
-// ------------------------------------------------------------ the rule itself
-check('the removed feature\'s button is dropped, the retry beside it survives', () => {
-  const card = { kind: 'err', title: 'Deploy failed', buttons: [btn('retryDeploy'), btn('retryDeployChanged')] };
-  const out = pruneCardButtons(card);
-  assert.deepStrictEqual(out.buttons.map(b => b.send.type), ['retryDeploy']);
-});
-
-check('every button the provider still emits survives a prune', () => {
-  const types = ['retryDeploy', 'resumeDeploy', 'restoreBackup', 'discardBackup', 'selectDeployed'];
-  const card = { buttons: types.map(t => btn(t)) };
-  assert.strictEqual(pruneCardButtons(card), card, 'a clean card should not be rebuilt');
-  assert.deepStrictEqual(pruneCardButtons(card).buttons.map(b => b.send.type), types);
-});
-
-check('nothing else about the card is touched', () => {
-  const card = {
-    kind: 'err', title: 'Deploy failed', meta: '2 failures', lines: ['a', 'b'], at: 123,
-    buttons: [btn('retryDeployChanged'), btn('selectDeployed', { keys: ['ApexClass:A'] })]
-  };
-  const out = pruneCardButtons(card);
-  assert.deepStrictEqual(
-    { ...out, buttons: undefined },
-    { kind: 'err', title: 'Deploy failed', meta: '2 failures', lines: ['a', 'b'], at: 123, buttons: undefined }
-  );
-  assert.deepStrictEqual(out.buttons[0].send.keys, ['ApexClass:A'], 'the surviving button lost its payload');
-});
-
-check('a card left with no buttons drops the key rather than keeping an empty array', () => {
-  const out = pruneCardButtons({ kind: 'err', buttons: [btn('retryDeployChanged')] });
-  assert.ok(!('buttons' in out), JSON.stringify(out));
-});
-
-check('the input card is never mutated — the live copy keeps its own buttons', () => {
-  const card = { buttons: [btn('retryDeployChanged')] };
-  pruneCardButtons(card);
-  assert.strictEqual(card.buttons.length, 1);
-});
-
-check('a malformed button is dropped too — it could never have posted anything', () => {
-  for (const bad of [{ label: 'x' }, { label: 'x', send: null }, { label: 'x', send: { type: 7 } }, null]) {
-    const out = pruneCardButtons({ buttons: [bad] });
-    assert.ok(!('buttons' in out), JSON.stringify(bad));
-  }
-});
-
-check('a card with no buttons, or a corrupted buttons value, passes straight through', () => {
-  for (const card of [{ kind: 'ok' }, { kind: 'ok', buttons: 'nope' }, { kind: 'ok', buttons: null }]) {
-    assert.strictEqual(pruneCardButtons(card), card);
-  }
-});
-
-// -------------------------------------------------- emitted, not merely routed
-check('retryDeployChanged is excluded even though the provider still routes it', () => {
-  assert.ok(!SUPPORTED_CARD_BUTTON_SENDS.has('retryDeployChanged'));
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
-  assert.ok(src.includes("case 'retryDeployChanged'"),
-    'the handler was removed — then the allow-list is no longer making the distinction this check is about');
-});
-
-check('the allow-list matches the send types the provider actually emits', () => {
-  // Comment lines are dropped first: a doc comment that SPELLS the button shape
-  // (this rule is documented next to the list it guards) would otherwise read as
-  // an emitted button.
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8')
-    .split('\n').filter(l => !/^\s*(\/\/|\/?\*)/.test(l)).join('\n');
-  const emitted = new Set();
-  const re = /send:\s*\{\s*type:\s*'([^']+)'/g;
-  let m;
-  while ((m = re.exec(src))) emitted.add(m[1]);
-  assert.ok(emitted.size > 0, 'the card-button literals moved — this check no longer sees anything');
-  assert.deepStrictEqual([...SUPPORTED_CARD_BUTTON_SENDS].sort(), [...emitted].sort(),
-    'a card button naming an unemitted message is dead weight; drop it from the list (or add the new one)');
-});
+const RETRY = { keys: ['ApexClass:OrderService'], validateOnly: false, testLevel: 'NoTestRun' };
 
 // ------------------------------------------------------------- the real wiring
 const HISTORY_KEY = 'statusCardHistory';
@@ -146,13 +65,14 @@ function providerWith(stored) {
 const readHistory = (prov) => DeployPanelProvider.prototype.cardHistory.call(prov);
 const pushHistory = (prov, card) => DeployPanelProvider.prototype.pushCardHistory.call(prov, card);
 
-check('a card persisted while the feature existed heals on RESTORE', () => {
+check('a card persisted while the feature existed heals on RESTORE — every button goes', () => {
   // The reported bug: this entry was written by 0.15.0 and is still in the store.
   const prov = providerWith([
     { kind: 'err', title: 'Deploy failed against acme-dev', buttons: [btn('retryDeploy'), btn('retryDeployChanged')] }
   ]);
   const restored = readHistory(prov);
-  assert.deepStrictEqual(restored[0].buttons.map(b => b.send.type), ['retryDeploy']);
+  assert.ok(!('buttons' in restored[0]), JSON.stringify(restored[0]));
+  assert.strictEqual(restored[0].title, 'Deploy failed against acme-dev', 'the record itself survives');
 });
 
 check('the healed history is what gets written back on the next push', () => {
@@ -163,19 +83,19 @@ check('the healed history is what gets written back on the next push', () => {
   assert.ok(!('buttons' in persisted[1]), JSON.stringify(persisted[1]));
 });
 
-check('the legitimate persisted buttons all still survive a reload', () => {
+check('a restored notice carries no button, even one the provider still routes — actions live on the newest run', () => {
   const prov = providerWith([
     { kind: 'err', buttons: [btn('retryDeploy')] },
     { kind: 'warn', buttons: [btn('resumeDeploy', { jobId: '0Af' })] },
     { kind: 'ok', buttons: [btn('restoreBackup', { dir: '/b' }), btn('discardBackup', { dir: '/b' })] },
     { kind: 'ok', buttons: [btn('selectDeployed', { keys: ['ApexClass:A'] })] }
   ]);
-  assert.deepStrictEqual(readHistory(prov).map(c => c.buttons.map(b => b.send.type)), [
-    ['retryDeploy'], ['resumeDeploy'], ['restoreBackup', 'discardBackup'], ['selectDeployed']
-  ]);
+  const restored = readHistory(prov);
+  assert.strictEqual(restored.length, 4);
+  assert.ok(restored.every(c => !('buttons' in c)), JSON.stringify(restored));
 });
 
-check('both persistence rules apply — an unsupported button and an oversized one', () => {
+check('a pushed card is kept without any of its buttons — the removed one, an oversized one, a plain Retry', () => {
   const prov = providerWith([]);
   pushHistory(prov, {
     kind: 'ok',
@@ -185,7 +105,7 @@ check('both persistence rules apply — an unsupported button and an oversized o
       btn('retryDeploy')
     ]
   });
-  assert.deepStrictEqual(prov._state[HISTORY_KEY][0].buttons.map(b => b.send.type), ['retryDeploy']);
+  assert.ok(!('buttons' in prov._state[HISTORY_KEY][0]), JSON.stringify(prov._state[HISTORY_KEY][0]));
 });
 
 check('quickDeploy is still stripped, and the live card keeps everything', () => {
@@ -200,6 +120,57 @@ check('quickDeploy is still stripped, and the live card keeps everything', () =>
 check('a corrupted stored history still degrades to empty, not a throw', () => {
   assert.deepStrictEqual(readHistory(providerWith('nonsense')), []);
   assert.deepStrictEqual(readHistory(providerWith([null, 7, { kind: 'ok' }])), [{ kind: 'ok' }]);
+});
+
+// ============================================================== drift check
+const SRC = (f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8');
+/** Message types in `type: '…'` literals inside `text` (comments dropped first,
+ *  so a doc comment spelling a message is never read as code). */
+function messageTypes(text) {
+  const code = text.split('\n').filter(l => !/^\s*(\/\/|\/?\*)/.test(l)).join('\n');
+  const out = new Set();
+  const re = /type:\s*'([A-Za-z]+)'/g;
+  let m;
+  while ((m = re.exec(code))) out.add(m[1]);
+  return out;
+}
+/** The webview's run-card sends: send('x', …) / sendAction('x', …) from the
+ *  suggestion view the run card shares and the run-card code itself. */
+function runCardSends() {
+  const panel = SRC('panel.js');
+  const from = panel.indexOf('function renderSuggestAfter(');
+  const to = panel.indexOf('function renderCmdLog(');
+  assert.ok(from > 0 && to > from && panel.indexOf('// ---- Run cards ----') > from, 'the run-card code moved — this check no longer sees it');
+  const section = panel.slice(from, to);
+  const out = new Set();
+  const re = /send(?:Action)?\('([A-Za-z]+)'/g;
+  let m;
+  while ((m = re.exec(section))) out.add(m[1]);
+  return out;
+}
+
+check('every message a run card can post has a handler in the provider', () => {
+  const actions = SRC('runView.js');
+  const fromActions = messageTypes(actions.slice(actions.indexOf('function actionsFor('), actions.indexOf('// ---- copy ----')));
+  const fromPanel = runCardSends();
+  for (const t of ['retryDeploy', 'quickDeploy', 'resumeDeploy', 'restoreBackup', 'discardBackup', 'selectDeployed']) {
+    assert.ok(fromActions.has(t), `actionsFor no longer posts ${t} — this list is out of date`);
+  }
+  for (const t of ['copyText', 'openFile', 'suggestionOpened', 'suggestionDeploy', 'suggestionDeclined', 'suggestionVerdict']) {
+    assert.ok(fromPanel.has(t), `the run card no longer sends ${t} — this list is out of date`);
+  }
+  const provider = SRC('panelProvider.ts');
+  const handled = new Set([...provider.matchAll(/case '([A-Za-z]+)':/g)].map(m => m[1]));
+  for (const t of [...fromActions, ...fromPanel]) {
+    assert.ok(handled.has(t), `a run-card button posts '${t}', which handleMessage has no case for`);
+  }
+});
+
+check('no card is built with buttons for the deploy family any more — its actions are the run\'s', () => {
+  const provider = SRC('panelProvider.ts').split('\n').filter(l => !/^\s*(\/\/|\/?\*)/.test(l)).join('\n');
+  for (const t of ['retryDeploy', 'selectDeployed', 'quickDeploy']) {
+    assert.ok(!new RegExp(`send:\\s*\\{\\s*type:\\s*'${t}'`).test(provider), `a card still carries a ${t} button`);
+  }
 });
 
 // ======================================================== isConflictFailure
@@ -267,67 +238,6 @@ check('bounded: the phrase is still found buried inside a 10k-char message', () 
   // Proves the check reads the whole string rather than only a truncated prefix.
   const buried = `${'x'.repeat(9_000)} 4 conflicts detected ${'y'.repeat(900)}`;
   assert.strictEqual(isConflictFailure(new SfCliError(buried)), true);
-});
-
-// ======================================================= deployFailureButtons
-const RETRY = { keys: ['ApexClass:OrderService'], validateOnly: false, testLevel: 'NoTestRun' };
-const RETRY_VALIDATE = { ...RETRY, validateOnly: true };
-
-check('no retry request → no buttons at all (manifest retry has none)', () => {
-  assert.strictEqual(deployFailureButtons(undefined, true), undefined);
-  assert.strictEqual(deployFailureButtons(undefined, false), undefined);
-});
-
-check('non-conflict failure → only the plain Retry, unchanged from before this feature', () => {
-  const out = deployFailureButtons(RETRY, false);
-  assert.deepStrictEqual(out.map(b => b.label), ['Retry deploy']);
-  assert.deepStrictEqual(out[0].send, { type: 'retryDeploy', request: RETRY });
-});
-
-check('conflict failure on a real deploy → both buttons, overwrite second', () => {
-  const out = deployFailureButtons(RETRY, true);
-  assert.deepStrictEqual(out.map(b => b.label), ['Retry deploy', 'Retry + overwrite']);
-  for (const b of out) assert.strictEqual(b.send.type, 'retryDeploy');
-  // The overwrite button's request is the SAME retry request plus the one flag —
-  // never a different key list, org, sourceDir or test plan.
-  assert.deepStrictEqual(out[1].send.request, { ...RETRY, ignoreConflicts: true });
-});
-
-check('conflict failure on a validate-only run → no overwrite button (nothing to overwrite)', () => {
-  const out = deployFailureButtons(RETRY_VALIDATE, true);
-  assert.deepStrictEqual(out.map(b => b.label), ['Retry validation']);
-});
-
-check('non-conflict validate-only failure → plain "Retry validation" only', () => {
-  const out = deployFailureButtons(RETRY_VALIDATE, false);
-  assert.deepStrictEqual(out.map(b => b.label), ['Retry validation']);
-});
-
-check('the input retry request is never mutated', () => {
-  const retry = { ...RETRY };
-  const frozen = JSON.stringify(retry);
-  deployFailureButtons(retry, true);
-  assert.strictEqual(JSON.stringify(retry), frozen);
-  assert.ok(!('ignoreConflicts' in retry), 'the one-off flag leaked back onto the base request');
-});
-
-check('both buttons use send.type retryDeploy — no new message type needed, and both survive pruning', () => {
-  const out = deployFailureButtons(RETRY, true);
-  for (const b of out) assert.ok(SUPPORTED_CARD_BUTTON_SENDS.has(b.send.type), b.send.type);
-  const card = { kind: 'err', buttons: out };
-  assert.strictEqual(pruneCardButtons(card), card, 'a conflict-failure card must not be rebuilt by pruning');
-});
-
-check('a conflict-failure card with both buttons survives a full persist/restore round trip', () => {
-  // The same 0.12.0 (persisted Retry) / 0.17.0 (stale-button pruning) guarantees
-  // the plain Retry button already had — proven here through the REAL
-  // pushCardHistory/cardHistory, not just pruneCardButtons in isolation.
-  const prov = providerWith([]);
-  const live = { kind: 'err', title: 'Deploy failed against acme-dev', buttons: deployFailureButtons(RETRY, true) };
-  pushHistory(prov, live);
-  const restored = readHistory(prov)[0];
-  assert.deepStrictEqual(restored.buttons.map(b => b.label), ['Retry deploy', 'Retry + overwrite']);
-  assert.deepStrictEqual(restored.buttons[1].send.request, { ...RETRY, ignoreConflicts: true });
 });
 
 (async () => {

@@ -3,6 +3,29 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## Unreleased
+
+- **The Status pane shows runs.** A deploy, validation, quick deploy or retrieve appears the
+  moment you confirm it — what it sends, what it skips and why, and progress bars while the org
+  works — and its result lands on the same card: every component deployed, failed, rolled back,
+  validated or retrieved, with file:line links to the failures. The counts filter the list, a
+  search box narrows a long one, and nothing is cut at 100 lines any more, so the Output
+  channel now gets only the failures, not the whole list.
+- **Actions are on the newest run only.** Retry, Retry + overwrite, Try with dependencies,
+  Quick Deploy, Resume monitoring, Restore / Discard backup and Select sit on the newest run.
+  Older runs are one-line summaries under "Earlier" in the pane's header: you can open and copy
+  them, but they lose their Retry, Select and backup buttons — an older retrieve's backup is
+  still restorable with **SF Deploy: Restore Retrieve Backup**. Cards kept by earlier versions
+  come back as notices, without their buttons.
+- **The history keeps your last 3 runs, and 3 other results** — set how many with the new
+  `sfOrgDeployWrapper.statusHistoryRuns` (1–10). The newest run keeps its full list across
+  reloads. Other results (diff, delete, Fetch Org…) are notices, and the pane keeps the same
+  number of them — 3 by default, where it used to keep 50 cards.
+- **A deploy running when the window reloads keeps its card.** The panel picks the job up
+  again, as before, and now finishes the same run — keeping what it skipped and the test level
+  a Retry uses. A run whose result could not be recorded says so and points you to Deployment
+  Status in the org.
+
 ## 0.28.0
 
 - **Select all in the All view.** A "Select all (N)" button left of Expand all / Collapse all

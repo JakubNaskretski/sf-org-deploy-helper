@@ -1222,9 +1222,11 @@ check('an envelope naming a missing layout also reaches the detector', () => {
 // file — which proves nothing about whether the PRODUCT composes them. The one
 // line that does (`if (envProblem) problemRows.push(...)` in reportDeployResult)
 // is what turns a request-level rejection into a suggestion, so it is pinned
-// here through the real card builder, driven with a stub `this`: the pure helpers
-// run for real, only the side effects (post/toasts/log) are captured.
-function failureCard(result, retryKeys) {
+// here through the real result builder, driven with a stub `this`: the pure
+// helpers run for real, only the side effects (post/toasts/log) are captured —
+// and what it posts is the run the Status pane shows, the live suggestion
+// merged into it.
+function failureRun(result, retryKeys) {
   const posted = [];
   const stub = Object.create(DeployPanelProvider.prototype);
   stub.items = ITEMS;
@@ -1240,27 +1242,28 @@ function failureCard(result, retryKeys) {
     noun: `${retryKeys.length} component`, cmdId: 'c1', start: Date.now(), validateOnly: false,
     retry: { keys: retryKeys }
   });
-  return { card: posted.find(m => m.type === 'status').card, deps };
+  const runs = posted.filter(m => m.type === 'runs').slice(-1)[0];
+  return { run: runs.runs[0], deps };
 }
 
 check('WIRING: a rejection with NO component rows still produces a suggestion', () => {
   // The whole point: before the envelope reached the detector this card said
   // "no per-component details" and offered nothing at all.
-  const { card, deps } = failureCard(
+  const { run, deps } = failureRun(
     { success: false, status: 'Failed', errorMessage: 'Deploy failed.\n  MyThing: Invalid type: smth__mdt' },
     ['ApexClass:MyThing']
   );
   assert.deepStrictEqual(deps.keys, ['CustomObject:smth__mdt']);
-  assert.deepStrictEqual(card.suggest.candidates.map(c => c.key), ['CustomObject:smth__mdt']);
-  // …and the org's own words are on the card, not just the fact that it failed.
-  assert.ok(card.lines.some(l => typeof l === 'string' && l.includes('Invalid type: smth__mdt')), JSON.stringify(card.lines));
+  assert.deepStrictEqual(run.suggest.candidates.map(c => c.key), ['CustomObject:smth__mdt']);
+  // …and the org's own words are on the run, not just the fact that it failed.
+  assert.ok((run.message || '').includes('Invalid type: smth__mdt'), JSON.stringify(run.message));
 });
 
 check('WIRING: the envelope is read even when component rows ARE present', () => {
   // "Every failure, not just the no-rows one" is a decision, not an accident:
   // restricting it to the empty-rows case loses the referent whenever the org
   // sends both a row and a request-level message.
-  const { card } = failureCard(
+  const { run } = failureRun(
     {
       success: false, status: 'Failed', numberComponentErrors: 1,
       errorMessage: 'Invalid type: smth__mdt',
@@ -1268,19 +1271,19 @@ check('WIRING: the envelope is read even when component rows ARE present', () =>
     },
     ['ApexClass:MyThing']
   );
-  const keys = card.suggest.candidates.map(c => c.key);
+  const keys = run.suggest.candidates.map(c => c.key);
   assert.ok(keys.includes('CustomObject:smth__mdt'), `envelope referent lost: ${keys.join(', ')}`);
   assert.ok(keys.includes('ApexClass:MyHelper'), `component-row referent lost: ${keys.join(', ')}`);
 });
 
 check('WIRING: an org message naming nothing local still leaves the card honest', () => {
-  const { card, deps } = failureCard(
+  const { run, deps } = failureRun(
     { success: false, status: 'Failed', errorMessage: 'no Layout named Ghost__c-Ghost Layout found' },
     ['ApexClass:MyThing']
   );
   assert.deepStrictEqual(deps.unresolved, ['Layout:Ghost__c-Ghost Layout']);
-  assert.strictEqual(card.suggest, undefined, 'nothing resolved locally — no checkbox list to offer');
-  assert.ok(card.lines.some(l => typeof l === 'string' && l.includes('Referenced but not found in your workspace')), JSON.stringify(card.lines));
+  assert.strictEqual(run.suggest, undefined, 'nothing resolved locally — no checkbox list to offer');
+  assert.ok((run.notes || []).some(l => l.includes('Referenced but not found in your workspace')), JSON.stringify(run.notes));
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

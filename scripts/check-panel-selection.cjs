@@ -51,7 +51,6 @@
 // what panel.js actually touches — it is a test double, not a browser.
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 const assert = require('assert');
 
 const PANEL_JS = fs.readFileSync(path.join(__dirname, '..', 'src', 'panel.js'), 'utf8');
@@ -64,164 +63,9 @@ function check(name, fn) {
 }
 
 // ------------------------------------------------------------------ DOM shim
-class El {
-  constructor(tag) {
-    this.tagName = String(tag || 'div').toUpperCase();
-    this.children = [];
-    this.style = {};
-    this.dataset = {};
-    this.value = '';
-    this.textContent = '';
-    this.title = '';
-    this.checked = false;
-    this.indeterminate = false;
-    this.disabled = false;
-    this.listeners = {};
-    this._classes = new Set();
-    this.classList = {
-      add: (...c) => c.forEach(x => this._classes.add(x)),
-      remove: (...c) => c.forEach(x => this._classes.delete(x)),
-      contains: (c) => this._classes.has(c),
-      toggle: (c, on) => {
-        const want = on === undefined ? !this._classes.has(c) : !!on;
-        if (want) this._classes.add(c); else this._classes.delete(c);
-      }
-    };
-  }
-  get className() { return [...this._classes].join(' '); }
-  set className(v) { this._classes = new Set(String(v).split(/\s+/).filter(Boolean)); }
-  get innerHTML() { return ''; }
-  set innerHTML(_v) { this.children = []; }
-  get firstChild() { return this.children[0] || null; }
-  get lastChild() { return this.children[this.children.length - 1] || null; }
-  get parentNode() { return this._parent || null; }
-  get parentElement() { return this._parent || null; }
-  appendChild(c) { c._parent = this; this.children.push(c); return c; }
-  insertBefore(c, ref) {
-    c._parent = this;
-    const i = this.children.indexOf(ref);
-    this.children.splice(i < 0 ? this.children.length : i, 0, c);
-    return c;
-  }
-  removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; }
-  remove() { if (this._parent) this._parent.removeChild(this); }
-  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? Object.assign(new El('#text'), { textContent: n }) : n); }
-  prepend(...nodes) { for (const n of nodes.reverse()) this.insertBefore(n, this.firstChild); }
-  addEventListener(t, fn) { (this.listeners[t] ||= []).push(fn); }
-  removeEventListener(t, fn) { this.listeners[t] = (this.listeners[t] || []).filter(f => f !== fn); }
-  fire(t) {
-    for (const fn of this.listeners[t] || []) {
-      fn({ target: this, preventDefault() {}, stopPropagation() {} });
-    }
-  }
-  /** Depth-first search over what a render actually built. */
-  find(pred) {
-    for (const c of this.children) {
-      if (pred(c)) return c;
-      const hit = c.find(pred);
-      if (hit) return hit;
-    }
-    return null;
-  }
-  querySelector() { return null; }
-  querySelectorAll() { return []; }
-  closest() { return null; }
-  contains() { return false; }
-  focus() {}
-  scrollIntoView() {}
-  getBoundingClientRect() { return { top: 0, left: 0, right: 100, bottom: 100, width: 100, height: 100 }; }
-  setAttribute(k, v) { this[k] = v; }
-  getAttribute(k) { return this[k]; }
-  get offsetHeight() { return 100; }
-  get offsetWidth() { return 100; }
-  get clientHeight() { return 100; }
-  get clientWidth() { return 100; }
-  get scrollTop() { return 0; }
-  set scrollTop(_v) {}
-}
-
-// Every id panel.js resolves with $() at load or during a render.
-const IDS = [
-  'actionsBar', 'addOrg', 'banner', 'cancelBtn', 'clearCmdLog', 'clearSel', 'clearStatus', 'cmdlog',
-  'cmdlogBody', 'cmdlogCaret', 'cmdlogHeader', 'deployBtn', 'diffBtn', 'fetchOrgBtn',
-  'ignoreConflictsControl', 'ignoreDeployConflicts', 'modeAll', 'modeChanged', 'modeSelected',
-  'orgSelect', 'queueStrip', 'refreshFiles', 'refreshOrgs', 'retrieveBtn', 'scanBanner', 'search',
-  'selCount', 'sourceFilter', 'sourceFilterRow', 'splitter', 'status', 'statusHeader', 'testClasses',
-  'testLevel', 'tree', 'typeFilterDetails', 'typeFilterLabel', 'typeFilterList', 'typeFilterRow',
-  'useActive', 'useOpenTabs', 'validateBtn', 'viewModes',
-  'typeFilterAll', 'typeFilterNone', 'treeTools', 'expandAll', 'collapseAll', 'orgAsOf', 'selectAllRows'
-];
-
-/** Boot one panel instance over the given persisted webview state. */
-function panel(persisted) {
-  const els = new Map();
-  for (const id of IDS) { const e = new El('div'); e.id = id; els.set(id, e); }
-  // The three lens tabs are static markup in panelHtml.ts; renderViewModes finds
-  // them via querySelectorAll('#viewModes button') and rewrites their text.
-  for (const mode of ['all', 'selected', 'changed']) {
-    const b = new El('button'); b.dataset.mode = mode; els.get('viewModes').appendChild(b);
-  }
-  const listeners = {};
-  let stored = persisted ? JSON.parse(JSON.stringify(persisted)) : undefined;
-  const outbound = [];
-  // sendAction defers renderActions()/renderStatus() via requestAnimationFrame
-  // (debugTiming/click-latency fix) so the click handler returns right after
-  // postMessage — the whole point being that the outbound message exists BEFORE
-  // the render runs. Captured here instead of firing immediately, so a check can
-  // assert exactly that ordering, then call flush() to run the deferred render
-  // and get the old "render already happened" behaviour back.
-  const pendingFrames = [];
-
-  const sandbox = {
-    console,
-    setTimeout, clearTimeout, clearInterval,
-    // The progress card's elapsed clock is a real setInterval; a panel left busy
-    // at the end of a check must not keep this process alive.
-    setInterval: (fn, ms) => { const t = setInterval(fn, ms); t.unref(); return t; },
-    requestAnimationFrame: (fn) => { pendingFrames.push(fn); return pendingFrames.length; },
-    // panel.js stamps clickSpan with performance.now() (sendAction, debugTiming) —
-    // Date.now()-based is precise enough for these checks (they only need a
-    // finite, non-negative number, not sub-ms resolution).
-    performance: { now: () => Date.now() },
-    acquireVsCodeApi: () => ({
-      postMessage: (m) => outbound.push(m),
-      getState: () => stored,
-      setState: (s) => { stored = s; }
-    }),
-    document: {
-      body: new El('body'),
-      getElementById: (id) => els.get(id) || null,
-      createElement: (tag) => new El(tag),
-      querySelector: () => null,
-      querySelectorAll: (sel) => (sel === '#viewModes button' ? els.get('viewModes').children.slice() : []),
-      addEventListener: () => {},
-      removeEventListener: () => {}
-    },
-    window: {
-      innerHeight: 800,
-      innerWidth: 600,
-      addEventListener: (t, fn) => { (listeners[t] ||= []).push(fn); },
-      removeEventListener: (t, fn) => { listeners[t] = (listeners[t] || []).filter(f => f !== fn); }
-    }
-  };
-  sandbox.globalThis = sandbox;
-  vm.createContext(sandbox);
-  vm.runInContext(PANEL_JS, sandbox, { filename: 'panel.js' });
-
-  return {
-    deliver: (msg) => { for (const fn of listeners.message || []) fn({ data: msg }); },
-    // A snapshot, copied out of the sandbox realm so assert.deepStrictEqual
-    // compares values rather than tripping over a foreign Array prototype.
-    /** What the webview would restore from on the next rebuild. */
-    persisted: () => (stored === undefined ? undefined : JSON.parse(JSON.stringify(stored))),
-    /** The LIVE selection, read the way the user reads it (toolbar count). */
-    liveCount: () => Number(/^(\d+)/.exec(els.get('selCount').textContent)?.[1] ?? -1),
-    el: (id) => els.get(id),
-    outbound,
-    pendingRenders: pendingFrames,
-    flush: () => { while (pendingFrames.length) pendingFrames.shift()(); }
-  };
-}
+// scripts/lib/dom-shim.cjs boots src/runView.js then src/panel.js the way the
+// page loads them; panel(persisted) returns the driver every check below uses.
+const { panel } = require('./lib/dom-shim.cjs');
 
 // ------------------------------------------------------------------ fixtures
 const cls = (name) => ({ type: 'ApexClass', name, filePath: `/ws/force-app/classes/${name}.cls`, files: [] });
@@ -1323,26 +1167,35 @@ check('Deploy queues while busy but never sends while its previous click is unan
   assert.strictEqual(p.el('retrieveBtn').style.display, 'none', 'Retrieve stays hidden while busy');
 });
 
-const CARD = (buttons) => ({ type: 'status', card: { kind: 'ok', title: 'Retrieved 2 components', buttons } });
-const CARD_BTNS = [
-  ['Retry deploy', { type: 'retryDeploy', request: { keys: DC.selected } }, 1],
-  ['Resume monitoring', { type: 'resumeDeploy', jobId: '0Af000000000001AAA' }, 1],
-  ['Restore backup…', { type: 'restoreBackup', dir: '/backups/x' }, 1],
-  ['Discard backup', { type: 'discardBackup', dir: '/backups/x' }, 1],
-  ['Select these 2', { type: 'selectDeployed', keys: DC.selected }, 2] // selection-only: never gated
+// The newest run's buttons go through the same guards (a notice carries none).
+/** A `runs` post with one finished run over the two local classes. */
+function RUN(fields) {
+  const rows = fields.rows || DC.selected.map(k => ({ k, o: fields.o || 'deployed', s: 1 }));
+  const run = Object.assign({
+    v: 1, id: 'rbtn00001', op: 'deploy', status: 'succeeded', org: 'acme-dev-user', orgLabel: 'acme-dev', orgKind: 'sandbox',
+    startedAt: 1, finishedAt: 2, target: 'selection', counts: { sent: rows.length }, rows, rowsComplete: true, tests: []
+  }, fields.run || {});
+  return { type: 'runs', runs: [run], cap: 3, latestRows: { runId: run.id, rows, tests: [] } };
+}
+const RUN_BTNS = [
+  ['Retry deploy', 'retryDeploy', RUN({ o: 'rolledback', run: { status: 'failed', retry: { validateOnly: false, testLevel: 'NoTestRun' } } }), 1],
+  ['Resume monitoring', 'resumeDeploy', RUN({ o: 'pending', run: { status: 'lost', jobId: '0Af000000000001AAA' } }), 1],
+  ['Restore backup…', 'restoreBackup', RUN({ o: 'changed', run: { op: 'retrieve', backupDir: '/backups/x' } }), 1],
+  ['Discard backup', 'discardBackup', RUN({ o: 'changed', run: { op: 'retrieve', backupDir: '/backups/x' } }), 1],
+  ['Select 2 in tree', 'selectDeployed', RUN({}), 2] // selection-only: never gated
 ];
-for (const [label, send, expect] of CARD_BTNS) {
-  check(`card "${label}": two clicks send ${expect} ${send.type}`, () => {
+for (const [label, type, msg, expect] of RUN_BTNS) {
+  check(`run card "${label}": two clicks send ${expect} ${type}`, () => {
     const p = armed();
-    p.deliver(CARD([{ label, send }]));
+    p.deliver(msg);
     click(findBtn(p, label));
     click(findBtn(p, label)); // re-found: a render replaces the element under the cursor
-    assert.strictEqual(sent(p, send.type), expect);
+    assert.strictEqual(sent(p, type), expect);
     p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
     if (expect === 1) {
       assert.strictEqual(findBtn(p, label).disabled, true);
       assert.strictEqual(findBtn(p, label).title, 'Sending…');
-      assert.strictEqual(p.el('deployBtn').disabled, true, 'the toolbar locks with the card');
+      assert.strictEqual(p.el('deployBtn').disabled, true, 'the toolbar locks with the run card');
       p.deliver({ type: 'busy', busy: false });
       assert.strictEqual(findBtn(p, label).disabled, false);
       assert.strictEqual(p.el('deployBtn').disabled, false);
@@ -1350,9 +1203,9 @@ for (const [label, send, expect] of CARD_BTNS) {
   });
 }
 
-check('card Retry queues while busy, not while pending', () => {
+check('run card Retry queues while busy, not while pending', () => {
   const p = armed({ busy: 'Deploy' });
-  p.deliver(CARD([{ label: 'Retry deploy', send: { type: 'retryDeploy', request: { keys: DC.selected } } }]));
+  p.deliver(RUN_BTNS[0][2]);
   assert.ok(click(findBtn(p, 'Retry deploy')));
   assert.strictEqual(sent(p, 'retryDeploy'), 1);
   p.flush(); // renderActions/renderStatus are deferred (sendAction) — flush before reading DOM state
@@ -1365,9 +1218,12 @@ check('card Retry queues while busy, not while pending', () => {
 
 check('Quick Deploy stays one-shot', () => {
   const p = armed();
-  p.deliver({ type: 'status', card: { kind: 'ok', title: 'Validation succeeded', quickDeploy: { jobId: '0Af000000000001AAA', label: 'Quick Deploy 2' } } });
-  assert.ok(click(findBtn(p, 'Quick Deploy 2')));
-  assert.strictEqual(findBtn(p, 'Quick Deploy 2'), null, 'the button must vanish on its one click');
+  p.deliver(RUN({ o: 'validated', run: { op: 'validate', jobId: '0Af000000000001AAA', testsRan: true, counts: { validated: 2, sent: 2 }, quick: { jobId: '0Af000000000001AAA', until: Date.now() + 864e5 } } }));
+  assert.ok(click(findBtn(p, 'Quick Deploy 2 to acme-dev')));
+  p.flush(); // renderStatus is deferred (sendAction) — flush before reading DOM state
+  assert.strictEqual(findBtn(p, 'Quick Deploy 2 to acme-dev'), null, 'the button must vanish on its one click');
+  p.deliver({ type: 'busy', busy: false });
+  assert.strictEqual(findBtn(p, 'Quick Deploy 2 to acme-dev'), null, 'and stays gone once the provider answers');
   assert.strictEqual(sent(p, 'quickDeploy'), 1);
 });
 
@@ -1416,61 +1272,67 @@ check('the context-menu paths and the provider\'s Rescan reply share the same gu
 
 // ---------------------------------- 10) B1/B8: dependency-suggestion rendering
 // The provider-side contract (liveSuggestions, orgOverride, transient selectKeys,
-// suggestionRestore payload shape) is covered end to end in
+// the live payload merged into the newest run) is covered end to end in
 // check-suggestion-flow.cjs against the REAL provider; this section is the
 // webview-only half — panel.js is a browser IIFE with no exports of its own, so
 // it can only be driven the way check-panel-selection.cjs already does, by
 // delivering messages and reading back the DOM/state.
-const suggestCard = (overrides = {}) => ({
-  type: 'status',
-  card: {
-    kind: 'err', title: 'Deploy failed', at: 1,
-    lines: ['ApexClass:MyThing — Invalid type: smth__mdt'],
-    suggest: {
+/** A failed run whose live payload carries a dependency suggestion — the only
+ *  place a suggestion shows (a notice never carries one). */
+const suggestRun = (suggest = {}) => {
+  const rows = [{ k: 'ApexClass:MyThing', o: 'failed', s: 1, m: 'Invalid type: smth__mdt' }];
+  const run = {
+    v: 1, id: 'rsug00001', op: 'deploy', status: 'failed', org: 'acme-dev-user', orgLabel: 'acme-dev', orgKind: 'sandbox',
+    startedAt: 1, finishedAt: 2, target: 'selection', counts: { failed: 1, rolledback: 0, sent: 1 }, rows, rowsComplete: true, tests: [],
+    suggestId: 'sug-1000-0',
+    suggest: Object.assign({
       id: 'sug-1000-0',
       candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing', why: 'Invalid type: smth__mdt' }],
       unresolved: ['Ghost__mdt']
-    },
-    ...overrides
-  }
-});
+    }, suggest)
+  };
+  return { type: 'runs', runs: [run], cap: 3, latestRows: { runId: run.id, rows, tests: [] } };
+};
 const openSuggestBtn = (p) => p.el('status').find(e => e.tagName === 'BUTTON' && /^Try with dependencies/.test(e.textContent));
 const statusLines = (p) => { const o = []; p.el('status').find(e => { if (e.tagName === 'LI') o.push(e.textContent); return false; }); return o; };
 const suggestWhys = (p) => { const o = []; p.el('status').find(e => { if (e.className === 'suggest-why') o.push(e.textContent); return false; }); return o; };
 const suggestRows = (p) => p.el('status').find(e => e.className === 'suggest-rows');
 const suggestUnresolved = (p) => p.el('status').find(e => e.className === 'suggest-unresolved');
 
-check('B11: the "Try with dependencies" button renders even with no other card.buttons', () => {
+check('B11: the "Try with dependencies" button renders even when the run offers no Retry', () => {
   const p = panel(null);
-  p.deliver(suggestCard()); // no `buttons` field at all
-  assert.ok(openSuggestBtn(p), 'the button must not be gated behind card.buttons');
+  p.deliver(suggestRun()); // no `retry` on the run at all
+  assert.ok(openSuggestBtn(p), 'the button must not be gated behind Retry');
 });
 
-check('B8: opening the suggestion keeps the org error lines visible above the checkbox rows', () => {
+check('B8: opening the suggestion keeps the org error visible below the checkbox rows', () => {
   const p = panel(null);
-  p.deliver(suggestCard());
+  p.el('status').clientHeight = 400;
+  p.deliver(suggestRun());
   openSuggestBtn(p).fire('click');
   assert.ok(suggestRows(p), 'checkbox rows did not render');
-  assert.ok(statusLines(p).some(l => l.includes('smth__mdt')), `expected the org error line to stay visible: ${JSON.stringify(statusLines(p))}`);
+  const listed = p.el('status').find(e => e._classes && e._classes.has('run-list'));
+  const text = (e) => (e ? [e.textContent, ...e.children.map(text)].join('') : '');
+  assert.ok(text(listed).includes('Invalid type: smth__mdt'), 'expected the failed row to stay listed');
 });
 
 check('B8: the "why" reason renders under its checkbox', () => {
   const p = panel(null);
-  p.deliver(suggestCard());
+  p.deliver(suggestRun());
   openSuggestBtn(p).fire('click');
   assert.deepStrictEqual(suggestWhys(p), ['Invalid type: smth__mdt']);
 });
 
 check('B8: a candidate with no why renders no suggest-why row (field is optional)', () => {
   const p = panel(null);
-  p.deliver(suggestCard({ suggest: { id: 'sug-1000-1', candidates: [{ key: 'CustomObject:smth__mdt' }], unresolved: [] } }));
+  p.deliver(suggestRun({ candidates: [{ key: 'CustomObject:smth__mdt' }], unresolved: [] }));
   openSuggestBtn(p).fire('click');
   assert.deepStrictEqual(suggestWhys(p), []);
 });
 
 check('B11: the unresolved wording says "Not found in your workspace (retrieve it, or its type is not scanned)"', () => {
   const p = panel(null);
-  p.deliver(suggestCard());
+  p.deliver(suggestRun());
   openSuggestBtn(p).fire('click');
   const el = suggestUnresolved(p);
   assert.ok(el, 'no suggest-unresolved element');
@@ -1478,10 +1340,11 @@ check('B11: the unresolved wording says "Not found in your workspace (retrieve i
   assert.ok(el.textContent.includes('Ghost__mdt'), el.textContent);
 });
 
-check('B1: suggestionRestore merges the payload into the matching history card by suggestId, and the button reappears', () => {
+check('B1: the old suggestionRestore message is inert — a suggestion now comes back with its run', () => {
+  // A kept card is a record with no buttons; the provider merges a still-live
+  // suggestion into the newest run whenever it posts the runs (see
+  // check-status-pane.cjs), so nothing may re-attach one to a card.
   const p = panel(null);
-  // What a webview rebuild actually receives: the STRIPPED persisted copy —
-  // `suggest` is gone, `suggestId` is what correlates a later restore.
   p.deliver({
     type: 'statusHistory',
     cards: [{
@@ -1489,27 +1352,9 @@ check('B1: suggestionRestore merges the payload into the matching history card b
       lines: ['Missing but available locally: CustomObject:smth__mdt — add them to the deploy by hand.', 'ApexClass:MyThing — Invalid type: smth__mdt']
     }]
   });
-  assert.ok(!openSuggestBtn(p), 'a stripped history card must not show the button before restore');
   p.deliver({ type: 'suggestionRestore', id: 'sug-2000-0', candidates: [{ key: 'CustomObject:smth__mdt', from: 'ApexClass:MyThing' }], unresolved: [] });
-  const btn = openSuggestBtn(p);
-  assert.ok(btn, 'suggestionRestore did not bring the button back');
-  assert.strictEqual(btn.textContent, 'Try with dependencies (1)');
-  // And it is fully live — opening it works exactly like a fresh suggestion.
-  btn.fire('click');
-  assert.ok(suggestRows(p), 'the restored suggestion cannot be opened');
-});
-
-check('B1: suggestionRestore for an id with no matching card, or already carrying a live suggest, is a no-op', () => {
-  const p = panel(null);
-  p.deliver({ type: 'statusHistory', cards: [{ kind: 'err', title: 'X', at: 1, suggestId: 'sug-3000-0', lines: [] }] });
-  p.deliver({ type: 'suggestionRestore', id: 'sug-nonexistent', candidates: [{ key: 'CustomObject:X' }], unresolved: [] });
-  assert.ok(!openSuggestBtn(p), 'restore attached to the wrong card');
-  // A card that already has a live suggest (e.g. the session's own posted card,
-  // never stripped) must not be clobbered by a stale restore for the same id.
-  const q = panel(null);
-  q.deliver(suggestCard({ suggestId: 'sug-1000-0' }));
-  q.deliver({ type: 'suggestionRestore', id: 'sug-1000-0', candidates: [{ key: 'CustomObject:different' }], unresolved: [] });
-  assert.strictEqual(openSuggestBtn(q).textContent, 'Try with dependencies (1)', 'a live suggest was overwritten by a restore');
+  assert.ok(!openSuggestBtn(p), 'nothing re-attaches a suggestion to a kept card');
+  assert.ok(statusLines(p).some(l => l.startsWith('Missing but available locally')), 'the card still reads as it did');
 });
 
 // ---------------------------------- 10) the Changed view's commit sections ----

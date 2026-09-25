@@ -150,8 +150,8 @@ check('it round-trips every buildRetryRequest shape faithfully', () => {
       testLevel: level,
       runTests: classes.length ? classes : undefined,
       // buildRetryRequest never sets `ignoreConflicts` — only a "Retry +
-      // overwrite" button's own request does (see deployFailureButtons) — so
-      // every card it snapshots reads back with no override at all.
+      // overwrite" button's own request does (see runView.actionsFor) — so
+      // every run it snapshots reads back with no override at all.
       ignoreConflictsOverride: undefined
     }, `run: ${JSON.stringify({ opts, level, classes })}`);
   }
@@ -208,9 +208,9 @@ check('a stale dryRun flag cannot flip the mode a card re-runs in', () => {
 
 // ------------------------------------------------- ignoreConflictsOverride rules
 check('ignoreConflicts: true is the only value that sets an override', () => {
-  // "Retry + overwrite" is the only writer of this field — deployFailureButtons
+  // "Retry + overwrite" is the only writer of this field — runView.actionsFor
   // always sets it to the literal `true`. Everything else a persisted/forged
-  // card could carry must read as "no override" so the machine-scoped setting
+  // request could carry must read as "no override" so the machine-scoped setting
   // decides, exactly like a request that never had the field at all.
   assert.strictEqual(deployOptsFromRetry({ keys: KEYS, ignoreConflicts: true }).ignoreConflictsOverride, true);
   for (const forged of ['true', 1, {}, [], 'yes', false, 0, null, undefined]) {
@@ -342,6 +342,14 @@ check('the match is exact — only the persisted verb itself reads as a validati
   for (const near of ['validate', 'VALIDATE', 'Validate ', 'Validation', '', undefined]) {
     assert.strictEqual(verbModes(near).validateOnly, false, `near-miss accepted: ${JSON.stringify(near)}`);
   }
+});
+
+check('a reattached job\'s run retries in the job\'s mode and test level, and stores no keys', () => {
+  // The run keeps what a Retry re-runs with; the keys come from the rows the
+  // org's report listed, never from storage.
+  const { runRetryFrom } = require(path.join(__dirname, '..', 'out', 'runRecords.js'));
+  assert.deepStrictEqual(runRetryFrom({ keys: ['ApexClass:AcmeA'], ...verbModes('Validate'), testLevel: 'RunLocalTests' }), { validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.deepStrictEqual(runRetryFrom({ keys: ['ApexClass:AcmeA'], ...verbModes('Deploy') }), { validateOnly: false });
 });
 
 // ============================== a validation stays a validation, end to end

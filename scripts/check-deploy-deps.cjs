@@ -222,7 +222,9 @@ check('a failed deploy still explains the set — that is when the user most nee
 check('runDeploy: enqueue success and the post-confirm fallback both return confirmed:true', () => {
   assert.ok(/return queued \? ABORTED_CONFIRMED : ABORTED;/.test(src), 'enqueue result must decide confirmed via enqueueDeploy\'s own return value');
   assert.ok(/return sawTerminal \? \{ status: 'ok' \} : ABORTED_CONFIRMED;/.test(src), 'the final fallback (submit threw / timed out / org-cancelled) must be confirmed:true — it is always past the confirm gate');
-  assert.ok(/this\.reportError\(`\$\{verb\} \$\{orgPrep\(verb\)\} \$\{orgLabel\}`, err, retry\);\n\s*\/\/ Past the confirm gate above[^\n]*\n\s*return ABORTED_CONFIRMED;/.test(src), 'a writeTempManifest failure (post-confirm) must also be confirmed:true');
+  // The failure ends the run already begun for this deploy (runId), and the
+  // call still reports confirmed:true — the user said yes before it failed.
+  assert.ok(/this\.reportError\(`\$\{verb\} \$\{orgPrep\(verb\)\} \$\{orgLabel\}`, err, runId\);\n\s*\/\/ Past the confirm gate above[^\n]*\n\s*return ABORTED_CONFIRMED;/.test(src), 'a writeTempManifest failure (post-confirm) must also be confirmed:true');
 });
 
 check('runDeploy: a dismissed modal and a refused busy-slot twin stay plain ABORTED (unconfirmed)', () => {

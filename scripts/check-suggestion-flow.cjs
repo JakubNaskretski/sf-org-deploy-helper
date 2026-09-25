@@ -1,13 +1,14 @@
 // Runnable contract test for the "Try with dependencies" suggestion flow
 // (panelProvider.ts suggestionOpened/suggestionDeploy/suggestionDeclined/
-// suggestionVerdict handlers, liveSuggestions, pushCardHistory/stripSuggestForHistory,
-// the 'ready' suggestionRestore replay). No framework.
+// suggestionVerdict handlers, liveSuggestions, and the live payload merged into
+// the newest run whenever the runs are posted). No framework.
 //   1) npm run compile   2) node scripts/check-suggestion-flow.cjs
 //
 // Findings fixed here (2026-09-08):
-//   B1 a hidden/rebuilt panel still gets the feature — pushCardHistory folds the
-//      displaced guidance lines back onto the persisted card, and 'ready' replays
-//      a `suggestionRestore` for every suggestion still alive server-side;
+//   B1 a hidden/rebuilt panel still gets the feature — the failed run keeps the
+//      suggestion's id (never its payload), and every runs post, including the
+//      one a rebuilt webview gets on `ready`, carries the payload for as long as
+//      the provider still holds it;
 //   B3 the expired and no-picks paths post `suggestionReset` (mirroring busy);
 //   B4 an accepted suggestion's selectKeys carries `transient: true` — it must
 //      never join the persisted selection;
@@ -55,6 +56,7 @@ const vscodeStub = {
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 const { DeployPanelProvider, autoIncludedNotice } = require(path.join(ROOT, 'out', 'panelProvider.js'));
+const RV = require(path.join(ROOT, 'src', 'runView.js'));
 const proto = DeployPanelProvider.prototype;
 
 let failed = 0;
@@ -89,18 +91,19 @@ function provider(extra = {}) {
   // call (the later outcome/verdict patch) merges onto what the first one wrote,
   // exactly like the real workspaceState-backed suggestion log does.
   let logStore = extra.suggestionLog ? extra.suggestionLog.slice() : [];
+  const kept = {}; // workspaceState, where the Status history is persisted
   const s = Object.create(proto);
   Object.assign(s, {
     busy: false, confirmOpen: false, deployQueue: [], cmdSeq: 0,
     orgMembers: new Map(), orgMembersOrg: undefined,
-    items: ITEMS, workspaceRoot: '/ws', cardHistoryCache: [],
+    items: ITEMS, workspaceRoot: '/ws',
     liveSuggestions: new Map(), suggestionSeq: 0,
     testLevel: undefined, runTests: undefined,
     orgs: [DEV, UAT],
     orgStore: { get: () => extra.currentOrg ?? DEV.username, set: async () => {}, setFromUserPick: async () => {} },
     output: { appendLine: () => {} },
     context: {
-      workspaceState: { get: () => undefined, update: async () => {} },
+      workspaceState: { get: (k) => kept[k], update: async (k, v) => { kept[k] = v === undefined ? undefined : JSON.parse(JSON.stringify(v)); } },
       globalState: {
         get: () => logStore,
         update: (_k, v) => {
@@ -115,7 +118,7 @@ function provider(extra = {}) {
       }
     },
     // No `post` override here — the REAL prototype method runs (pushCardHistory
-    // /stripSuggestForHistory included), so its persisted-history side effects
+    // included), so its persisted-history side effects
     // are genuinely exercised. Captured one layer down, at the webview boundary.
     view: { visible: true, webview: { postMessage: (m) => posted.push(m) } },
     // 'ready'-only stubs — no-ops so handleMessage({type:'ready'}) can run without
@@ -129,11 +132,11 @@ function provider(extra = {}) {
     .catch(err => s.reportError(m?.type ?? 'panel action', err))
     .finally(() => s.postBusy());
   const suggestionLogEntries = () => logStore;
-  return { s, sfCalls, posted, globalWrites, send, releaseGlobalUpdate: () => releaseGlobalUpdate && releaseGlobalUpdate(), suggestionLogEntries };
+  return { s, sfCalls, posted, globalWrites, kept, send, releaseGlobalUpdate: () => releaseGlobalUpdate && releaseGlobalUpdate(), suggestionLogEntries };
 }
 
 /** Populate liveSuggestions the way a real failed deploy would — through the
- *  REAL reportDeployResult, so `card.suggest` and the map entry are exactly
+ *  REAL reportDeployResult, so the run's `suggest` and the map entry are exactly
  *  what production builds. `org`/`orgLabel` are the ORIGINAL failure's org
  *  (independent of `currentOrg` on the returned provider). */
 function seedSuggestion(p, { org = UAT.username, orgLabel = UAT.alias, retryKeys = ['ApexClass:MyThing'] } = {}) {
@@ -144,10 +147,12 @@ function seedSuggestion(p, { org = UAT.username, orgLabel = UAT.alias, retryKeys
     items: retryKeys.map(k => cls(k.split(':')[1])), orgOnlySkipped: [], orgLabel, org,
     noun: `${retryKeys.length} component`, cmdId: 'c1', start: Date.now(), validateOnly: false, retry
   });
-  const card = p.posted.find(m => m.type === 'status').card;
-  assert.ok(card.suggest, 'seedSuggestion: no suggestion candidate resolved — fixture is broken');
-  return { id: card.suggest.id, card };
+  const run = lastRunsPost(p).runs[0];
+  assert.ok(run.suggest, 'seedSuggestion: no suggestion candidate resolved — fixture is broken');
+  return { id: run.suggest.id, run };
 }
+/** The last `runs` post: the history as the webview has it. */
+const lastRunsPost = (p) => p.posted.filter(m => m.type === 'runs').slice(-1)[0];
 const suggestResets = (p) => p.posted.filter(m => m.type === 'suggestionReset');
 const deployCalls = (p) => p.sfCalls.filter(c => c.name === 'deployMetadata');
 const confirmOf = (m) => m.items[0];
@@ -234,7 +239,7 @@ check('accepting posts selectKeys with transient:true — scroll/reveal only, ne
 });
 
 // =================================================================== B5 + B6
-check('orgOverride pins the retry to the CARD\'s org, even when the live selector has moved on; the modal names it; the log records it', async () => {
+check('orgOverride pins the retry to the failed run\'s org, even when the live selector has moved on; the modal names it; the log records it', async () => {
   reset();
   // The failure happened on acme-uat; the panel's current selector has since
   // moved to acme-dev — the bug this fixes sent the retry to acme-dev anyway.
@@ -244,7 +249,7 @@ check('orgOverride pins the retry to the CARD\'s org, even when the live selecto
   await ticks();
   assert.strictEqual(modals.length, 1, 'expected exactly one confirm modal');
   const modal = modals[0];
-  assert.ok(modal.message.includes(UAT.alias), `modal must name the card's org (${UAT.alias}): ${modal.message}`);
+  assert.ok(modal.message.includes(UAT.alias), `modal must name the failed run's org (${UAT.alias}): ${modal.message}`);
   assert.ok(!modal.message.includes(DEV.alias), `modal must NOT name the live selector's org: ${modal.message}`);
   // B6: the confirm modal discloses the auto-included count.
   const detail = modal.options.detail || '';
@@ -252,13 +257,13 @@ check('orgOverride pins the retry to the CARD\'s org, even when the live selecto
   modal.resolve(confirmOf(modal));
   await ticks();
   assert.strictEqual(deployCalls(p).length, 1);
-  assert.strictEqual(deployCalls(p)[0].args[1], UAT.username, 'the deploy must target the card\'s org, not the live selector');
+  assert.strictEqual(deployCalls(p)[0].args[1], UAT.username, 'the deploy must target the failed run\'s org, not the live selector');
   const entries = p.suggestionLogEntries();
   const accepted = entries.find(e => e.action === 'accepted');
   assert.strictEqual(accepted.org, UAT.alias, 'the log must name the org that actually ran, not the live selector');
 });
 
-check('a suggestion accepted while the selector already agrees still targets the card\'s org (no regression on the common case)', async () => {
+check('a suggestion accepted while the selector already agrees still targets the failed run\'s org (no regression on the common case)', async () => {
   reset();
   const p = provider({ currentOrg: DEV.username });
   const { id } = seedSuggestion(p, { org: DEV.username, orgLabel: DEV.alias });
@@ -295,7 +300,7 @@ check('a completed retry deletes the live suggestion and logs the resolved org a
   assert.strictEqual(entry.org, UAT.alias);
 });
 
-check('a dismissed confirm modal keeps the suggestion alive and resets the card', async () => {
+check('a dismissed confirm modal keeps the suggestion alive and resets the run\'s suggestion view', async () => {
   reset();
   const p = provider();
   const { id } = seedSuggestion(p);
@@ -328,57 +333,73 @@ check('a 10-entry cap evicts the OLDEST liveSuggestions entry (first-in-first-ou
 });
 
 // =================================================================== B1(a)
-check('a hidden/rebuilt panel: the persisted history card carries the guidance lines the live payload would have shown', () => {
+check('a hidden/rebuilt panel: the kept run carries the suggestion\'s id, never its payload, and the org\'s own words', () => {
   reset();
   const p = provider();
-  const { card } = seedSuggestion(p);
-  const persisted = p.s.cardHistoryCache[0];
-  assert.strictEqual(persisted.suggest, undefined, 'the live payload must never be persisted');
-  assert.strictEqual(persisted.suggestId, card.suggest.id, 'the id must survive so a later ready can restore it');
-  assert.ok(Array.isArray(persisted.lines) && persisted.lines.length > 0, 'no lines at all on the persisted card');
-  assert.ok(
-    persisted.lines[0].includes('Missing but available locally') && persisted.lines[0].includes('CustomObject:smth__mdt'),
-    `expected the guidance line first, got: ${JSON.stringify(persisted.lines[0])}`
-  );
+  const { id } = seedSuggestion(p);
+  const kept = p.kept.statusRuns.runs[0];
+  assert.strictEqual(kept.suggest, undefined, 'the live payload must never be persisted');
+  assert.strictEqual(kept.suggestId, id, 'the id must survive so a later post can bring the payload back');
+  assert.ok((kept.message || '').includes('Invalid type: smth__mdt'), `the org's message must survive: ${JSON.stringify(kept.message)}`);
+  assert.ok(!(kept.notes || []).some(n => n.includes('Missing but available locally')),
+    'with a live suggestion the guidance is the suggestion itself, not a note');
+  // ...but the diagnosis is kept beside it, so a reload (no live suggestion
+  // any more) still says what was missing — the way the kept card used to.
+  assert.ok((kept.diagnosis || []).some(n => n.startsWith('Missing but available locally: CustomObject:smth__mdt')), JSON.stringify(kept.diagnosis));
+  const live = lastRunsPost(p).runs[0];
+  assert.ok(live.suggest, 'the live run carries the suggestion');
+  const said = (run) => RV.verdictFor(run, { now: Date.now() }).plain.map(x => x.text);
+  assert.ok(!said(live).some(t => t.startsWith('Missing but available locally')), 'not twice while the suggestion is live');
+  assert.ok(said(kept).some(t => t.startsWith('Missing but available locally')), 'said once it is gone');
 });
 
-check('the ORIGINAL error lines still follow the guidance line — nothing is dropped, only reordered to the front', () => {
+check('without a suggestion view to carry it, the diagnosis is kept as the run\'s notes', () => {
   reset();
   const p = provider();
-  seedSuggestion(p);
-  const persisted = p.s.cardHistoryCache[0];
-  assert.ok(persisted.lines.some(l => (typeof l === 'string' ? l : l.text || '').includes('smth__mdt') && !l.toString().includes('Missing but available')),
-    `expected an original error line naming smth__mdt too: ${JSON.stringify(persisted.lines)}`);
+  // A sourceDir-pinned retry can't be extended automatically: no suggestion,
+  // so the diagnosis must still reach the user.
+  proto.reportDeployResult.call(p.s, { success: false, status: 'Failed', errorMessage: 'Invalid type: smth__mdt' }, {
+    items: [cls('MyThing')], orgOnlySkipped: [], orgLabel: UAT.alias, org: UAT.username,
+    noun: '1 component', cmdId: 'c1', start: Date.now(), validateOnly: false,
+    retry: { keys: ['ApexClass:MyThing'], sourceDir: '/ws/force-app/classes', validateOnly: false, testLevel: 'NoTestRun' }
+  });
+  const run = lastRunsPost(p).runs[0];
+  assert.strictEqual(run.suggest, undefined);
+  assert.ok((run.notes || []).some(n => n.startsWith('Missing but available locally: CustomObject:smth__mdt')), JSON.stringify(run.notes));
+  assert.ok((p.kept.statusRuns.runs[0].notes || []).length > 0, 'the notes are kept across a reload');
 });
 
 // =================================================================== B1(b)
-check('ready: a suggestionRestore is posted for every suggestion still alive, after statusHistory', async () => {
+check('ready: the newest run comes back with its live suggestion (after the notices)', async () => {
   reset();
   const p = provider();
-  const { id, card } = seedSuggestion(p);
-  // Simulate the rebuild: the LIVE card (with its payload) is gone, only the
-  // stripped persisted copy remains as what a fresh webview would see.
+  const { id, run } = seedSuggestion(p);
+  // Simulate the rebuild: a fresh webview gets the history replayed.
   p.posted.length = 0;
   p.send({ type: 'ready' });
   await ticks();
+  const runsIdx = p.posted.findIndex(m => m.type === 'runs');
+  assert.ok(runsIdx >= 0, 'expected a runs replay');
   const historyIdx = p.posted.findIndex(m => m.type === 'statusHistory');
-  const restoreIdx = p.posted.findIndex(m => m.type === 'suggestionRestore' && m.id === id);
-  assert.ok(historyIdx >= 0, 'expected a statusHistory replay');
-  assert.ok(restoreIdx >= 0, 'expected a suggestionRestore for the still-live suggestion');
-  assert.ok(restoreIdx > historyIdx, 'suggestionRestore must be posted AFTER statusHistory, so the target card already exists');
-  const restore = p.posted[restoreIdx];
-  assert.deepStrictEqual(restore.candidates, card.suggest.candidates);
-  assert.deepStrictEqual(restore.unresolved, card.suggest.unresolved);
+  if (historyIdx >= 0) assert.ok(runsIdx > historyIdx, 'the runs follow the notices');
+  const back = p.posted[runsIdx].runs[0];
+  assert.strictEqual(back.suggest.id, id);
+  assert.deepStrictEqual(back.suggest.candidates, run.suggest.candidates);
+  assert.deepStrictEqual(back.suggest.unresolved, run.suggest.unresolved);
+  assert.ok(!p.posted.some(m => m.type === 'suggestionRestore'), 'the old restore message is retired');
 });
 
-check('ready: a consumed (deleted) suggestion is never restored', async () => {
+check('ready: a consumed (deleted) suggestion never comes back', async () => {
   reset();
   const p = provider();
   const { id } = seedSuggestion(p);
   p.s.liveSuggestions.delete(id);
+  p.posted.length = 0;
   p.send({ type: 'ready' });
   await ticks();
-  assert.strictEqual(p.posted.some(m => m.type === 'suggestionRestore'), false);
+  const back = p.posted.find(m => m.type === 'runs').runs[0];
+  assert.strictEqual(back.suggestId, id, 'the run still names it');
+  assert.strictEqual(back.suggest, undefined, 'but the provider no longer offers it');
 });
 
 // =================================================================== B3 (declined/verdict untouched)

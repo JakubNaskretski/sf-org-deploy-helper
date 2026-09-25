@@ -79,7 +79,9 @@ const cacheOf = orgs => ({ [KEY]: Object.fromEntries(orgs.map(s => [s.org, s])) 
  *  `script[type]` is the member list (or Error) for that type; unscripted
  *  types list empty. Everything the cache never touches is stubbed. */
 function boot({ state = {}, org = DEV, script = {} } = {}) {
-  const store = new Map(Object.entries(state));
+  // The Status history already in its current shape, so its one-time carry-over
+  // write on a first start is not counted as an org-cache write below.
+  const store = new Map(Object.entries({ statusRuns: { v: 1, runs: [] }, statusCardHistory: [], ...state }));
   const posted = [];
   const log = [];
   const calls = [];
