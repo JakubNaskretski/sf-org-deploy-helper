@@ -440,7 +440,7 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
 
 export interface BeginRunInput {
   id: string;
-  op: 'deploy' | 'validate' | 'quickDeploy';
+  op: RunOp;
   org: string;
   orgLabel: string;
   orgKind: OrgKind;
@@ -451,13 +451,15 @@ export interface BeginRunInput {
   skipped?: { orgOnly: ReadonlyArray<RunItem>; unread: ReadonlyArray<RunItem> };
   testLevel?: TestLevel;
   retry?: RunRetry;
+  /** A quick deploy's validation. */
+  fromRunId?: string;
 }
 
-/** A deploy or validation as it starts: every component it sends, still
- *  without a verdict, and every one it skipped — both known before the org
- *  answers. If the run ends without a result (lost contact, a refused submit)
- *  these rows are still what it sent, so a Retry can send them again. */
-export function beginDeployRun(input: BeginRunInput): RunRecord {
+/** A run as it starts: every component it sends (or asks for), still without
+ *  a verdict, and every one it skipped — both known before the org answers.
+ *  If the run ends without a result (lost contact, a refused submit) these
+ *  rows are still what it sent, so a Retry can send them again. */
+export function beginRun(input: BeginRunInput): RunRecord {
   const rows: RunRow[] = input.items.map(i => ({ k: `${i.type}:${i.name}`, o: 'pending', s: 1 }));
   const seen = new Set(rows.map(r => r.k));
   const skip = (i: RunItem, why: 'org' | 'unread'): void => {
@@ -476,6 +478,7 @@ export function beginDeployRun(input: BeginRunInput): RunRecord {
   };
   if (isTestLevel(input.testLevel)) run.testLevel = input.testLevel;
   if (input.retry) run.retry = { ...input.retry };
+  if (input.fromRunId) run.fromRunId = input.fromRunId;
   return run;
 }
 

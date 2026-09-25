@@ -2649,7 +2649,8 @@
       row.appendChild(mk('span', 'run-pn', note));
       return row;
     };
-    if (!p) box.appendChild(bar('Components', 0, 0, true, 'waiting for the org'));
+    // A retrieve is one CLI call with nothing to count until it returns.
+    if (!p) box.appendChild(bar('Components', 0, 0, true, run.op === 'retrieve' ? 'retrieving…' : 'waiting for the org'));
     else {
       box.appendChild(bar('Components', p.compDone, p.compTotal, !p.compTotal, `${RV.fmtN(p.compDone)}/${RV.fmtN(p.compTotal)}`));
       // Tests run after the components are in, so until then they are queued.
@@ -2680,9 +2681,9 @@
 
   function runHeroEl(run, ui) {
     const local = runLocalFor(run.id);
-    // The Quick Deploy offer is one-shot: once used — here, or as the provider
-    // reports — "available until" has nothing left to say.
-    const quickUsed = !!local.quickUsed || !!(run.quick && run.quick.used);
+    // The Quick Deploy offer is one-shot: once clicked, "available until" has
+    // nothing left to say.
+    const quickUsed = !!local.quickUsed;
     const ctx = {
       now: Date.now(), quick: quickUsed ? undefined : run.quick,
       fromRun: run.fromRunId ? state.runs.find(r => r.id === run.fromRunId) : null,
@@ -2798,8 +2799,8 @@
       isLatest: true, busy: state.busy, pending: !!state.pendingAction, busyAction: state.busyAction,
       complete: runSrc.complete, sent: runSrc.rows.filter(r => r.s === 1).map(r => r.k), selectKeys,
       filterLabel: chip ? chip.label.toLowerCase() : '',
-      quick: run.quick && !run.quick.used ? run.quick : undefined, suggest: run.suggest,
-      quickUsed: !!local.quickUsed || !!(run.quick && run.quick.used), suggestDone: !!local.suggestDone
+      quick: run.quick, suggest: run.suggest,
+      quickUsed: !!local.quickUsed, suggestDone: !!local.suggestDone
     });
     for (const b of buttons) {
       const btn = mk('button', `run-btn${b.primary ? ' primary' : ''}`, b.label);

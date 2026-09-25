@@ -17,7 +17,7 @@ import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from '.
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
-import { DeployRunInput, OrgKind, RUN_ID_RE, RunRecord, RunRow, RunTarget, beginDeployRun, deployRunFromResult, deploySuccessRows, envelopeProblem, newRunId, runRetryFrom } from './runRecords';
+import { DeployRunInput, OrgKind, RUN_ID_RE, RunItem, RunRecord, RunRow, RunTarget, beginRun, deployRunFromResult, deploySuccessRows, envelopeProblem, newRunId, retrieveRunFromResult, runRetryFrom } from './runRecords';
 import { RunLive, RunStore } from './runStore';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
@@ -74,8 +74,8 @@ type Inbound =
   // before use; an unknown id is simply a no-op removal.
   | { type: 'cancelQueued'; id?: string }
   | { type: 'clearStatusHistory' }
-  // Card-button affordances on a retrieve result that made a pre-retrieve backup
-  // (see backupCardButtons). `dir` is the webview's copy of the backup's absolute
+  // Restore / Discard on the newest retrieve run when it made a pre-retrieve
+  // backup (the run's backupDir). `dir` is the webview's copy of the backup's absolute
   // path — untrusted until resolveBackupDir confines it to this workspace's own
   // backup root. Omitted only if a hand-built message reaches us some other way.
   | { type: 'restoreBackup'; dir?: string }
@@ -419,10 +419,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The org a `currentDeployJobId` belongs to (for the server-side cancel call). */
   private currentDeployOrg?: string;
   /** Last successful validate-only deployment, offered for quick-deploy on its run. */
-  private lastValidated?: { jobId: string; org: string; label: string; count: number };
-  /** Validations this window has quick-deployed — their runs say the offer was
-   *  used instead of explaining why there is none. Lazily created. */
-  private quickDeployedJobs?: Set<string>;
+  private lastValidated?: { jobId: string; org: string; label: string; count: number; runId: string };
   /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
   private orgMembers = new Map<string, true>();
   /** The org username `orgMembers` was fetched from — guards against using a stale
@@ -2821,7 +2818,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // call can end below finishes that same run.
       const runId = newRunId();
       const runStartedAt = Date.now();
-      this.runStore.begin(beginDeployRun({
+      this.runStore.begin(beginRun({
         id: runId, op: opts.validateOnly ? 'validate' : 'deploy',
         org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt,
         target: opts.sourceDir ? 'sourceDir' : 'selection',
@@ -3381,7 +3378,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Remember the validated deployment so the run's Quick Deploy button can
         // deploy it without re-validating / re-running tests. In memory only: the
         // offer ends with this window.
-        this.lastValidated = { jobId: quickId, org, label: orgLabel, count: items.length };
+        this.lastValidated = { jobId: quickId, org, label: orgLabel, count: items.length, runId: runInput.id };
       }
       // A real deploy landed these on the org — refresh their badges. Validate-only
       // lands nothing. Failure path deliberately skipped: deploys are atomic
@@ -3389,14 +3386,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // leaves org membership as it was.
       if (!validateOnly) this.confirmDeployedOnOrg(successes, items, org, orgLabel);
       this.runStore.finish(withKept(deployRunFromResult(result, runInput)));
-      this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
+      this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}`
+        : `${ctx.op === 'quickDeploy' ? 'Quick-deployed' : 'Deployed'} ${ctx.noun} to ${orgLabel}`);
       return undefined;
     }
     if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
       // The org stopped it and rolled back whatever it had processed: an honest
       // "cancelled" run, never a failure to act on.
       this.runStore.finish(withKept(deployRunFromResult(result, runInput)));
-      this.notifyIfPanelHidden(`${validateOnly ? 'Validate against' : 'Deploy to'} ${orgLabel} cancelled — The org cancelled the deploy.`, 'warn');
+      this.notifyIfPanelHidden(`${validateOnly ? 'Validate against' : ctx.op === 'quickDeploy' ? 'Quick Deploy to' : 'Deploy to'} ${orgLabel} cancelled — The org cancelled the deploy.`, 'warn');
       return undefined;
     }
     // The org's request-level message. Read for EVERY failure, not just the
@@ -3413,6 +3411,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         ? `Deploy reported failure with no per-component details: ${envProblem}`
         : 'Deploy reported failure with no per-component details.']);
     const testLines = testFailures.map(t => `✗ test ${t.name ?? '?'}.${t.methodName ?? '?'} — ${stripAnsi(t.message ?? 'failed').split('\n')[0]}`);
+    if (ctx.op === 'quickDeploy') {
+      // A quick deploy applies a validation exactly as it was — there is nothing
+      // to add to it, so no dependency diagnosis: its failure says the
+      // validation no longer holds (the run says so).
+      this.runStore.finish(deployRunFromResult(result, runInput));
+      this.failureToast(`Quick Deploy failed against ${orgLabel}.`, [...errLines, ...testLines]);
+      return undefined;
+    }
 
     // A failed deploy can reference a component that's missing on the org but
     // DOES exist locally (e.g. a FlexiPage's QuickAction, or an Apex class
@@ -3517,7 +3523,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (run.op === 'validate' && run.status === 'succeeded' && run.jobId) {
       const v = this.lastValidated;
       if (v && v.jobId === run.jobId) out.quick = { jobId: v.jobId, until: (run.finishedAt ?? Date.now()) + QUICK_DEPLOY_WINDOW_MS };
-      else if (this.quickDeployedJobs?.has(run.jobId)) out.quick = { jobId: run.jobId, until: 0, used: true };
     }
     return out.suggest || out.quick ? out : undefined;
   }
@@ -3809,8 +3814,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Resume polling a persisted job under a fresh progress notification, reporting
    *  its outcome exactly like a live deploy. Mirrors runDeploy's finally discipline
    *  (clear cancel/job pins, release the slot; keep the persisted job only on lost
-   *  contact). The original component selection is gone, so the result card's list is
-   *  synthesized from the report (itemsFromReport). */
+   *  contact). The original component selection is gone, so the run's rows come from
+   *  the report (itemsFromReport). */
   private async reattachDeployJob(job: ActiveDeployJob): Promise<void> {
     const root = this.workspaceRoot ?? process.cwd();
     const prep = orgPrep(job.verb);
@@ -3835,7 +3840,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const priorRetry = prior?.retry;
     if (prior) this.runStore.resume(runId);
     else {
-      this.runStore.begin(beginDeployRun({
+      this.runStore.begin(beginRun({
         id: runId, op, org: job.org, orgLabel: job.orgLabel, orgKind: this.orgKindOf(job.org),
         startedAt: job.startedAt, target, items: [], testLevel
       }));
@@ -3860,7 +3865,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               noun: job.noun, cmdId, start, ...modes, verb: job.verb, op,
               retry: op === 'quickDeploy' ? undefined
                 : { ...(priorRetry ?? { ...modes, ...(testLevel ? { testLevel } : {}) }), keys: items.map(i => `${i.type}:${i.name}`) },
-              target, runId, runStartedAt: prior?.startedAt ?? job.startedAt, keptSkipped: kept, notes: [known]
+              target, runId, runStartedAt: prior?.startedAt ?? job.startedAt, keptSkipped: kept, notes: [known], fromRunId: prior?.fromRunId
             });
           }
         );
@@ -3916,6 +3921,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const start = Date.now();
       const noun = `${validated.count} component${validated.count === 1 ? '' : 's'}`;
       const progressTitle = `Quick-deploying ${noun} to ${orgLabel}`;
+      // A run from here on, sending what its validation validated; the org's
+      // report fills in the result.
+      const runId = newRunId();
+      const sent = this.runStore.rowsOf(validated.runId).filter(r => r.s === 1).map(r => keyItem(r.k));
+      this.runStore.begin(beginRun({
+        id: runId, op: 'quickDeploy', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: start,
+        target: 'report', items: sent, fromRunId: validated.runId
+      }));
       let keepPersisted = false;
       try {
         await this.withWindowProgress(progressTitle, async report => {
@@ -3927,18 +3940,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.currentDeployOrg = org;
           const { result: submit, cmd } = await handle.promise;
           this.updateCmd(cmdId, cmd);
-          // The quick deploy consumes the validation — clear it now we've committed,
-          // and let its run say the offer was used rather than missing.
+          // The quick deploy consumes the validation — clear it now we've committed.
           this.lastValidated = undefined;
-          (this.quickDeployedJobs ??= new Set()).add(jobId);
-          this.runStore.postRuns();
           const quickJobId = submit.id;
           if (!quickJobId) throw new SfCliError('Quick Deploy submitted but the CLI returned no job id to track.');
           this.currentDeployJobId = quickJobId;
-          this.persistActiveJob({ jobId: quickJobId, org, orgLabel, startedAt: Date.now(), verb: 'Quick Deploy', noun });
+          this.persistActiveJob({ jobId: quickJobId, org, orgLabel, startedAt: Date.now(), verb: 'Quick Deploy', noun, runId });
+          this.runStore.update(runId, { jobId: quickJobId });
           const outcome = await this.drivePolledDeploy(
-            { jobId: quickJobId, org, orgLabel, root, verb: 'Quick Deploy', noun, cmdId, start, progressTitle }, report,
-            result => this.reportQuickDeployResult(result, { org, orgLabel, count: validated.count, cmdId, start })
+            { jobId: quickJobId, org, orgLabel, root, verb: 'Quick Deploy', noun, cmdId, start, progressTitle, runId }, report,
+            // No original item list survives to a quick deploy, so the rows are
+            // the org's report (and confirming them on the org leans on the
+            // scanner's current items alone).
+            result => this.reportPolledDeploy(result, {
+              items: [], orgOnlySkipped: [], orgLabel, org, noun, cmdId, start, validateOnly: false, verb: 'Quick Deploy',
+              op: 'quickDeploy', target: 'report', runId, runStartedAt: start, fromRunId: validated.runId
+            })
           );
           keepPersisted = outcome.keepPersisted;
         });
@@ -3948,10 +3965,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         if (err instanceof SfCliCancelledError) {
           // A cancel here means the ASYNC SUBMIT was killed before it returned a job
           // id — the org may still have enqueued the quick deploy.
-          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.');
+          this.reportCancelled(labeledAction, 'The org-side deploy may still complete — check the org.', runId);
         } else if (isTimeoutError(err)) {
-          this.reportDeployTimeout(labeledAction, err);
-        } else this.reportError(labeledAction, err);
+          this.reportDeployTimeout(labeledAction, err, 'deploy', runId);
+        } else this.reportError(labeledAction, err, runId);
       } finally {
         if (!keepPersisted) this.clearActiveJob();
         this.currentCancel = undefined;
@@ -3961,59 +3978,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       if (reserved) this.setBusy(false);
-    }
-  }
-
-  /** Terminal card for a polled quick deploy. `Canceled` → honest cancelled card;
-   *  otherwise the quick-deploy-specific success/failure card. */
-  private reportQuickDeployResult(
-    result: DeployResult,
-    ctx: { org: string; orgLabel: string; count: number; cmdId: string; start: number }
-  ): void {
-    const { org, orgLabel, count, cmdId, start } = ctx;
-    const noun = `${count} component${count === 1 ? '' : 's'}`;
-    if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
-      this.endCmd(cmdId, false, Date.now() - start);
-      this.reportCancelled(`Quick Deploy to ${orgLabel}`, 'The org cancelled the deploy.');
-      return;
-    }
-    const failures = result.details?.componentFailures
-      ?? (result.files ?? []).filter(f => f.state === 'Failed' || !!fileProblem(f));
-    const success = result.success
-      && (result.numberComponentErrors == null || result.numberComponentErrors === 0)
-      && failures.length === 0;
-    this.endCmd(cmdId, success, Date.now() - start);
-    if (success) {
-      // No original item list survives to a quick deploy (only a count), so the
-      // row→item mapping leans on the scanner's current items alone.
-      this.confirmDeployedOnOrg(deploySuccessRows(result), [], org, orgLabel);
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'ok',
-          title: `Quick-deployed ${noun} to ${orgLabel}`,
-          meta: `${result.numberComponentsDeployed ?? count} deployed`
-        }
-      });
-      this.notifySuccessIfPanelHidden(`Quick-deployed ${noun} to ${orgLabel}`);
-    } else {
-      const failLines = failures.map(f => {
-        const key = this.localFailureKey(f);
-        return {
-          text: `${fileType(f)}:${f.fullName} — ${fileProblem(f) ?? 'failed'}`,
-          ...(key ? { key } : {})
-        };
-      });
-      this.post({
-        type: 'status',
-        card: {
-          kind: 'err',
-          title: `Quick Deploy failed against ${orgLabel}`,
-          meta: 'The validation may have expired (validated deployments are valid for ~10 days; the org may also have changed).',
-          lines: failLines
-        }
-      });
-      this.failureToast(`Quick Deploy failed against ${orgLabel}.`, failLines);
     }
   }
 
@@ -4048,6 +4012,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         'Retrieve'
       );
       if (confirm !== 'Retrieve') return;
+      // A run from here on: what it asks for, then what came back.
+      const runId = newRunId();
+      const runStartedAt = Date.now();
+      const target: RunTarget = opts.sourceDir ? 'sourceDir' : 'selection';
+      this.runStore.begin(beginRun({ id: runId, op: 'retrieve', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, target, items }));
 
       // Pre-retrieve backup: save the local copies about to be overwritten so the
       // retrieve is undoable. Only local files matter — org-only/new items have none.
@@ -4061,7 +4030,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         backupNote = backupResult?.note;
         backupDir = backupResult?.dir;
       } catch (err) {
-        this.reportError(`Backup before retrieve from ${orgLabel}`, err);
+        this.reportError(`Backup before retrieve from ${orgLabel}`, err, runId);
         return; // releaseBusy() in the outer finally frees the slot
       }
 
@@ -4080,7 +4049,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         try {
           manifest = await this.writeTempManifest(items);
         } catch (err) {
-          this.reportError(`Retrieve from ${orgLabel}`, err);
+          this.reportError(`Retrieve from ${orgLabel}`, err, runId);
           return; // releaseBusy() in the outer finally frees the slot
         }
       }
@@ -4109,63 +4078,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Fetch Org predates the component. The local side ('On org' → 'In both')
         // is covered by the loadFiles() rescan below.
         this.confirmOnOrg(ok, org, orgLabel);
-
+        this.runStore.finish(retrieveRunFromResult(result, {
+          id: runId, org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, finishedAt: Date.now(),
+          target, items, backupDir, notes: backupNote ? [backupNote] : undefined
+        }));
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
-          this.post({
-            type: 'status',
-            card: {
-              kind: 'ok',
-              title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
-              ...(backupNote ? { meta: backupNote } : {}),
-              lines: this.capForCard(`Retrieved from ${orgLabel} — full component list`, ok.map(f => `${f.type}:${f.fullName}`)),
-              ...this.backupCardButtons(backupDir)
-            }
-          });
           this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
         } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
-          this.post({
-            type: 'status',
-            card: {
-              kind: 'warn',
-              title: `Nothing retrieved from ${orgLabel}`,
-              meta: `${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`,
-              lines: [...missing.map(i => `${i.type}:${i.name} — not on org`), ...msgLines]
-            }
-          });
           this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
-        } else {
-          // Failures FIRST: capForCard cuts off the TAIL, and a failure must
-          // never be the thing that gets cut just because there were more
-          // successes ahead of it in the list.
-          const lines: string[] = [];
-          for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`);
-          for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
-          for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
-          lines.push(...msgLines);
-          this.post({
-            type: 'status',
-            card: {
-              kind: failed.length > 0 ? 'err' : 'warn',
-              title: `Retrieve from ${orgLabel} completed with issues`,
-              meta: `${ok.length} ok · ${failed.length} failed · ${missing.length} missing${backupNote ? ` · ${backupNote}` : ''}`,
-              lines: this.capForCard(`Retrieve from ${orgLabel} — full detail list`, lines),
-              ...this.backupCardButtons(backupDir)
-            }
-          });
-          if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
-          // Nothing FAILED, but components the user asked for weren't on the org —
-          // a warn card only, so with the panel hidden the skipped ones went unsaid.
-          else if (missing.length > 0) this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${ok.length} retrieved · ${missing.length} not on org`, 'warn');
+        } else if (failed.length > 0) {
+          this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, [
+            ...failed.map(f => `✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`), ...msgLines
+          ]);
+        } else if (missing.length > 0) {
+          // Nothing FAILED, but components the user asked for weren't on the org.
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${ok.length} retrieved · ${missing.length} not on org`, 'warn');
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
-        // Org-labelled so the exception card is attributable in the mixed-org history.
-        if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`);
-        else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve');
-        else this.reportError(`Retrieve from ${orgLabel}`, err);
+        if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`, undefined, runId, 'cancelled');
+        else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve', runId);
+        else this.reportError(`Retrieve from ${orgLabel}`, err, runId);
       } finally {
         this.currentCancel = undefined;
         this.setBusy(false);
@@ -4180,10 +4116,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * Deploy a whole package.xml manifest (`sf project deploy start --manifest`).
    * Mirrors runDeploy's discipline — synchronous reserveBusy, requireRoot/Org, prod
    * guard + ⚠ confirm, the effective test-level chain (incl. RunSpecifiedTests),
-   * withWindowProgress, org-labelled status cards/history, cancel support, and the
+   * withWindowProgress, an org-labelled run in the Status pane, cancel support, and the
    * timeout-honesty path — keyed on a manifest file instead of a component
-   * selection. The parsed types drive the confirm noun and the status card's target
-   * list; the deploy result drives the counts, test failures and quick-deploy offer.
+   * selection. The parsed types drive the confirm noun; the deploy result drives the
+   * run's rows, counts, test failures and quick-deploy offer.
    */
   private async runManifestDeploy(manifestPath: string, types: Array<{ type: string; members: string[] }>): Promise<void> {
     if (!this.reserveBusy('Deploy')) return;
@@ -4202,9 +4138,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const basename = path.basename(manifestPath);
       const typeCount = types.length;
       const memberCount = types.reduce((sum, t) => sum + t.members.length, 0);
-      // Synthesize items from the manifest so the result card can list what was
-      // targeted; the deploy goes by --manifest, so none carry a local filePath and
-      // the actual per-component outcome comes from the deploy result.
+      // Synthesize items from the manifest — what was sent, for the result's
+      // dependency check and org-membership update; the deploy goes by --manifest,
+      // so none carry a local filePath and the run's rows come from the result.
       const items: MetadataItem[] = types.flatMap(t => t.members.map(m => ({ type: t.type, name: m, filePath: '', files: [] })));
       const noun = `manifest ${basename} — ${typeCount} type${typeCount === 1 ? '' : 's'}, ${memberCount} member${memberCount === 1 ? '' : 's'}`;
 
@@ -4246,7 +4182,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // report says what became of each one.
       const retry: RetryRequest = { manifest: manifestPath, testLevel };
       const runId = newRunId();
-      this.runStore.begin(beginDeployRun({
+      this.runStore.begin(beginRun({
         id: runId, op: 'deploy', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: start,
         target: 'manifest', items: [], testLevel, retry: runRetryFrom(retry)
       }));
@@ -4328,6 +4264,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         'Retrieve'
       );
       if (confirm !== 'Retrieve') return;
+      // A run from here on. The rows asked for are the manifest's named members;
+      // a wildcard names none (the org's answer lists what it matched).
+      const runId = newRunId();
+      const runStartedAt = Date.now();
+      const asked: RunItem[] = types.flatMap(t => t.members.filter(m => m !== '*').map(name => ({ type: t.type, name })));
+      this.runStore.begin(beginRun({ id: runId, op: 'retrieve', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, target: 'manifest', items: asked }));
 
       // Pre-retrieve backup (see runRetrieve). The manifest deploy goes by
       // --manifest, so resolve which LOCAL components it names via the workspace
@@ -4346,7 +4288,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         backupNote = backupResult?.note;
         backupDir = backupResult?.dir;
       } catch (err) {
-        this.reportError(`Backup before retrieve from ${orgLabel}`, err);
+        this.reportError(`Backup before retrieve from ${orgLabel}`, err, runId);
         return; // releaseBusy() in the outer finally frees the slot
       }
 
@@ -4374,55 +4316,31 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
           // See runRetrieve: ok rows are org-confirmed membership.
           this.confirmOnOrg(ok, org, orgLabel);
-
+          const notes = [
+            ...(backupNote ? [backupNote] : []),
+            ...(ok.length === 0 && failed.length === 0 && !msgLines.length ? [`The org returned no components for ${basename}.`] : [])
+          ];
+          this.runStore.finish(retrieveRunFromResult(result, {
+            id: runId, org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, finishedAt: Date.now(),
+            target: 'manifest', items: asked, backupDir, notes
+          }));
           if (failed.length === 0 && ok.length > 0) {
-            this.post({
-              type: 'status',
-              card: {
-                kind: 'ok',
-                title: `Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`,
-                meta: `manifest ${basename}${backupNote ? ` · ${backupNote}` : ''}`,
-                lines: ok.map(f => `${f.type}:${f.fullName}`),
-                ...this.backupCardButtons(backupDir)
-              }
-            });
             this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
           } else if (ok.length === 0 && failed.length === 0) {
-            this.post({
-              type: 'status',
-              card: {
-                kind: 'warn',
-                title: `Nothing retrieved from ${orgLabel}`,
-                meta: `manifest ${basename}`,
-                lines: msgLines.length ? msgLines : ['The org returned no components for this manifest.']
-              }
-            });
             this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${basename} matched no components on the org`, 'warn');
-          } else {
-            const lines: string[] = [];
-            for (const f of ok) lines.push(`✓ ${f.type}:${f.fullName}`);
-            for (const f of failed) lines.push(`✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`);
-            lines.push(...msgLines);
-            this.post({
-              type: 'status',
-              card: {
-                kind: failed.length > 0 ? 'err' : 'warn',
-                title: `Retrieve from ${orgLabel} completed with issues`,
-                meta: `${ok.length} ok · ${failed.length} failed${backupNote ? ` · ${backupNote}` : ''}`,
-                lines,
-                ...this.backupCardButtons(backupDir)
-              }
-            });
-            if (failed.length > 0) this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, lines);
+          } else if (failed.length > 0) {
+            this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, [
+              ...failed.map(f => `✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`), ...msgLines
+            ]);
           }
           // refresh workspace scan (file count badges etc.), like runRetrieve.
           this.loadFiles().catch(() => undefined);
         });
       } catch (err) {
         this.endCmd(cmdId, false, Date.now() - start);
-        if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`);
-        else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve');
-        else this.reportError(`Retrieve from ${orgLabel}`, err);
+        if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`, undefined, runId, 'cancelled');
+        else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve', runId);
+        else this.reportError(`Retrieve from ${orgLabel}`, err, runId);
       } finally {
         this.currentCancel = undefined;
         this.setBusy(false);
@@ -5720,8 +5638,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** `runId`: the run this cancel ends — its card says it, instead of a card of
    *  its own. The org may still finish (the cancel could not be confirmed), so
    *  the run is marked as such. */
-  private reportCancelled(action: string, note?: string, runId?: string): void {
-    const ended = runId !== undefined && this.runStore.end(runId, { status: 'cancelUnconfirmed', ...(note ? { notes: [note] } : {}) });
+  private reportCancelled(action: string, note?: string, runId?: string, status: 'cancelled' | 'cancelUnconfirmed' = 'cancelUnconfirmed'): void {
+    // A deploy's cancel reaches the org only as a request (the org may still
+    // finish it); a retrieve's stops the local command, and with it the run.
+    const ended = runId !== undefined && this.runStore.end(runId, { status, ...(note ? { notes: [note] } : {}) });
     if (!ended) {
       this.post({
         type: 'status',
@@ -5909,15 +5829,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private skipCounts(skipped: MetadataItem[]): { skipped: number; unread: { count: number; types: string[] } } {
     const { orgOnly, unread } = this.splitSkipped(skipped);
     return { skipped: orgOnly.length, unread: { count: unread.length, types: [...new Set(unread.map(i => i.type))].sort() } };
-  }
-
-  /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
-   *  list into the Output channel first when it's about to be cut — a deploy/
-   *  retrieve over a few thousand components is inconvenient to scroll in a
-   *  card, but the full list must never simply be gone. */
-  private capForCard(header: string, lines: Array<string | { text: string }>): Array<string | { text: string }> {
-    if (lines.length > CARD_LINE_CAP) this.logResultLines(header, lines);
-    return capLines(lines);
   }
 
   /** Injection point for notify()'s de-dup/rate-limit clock — real time in
@@ -6116,7 +6027,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /**
    * Back up the given local files before a retrieve overwrites them, when the feature
-   * is enabled. Returns a note for the result card (files saved, or the over-limit
+   * is enabled. Returns a note for the retrieve's run (files saved, or the over-limit
    * skip), or undefined when disabled / nothing needed saving. THROWS on any
    * copy/write failure so the caller can abort the retrieve — silently proceeding
    * would strip the safety net the setting promises.
@@ -6126,7 +6037,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const result = await this.writeBackup(root, candidatePaths, orgLabel);
     if (result.skippedTooMany) {
       this.output.appendLine(`[backup] skipped — more than ${BACKUP_MAX_FILES} files would be backed up before retrieve`);
-      return { note: `backup skipped — over ${BACKUP_MAX_FILES} files` };
+      return { note: `Backup skipped — over ${BACKUP_MAX_FILES} files.` };
     }
     // `offered` distinguishes "nothing local to save" (org-only items — no note,
     // there was never a safety net to promise) from "there WERE local files but
@@ -6135,14 +6046,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // a note too. No `dir` either way: the CLI conflict check below stays on.
     if (result.count === 0) {
       if (result.offered) {
-        return { note: `backup skipped — none of ${result.offered} local file${result.offered === 1 ? '' : 's'} could be saved (see Output)` };
+        return { note: `Backup skipped — none of ${result.offered} local file${result.offered === 1 ? '' : 's'} could be saved (see Output).` };
       }
       return undefined;
     }
-    // `dir` rides along so the caller can offer the card's Restore/Discard buttons
-    // (backupCardButtons) against this EXACT backup — never a re-derived "latest".
+    // `dir` rides along so the run can offer Restore/Discard against this EXACT
+    // backup — never a re-derived "latest".
     return {
-      note: `backed up ${result.count} file${result.count === 1 ? '' : 's'} — restore via 'SF Deploy: Restore Retrieve Backup'`,
+      note: `Backed up ${result.count} file${result.count === 1 ? '' : 's'} — restore via 'SF Deploy: Restore Retrieve Backup'.`,
       dir: result.dir
     };
   }
@@ -6182,7 +6093,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // missing or resolved outside the workspace — e.g. a mis-cased inferred path
       // that isUnder now folds, or a file already gone — leave a trace, and hand
       // `offered` back so the caller can tell this apart from "nothing to save"
-      // (org-only items) and surface it on the retrieve card instead of staying silent.
+      // (org-only items) and surface it on the retrieve's run instead of staying silent.
       const offered = candidatePaths.filter(Boolean).length;
       if (offered > 0) {
         this.output.appendLine(`[backup] backup skipped ${offered} candidate(s): missing or outside the workspace`);
@@ -6294,7 +6205,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /**
    * Restore local files from a pre-retrieve backup — the undo for a retrieve
    * overwrite. Shared by the palette command (`SF Deploy: Restore Retrieve Backup`,
-   * `dir` undefined — shows the backup picker first) and a status card's "Restore
+   * `dir` undefined — shows the backup picker first) and a retrieve run's "Restore
    * backup…" button (`dir` already names the exact backup that retrieve made, so the
    * picker is skipped and we go straight to picking which files to restore).
    *
@@ -6434,7 +6345,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /**
    * Discard a pre-retrieve backup permanently (no undo) — the counterpart to
-   * restoreRetrieveBackup, reached from the status-card "Discard backup" button and
+   * restoreRetrieveBackup, reached from a retrieve run's "Discard backup" button and
    * from the palette restore flow's "Discard this backup" alternative. `dir` is
    * validated exactly like restoreRetrieveBackup's, before any fs use.
    *
@@ -6486,21 +6397,6 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       this.reportError('Discard backup', err);
     }
-  }
-
-  /** Card `buttons` for a retrieve result that made a backup — spreads to nothing
-   *  when no backup was made this run (dir undefined). Both buttons round-trip the
-   *  SAME dir through the webview; the provider re-validates it against this
-   *  workspace's backup root before acting (resolveBackupDir), so neither a stale
-   *  dir (pruned since) nor a tampered one can reach fs directly. */
-  private backupCardButtons(dir: string | undefined): { buttons: Array<{ label: string; send: { type: string; dir: string } }> } | Record<string, never> {
-    if (!dir) return {};
-    return {
-      buttons: [
-        { label: 'Restore backup…', send: { type: 'restoreBackup', dir } },
-        { label: 'Discard backup', send: { type: 'discardBackup', dir } }
-      ]
-    };
   }
 
   /** Keys echoed back from a result card, reduced to what can actually be selected
@@ -6866,6 +6762,12 @@ export function capLines<T extends string | { text: string }>(
 
 /** Preposition for a verb in card / progress / toast text: a check-only run
  *  (validate) goes "against" an org, runs that actually write go "to" it. */
+/** A "Type:Name" key back to its parts (a type never holds a colon). */
+function keyItem(k: string): RunItem {
+  const c = k.indexOf(':');
+  return { type: k.slice(0, c), name: k.slice(c + 1) };
+}
+
 function orgPrep(verb: DeployVerb): 'against' | 'to' {
   return verb === 'Validate' ? 'against' : 'to';
 }

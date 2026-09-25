@@ -33,11 +33,9 @@
 //      short, and the real SfCliService argv (a separate, direct check) carries
 //      no --metadata when a manifest is set;
 //   c) the same, for retrieve;
-//   d) a deploy's run holds EVERY row (the pane's list is virtual), while the
-//      copy kept across reloads is a bounded summary with exact counts; a
-//      retrieve card's lines are still capped at CARD_LINE_CAP with the "and N
-//      more" tail, ✗ lines surviving the cut ahead of ✓ lines, and the Output
-//      channel getting the FULL uncapped list;
+//   d) a deploy's or retrieve's run holds EVERY row (the pane's list is
+//      virtual), while the copy kept across reloads is a bounded summary with
+//      exact counts; a retrieve's failures still reach the Output channel;
 //   e) the temp manifest dir is gone once the run resolves;
 //   f) buildManifestXml: escaping and deterministic sort, as a pure unit test;
 //   g) a failed 10,000-item deploy's Retry still sends all 10,000 Type:Name
@@ -445,7 +443,7 @@ check('a 150-component deploy: the run holds all 150 rows; a reload keeps the ex
   assert.strictEqual(kept.rowsComplete, false);
 });
 
-check('retrieve mixed card: ✗ lines survive the cap ahead of ✓ lines, tail present, full list mirrored to Output', async () => {
+check('a mixed retrieve: the run holds every row — 5 failed, 150 retrieved — and the failures still reach Output', async () => {
   const failedItems = makeItems(5, 'ApexTrigger');
   const okItems = makeItems(150, 'ApexClass');
   const all = [...failedItems, ...okItems];
@@ -458,14 +456,15 @@ check('retrieve mixed card: ✗ lines survive the cap ahead of ✓ lines, tail p
     }
   });
   await runRetrieve(p, keysOf(all));
-  const card = statusCards(p).find(c => c.kind === 'err');
-  assert.ok(card, 'expected a mixed err card');
-  assert.strictEqual(card.lines.length, 101, String(card.lines.length));
-  for (let i = 0; i < 5; i++) assert.ok(card.lines[i].startsWith('✗ ApexTrigger:'), card.lines[i]);
-  for (let i = 5; i < 100; i++) assert.ok(card.lines[i].startsWith('✓ ApexClass:'), card.lines[i]);
-  assert.ok(/^… and 55 more — full list in the Output channel$/.test(card.lines[100]), card.lines[100]);
+  const { run, rows } = lastRun(p);
+  assert.strictEqual(run.op, 'retrieve');
+  assert.strictEqual(run.status, 'partial');
+  assert.strictEqual(rows.length, 155, 'nothing is cut to fit a card');
+  assert.deepStrictEqual(rows.filter(r => r.o === 'failed').map(r => r.k), keysOf(failedItems));
+  assert.ok(rows.filter(r => r.o === 'failed').every(r => r.m === 'boom'));
+  assert.strictEqual(rows.filter(r => r.o === 'changed').length, 150);
+  assert.ok(!statusCards(p).length, 'a retrieve result is a run, not a card');
   for (const item of failedItems) assert.ok(p.outputLines.some(l => l.includes(`✗ ${item.type}:${item.name}`)));
-  for (const item of okItems) assert.ok(p.outputLines.some(l => l.includes(`✓ ${item.type}:${item.name}`)));
 });
 
 check('a small successful deploy writes nothing to the Output channel — its run is the record', async () => {
@@ -641,15 +640,16 @@ check('retrieve: a local timeout is reported as a timeout, naming the setting th
   const items = makeItems(40);
   const p = provider(items, { retrieveError: new SfCliError('sf project retrieve start timed out after 180000ms') });
   await runRetrieve(p, keysOf(items));
-  const card = statusCards(p).pop();
-  assert.ok(card, 'a timed-out retrieve must still produce a card');
-  assert.ok(/timed out$/.test(card.title), card.title);
-  assert.ok(card.hint && card.hint.includes('sfOrgDeployWrapper.commandTimeoutMs'),
-    `the raise-the-cap setting must be named: ${JSON.stringify(card.hint)}`);
+  const { run } = lastRun(p);
+  assert.strictEqual(run.op, 'retrieve');
+  assert.strictEqual(run.status, 'timeout', 'a timed-out retrieve ends its run as a timeout');
+  assert.ok(run.hint && run.hint.includes('sfOrgDeployWrapper.commandTimeoutMs'),
+    `the raise-the-cap setting must be named: ${JSON.stringify(run.hint)}`);
   // Retrieve wording, NOT the deploy one: files may not have been written, and
   // there is no org-side deploy to go and check.
-  assert.ok(/files may not have been written/i.test(`${card.meta} ${card.hint}`), `${card.meta} / ${card.hint}`);
-  assert.ok(!/still be running on the org/i.test(`${card.meta} ${card.hint}`), 'deploy wording leaked into a retrieve');
+  assert.ok(/before it finished writing files/i.test(run.hint), run.hint);
+  const said = [run.hint, run.message, ...RV.verdictFor(run, { now: Date.now() }).plain.map(x => x.text)].join(' ');
+  assert.ok(!/still be running on the org|Deployment Status/i.test(said), `deploy wording leaked into a retrieve: ${said}`);
 });
 
 check('delete: the cap is a boundary on the rendered list — at it runs, one character over is refused', async () => {

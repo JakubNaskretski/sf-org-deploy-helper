@@ -1,5 +1,6 @@
-// Runnable contract test for the runs a deploy or validation produces — driven
-// through the REAL runDeploy / runManifestDeploy / reattach / quick-deploy code
+// Runnable contract test for the runs a deploy, validation, quick deploy or
+// retrieve produces — driven through the REAL runDeploy / runManifestDeploy /
+// reattach / runQuickDeploy / runRetrieve / runManifestRetrieve code
 // (panelProvider.ts) on a prototype double, with `sf` scripted. No framework.
 //   1) npm run compile   2) node scripts/check-run-producers.cjs
 //
@@ -13,7 +14,11 @@
 //   - no result: lost contact (Resume), a refused submit (+ Retry + overwrite for
 //     a conflict), a timed-out submit, a killed submit, a failed package.xml
 //     write — each keeps what was sent, so a Retry can send it again;
-//   - Quick Deploy's offer on a validation that ran tests, and its "used" state;
+//   - Quick Deploy's offer on a validation that ran tests; the quick deploy as a
+//     run of its own (the validated set, its validation named), and its failure;
+//   - a retrieve as a run: what it asks for, then one row per component, its
+//     backup offered on the newest run only; a failed backup, a cancel, a
+//     package.xml retrieve that names a wildcard;
 //   - after a window reload: the job's own run stays running and the reattach
 //     finishes that SAME run (skipped rows and count kept, Retry at the original
 //     test level); a run with no job left, or whose job is too old, is
@@ -59,6 +64,7 @@ const check = (name, fn) => queue.push([name, fn]);
 
 const ORG = 'acme-dev-user';
 const JOB = '0AfAc000001kQ9zSAE';
+const QJOB = '0AfAc000001kR7wSAE';
 const cls = (name) => ({ type: 'ApexClass', name, filePath: `/ws/force-app/main/default/classes/${name}.cls`, files: [] });
 const ITEMS = [cls('AcmeOrderService'), cls('AcmeInvoiceService'), cls('AcmeLedgerSync')];
 const KEYS = ITEMS.map(i => `${i.type}:${i.name}`);
@@ -78,7 +84,11 @@ function provider(extra = {}) {
       cancel: () => undefined
     }),
     deployReport: () => ({ promise: Promise.resolve({ result: extra.report ?? { id: JOB, status: 'Succeeded', success: true, done: true } }), cancel: () => undefined }),
-    quickDeploy: () => ({ promise: Promise.resolve({ result: { id: '0AfAc000001kQuickAE' }, cmd: 'sf project deploy quick --json' }), cancel: () => undefined }),
+    quickDeploy: () => ({ promise: Promise.resolve({ result: { id: QJOB }, cmd: 'sf project deploy quick --json' }), cancel: () => undefined }),
+    retrieveMetadata: () => ({
+      promise: extra.retrieveError ? Promise.reject(extra.retrieveError) : Promise.resolve({ result: extra.retrieve ?? { inboundFiles: [] }, cmd: 'sf project retrieve start --json' }),
+      cancel: () => undefined
+    }),
     runCancellable: () => ({ promise: Promise.resolve({ stdout: 'sf 0.0.0-test', stderr: '', code: 0 }), cancel: () => undefined })
   };
   Object.assign(s, {
@@ -89,6 +99,7 @@ function provider(extra = {}) {
     orgs: [{ username: ORG, alias: 'acme-dev', instanceUrl: 'https://acme-dev.sandbox.my.salesforce.com', isSandbox: true }],
     learnedRules: () => [],
     orgStore: { get: () => ORG, set: async () => {}, setFromUserPick: async () => {} },
+    loadFiles: async () => {}, maybeBackupBeforeRetrieve: async () => undefined,
     output: { appendLine: () => {} },
     context: {
       workspaceState: { get: k => kept[k], update: async (k, v) => { kept[k] = v === undefined ? undefined : JSON.parse(JSON.stringify(v)); } },
@@ -284,17 +295,53 @@ check('whatever happens, a confirmed deploy never leaves its run running', async
 });
 
 // ================================================================ Quick Deploy
-check('a validation that ran tests offers Quick Deploy live, until the window reload; using it marks the offer used', async () => {
-  const p = provider({ report: { id: JOB, status: 'Succeeded', success: true, done: true, runTestsEnabled: true, numberTestsTotal: 4, numberTestsCompleted: 4 } });
+const VALIDATED = { id: JOB, status: 'Succeeded', success: true, done: true, runTestsEnabled: true, numberTestsTotal: 4, numberTestsCompleted: 4 };
+const reportOnce = (result) => () => ({ promise: Promise.resolve({ result }), cancel: () => undefined });
+
+check('a validation that ran tests offers Quick Deploy live — the offer is never stored, so it ends with the window', async () => {
+  const p = provider({ report: VALIDATED });
   await deploy(p, KEYS, { validateOnly: true, testLevel: 'RunLocalTests' });
   const run = last(p).runs[0];
   assert.strictEqual(run.quick.jobId, JOB);
-  assert.ok(!('quick' in p.kept.statusRuns.runs[0]), 'the offer is never stored: it does not survive a reload');
+  assert.ok(!('quick' in p.kept.statusRuns.runs[0]));
+});
+
+check('Quick Deploy is a run from its confirm: the validated set, its validation named, the org\'s report as its rows', async () => {
+  const p = provider({ report: VALIDATED });
+  await deploy(p, KEYS, { validateOnly: true, testLevel: 'RunLocalTests' });
+  const validation = last(p).runs[0];
+  p.s.sf.deployReport = reportOnce({ id: QJOB, status: 'Succeeded', success: true, done: true, numberComponentsDeployed: 3, details: {
+    componentSuccesses: KEYS.map(k => ({ componentType: 'ApexClass', fullName: k.split(':')[1] }))
+  } });
+  const posts = runsPosts(p).length;
   await proto.runQuickDeploy.call(p.s, JOB);
-  const after = runsPosts(p).find((m, i, all) => i > all.indexOf(runsPosts(p).find(x => x.runs[0].quick && !x.runs[0].quick.used)) && m.runs[0].quick && m.runs[0].quick.used);
-  assert.ok(after, 'the run is re-posted with the offer used');
-  const acts = RV.actionsFor(after.runs[0], { isLatest: true, complete: true, quick: undefined, quickUsed: true });
-  assert.ok(!acts.buttons.some(b => b.id === 'quickDeploy') && !acts.why, 'no button, and no "why not" either');
+  const begun = runsPosts(p)[posts];
+  assert.deepStrictEqual([begun.runs[0].op, begun.runs[0].status, begun.runs[0].fromRunId], ['quickDeploy', 'running', validation.id]);
+  assert.deepStrictEqual(begun.latestRows.rows.map(r => [r.k, r.o]), KEYS.map(k => [k, 'pending']), 'what it sends: what the validation validated');
+  const { runs, latestRows } = last(p);
+  assert.deepStrictEqual(runs.map(r => [r.id, r.op, r.status]), [[begun.runs[0].id, 'quickDeploy', 'succeeded'], [validation.id, 'validate', 'succeeded']]);
+  assert.strictEqual(runs[0].jobId, QJOB);
+  assert.strictEqual(runs[0].fromRunId, validation.id, 'the finished run still names its validation');
+  assert.deepStrictEqual(latestRows.rows.map(r => [r.k, r.o]), KEYS.map(k => [k, 'deployed']));
+  assert.ok(!('quick' in runs[1]), 'the validation is an older run now: no offer on it');
+  assert.deepStrictEqual(RV.actionsFor(runs[1], { isLatest: false }).buttons.map(b => b.id), ['copy']);
+  assert.ok(RV.verdictFor(runs[0], { now: Date.now(), fromRun: runs[1] }).plain.some(x => x.text.startsWith('Applied the set validated')));
+  assert.strictEqual(p.s.lastValidated, undefined, 'a validation is quick-deployed once');
+  assert.ok(!p.posted.some(m => m.type === 'status'), 'no card');
+});
+
+check('a Quick Deploy the org refuses: a failed run that says the validation may have expired — no dependency suggestion, the toast still fires', async () => {
+  const withObj = [...ITEMS, { type: 'CustomObject', name: 'AcmeRate__mdt', filePath: '/ws/force-app/main/default/objects/AcmeRate__mdt', files: [] }];
+  const p = provider({ fields: { items: withObj }, report: VALIDATED });
+  await deploy(p, KEYS, { validateOnly: true, testLevel: 'RunLocalTests' });
+  p.s.sf.deployReport = reportOnce({ id: QJOB, status: 'Failed', success: false, done: true, numberComponentErrors: 1, errorMessage: 'AcmeOrderService: Invalid type: AcmeRate__mdt',
+    details: { componentFailures: [{ componentType: 'ApexClass', fullName: 'AcmeOrderService', problem: 'Invalid type: AcmeRate__mdt' }] } });
+  await proto.runQuickDeploy.call(p.s, JOB);
+  const run = last(p).runs[0];
+  assert.deepStrictEqual([run.op, run.status], ['quickDeploy', 'failed']);
+  assert.ok(!run.suggest && !run.suggestId, 'nothing can be added to a quick deploy');
+  assert.ok(RV.verdictFor(run, { now: Date.now() }).plain.some(x => /validation may have expired/.test(x.text)));
+  assert.deepStrictEqual(p.toasts, ['Quick Deploy failed against acme-dev.']);
 });
 
 check('a validation without tests offers no Quick Deploy — the run says why', async () => {
@@ -388,6 +435,24 @@ check('lost contact, then Resume monitoring: the SAME run goes back to running a
   assert.ok(runs[0].notes.includes('Picked up again after contact was lost: rows are what acme-dev reported; 60 skipped rows are from when it started.'), JSON.stringify(runs[0].notes));
 });
 
+check('reload mid-quick-deploy: the reattach finishes the same quick deploy run, still naming its validation', async () => {
+  const p1 = provider({ report: VALIDATED });
+  await deploy(p1, KEYS, { validateOnly: true, testLevel: 'RunLocalTests' });
+  const validation = last(p1).runs[0];
+  let state;
+  p1.s.pollDeployJob = async function () { state = JSON.parse(JSON.stringify(p1.kept)); return { kind: 'lost' }; };
+  await proto.runQuickDeploy.call(p1.s, JOB);
+  const qd = last(p1).runs[0];
+  assert.strictEqual(state.activeDeployJob.runId, qd.id);
+  const p2 = provider({ state, report: { id: QJOB, status: 'Succeeded', success: true, done: true, details: {
+    componentSuccesses: KEYS.map(k => ({ componentType: 'ApexClass', fullName: k.split(':')[1] }))
+  } } });
+  await proto.reattachDeployJob.call(p2.s, proto.readActiveJob.call(p2.s));
+  const { runs } = last(p2);
+  assert.deepStrictEqual(runs.map(r => [r.id, r.op, r.status]), [[qd.id, 'quickDeploy', 'succeeded'], [validation.id, 'validate', 'succeeded']]);
+  assert.strictEqual(runs[0].fromRunId, validation.id);
+});
+
 check('a run id in the persisted job that is not one of ours is dropped; the job still reattaches, as a run of its own', async () => {
   const p = provider({ state: { activeDeployJob: { jobId: JOB, org: ORG, orgLabel: 'acme-dev', startedAt: Date.now(), verb: 'Deploy', noun: '2 components', runId: '../../x', testLevel: 'RunEverything!' } } });
   const job = proto.readActiveJob.call(p.s);
@@ -395,6 +460,79 @@ check('a run id in the persisted job that is not one of ours is dropped; the job
   await proto.reattachDeployJob.call(p.s, job);
   assert.strictEqual(last(p).runs[0].target, 'report');
   assert.ok(RR.RUN_ID_RE.test(last(p).runs[0].id));
+});
+
+// ================================================================ retrieves
+const retrieve = (p, keys = KEYS) => proto.runRetrieve.call(p.s, keys);
+const BACKUP = { note: 'Backed up 2 files — restore via \'SF Deploy: Restore Retrieve Backup\'.', dir: '/acme/storage/backups/acme-dev-1' };
+
+check('a retrieve is a run from its confirm: what it asks for, then one row per component; its backup offered on the newest run only', async () => {
+  const p = provider({ fields: { maybeBackupBeforeRetrieve: async () => BACKUP }, retrieve: { inboundFiles: [
+    { type: 'ApexClass', fullName: 'AcmeOrderService', state: 'Changed' },
+    { type: 'ApexClass', fullName: 'AcmeInvoiceService', state: 'Unchanged' }
+  ] } });
+  await retrieve(p);
+  const begun = runsPosts(p)[0];
+  assert.deepStrictEqual([begun.runs[0].op, begun.runs[0].status, begun.runs[0].target], ['retrieve', 'running', 'selection']);
+  assert.deepStrictEqual(begun.latestRows.rows.map(r => [r.k, r.o]), KEYS.map(k => [k, 'pending']));
+  assert.strictEqual(RV.outcomeLabel('pending', begun.runs[0]), 'Requested');
+  const { runs: [run], latestRows } = last(p);
+  assert.strictEqual(run.id, begun.runs[0].id);
+  assert.strictEqual(run.status, 'succeeded');
+  assert.deepStrictEqual(latestRows.rows.map(r => [r.k, r.o]), [
+    ['ApexClass:AcmeOrderService', 'changed'], ['ApexClass:AcmeInvoiceService', 'unchanged'], ['ApexClass:AcmeLedgerSync', 'missing']
+  ]);
+  assert.strictEqual(run.backupDir, BACKUP.dir);
+  assert.deepStrictEqual(run.notes, [BACKUP.note]);
+  const acts = RV.actionsFor(run, { isLatest: true, complete: true, selectKeys: KEYS });
+  assert.deepStrictEqual(acts.buttons.filter(b => b.via === 'action').map(b => b.message), [
+    { type: 'restoreBackup', dir: BACKUP.dir }, { type: 'discardBackup', dir: BACKUP.dir }
+  ]);
+  assert.ok(!p.posted.some(m => m.type === 'status'), 'no card');
+  // A newer run: the retrieve keeps its summary, not its backup buttons.
+  await deploy(p, KEYS);
+  const older = last(p).runs[1];
+  assert.strictEqual(older.id, run.id);
+  assert.ok(!('backupDir' in older) && !('backupDir' in p.kept.statusRuns.runs[1]), 'the backup stays reachable from the palette only');
+  assert.deepStrictEqual(RV.actionsFor(older, { isLatest: false, complete: true, selectKeys: KEYS }).buttons.map(b => b.id), ['copy']);
+});
+
+check('a backup that fails stops the retrieve: an "error" run — nothing was retrieved — and the org is never asked', async () => {
+  let asked = 0;
+  const p = provider({ fields: { maybeBackupBeforeRetrieve: async () => { throw new Error('EACCES: permission denied, mkdir'); } } });
+  p.s.sf.retrieveMetadata = () => { asked++; return { promise: new Promise(() => {}), cancel() {} }; };
+  await retrieve(p);
+  const run = last(p).runs[0];
+  assert.deepStrictEqual([run.op, run.status], ['retrieve', 'error']);
+  assert.ok(run.message.includes('EACCES'));
+  assert.strictEqual(RV.titleText(run, { now: Date.now() }), 'Retrieve from acme-dev failed — nothing was retrieved');
+  assert.strictEqual(asked, 0);
+  assert.ok(!p.posted.some(m => m.type === 'status'), 'no card');
+});
+
+check('a cancelled retrieve is "cancelled" — the local command stopped, not a deploy the org may still finish', async () => {
+  const p = provider({ retrieveError: new SfCliCancelledError() });
+  await retrieve(p);
+  const run = last(p).runs[0];
+  assert.deepStrictEqual([run.op, run.status], ['retrieve', 'cancelled']);
+  assert.strictEqual(RV.titleText(run, { now: Date.now() }), 'Retrieve from acme-dev cancelled');
+});
+
+check('a package.xml retrieve: its named members are asked for, a wildcard never goes "missing", and an empty answer says so', async () => {
+  const p = provider();
+  await proto.runManifestRetrieve.call(p.s, '/ws/manifest/package.xml', [{ type: 'ApexClass', members: ['AcmeOrderService'] }, { type: 'CustomLabels', members: ['*'] }]);
+  assert.deepStrictEqual(runsPosts(p)[0].latestRows.rows.map(r => r.k), ['ApexClass:AcmeOrderService'], 'asked for: the named member only');
+  const { runs: [run], latestRows } = last(p);
+  assert.deepStrictEqual([run.op, run.status, run.target], ['retrieve', 'succeeded', 'manifest']);
+  assert.deepStrictEqual(latestRows.rows.map(r => [r.k, r.o]), [['ApexClass:AcmeOrderService', 'missing']]);
+  assert.strictEqual(RV.titleText(run, { now: Date.now() }), 'Nothing retrieved from acme-dev');
+  assert.ok(run.notes.includes('The org returned no components for package.xml.'), JSON.stringify(run.notes));
+  // Only a wildcard, and nothing came back: no rows at all, and still no "Retrieved".
+  const w = provider();
+  await proto.runManifestRetrieve.call(w.s, '/ws/manifest/labels.xml', [{ type: 'CustomLabels', members: ['*'] }]);
+  const only = last(w);
+  assert.deepStrictEqual(only.latestRows.rows, []);
+  assert.strictEqual(RV.titleText(only.runs[0], { now: Date.now() }), 'Nothing retrieved from acme-dev');
 });
 
 // ============================================================ runs nothing began

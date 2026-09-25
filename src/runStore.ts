@@ -23,7 +23,7 @@ export const ROWS_FILE = path.join('status', 'latest-run.json');
  *  stored: a dependency suggestion's choices, and the Quick Deploy offer. */
 export interface RunLive {
   suggest?: { id: string; candidates: unknown[]; unresolved: string[] };
-  quick?: { jobId: string; until: number; used?: boolean };
+  quick?: { jobId: string; until: number };
 }
 
 export interface RunStoreHost {

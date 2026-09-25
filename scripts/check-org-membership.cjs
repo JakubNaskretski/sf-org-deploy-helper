@@ -212,13 +212,16 @@ check('source: deploy confirm is validateOnly-gated and feeds result successes',
 });
 
 check('source: quick deploy feeds deploySuccessRows(result), scanner-only mapping', () => {
-  assert.ok(src.includes('this.confirmDeployedOnOrg(deploySuccessRows(result), [], org, orgLabel);'));
+  // It reports through the deploy result path with no item list of its own.
+  assert.ok(src.includes('const successes = deploySuccessRows(result);'));
+  assert.ok(src.includes('if (!validateOnly) this.confirmDeployedOnOrg(successes, items, org, orgLabel);'));
+  assert.ok(/items: \[\], orgOnlySkipped: \[\], orgLabel, org, noun, cmdId, start, validateOnly: false, verb: 'Quick Deploy',/.test(src));
 });
 
 check('source: both retrieve sites feed org `ok` rows; no other confirm call sites', () => {
   assert.strictEqual((src.match(/this\.confirmOnOrg\(ok, org, orgLabel\);/g) || []).length, 2);
   assert.strictEqual((src.match(/this\.confirmOnOrg\(/g) || []).length, 2);
-  assert.strictEqual((src.match(/this\.confirmDeployedOnOrg\(/g) || []).length, 2);
+  assert.strictEqual((src.match(/this\.confirmDeployedOnOrg\(/g) || []).length, 1, 'deploy and quick deploy share one call site');
 });
 
 if (failed > 0) { console.error(`${failed}/${ran} checks FAILED`); process.exit(1); }

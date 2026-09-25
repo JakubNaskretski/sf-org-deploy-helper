@@ -94,7 +94,7 @@
    *  the org may still be working on it. */
   function outcomeLabel(o, run) {
     if (o === 'pending' && run && run.status === 'error') return run.op === 'validate' ? 'Not validated' : run.op === 'retrieve' ? 'Not retrieved' : 'Not deployed';
-    if (o === 'pending' && run && run.status === 'running') return 'Sent';
+    if (o === 'pending' && run && run.status === 'running') return run.op === 'retrieve' ? 'Requested' : 'Sent';
     return (OUTCOMES[o] || { label: o }).label;
   }
   const outcomeKind = (o) => (OUTCOMES[o] || { kind: 'skip' }).kind;
@@ -137,7 +137,7 @@
         } else if (run.op === 'retrieve') {
           const got = cnt(run, 'changed') + cnt(run, 'created') + cnt(run, 'unchanged');
           out.glyph = '↓';
-          if (got === 0 && cnt(run, 'missing') > 0) { out.kind = 'warn'; out.title = ['Nothing retrieved from ', ORG]; } else out.title = ['Retrieved from ', ORG];
+          if (got === 0) { out.kind = 'warn'; out.title = ['Nothing retrieved from ', ORG]; } else out.title = ['Retrieved from ', ORG];
           if (run.backupDir) out.plain.push({ kind: '', text: 'Your local copies were backed up before being overwritten — Restore or Discard below.' });
         } else if (run.op === 'quickDeploy') {
           out.title = ['Quick-deployed to ', ORG];
@@ -193,7 +193,8 @@
       case 'timeout':
         out.kind = 'warn'; out.glyph = '⚠';
         out.title = ['Timed out waiting for ', ORG];
-        out.plain.push({ kind: 'warn', text: 'Stopping the wait did not stop the org — it may still finish this. Check Deployment Status in the org.' });
+        // A retrieve's hint says what its timeout means for local files.
+        if (run.op !== 'retrieve') out.plain.push({ kind: 'warn', text: 'Stopping the wait did not stop the org — it may still finish this. Check Deployment Status in the org.' });
         if (message) out.plain.push(message);
         if (run.hint) out.plain.push({ kind: 'muted', text: 'Hint: ' + run.hint });
         break;
