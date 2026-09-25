@@ -344,6 +344,14 @@ check('the match is exact — only the persisted verb itself reads as a validati
   }
 });
 
+check('a reattached job\'s run retries in the job\'s mode and test level, and stores no keys', () => {
+  // The run keeps what a Retry re-runs with; the keys come from the rows the
+  // org's report listed, never from storage.
+  const { runRetryFrom } = require(path.join(__dirname, '..', 'out', 'runRecords.js'));
+  assert.deepStrictEqual(runRetryFrom({ keys: ['ApexClass:AcmeA'], ...verbModes('Validate'), testLevel: 'RunLocalTests' }), { validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.deepStrictEqual(runRetryFrom({ keys: ['ApexClass:AcmeA'], ...verbModes('Deploy') }), { validateOnly: false });
+});
+
 // ============================== a validation stays a validation, end to end
 // The load-bearing contract: every path back into runDeploy from a validation's
 // card must re-enter it as a validation.

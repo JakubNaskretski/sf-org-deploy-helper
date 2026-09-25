@@ -369,10 +369,12 @@
     const visibleTests = [];
     const types = new Map();
     let listed = 0;
+    let skippedListed = 0;
     if (filter !== 'tests') {
       for (const r of rows) {
         if (filter !== 'all' && r.o !== filter) continue;
         listed++;
+        if (r.o === 'skipped') skippedListed++;
         const { type, name } = splitKey(r.k);
         if (t.length && !matches(t, name + ' ' + type + ' ' + (r.m || '') + ' ' + (r.f || ''))) continue;
         let g = types.get(type);
@@ -397,7 +399,7 @@
     }
     const tgroups = [...classes.values()].sort((a, b) => b.items.length - a.items.length || (a.cls < b.cls ? -1 : a.cls > b.cls ? 1 : 0));
     for (const g of tgroups) g.items.sort((a, b) => (a.method < b.method ? -1 : a.method > b.method ? 1 : 0));
-    const grouped = { groups, tgroups, visible, visibleTests, listed };
+    const grouped = { groups, tgroups, visible, visibleTests, listed, skippedListed };
     if (cache) Object.assign(cache, { rows, tests, filter, q, run, grouped });
     return grouped;
   }
@@ -434,8 +436,16 @@
       const order = run.op === 'retrieve' ? RETRIEVE_CHIPS : DEPLOY_CHIPS;
       const known = filter === 'all' ? order.reduce((s, o) => s + (typeof c[o] === 'number' ? c[o] : 0), 0) : (c[filter] || 0);
       const missingRows = known - g.listed;
-      if (missingRows > 0) {
-        out.push({ k: 'note', h: ROW_H.note, text: fmtN(missingRows) + ' more ' + plural(missingRows, 'row') + ' not listed — ' + (opts.complete
+      // A run picked up again after a reload keeps only some of the rows it
+      // skipped before the reload; it knows the rest by count.
+      const skippedGap = opts.complete && (filter === 'all' || filter === 'skipped')
+        ? Math.min(missingRows, (typeof c.skipped === 'number' ? c.skipped : 0) - g.skippedListed) : 0;
+      if (skippedGap > 0) {
+        out.push({ k: 'note', h: ROW_H.note, text: fmtN(skippedGap) + ' more skipped ' + plural(skippedGap, 'row') + ' not listed — only ' + fmtN(g.skippedListed) + ' were kept across the window reload.' });
+      }
+      const otherGap = missingRows - Math.max(0, skippedGap);
+      if (otherGap > 0) {
+        out.push({ k: 'note', h: ROW_H.note, text: fmtN(otherGap) + ' more ' + plural(otherGap, 'row') + ' not listed — ' + (opts.complete
           ? 'the org counted them without itemizing them.'
           : 'the full list is kept for the newest run only, and was not available after the window reloaded.') });
       }

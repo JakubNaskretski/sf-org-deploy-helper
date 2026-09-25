@@ -440,7 +440,7 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
 
 export interface BeginRunInput {
   id: string;
-  op: 'deploy' | 'validate';
+  op: 'deploy' | 'validate' | 'quickDeploy';
   org: string;
   orgLabel: string;
   orgKind: OrgKind;

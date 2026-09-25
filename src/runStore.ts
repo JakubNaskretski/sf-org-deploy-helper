@@ -160,6 +160,37 @@ export class RunStore {
     return true;
   }
 
+  /** The rows this window holds for a run: the newest run's full list when it
+   *  has it, else what the run's summary kept. */
+  rowsOf(id: string): RunRow[] {
+    this.load();
+    if (this.full?.runId === id) return this.full.rows;
+    return this.list.find(r => r.id === id)?.rows ?? [];
+  }
+
+  /** A run picked up again (its job still on the org): back to running, with
+   *  the rows it still holds. False when the history no longer has it. */
+  resume(id: string): boolean {
+    this.load();
+    const at = this.list.findIndex(r => r.id === id);
+    if (at < 0) return false;
+    const { finishedAt: _finished, ...rest } = this.list[at];
+    this.list[at] = { ...rest, status: 'running' };
+    this.persistRuns();
+    this.post(true);
+    return true;
+  }
+
+  /** A run whose job can no longer be picked up: its result was never recorded. */
+  interrupt(id: string): void {
+    this.load();
+    const at = this.list.findIndex(r => r.id === id);
+    if (at < 0 || this.list[at].status !== 'running') return;
+    this.list[at] = interruptedRun(this.list[at]);
+    this.persistRuns();
+    this.post(false);
+  }
+
   /** Clear: notices, finished runs and the rows file go; a running run stays —
    *  its result is on its way. */
   async clear(): Promise<void> {

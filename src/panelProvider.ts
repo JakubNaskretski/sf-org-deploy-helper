@@ -17,7 +17,7 @@ import { SuggestionLogEntry, formatSuggestionLog, mergeSuggestionEntry } from '.
 import { canScanDependencies, DEFAULT_MAX_BUNDLE_FILES, DEFAULT_MAX_DEPS, DEFAULT_MAX_DEPTH, formatDependencyAttribution, resolveLocalDependencies } from './depGraph';
 import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
-import { DeployRunInput, OrgKind, RunRecord, RunTarget, beginDeployRun, deployRunFromResult, deploySuccessRows, envelopeProblem, newRunId, runRetryFrom } from './runRecords';
+import { DeployRunInput, OrgKind, RUN_ID_RE, RunRecord, RunRow, RunTarget, beginDeployRun, deployRunFromResult, deploySuccessRows, envelopeProblem, newRunId, runRetryFrom } from './runRecords';
 import { RunLive, RunStore } from './runStore';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
@@ -209,6 +209,11 @@ interface ActiveDeployJob {
   startedAt: number;
   verb: DeployVerb;
   noun: string;
+  /** The Status pane run this job belongs to, so a reattach finishes that same
+   *  run. Absent on a job persisted before runs existed. */
+  runId?: string;
+  /** The test level it ran with — what a Retry after a reattach runs again. */
+  testLevel?: TestLevel;
 }
 
 /** How a poll loop ended: `terminal` (the org finished — render the result),
@@ -2881,7 +2886,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // The job now exists on the org — pin it (makes Cancel org-side-live) and
           // persist it so a window reload can reattach.
           this.currentDeployJobId = jobId;
-          this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb, noun });
+          this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb, noun, runId, testLevel });
           this.runStore.update(runId, { jobId });
           const outcome = await this.drivePolledDeploy(
             { jobId, org, orgLabel, root, verb, noun, cmdId, start, progressTitle, runId }, report,
@@ -3313,6 +3318,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  selection to go on — the org's own report. */
       target?: RunTarget;
       notes?: string[];
+      /** The run's operation when the verb alone can't say it (a quick deploy
+       *  reports through here too). */
+      op?: 'deploy' | 'validate' | 'quickDeploy';
+      /** Skipped rows a run picked up after a reload still knows (and their
+       *  exact count): the report cannot say what never reached the org. */
+      keptSkipped?: { rows: RunRow[]; count: number };
+      /** A quick deploy's validation. */
+      fromRunId?: string;
     }
   ): MissingDependencies | undefined {
     const { items, orgOnlySkipped, orgLabel, org, cmdId, start, validateOnly } = ctx;
@@ -3333,7 +3346,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const fromSelection = target === 'selection' || target === 'sourceDir';
     const runInput: DeployRunInput = {
       id: ctx.runId ?? newRunId(),
-      op: validateOnly ? 'validate' : 'deploy',
+      op: ctx.op ?? (validateOnly ? 'validate' : 'deploy'),
       org, orgLabel, orgKind: this.orgKindOf(org),
       startedAt: ctx.runStartedAt ?? start,
       finishedAt: Date.now(),
@@ -3345,7 +3358,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       testLevel: ctx.retry?.testLevel,
       retry: runRetryFrom(ctx.retry),
       conflict: isConflictFailure(result),
-      notes: ctx.notes
+      notes: ctx.notes,
+      fromRunId: ctx.fromRunId
+    };
+    // A run picked up after a reload keeps the skipped rows it knew about.
+    const withKept = (run: RunRecord): RunRecord => {
+      const kept = ctx.keptSkipped;
+      if (!kept) return run;
+      const have = new Set(run.rows.map(r => r.k));
+      for (const r of kept.rows) if (!have.has(r.k)) run.rows.push({ ...r });
+      run.counts.skipped = kept.count;
+      return run;
     };
     if (success) {
       // Only a validation that ran tests can be quick-deployed (the org refuses
@@ -3365,14 +3388,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (rollbackOnError is never disabled by this extension), so a failed run
       // leaves org membership as it was.
       if (!validateOnly) this.confirmDeployedOnOrg(successes, items, org, orgLabel);
-      this.runStore.finish(deployRunFromResult(result, runInput));
+      this.runStore.finish(withKept(deployRunFromResult(result, runInput)));
       this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}` : `Deployed ${ctx.noun} to ${orgLabel}`);
       return undefined;
     }
     if ((typeof result.status === 'string' ? result.status : '') === 'Canceled') {
       // The org stopped it and rolled back whatever it had processed: an honest
       // "cancelled" run, never a failure to act on.
-      this.runStore.finish(deployRunFromResult(result, runInput));
+      this.runStore.finish(withKept(deployRunFromResult(result, runInput)));
       this.notifyIfPanelHidden(`${validateOnly ? 'Validate against' : 'Deploy to'} ${orgLabel} cancelled — The org cancelled the deploy.`, 'warn');
       return undefined;
     }
@@ -3464,7 +3487,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         ? [`Referenced but not found in your workspace: ${deps.unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
         : [])
     ];
-    const run = deployRunFromResult(result, { ...runInput, notes: [...guidanceLines, ...(ctx.notes ?? [])] });
+    const run = withKept(deployRunFromResult(result, { ...runInput, notes: [...guidanceLines, ...(ctx.notes ?? [])] }));
     if (suggestId) run.suggestId = suggestId;
     this.runStore.finish(run);
     const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
@@ -3653,6 +3676,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     ctx: {
       items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number;
       validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest; runId?: string; runStartedAt?: number; target?: RunTarget; notes?: string[];
+      op?: 'deploy' | 'validate' | 'quickDeploy'; keptSkipped?: { rows: RunRow[]; count: number }; fromRunId?: string;
     }
   ): MissingDependencies | undefined {
     return this.reportDeployResult(result, ctx);
@@ -3732,7 +3756,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (typeof j.orgLabel !== 'string' || typeof j.noun !== 'string') return undefined;
     if (typeof j.startedAt !== 'number') return undefined;
     if (j.verb !== 'Deploy' && j.verb !== 'Validate' && j.verb !== 'Quick Deploy') return undefined;
-    return { jobId: j.jobId, org: j.org, orgLabel: j.orgLabel, startedAt: j.startedAt, verb: j.verb, noun: j.noun };
+    const job: ActiveDeployJob = { jobId: j.jobId, org: j.org, orgLabel: j.orgLabel, startedAt: j.startedAt, verb: j.verb, noun: j.noun };
+    // Both optional: a job persisted before runs existed has neither, and still
+    // reattaches (as a run of its own). A malformed value is dropped, not trusted.
+    if (typeof j.runId === 'string' && RUN_ID_RE.test(j.runId)) job.runId = j.runId;
+    if (isTestLevel(j.testLevel)) job.testLevel = j.testLevel;
+    return job;
   }
 
   /** On panel `ready`: if a still-recent async job is persisted and the busy slot is
@@ -3742,7 +3771,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private maybeReattachDeploy(): void {
     const job = this.readActiveJob();
     if (!job) return;
-    if (Date.now() - job.startedAt > ACTIVE_JOB_MAX_AGE_MS) { this.clearActiveJob(); return; }
+    if (Date.now() - job.startedAt > ACTIVE_JOB_MAX_AGE_MS) {
+      this.clearActiveJob();
+      // Nothing will ever report on its run now.
+      if (job.runId) this.runStore.interrupt(job.runId);
+      return;
+    }
     if (this.busy) return; // an op holds the slot — leave the job for the next ready
     if (!this.reserveBusy(job.verb)) return;
     void this.reattachDeployJob(job);
@@ -3783,6 +3817,34 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const cmdId = this.beginCmd(`sf project deploy report --job-id ${job.jobId} --target-org ${job.org}`);
     const start = Date.now();
     const progressTitle = `Reattaching to ${job.verb.toLowerCase()} of ${job.noun} ${prep} ${job.orgLabel}`;
+    // The persisted verb is the ONLY record that this job was check-only (a
+    // validation) once the original run's opts are gone — read once, for both the
+    // run and its retry, so the two can never disagree.
+    const modes = verbModes(job.verb);
+    const op = job.verb === 'Quick Deploy' ? 'quickDeploy' : modes.validateOnly ? 'validate' : 'deploy';
+    // The run this job belongs to goes back to running and finishes as the same
+    // run, keeping what it knew before the reload (its skipped rows, its test
+    // level). A job from before runs existed, or whose run is gone from the
+    // history, becomes a run of its own that knows only the org's report.
+    const prior = job.runId ? this.runStore.runs().find(r => r.id === job.runId) : undefined;
+    const runId = prior ? prior.id : newRunId();
+    const testLevel = job.testLevel ?? prior?.testLevel;
+    // A package.xml run still retries its package.xml; any other run's Retry
+    // sends the rows the report lists, with the options it ran with.
+    const target: RunTarget = prior?.target === 'manifest' ? 'manifest' : 'report';
+    const priorRetry = prior?.retry;
+    if (prior) this.runStore.resume(runId);
+    else {
+      this.runStore.begin(beginDeployRun({
+        id: runId, op, org: job.org, orgLabel: job.orgLabel, orgKind: this.orgKindOf(job.org),
+        startedAt: job.startedAt, target, items: [], testLevel
+      }));
+      this.runStore.update(runId, { jobId: job.jobId });
+    }
+    const kept = prior ? this.keptSkipped(prior) : undefined;
+    const known = prior
+      ? `${prior.status === 'lost' ? 'Picked up again after contact was lost' : 'Re-attached after a window reload'}: rows are what ${job.orgLabel} reported${kept?.count ? `; ${kept.count} skipped row${kept.count === 1 ? ' is' : 's are'} from when it started` : ''}.`
+      : `Re-attached after a window reload: only what ${job.orgLabel}'s report contains. Rows skipped before the deploy started aren't known.`;
     this.currentDeployJobId = job.jobId;
     this.currentDeployOrg = job.org;
     let keepPersisted = false;
@@ -3790,21 +3852,15 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       await this.withWindowProgress(progressTitle, async report => {
         this.postProgress(`${progressTitle}…`);
         const outcome = await this.drivePolledDeploy(
-          { jobId: job.jobId, org: job.org, orgLabel: job.orgLabel, root, verb: job.verb, noun: job.noun, cmdId, start, progressTitle }, report,
+          { jobId: job.jobId, org: job.org, orgLabel: job.orgLabel, root, verb: job.verb, noun: job.noun, cmdId, start, progressTitle, runId }, report,
           result => {
             const items = this.itemsFromReport(result);
-            // The persisted verb is the ONLY record that this job was check-only
-            // (a validation) once the original run's opts are gone — read once, for
-            // both the card and its retry, so the two can never disagree.
-            const modes = verbModes(job.verb);
             this.reportPolledDeploy(result, {
               items, orgOnlySkipped: [], orgLabel: job.orgLabel, org: job.org,
-              noun: job.noun, cmdId, start, ...modes, verb: job.verb,
-              // Reattached runs take their component list from the report —
-              // retry re-deploys that set under the CURRENT panel defaults.
-              retry: { keys: items.map(i => `${i.type}:${i.name}`), ...modes },
-              target: 'report', runStartedAt: job.startedAt,
-              notes: [`Re-attached after a window reload: only what ${job.orgLabel}'s report contains. Rows skipped before the deploy started aren't known.`]
+              noun: job.noun, cmdId, start, ...modes, verb: job.verb, op,
+              retry: op === 'quickDeploy' ? undefined
+                : { ...(priorRetry ?? { ...modes, ...(testLevel ? { testLevel } : {}) }), keys: items.map(i => `${i.type}:${i.name}`) },
+              target, runId, runStartedAt: prior?.startedAt ?? job.startedAt, keptSkipped: kept, notes: [known]
             });
           }
         );
@@ -3812,7 +3868,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       });
     } catch (err) {
       this.endCmd(cmdId, false, Date.now() - start);
-      this.reportError(`${job.verb} ${prep} ${job.orgLabel}`, err);
+      this.reportError(`${job.verb} ${prep} ${job.orgLabel}`, err, runId);
     } finally {
       if (!keepPersisted) this.clearActiveJob();
       this.currentCancel = undefined;
@@ -3820,6 +3876,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.currentDeployOrg = undefined;
       this.setBusy(false);
     }
+  }
+
+  /** What a run that is picked up again still knows about its skipped rows:
+   *  the ones this window holds (all of them, or after a reload the ones its
+   *  summary kept), and the exact count. Undefined when it never knew. */
+  private keptSkipped(run: RunRecord): { rows: RunRow[]; count: number } | undefined {
+    if (typeof run.counts.skipped !== 'number') return undefined;
+    return { rows: this.runStore.rowsOf(run.id).filter(r => r.o === 'skipped'), count: run.counts.skipped };
   }
 
   /** Quick-deploy a previously-validated deployment by its job id — no re-run of
@@ -4206,7 +4270,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const jobId = submit.id;
           if (!jobId) throw new SfCliError('Deploy submitted but the CLI returned no job id to track.');
           this.currentDeployJobId = jobId;
-          this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb: 'Deploy', noun });
+          this.persistActiveJob({ jobId, org, orgLabel, startedAt: Date.now(), verb: 'Deploy', noun, runId, testLevel });
           this.runStore.update(runId, { jobId });
           const outcome = await this.drivePolledDeploy(
             { jobId, org, orgLabel, root, verb: 'Deploy', noun, cmdId, start, progressTitle, runId }, report,
@@ -5738,7 +5802,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       cap: () => {
         try { return vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('statusHistoryRuns'); } catch { return undefined; }
       },
-      live: run => this.liveRunPayload(run)
+      live: run => this.liveRunPayload(run),
+      // The run whose job a reload left persisted is picked up again on the next
+      // ready, so it is not "interrupted".
+      activeRunId: () => {
+        try { return this.readActiveJob()?.runId; } catch { return undefined; }
+      }
     }));
   }
 

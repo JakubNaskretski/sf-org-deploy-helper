@@ -14,7 +14,11 @@
 //     a conflict), a timed-out submit, a killed submit, a failed package.xml
 //     write — each keeps what was sent, so a Retry can send it again;
 //   - Quick Deploy's offer on a validation that ran tests, and its "used" state;
-//   - a reattached job (no run began it) and a package.xml deploy.
+//   - after a window reload: the job's own run stays running and the reattach
+//     finishes that SAME run (skipped rows and count kept, Retry at the original
+//     test level); a run with no job left, or whose job is too old, is
+//     "interrupted"; a lost run's Resume picks the same run up again;
+//   - a reattached job no run began (an older version's) and a package.xml deploy.
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
@@ -65,7 +69,7 @@ const ORG_ONLY = 'ApexClass:AcmeOrgOnly';
  *  only reaches after minutes (lost contact, an unconfirmed cancel). */
 function provider(extra = {}) {
   const posted = [];
-  const kept = {};
+  const kept = extra.state ? JSON.parse(JSON.stringify(extra.state)) : {};
   const toasts = [];
   const s = Object.create(proto);
   const sf = {
@@ -300,6 +304,97 @@ check('a validation without tests offers no Quick Deploy — the run says why', 
   assert.strictEqual(run.quick, undefined);
   assert.strictEqual(run.testsRan, false);
   assert.ok(RV.actionsFor(run, { isLatest: true, complete: true }).why.includes('no Apex tests ran'));
+});
+
+// ============================================================ after a reload
+const SKIPS = Array.from({ length: 60 }, (_, i) => `ApexClass:AcmeOrgOnly${String(i).padStart(2, '0')}`);
+const MEMBERS = new Map(SKIPS.map(k => [k, {}]));
+/** What a window reload finds when it happens mid-run: the state as the poll
+ *  loop starts (the run running, its job persisted). */
+async function stateMidRun(opts = {}) {
+  let state;
+  const p = provider({ fields: { orgMembers: MEMBERS }, poll: async function () { state = JSON.parse(JSON.stringify(p.kept)); return { kind: 'lost' }; } });
+  await deploy(p, [...KEYS, ...SKIPS], opts);
+  return { state, id: runsPosts(p)[0].runs[0].id };
+}
+const FAILED_VALIDATION = { id: JOB, status: 'Failed', success: false, done: true, numberComponentErrors: 1, runTestsEnabled: true, details: {
+  componentSuccesses: [{ componentType: 'ApexClass', fullName: 'AcmeOrderService' }],
+  componentFailures: [{ componentType: 'ApexClass', fullName: 'AcmeInvoiceService', problem: 'Variable does not exist: acmeTotal', lineNumber: 7 }]
+} };
+
+check('reload mid-validation: the job\'s run stays running, and the reattach finishes the SAME run — skipped rows and count kept, Retry at its test level', async () => {
+  const { state, id } = await stateMidRun({ validateOnly: true, testLevel: 'RunLocalTests' });
+  assert.strictEqual(state.activeDeployJob.runId, id, 'the job knows its run');
+  assert.strictEqual(state.activeDeployJob.testLevel, 'RunLocalTests');
+  const p = provider({ state, fields: { orgMembers: MEMBERS }, report: FAILED_VALIDATION });
+  assert.strictEqual(p.s.runStore.runs()[0].status, 'running', 'the run whose job is persisted is not "interrupted" by the reload');
+  await proto.reattachDeployJob.call(p.s, proto.readActiveJob.call(p.s));
+  const { runs, latestRows } = last(p);
+  assert.deepStrictEqual(runs.map(r => r.id), [id], 'one run for one job — never a second one');
+  const run = runs[0];
+  assert.strictEqual(run.status, 'failed');
+  assert.strictEqual(run.op, 'validate');
+  assert.strictEqual(run.counts.skipped, 60, 'the exact count from before the reload');
+  assert.strictEqual(latestRows.rows.filter(r => r.o === 'skipped').length, 50, 'the skipped rows its summary kept');
+  assert.ok(run.notes.includes('Re-attached after a window reload: rows are what acme-dev reported; 60 skipped rows are from when it started.'), JSON.stringify(run.notes));
+  const retry = RV.actionsFor(run, { isLatest: true, complete: true, sent: RR.sentKeys({ rows: latestRows.rows }) }).buttons.find(b => b.id === 'retry');
+  assert.deepStrictEqual(retry.message.request, { validateOnly: true, testLevel: 'RunLocalTests', keys: ['ApexClass:AcmeOrderService', 'ApexClass:AcmeInvoiceService'] });
+  const notes = RV.buildRows(run, latestRows.rows, latestRows.tests, { filter: 'all', folds: {} }, { complete: true }).rows.filter(r => r.k === 'note').map(r => r.text);
+  assert.deepStrictEqual(notes, ['10 more skipped rows not listed — only 50 were kept across the window reload.']);
+  assert.ok(!('activeDeployJob' in p.kept) || p.kept.activeDeployJob === undefined, 'the finished job is cleared');
+});
+
+check('reload with no job left for a running run: it is "interrupted" (and stays so), with the org to check', async () => {
+  const { state, id } = await stateMidRun();
+  delete state.activeDeployJob;
+  const p = provider({ state });
+  const run = p.s.runStore.runs()[0];
+  assert.strictEqual(run.id, id);
+  assert.strictEqual(run.status, 'interrupted');
+  assert.ok(run.notes.some(n => n.includes('Check Deployment Status in the org')));
+  assert.strictEqual(p.kept.statusRuns.runs[0].status, 'interrupted', 'the correction is persisted');
+});
+
+check('a job too old to pick up again: cleared without a report call, and its run is "interrupted"', async () => {
+  const { state } = await stateMidRun();
+  state.activeDeployJob.startedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
+  let reports = 0;
+  const p = provider({ state });
+  p.s.sf.deployReport = () => { reports++; return { promise: new Promise(() => {}), cancel() {} }; };
+  assert.strictEqual(p.s.runStore.runs()[0].status, 'running');
+  proto.maybeReattachDeploy.call(p.s);
+  assert.strictEqual(p.kept.activeDeployJob, undefined);
+  assert.strictEqual(p.s.runStore.runs()[0].status, 'interrupted');
+  assert.strictEqual(last(p).runs[0].status, 'interrupted', 'and the pane is told');
+  assert.strictEqual(reports, 0);
+});
+
+check('lost contact, then Resume monitoring: the SAME run goes back to running and finishes, every skipped row kept', async () => {
+  const p = provider({ fields: { orgMembers: MEMBERS }, poll: async () => ({ kind: 'lost' }), report: { id: JOB, status: 'Succeeded', success: true, done: true, details: {
+    componentSuccesses: KEYS.map(k => ({ componentType: 'ApexClass', fullName: k.split(':')[1] }))
+  } } });
+  await deploy(p, [...KEYS, ...SKIPS]);
+  const lost = last(p).runs[0];
+  assert.strictEqual(lost.status, 'lost');
+  delete p.s.pollDeployJob; // the real poll loop from here on
+  const posts = runsPosts(p).length;
+  await proto.reattachDeployJob.call(p.s, proto.readActiveJob.call(p.s));
+  const after = runsPosts(p).slice(posts);
+  assert.strictEqual(after[0].runs[0].status, 'running', 'back to running first');
+  const { runs, latestRows } = last(p);
+  assert.deepStrictEqual(runs.map(r => [r.id, r.status]), [[lost.id, 'succeeded']]);
+  assert.strictEqual(runs[0].counts.skipped, 60);
+  assert.strictEqual(latestRows.rows.filter(r => r.o === 'skipped').length, 60, 'this window still holds all of them');
+  assert.ok(runs[0].notes.includes('Picked up again after contact was lost: rows are what acme-dev reported; 60 skipped rows are from when it started.'), JSON.stringify(runs[0].notes));
+});
+
+check('a run id in the persisted job that is not one of ours is dropped; the job still reattaches, as a run of its own', async () => {
+  const p = provider({ state: { activeDeployJob: { jobId: JOB, org: ORG, orgLabel: 'acme-dev', startedAt: Date.now(), verb: 'Deploy', noun: '2 components', runId: '../../x', testLevel: 'RunEverything!' } } });
+  const job = proto.readActiveJob.call(p.s);
+  assert.ok(job && !('runId' in job) && !('testLevel' in job), JSON.stringify(job));
+  await proto.reattachDeployJob.call(p.s, job);
+  assert.strictEqual(last(p).runs[0].target, 'report');
+  assert.ok(RR.RUN_ID_RE.test(last(p).runs[0].id));
 });
 
 // ============================================================ runs nothing began

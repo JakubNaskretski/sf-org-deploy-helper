@@ -277,6 +277,19 @@ check('a slot-less early return is still answered with a busy re-sync', async ()
   assert.deepStrictEqual(p.busyPosts(), [{ busy: false, action: undefined }]);
 });
 
+check('Resume monitoring ×2: one reattach of the persisted job; the twin is told an operation is running', async () => {
+  reset();
+  const job = { jobId: '0Af000000000001AAA', org: 'acme-dev-user', orgLabel: 'acme-dev', startedAt: Date.now() - 60_000, verb: 'Deploy', noun: '2 components' };
+  const p = provider({ activeJob: job });
+  p.send({ type: 'resumeDeploy', jobId: job.jobId });
+  p.send({ type: 'resumeDeploy', jobId: job.jobId });
+  await ticks();
+  assert.strictEqual(p.sfCalls.filter(c => /report/i.test(c.name)).length, 1, JSON.stringify(p.sfCalls.map(c => c.name)));
+  assert.strictEqual(p.s.busy, true);
+  assert.ok(toasts.some(t => /Deploy is already running/.test(t)), JSON.stringify(toasts));
+  assert.ok(p.busyPosts().length >= 2 && p.busyPosts().every(b => b.busy === true), JSON.stringify(p.busyPosts()));
+});
+
 check('a handler that throws before touching the slot is still answered', async () => {
   reset();
   const p = provider({ fields: { resolveKeys: () => { throw new Error('boom'); } } });
