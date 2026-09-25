@@ -2816,11 +2816,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
 
       // Echo the --tests flags too (one per class, matching how the CLI itself
-      // repeats the flag) so the command log names exactly what will run. The
-      // level is always explicit: omitted, a production org runs local tests on
-      // an Apex payload whatever was picked. A no-test validate is a dry-run
-      // `start`; `validate` sets --ignore-conflicts itself (see deployMetadata).
-      const testArg = ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`;
+      // repeats the flag) so the command log names exactly what will run.
+      // NoTestRun stays off the command line: production refuses it for every
+      // payload, and a sandbox runs no tests by default anyway. A no-test
+      // validate is a dry-run `start`; `validate` sets --ignore-conflicts itself.
+      const testArg = testLevel !== 'NoTestRun'
+        ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
+        : '';
       const cmdVerb = !opts.validateOnly ? 'start' : testLevel === 'NoTestRun' ? 'start --dry-run' : 'validate';
 
       // Snapshot the retry request once, up front: the client-side conflict
@@ -2873,7 +2875,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined,
               manifest: manifest?.path,
               validateOnly: opts.validateOnly,
-              testLevel,
+              testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
               runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined,
               background: true
             }
@@ -3052,16 +3054,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // deploy that runs no tests at all — which is exactly the case the modal
     // exists to disclose.
     //
-    // NoTestRun against production is additionally a level the ORG refuses when
-    // the payload contains Apex, so the note warns there. It cannot be reached by
-    // the smart default (production falls back to RunLocalTests) — only an
-    // explicit pick in the panel or defaultTestLevel gets here, i.e. the user
-    // meant it and the deploy is about to bounce. It warns rather than refuses
-    // because NoTestRun is legitimate for an Apex-free payload, and nothing here
-    // knows whether this one carries Apex.
+    // NoTestRun never reaches sf as a flag (see runDeploy): production refuses the
+    // level outright, so there the org applies its own default instead — local
+    // tests when the payload has Apex. The smart default can't get here (prod
+    // falls back to RunLocalTests); only an explicit pick or defaultTestLevel
+    // does, and the note says what will really happen.
     const testNote = (testLevel === 'NoTestRun'
         ? (isProd
-          ? '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.'
+          ? '\n\nTests: none requested — production applies its own default, so local tests run if the payload contains Apex.'
           : opts.validateOnly
             ? '\n\nTests: none (NoTestRun) — no Quick Deploy afterwards; that needs a validation that ran tests.'
             : '\n\nTests: none (NoTestRun)')
@@ -3094,7 +3094,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const manifestLine = manifestNotice(useManifest);
     // Said BEFORE the run: selected org-only rows (a group checkbox ticks them)
     // have no local file, and "N skipped" on the card explained nothing.
-    const skipLine = skipped ? `${skipped} more selected exist only on the org — no local file to deploy, so they are skipped.` : undefined;
+    const skipLine = skipped ? `${skipped} more selected ${skipped === 1 ? 'exists' : 'exist'} only on the org — no local file to deploy, so ${skipped === 1 ? 'it is' : 'they are'} skipped.` : undefined;
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
@@ -3334,9 +3334,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.endCmd(cmdId, success, Date.now() - start);
     if (success) {
       // Only a validation that ran tests can be quick-deployed (the org refuses
-      // one that didn't). The org's own runTestsEnabled covers a reattached job,
-      // whose retry request carries no level.
-      const quickId = validateOnly && ctx.retry?.testLevel !== 'NoTestRun' && String(result.runTestsEnabled) !== 'false' ? result.id : undefined;
+      // one that didn't). The org's runTestsEnabled says whether they ran — a
+      // NoTestRun pick on production still runs local tests for an Apex payload;
+      // without it (older output) the resolved level decides.
+      const testsRan = result.runTestsEnabled == null ? ctx.retry?.testLevel !== 'NoTestRun' : String(result.runTestsEnabled) !== 'false';
+      const quickId = validateOnly && testsRan ? result.id : undefined;
       if (quickId) {
         // Remember the validated deployment so the card's Quick Deploy button can
         // deploy it without re-validating / re-running tests.
@@ -3355,7 +3357,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
             : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
           meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped (org only)` : ''}`,
-          lines: this.capForCard(`Deployed to ${orgLabel} — full component list`, [...skipHead, ...skipLines, ...lines]),
+          lines: this.cardWithSkips(`Deployed to ${orgLabel} — full component list`, skipHead, skipLines, lines),
           // Built from the ITEMS, not from the display lines: a manifest deploy
           // synthesizes its items straight from <members> (wildcards and all) and
           // a reattached job synthesizes them from the org's own report, so those
@@ -4172,7 +4174,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const confirm = await this.awaitConfirm(modal);
       if (!confirm) return;
 
-      const testArg = ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`;
+      const testArg = testLevel !== 'NoTestRun'
+        ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
+        : '';
       const cmdId = this.beginCmd(`sf project deploy start --manifest ${/\s/.test(manifestPath) ? `"${manifestPath}"` : manifestPath} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
       reserved = false;
       const start = Date.now();
@@ -4186,7 +4190,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             manifest: manifestPath,
             ignoreConflicts,
             timeoutMs: this.timeoutMs(),
-            testLevel,
+            testLevel: testLevel === 'NoTestRun' ? undefined : testLevel,
             runTests: testLevel === 'RunSpecifiedTests' ? runTests : undefined,
             background: true
           });
@@ -5848,6 +5852,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  list into the Output channel first when it's about to be cut — a deploy/
    *  retrieve over a few thousand components is inconvenient to scroll in a
    *  card, but the full list must never simply be gone. */
+  /** A success card with skipped rows: their explanation and the first few names
+   *  lead, the deployed rows follow — thousands of skipped rows (a Select all on a
+   *  fetched org) must not push every deployed one off the card. The full list,
+   *  skipped rows included, goes to the Output channel whenever the card drops any. */
+  private cardWithSkips(header: string, head: string[], skips: string[], lines: string[]): Array<string | { text: string }> {
+    const SHOWN = 10;
+    const shown = skips.length > SHOWN ? [...skips.slice(0, SHOWN), `… and ${skips.length - SHOWN} more skipped — full list in the Output channel`] : skips;
+    const full = [...head, ...skips, ...lines];
+    const card = [...head, ...shown, ...lines];
+    if (card.length !== full.length || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
+    return capLines(card);
+  }
+
   private capForCard(header: string, lines: Array<string | { text: string }>): Array<string | { text: string }> {
     if (lines.length > CARD_LINE_CAP) this.logResultLines(header, lines);
     return capLines(lines);

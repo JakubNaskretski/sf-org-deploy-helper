@@ -15,9 +15,9 @@ This file starts at the current release; earlier history predates it.
   RunLocalTests and say a validation always runs tests. It doesn't have to: with no tests it now
   runs as a check-only `sf project deploy start --dry-run`, and "Tests: default" on a sandbox
   means no tests here too, as the picker says. Quick Deploy needs a validation that ran tests,
-  so it is offered only after one — pick a test level when you want it. A NoTestRun pick now
-  reaches sf as `--test-level NoTestRun` on a deploy too: it used to be dropped, so a production
-  org ran local tests while the confirm said it would refuse.
+  so it is offered only after one — pick a test level when you want it. On production a
+  NoTestRun pick means the org's own default (local tests when the payload has Apex), and the
+  confirm now says that instead of promising a rejection.
 - **The command log starts collapsed**, and stays open once you open it.
 - **Long operations no longer pin a notification over the editor.** Deploy, validate, retrieve
   and the rest show their progress in the status bar and the panel's progress card. The

@@ -339,15 +339,14 @@ check('a real deploy keeps NoTestRun — only validate is upgraded', () => {
   }
 });
 
-// ------------------------------------- production + NoTestRun is a doomed deploy
-// `sf project deploy start --test-level NoTestRun` is refused by a production org
-// whenever the payload contains Apex. The smart default can't reach this (prod
-// falls back to RunLocalTests), so getting here means the user picked NoTestRun in
-// the panel or set it as defaultTestLevel — and the modal is the last place to say
-// the org will bounce it. It warns rather than blocks: NoTestRun against prod is
-// legal for an Apex-free payload, which nothing on this path can determine.
-const PROD_NO_TESTS = '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.';
-const warnsAboutProd = (note) => /Salesforce rejects/.test(note);
+// ------------------------------------- production + NoTestRun: the org's default
+// A production org refuses `--test-level NoTestRun` for every payload, so the flag
+// is never sent (runDeploy) and production applies its own default — local tests
+// when the payload has Apex. The smart default can't reach this (prod falls back
+// to RunLocalTests); only an explicit pick or defaultTestLevel does, and the note
+// says what will really happen rather than promising a rejection.
+const PROD_NO_TESTS = '\n\nTests: none requested — production applies its own default, so local tests run if the payload contains Apex.';
+const warnsAboutProd = (note) => /production applies its own default/.test(note);
 
 check('prod deploy + explicit NoTestRun → the note warns, level unchanged', () => {
   const p = plan({ pick: 'NoTestRun', isProd: true });
@@ -441,7 +440,7 @@ check('prod deploy confirm reads the rejection warning as its last line', () => 
   assert.strictEqual(
     out.message,
     '⚠ Deploy 3 components to PRODUCTION (acme-dev)?\n\nThis change will be live immediately.'
-    + '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.'
+    + '\n\nTests: none requested — production applies its own default, so local tests run if the payload contains Apex.'
   );
   // Still the ordinary confirm — no second dialog, and the detail block is
   // untouched by the warning.
@@ -454,7 +453,7 @@ check('a queued prod deploy carries the same warning', () => {
   // confirm the user answers at enqueue time must not be the quiet one.
   const out = modal({ isProd: true, instanceUrl: INSTANCE_URL, testNote: noteFor({ pick: 'NoTestRun', isProd: true }) }, true);
   assert.ok(out.message.startsWith('Queue: ⚠ Deploy'), out.message);
-  assert.ok(/Salesforce rejects this for a production deploy that contains Apex\.$/.test(out.message), out.message);
+  assert.ok(/production applies its own default, so local tests run if the payload contains Apex\.$/.test(out.message), out.message);
 });
 
 check('validate confirm states that no tests run', () => {
@@ -540,6 +539,7 @@ check('the confirm says how many selected rows will be skipped, and why', () => 
   assert.ok(SKIP.test(modal({ skipped: 1200, isProd: true, instanceUrl: INSTANCE_URL }).options.detail), 'on PROD too');
   assert.ok(SKIP.test(modal({ skipped: 1200 }, true).options.detail), 'and when queued');
   assert.deepStrictEqual(modal({ skipped: 0 }).options, { modal: true }, 'nothing skipped, nothing said');
+  assert.ok(/1 more selected exists only on the org — no local file to deploy, so it is skipped\./.test(modal({ skipped: 1 }).options.detail));
 });
 
 // ------------------------------------ what a no-test validation actually sends
@@ -565,8 +565,7 @@ check('a validation without tests is a dry-run deploy; with tests it is `deploy 
   const deploy = argvFor({});
   assert.deepStrictEqual(deploy.slice(0, 3), ['project', 'deploy', 'start']);
   assert.ok(!deploy.includes('--dry-run'), 'a real deploy is never a dry run');
-  // NoTestRun is passed, not dropped: omitted, a production org runs local tests
-  // on an Apex payload whatever the user picked.
+  // runDeploy leaves NoTestRun out; given it anyway, the service still dry-runs.
   const explicit = argvFor({ validateOnly: true, testLevel: 'NoTestRun' });
   assert.deepStrictEqual(explicit.slice(0, 4), ['project', 'deploy', 'start', '--dry-run'], explicit.join(' '));
   assert.strictEqual(explicit[explicit.indexOf('--test-level') + 1], 'NoTestRun');
@@ -579,9 +578,9 @@ check('`deploy validate` never gets --ignore-conflicts (it has no such flag); th
   assert.ok(argvFor({ ignoreConflicts: true }).includes('--ignore-conflicts'), 'a deploy takes it');
 });
 
-check('runDeploy passes the level it resolved, NoTestRun included', () => {
+check('NoTestRun never reaches sf as a flag (production refuses it for every payload)', () => {
   const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
-  assert.ok(!/testLevel === 'NoTestRun' \? undefined : testLevel/.test(src), 'a NoTestRun pick must reach the CLI, not the org default');
+  assert.strictEqual((src.match(/testLevel: testLevel === 'NoTestRun' \? undefined : testLevel,/g) || []).length, 2, 'runDeploy and the manifest deploy');
 });
 
 function validatedCard(retry, extra = {}) {
@@ -613,6 +612,8 @@ check('Quick Deploy is offered only for a validation that ran tests', () => {
     assert.ok(!validatedCard(undefined, { runTestsEnabled: v }).card.quickDeploy, `the org's runTestsEnabled=${JSON.stringify(v)} wins for a reattached job`);
   }
   assert.ok(validatedCard({ testLevel: 'RunLocalTests' }, { runTestsEnabled: true }).card.quickDeploy);
+  // A NoTestRun pick on production still ran local tests (the org's default): the org's word wins.
+  assert.ok(validatedCard({ testLevel: 'NoTestRun' }, { runTestsEnabled: true }).card.quickDeploy);
 });
 
 if (failed) { console.error(`\n${failed} of ${ran} check(s) failed`); process.exit(1); }

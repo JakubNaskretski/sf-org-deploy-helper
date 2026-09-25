@@ -1825,7 +1825,7 @@
     const queueTip = state.busy && hasLocalSelectedNow ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
     deployBtn.title = pendingTip || queueTip || orgOnlyTip;
     if (validateBtn) {
-      validateBtn.title = pendingTip || queueTip || orgOnlyTip || 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
+      validateBtn.title = pendingTip || queueTip || orgOnlyTip || 'Check-only deploy: nothing is deployed. With a test level it runs the tests and can be quick-deployed; with no tests it cannot.';
     }
 
     // Selection helpers stay VISIBLE while busy, just disabled — a control that

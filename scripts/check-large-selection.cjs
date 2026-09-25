@@ -218,6 +218,20 @@ check('deploy with org-only rows: the confirm says so, and the card leads with t
   assert.strictEqual(p.calls.deployMetadata[0].opts.manifest !== undefined, true, 'only the 150 local ones are sent');
 });
 
+check('thousands of org-only rows cannot push the deployed ones off the card', async () => {
+  // A Select all on a fetched org: the skipped block is capped, the deployed rows
+  // follow, and the Output channel still gets every row.
+  const items = makeItems(5);
+  const orgOnly = Array.from({ length: 150 }, (_, i) => `ApexClass:AcmeOrgOnly${i}`);
+  const p = provider(items, { fields: { orgMembers: new Map(orgOnly.map(k => [k, {}])), orgMembersOrg: ORG } });
+  await runDeploy(p, [...keysOf(items), ...orgOnly]);
+  const card = statusCards(p).find(c => c.kind === 'warn' || c.kind === 'ok');
+  assert.ok(/^150 skipped — /.test(card.lines[0]), card.lines[0]);
+  assert.strictEqual(card.lines[11], '… and 140 more skipped — full list in the Output channel');
+  assert.deepStrictEqual(card.lines.slice(12), keysOf(items), 'every deployed row is on the card');
+  for (const k of orgOnly) assert.ok(p.outputLines.some(l => l.includes(k)), `Output channel missing ${k}`);
+});
+
 check('a deploy queued behind a running op says the same before it waits', async () => {
   const items = makeItems(3);
   const orgOnly = ['ApexClass:AcmeOrgOnlyA'];
@@ -226,7 +240,7 @@ check('a deploy queued behind a running op says the same before it waits', async
   await proto.enqueueDeploy.call(p.s, [...keysOf(items), ...orgOnly], {});
   const confirm = warns.find(w => w.modal);
   assert.ok(confirm && /^Queue: /.test(confirm.message), JSON.stringify(warns));
-  assert.ok(/1 more selected exist only on the org/.test(confirm.detail || ''), JSON.stringify(confirm));
+  assert.ok(/1 more selected exists only on the org/.test(confirm.detail || ''), JSON.stringify(confirm));
 });
 
 // ------------------------------------------ the command log names what runs
@@ -235,8 +249,9 @@ check('validate: the echoed command matches the argv it runs', async () => {
   const items = makeItems(3);
   const none = provider(items);
   await runDeploy(none, keysOf(items), { validateOnly: true, testLevel: 'NoTestRun' });
-  assert.ok(/^sf project deploy start --dry-run .* --test-level NoTestRun$/.test(firstEchoedCmd(none)), firstEchoedCmd(none));
-  assert.strictEqual(none.calls.deployMetadata[0].opts.testLevel, 'NoTestRun', 'the pick reaches the CLI');
+  assert.ok(/^sf project deploy start --dry-run .* --target-org acme-dev-user$/.test(firstEchoedCmd(none)), firstEchoedCmd(none));
+  assert.strictEqual(none.calls.deployMetadata[0].opts.testLevel, undefined, 'NoTestRun is left out — production refuses it outright');
+  assert.strictEqual(none.calls.deployMetadata[0].opts.validateOnly, true);
   const tested = provider(items);
   await runDeploy(tested, keysOf(items), { validateOnly: true, testLevel: 'RunLocalTests', ignoreConflictsOverride: true });
   assert.ok(/^sf project deploy validate .* --test-level RunLocalTests$/.test(firstEchoedCmd(tested)), firstEchoedCmd(tested));

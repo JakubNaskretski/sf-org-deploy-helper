@@ -551,7 +551,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         </label>
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
-        <button id="validateBtn" class="secondary" disabled title="Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.">Validate</button>
+        <button id="validateBtn" class="secondary" disabled title="Check-only deploy: nothing is deployed. With a test level it runs the tests and can be quick-deployed; with no tests it cannot.">Validate</button>
         <button id="deployBtn" class="primary" disabled>Deploy</button>
         <button id="cancelBtn" class="danger" style="display:none;">Cancel</button>
       </div>
