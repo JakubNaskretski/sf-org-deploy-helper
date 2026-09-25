@@ -507,6 +507,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         <div id="sourceFilterRow" style="display:none;">
           <select id="sourceFilter">
             <option value="all">All sources</option>
+            <option value="local">In project (local)</option>
             <option value="local-only">Local only (not on org)</option>
             <option value="org-only">Org only (not local)</option>
             <option value="both">In both</option>
@@ -525,7 +526,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         </div>
       </div>
       <div id="treeTools" class="mode-head tree-tools" style="display:none;">
-        <span></span>
+        <span><button id="selectAllRows" type="button" style="display:none;" title="Tick every component this list shows — filters apply">Select all</button></span>
         <button id="expandAll" type="button" title="Expand every group">Expand all</button>
         <button id="collapseAll" type="button" title="Collapse every group">Collapse all</button>
       </div>
@@ -536,7 +537,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         <span class="spacer"></span>
         <span id="selCount" class="selected-count">0 selected</span>
         <button id="clearSel" class="subtle" style="display:none;" title="Clear selection">✕</button>
-        <select id="testLevel" class="org" title="Apex test level for deploy/validate. 'Tests: default' is resolved from the target org — sandbox: no tests (NoTestRun), production: RunLocalTests — unless the Default Test Level setting names one. Validate always runs tests, so NoTestRun becomes RunLocalTests there. The confirm dialog names the level that will actually run.">
+        <select id="testLevel" class="org" title="Apex test level for deploy/validate. 'Tests: default' is resolved from the target org — sandbox: no tests (NoTestRun), production: RunLocalTests — unless the Default Test Level setting names one. A Validate with no tests is a check-only deploy that can't be quick-deployed — pick a level for that. The confirm dialog names the level that will actually run.">
           <option value="" title="Resolved from the target org: sandbox runs no tests (NoTestRun), production runs RunLocalTests. The Default Test Level setting, when set, takes precedence.">Tests: default (sandbox: none, prod: RunLocalTests)</option>
           <option value="NoTestRun">NoTestRun</option>
           <option value="RunSpecifiedTests">RunSpecifiedTests</option>
@@ -550,7 +551,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         </label>
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
-        <button id="validateBtn" class="secondary" disabled title="Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.">Validate</button>
+        <button id="validateBtn" class="secondary" disabled title="Check-only deploy: nothing is deployed. With a test level it runs the tests and can be quick-deployed; with no tests it cannot.">Validate</button>
         <button id="deployBtn" class="primary" disabled>Deploy</button>
         <button id="cancelBtn" class="danger" style="display:none;">Cancel</button>
       </div>
@@ -568,12 +569,12 @@ body.resizing { cursor: row-resize; user-select: none; }
     </div>
   </div>
 
-  <div id="cmdlog" class="cmdlog">
+  <div id="cmdlog" class="cmdlog collapsed">
     <div class="section-header" id="cmdlogHeader">
       <span>Command log</span>
       <span class="hdr-actions">
         <button id="clearCmdLog" class="section-clear" title="Clear command log" style="display:none;">Clear</button>
-        <span class="caret" id="cmdlogCaret">▼</span>
+        <span class="caret" id="cmdlogCaret">▸</span>
       </span>
     </div>
     <div class="cmdlog-body" id="cmdlogBody"></div>

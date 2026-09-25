@@ -49,6 +49,9 @@ export interface FolderRule {
   /** flat rule whose fullName keeps the path below the type folder (a nested
    *  ReportFolder `reports/Parent/Child.reportFolder-meta.xml` is `Parent/Child`). */
   relName?: boolean;
+  /** the `-meta.xml` is the anchor and the content sits beside it with any
+   *  extension, or unzipped into a folder of the same name (StaticResource). */
+  content?: boolean;
 }
 
 /** Static folder rules. Every folder/suffix here is pinned to the sf CLI's own
@@ -64,7 +67,9 @@ export const RULES: FolderRule[] = [
   { folder: 'layouts', type: 'Layout', primaryExt: ['.layout-meta.xml'] },
   { folder: 'permissionsets', type: 'PermissionSet', primaryExt: ['.permissionset-meta.xml'] },
   { folder: 'profiles', type: 'Profile', primaryExt: ['.profile-meta.xml'] },
-  { folder: 'staticresources', type: 'StaticResource', primaryExt: ['.resource'], metaSuffix: '.resource-meta.xml' },
+  // sf writes the content as `<Name>.<mime ext>` (.js, .css, .zip…) or unzips it
+  // to `<Name>/` — only an octet-stream is `.resource` — so the meta is the anchor.
+  { folder: 'staticresources', type: 'StaticResource', primaryExt: ['.resource-meta.xml'], content: true },
   { folder: 'tabs', type: 'CustomTab', primaryExt: ['.tab-meta.xml'] },
   { folder: 'labels', type: 'CustomLabels', primaryExt: ['.labels-meta.xml'] },
   { folder: 'customMetadata', type: 'CustomMetadata', primaryExt: ['.md-meta.xml'] },
@@ -114,6 +119,10 @@ export const RULES: FolderRule[] = [
  *  (e.g. `CustomField:Account.MyField__c`). These exist on standard objects too —
  *  even ones with no deployable `*.object-meta.xml` — so they're scanned
  *  independently of the CustomObject bundle. */
+/** A content-rule component name (StaticResource): a letter, then letters, digits
+ *  or underscores — which also keeps `..` and dotfiles from naming anything. */
+const CONTENT_NAME = /^[A-Za-z]\w*$/;
+
 /** Folders the static rules own. Registry-derived rules skip these: the static
  *  entry knows shapes the registry's default adapter doesn't (bundles, objects). */
 export const STATIC_RULE_FOLDERS: ReadonlySet<string> = new Set([...RULES.map(r => r.folder), 'objects']);
@@ -369,6 +378,8 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
       if (residual.length) unknownFolders.push(p);
     }
     const targets: Array<{ rule: FolderRule; dir: string }> = [];
+    // One listing per folder for content rules — not one per resource in it.
+    const listings = new Map<string, Promise<string[]>>();
     for (const rule of rules) for (const dir of await realDirs(rule.folder)) targets.push({ rule, dir });
     for (const { rule, dir } of targets) {
       if (rule.bundle) {
@@ -413,6 +424,21 @@ export async function scanWorkspace(extraRules: FolderRule[] = []): Promise<Work
             ? [...path.relative(dir, filePath).split(path.sep).slice(0, -1), stem].join('/')
             : stem;
           const parentDir = path.dirname(filePath);
+          if (rule.content) {
+            // A real resource name only: `...resource-meta.xml` or a dotfile would
+            // otherwise name a folder above it, or nothing.
+            if (!CONTENT_NAME.test(stem)) continue;
+            // The meta stays the primary: content is often binary (an image, a zip),
+            // which a text editor refuses to open. The content rides in `files`.
+            if (!listings.has(parentDir)) listings.set(parentDir, fs.readdir(parentDir).catch(() => [] as string[]));
+            const content = (await listings.get(parentDir)!).filter(f => f !== baseName && f.startsWith(stem + '.')).map(f => path.join(parentDir, f));
+            // lstat: an untrusted repo's `<Name>` symlinked to `/` or `~/.ssh` must not
+            // be walked, listed, backed up or deployed as this resource's content.
+            const folder = await fs.lstat(path.join(parentDir, stem)).catch(() => undefined);
+            if (folder?.isDirectory()) content.push(...await listAllFiles(path.join(parentDir, stem)));
+            items.push({ type: rule.type, name, filePath, metaPath: filePath, files: [filePath, ...content] });
+            continue;
+          }
           const metaPath = rule.metaSuffix ? path.join(parentDir, name + rule.metaSuffix) : undefined;
           const files = [filePath];
           const metaExists = !!(metaPath && (await pathExists(metaPath)));
@@ -621,6 +647,16 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
     for (const suffix of ['.email-meta.xml', '.email']) {
       if (base.endsWith(suffix)) return item('EmailTemplate', `${segs[ei + 1]}/${base.slice(0, -suffix.length)}`);
     }
+  }
+
+  // 3b. Content types (StaticResource): the meta, `<Name>.<any ext>` beside it, or
+  // any file inside the unzipped `<Name>/`. Resource names carry no dots.
+  for (const rule of rules) {
+    const ci = rule.content ? lastSeg(rule.folder) : -1;
+    if (ci < 0 || ci + 1 >= segs.length) continue;
+    const anchor = (rule.primaryExt ?? []).find(ext => base.endsWith(ext));
+    const name = anchor ? base.slice(0, -anchor.length) : ci + 2 === segs.length ? base.split('.')[0] : segs[ci + 1];
+    return CONTENT_NAME.test(name) ? item(rule.type, name) : undefined;
   }
 
   // 4. Regular single-/per-file types — matched by the type's folder plus extension.

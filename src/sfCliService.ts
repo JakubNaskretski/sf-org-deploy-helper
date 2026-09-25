@@ -89,6 +89,9 @@ export interface DeployResult {
   numberTestsCompleted?: number;
   numberTestsTotal?: number;
   numberTestErrors?: number;
+  /** Whether the org ran Apex tests for this job — a validation that didn't can't
+   *  be quick-deployed. Boolean in practice; tolerated as the SOAP string too. */
+  runTestsEnabled?: boolean | string;
   /** Request-level failure text from the Metadata API status. Set when the org
    *  rejected the deploy as a whole rather than component by component — exactly
    *  the case where `details.componentFailures`/`files` are empty, so this is the
@@ -168,11 +171,13 @@ export interface DeployOptions {
   /** `--manifest <package.xml>` — deploy an entire manifest. Mutually exclusive
    *  with sourceDirs/metadata: when set, those targets are ignored. */
   manifest?: string;
-  /** `sf project deploy validate` (check-only) instead of `deploy start`; the
-   *  returned `id` can then be quick-deployed. Validation always runs tests, so
-   *  callers should pass a non-NoTestRun level (the CLI enforces this). */
+  /** Check-only. With tests: `sf project deploy validate`, whose `id` can then be
+   *  quick-deployed. With NoTestRun (or no level): `deploy start --dry-run` —
+   *  `validate` has no NoTestRun (it defaults to RunLocalTests), and a validation
+   *  that ran no tests can't be quick-deployed anyway. */
   validateOnly?: boolean;
-  /** `--test-level`. Omitted → CLI default (NoTestRun for a normal deploy). */
+  /** `--test-level`. Omitted → the org's default: none on a sandbox, but
+   *  RunLocalTests on production when the payload has Apex. */
   testLevel?: TestLevel;
   /** Class names for RunSpecifiedTests (`--tests`). */
   runTests?: string[];
@@ -193,8 +198,11 @@ export class SfCliService extends KitSfCliService {
   ): Cancellable<{ result: DeployResult; cmd: string }> {
     // Validation is a check-only deploy that returns a job id for a later
     // quick-deploy; `start` is the real thing. Both take the same arg shape.
-    const verb = opts.validateOnly ? 'validate' : 'start';
+    // A validation without tests is `start --dry-run` (see validateOnly).
+    const dryRun = !!opts.validateOnly && (!opts.testLevel || opts.testLevel === 'NoTestRun');
+    const verb = opts.validateOnly && !dryRun ? 'validate' : 'start';
     const args = ['project', 'deploy', verb];
+    if (dryRun) args.push('--dry-run');
     // Target selection, in precedence order (mutually exclusive):
     //   --manifest    a whole package.xml manifest
     //   --source-dir  an explicit path (file may live outside the package dirs,
@@ -205,7 +213,9 @@ export class SfCliService extends KitSfCliService {
     else if (opts.sourceDirs?.length) for (const d of opts.sourceDirs) args.push('--source-dir', d);
     else for (const m of metadata) args.push('--metadata', m);
     args.push('--target-org', targetOrg);
-    if (opts.ignoreConflicts) args.push('--ignore-conflicts');
+    // `deploy validate` ignores conflicts itself and has no such flag; its dry-run
+    // twin does the same — a check-only run writes nothing to conflict with.
+    if ((opts.ignoreConflicts || dryRun) && verb !== 'validate') args.push('--ignore-conflicts');
     if (opts.testLevel) args.push('--test-level', opts.testLevel);
     if (opts.testLevel === 'RunSpecifiedTests') for (const t of opts.runTests ?? []) args.push('--tests', t);
     // `--async` returns once the org has enqueued the job (id + `Queued`), so the

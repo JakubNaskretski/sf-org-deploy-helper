@@ -4,7 +4,7 @@
 // the 'ready' suggestionRestore replay). No framework.
 //   1) npm run compile   2) node scripts/check-suggestion-flow.cjs
 //
-// Findings fixed here (2026-09-08 Opus walk, section B of findings-deps.md):
+// Findings fixed here (2026-09-08):
 //   B1 a hidden/rebuilt panel still gets the feature — pushCardHistory folds the
 //      displaced guidance lines back onto the persisted card, and 'ready' replays
 //      a `suggestionRestore` for every suggestion still alive server-side;

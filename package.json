@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.27.0",
+  "version": "0.28.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -268,7 +268,7 @@
           ],
           "enumDescriptions": [
             "Smart default — RunLocalTests against a production org, NoTestRun against a sandbox or scratch org.",
-            "Run no Apex tests. Salesforce rejects this test level for a production deploy.",
+            "Run no Apex tests. On production the org applies its own default instead (local tests when the payload contains Apex).",
             "Run all Apex tests in this org's own namespace (excludes installed managed packages).",
             "Run every Apex test in the org, including tests belonging to installed managed packages."
           ],

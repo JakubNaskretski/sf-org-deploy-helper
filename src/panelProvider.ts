@@ -7,7 +7,7 @@ import { execFile } from 'child_process';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
@@ -957,10 +957,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       match = inferItemForPath(uri.fsPath, this.ruleSet());
       if (!match) {
         try {
-          // quiet: this runs BEFORE the slot is reserved, so a cancellable toast's
+          // No toast: this runs BEFORE the slot is reserved, so a cancellable toast's
           // Cancel could only reach whatever other op was running — a polled deploy's
           // handler, i.e. a real org-side `deploy cancel` from an unrelated click.
-          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath), { quiet: true });
+          match = await this.withWindowProgress('Resolving metadata type (sf registry)', () => this.resolveItemViaCli(uri.fsPath));
         } catch (err) {
           // CLI failure (timeout, no project, …) — distinct from "not metadata".
           const msg = err instanceof Error ? err.message : String(err);
@@ -1514,11 +1514,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<boolean>('fetchOrgOnOpen', true)) return;
     if (this.busy) return;
     this.autoFetchDone = true;
-    // Quiet: nobody clicked this — a Notification (with its own Cancel button)
-    // firing unasked at panel open is the flood being fixed here. The panel's own
-    // Cancel still reaches it (cancelCurrent is wired before withWindowProgress
-    // starts, independent of which progress UI is showing).
-    void this.loadOrgMetadata(true).catch(err =>
+    void this.loadOrgMetadata().catch(err =>
       this.output.appendLine(`[Fetch Org] auto-fetch failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
@@ -1908,10 +1904,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const scanRoot = scan.root;
       // Under window progress — this spawns `sf` (30s timeout per folder) and
       // would otherwise stall the tree with zero feedback on panel open/refresh.
-      // Quiet: this fires on an ordinary panel open/refresh, not a deliberate
-      // "resolve types" click, so a Notification here is exactly the flood a
-      // status-bar spinner exists to replace.
-      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot), { quiet: true });
+      const fresh = await this.withWindowProgress('Resolving metadata types (sf registry)', () => this.learnRulesForFolders(pending, scanRoot));
       // Fresh rules are passed directly (not just via the cache) so the rescan
       // sees them even with typeCacheDays 0.
       if (fresh.length) scan = await scanWorkspace([...this.ruleSet(), ...fresh]);
@@ -2406,6 +2399,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const p = foldPathKey(item.filePath);
           if (!byPrimary.has(p)) byPrimary.set(p, key);
           if (!byDir.has(p)) byDir.set(p, key); // bundles: filePath is the folder
+          // An unzipped StaticResource: its folder sits beside the meta (filePath),
+          // named after it — a file added or deleted inside still belongs to it.
+          const d = item.type === 'StaticResource' ? foldPathKey(path.join(path.dirname(item.filePath), item.name)) : '';
+          if (d && !byDir.has(d)) byDir.set(d, key);
         }
         for (const f of item.files) {
           const p = foldPathKey(f);
@@ -2805,7 +2802,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const modal = this.deployConfirmModal(
           {
             noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
-            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, useManifest
+            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, useManifest,
+            ...this.skipCounts(orgOnlySkipped)
           },
           false
         );
@@ -2819,12 +2817,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
       // Echo the --tests flags too (one per class, matching how the CLI itself
       // repeats the flag) so the command log names exactly what will run.
-      // NoTestRun is `deploy start`'s own default, so it stays off the command
-      // line; a validate can never arrive here as NoTestRun (resolveTestPlan
-      // resolves that to RunLocalTests, which `deploy validate` requires).
+      // NoTestRun stays off the command line: production refuses it for every
+      // payload, and a sandbox runs no tests by default anyway. A no-test
+      // validate is a dry-run `start`; `validate` sets --ignore-conflicts itself.
       const testArg = testLevel !== 'NoTestRun'
         ? ` --test-level ${testLevel}${testLevel === 'RunSpecifiedTests' ? runTests.map(t => ` --tests ${t}`).join('') : ''}`
         : '';
+      const cmdVerb = !opts.validateOnly ? 'start' : testLevel === 'NoTestRun' ? 'start --dry-run' : 'validate';
 
       // Snapshot the retry request once, up front: the client-side conflict
       // check throws from the submit call BELOW, before any job id exists, so
@@ -2847,7 +2846,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      const cmdId = this.beginCmd(`sf project deploy ${opts.validateOnly ? 'validate' : 'start'} ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}${testArg}`);
+      const cmdId = this.beginCmd(`sf project deploy ${cmdVerb} ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${(ignoreConflicts || cmdVerb === 'start --dry-run') && cmdVerb !== 'validate' ? ' --ignore-conflicts' : ''}${testArg}`);
       // From here the async work runs under the reserved slot; the finally block
       // owns releasing it, so stop the early-return releaser from double-firing.
       reserved = false;
@@ -3014,13 +3013,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       ?? this.configuredTestLevel()
       ?? (isProd ? 'RunLocalTests' : 'NoTestRun');
 
-    // `sf project deploy validate` has no NoTestRun at all — its --test-level
-    // defaults to RunLocalTests. Resolving that here, rather than passing
-    // NoTestRun on and omitting the flag at the deploy site, is what keeps the
-    // confirm modal, the echoed command and the card's retry request describing
-    // the tests the org will really run.
-    const validateForcesTests = !!opts.validateOnly && requested === 'NoTestRun';
-    const testLevel: TestLevel = validateForcesTests ? 'RunLocalTests' : requested;
+    // A validate honours NoTestRun too: deployMetadata runs it as `deploy start
+    // --dry-run` (check-only, no tests), since `deploy validate` has no NoTestRun.
+    const testLevel: TestLevel = requested;
 
     let runTests: string[] = [];
     // Names dropped by the argv filter below, surfaced in the confirm modal (not
@@ -3059,19 +3054,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // deploy that runs no tests at all — which is exactly the case the modal
     // exists to disclose.
     //
-    // NoTestRun against production is additionally a level the ORG refuses when
-    // the payload contains Apex, so the note warns there. It cannot be reached by
-    // the smart default (production falls back to RunLocalTests) — only an
-    // explicit pick in the panel or defaultTestLevel gets here, i.e. the user
-    // meant it and the deploy is about to bounce. It warns rather than refuses
-    // because NoTestRun is legitimate for an Apex-free payload, and nothing here
-    // knows whether this one carries Apex.
-    const testNote = (validateForcesTests
-      ? '\n\nTests: RunLocalTests — a validation always runs tests, so NoTestRun does not apply.'
-      : testLevel === 'NoTestRun'
+    // NoTestRun never reaches sf as a flag (see runDeploy): production refuses the
+    // level outright, so there the org applies its own default instead — local
+    // tests when the payload has Apex. The smart default can't get here (prod
+    // falls back to RunLocalTests); only an explicit pick or defaultTestLevel
+    // does, and the note says what will really happen.
+    const testNote = (testLevel === 'NoTestRun'
         ? (isProd
-          ? '\n\nTests: none (NoTestRun) — Salesforce rejects this for a production deploy that contains Apex.'
-          : '\n\nTests: none (NoTestRun)')
+          ? `\n\nTests: none requested — production applies its own default, so local tests run if the payload contains Apex.${opts.validateOnly ? ' Without Apex none run, and there is no Quick Deploy.' : ''}`
+          : opts.validateOnly
+            ? '\n\nTests: none (NoTestRun) — no Quick Deploy afterwards; that needs a validation that ran tests.'
+            : '\n\nTests: none (NoTestRun)')
       : testLevel === 'RunSpecifiedTests' ? `\n\nTests: RunSpecifiedTests (${runTests.length} class${runTests.length === 1 ? '' : 'es'})`
       : `\n\nTests: ${testLevel}`) + ignoredNote;
     return { testLevel, runTests, testNote };
@@ -3088,27 +3081,33 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
       instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: AutoIncludedInfo;
-      useManifest?: boolean;
+      useManifest?: boolean; skipped?: number; unread?: { count: number; types: string[] };
     },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest, skipped, unread } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
     const overwriteLine = overwriteNotice(ignoreConflicts, validateOnly, queued);
     const autoLine = autoIncludedNotice(autoIncluded);
     const manifestLine = manifestNotice(useManifest);
+    // Said BEFORE the run: selected org-only rows (a group checkbox ticks them)
+    // have no local file, and "N skipped" on the card explained nothing.
+    const skipLine = [
+      unread?.count ? `${unread.count} more ${unread.count === 1 ? 'is' : 'are'} of ${unread.types.length === 1 ? 'a type' : 'types'} this panel can't read from your project (${unread.types.join(', ')}) — skipped; if you have ${unread.count === 1 ? 'it' : 'them'} locally, deploy ${unread.count === 1 ? 'it' : 'them'} from the Explorer (right-click the -meta.xml) or with a package.xml.` : '',
+      skipped ? `${skipped} more selected ${skipped === 1 ? 'exists' : 'exist'} only on the org — no local file to deploy, so ${skipped === 1 ? 'it is' : 'they are'} skipped.` : ''
+    ].filter(Boolean).join('\n') || undefined;
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
-        options: { modal: true, detail: [instanceUrl ?? '', autoLine, manifestLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
+        options: { modal: true, detail: [instanceUrl ?? '', autoLine, manifestLine, skipLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
     }
     // Below prod: keep the pre-existing shape — with no lines to show at all the
     // `detail` key stays absent rather than becoming an empty string.
-    const rest = [autoLine, manifestLine, overwriteLine, queueNote].filter(Boolean);
+    const rest = [autoLine, manifestLine, skipLine, overwriteLine, queueNote].filter(Boolean);
     const detail = isProd
       ? [instanceUrl ?? '', ...rest].filter(Boolean).join('\n')
       : (rest.length > 0 ? rest.join('\n') : undefined);
@@ -3156,7 +3155,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (!root) return false;
     const org = this.requireOrg();
     if (!org) return false;
-    const items = this.resolveKeys(keys).filter(i => !!i.filePath);
+    const resolved = this.resolveKeys(keys);
+    const items = resolved.filter(i => !!i.filePath);
     if (items.length === 0) {
       vscode.window.showInformationMessage('Selected component(s) have no local source — retrieve them first before deploying.');
       return false;
@@ -3194,7 +3194,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       {
         noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
         instanceUrl: orgInfo?.instanceUrl, ignoreConflicts,
-        autoIncluded: opts.autoIncluded, useManifest
+        autoIncluded: opts.autoIncluded, useManifest, ...this.skipCounts(resolved.filter(i => !i.filePath))
       },
       true
     );
@@ -3325,16 +3325,39 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       && failures.length === 0
       && testFailures.length === 0;
     const lines = items.map(i => `${i.type}:${i.name}`);
-    const skipLines = orgOnlySkipped.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`);
+    // Headed and listed FIRST on a success card: below thousands of deployed rows
+    // the card's line cap cut every skipped one off, leaving a bare "N skipped".
+    // A type this panel never reads locally comes first: it may be in the project
+    // and was not deployed, which "only on the org" would wrongly rule out.
+    const { orgOnly, unread } = this.splitSkipped(orgOnlySkipped);
+    const unreadTypes = [...new Set(unread.map(i => i.type))].sort();
+    const skipGroups = [
+      ...(unread.length ? [{
+        head: `${unread.length} skipped — this panel can't read ${unreadTypes.join(', ')} from your project: if you have ${unread.length === 1 ? 'it' : 'them'} locally, ${unread.length === 1 ? 'it was' : 'they were'} NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml:`,
+        rows: unread.map(i => `— ${i.type}:${i.name} — not read from your project, skipped (right-click its -meta.xml to deploy)`)
+      }] : []),
+      ...(orgOnly.length ? [{
+        head: `${orgOnly.length} skipped — selected, but ${orgOnly.length === 1 ? 'it exists' : 'they exist'} only on the org, so there was no local file to deploy:`,
+        rows: orgOnly.map(i => `— ${i.type}:${i.name} — no local source, skipped (retrieve first)`)
+      }] : [])
+    ];
+    const skipLines = skipGroups.flatMap(g => g.rows);
+    const skipMeta = `${orgOnly.length ? ` · ${orgOnly.length} skipped (org only)` : ''}${unread.length ? ` · ${unread.length} skipped (not read locally)` : ''}`;
     const testMeta = result.numberTestsTotal
       ? ` · ${(result.numberTestsTotal ?? 0) - (result.numberTestErrors ?? 0)}/${result.numberTestsTotal} tests passed`
       : '';
     this.endCmd(cmdId, success, Date.now() - start);
     if (success) {
-      if (validateOnly && result.id) {
+      // Only a validation that ran tests can be quick-deployed (the org refuses
+      // one that didn't). The org's runTestsEnabled says whether they ran — a
+      // NoTestRun pick on production still runs local tests for an Apex payload;
+      // without it (older output) the resolved level decides.
+      const testsRan = result.runTestsEnabled == null ? ctx.retry?.testLevel !== 'NoTestRun' : String(result.runTestsEnabled) !== 'false';
+      const quickId = validateOnly && testsRan ? result.id : undefined;
+      if (quickId) {
         // Remember the validated deployment so the card's Quick Deploy button can
         // deploy it without re-validating / re-running tests.
-        this.lastValidated = { jobId: result.id, org, label: orgLabel, count: items.length };
+        this.lastValidated = { jobId: quickId, org, label: orgLabel, count: items.length };
       }
       // A real deploy landed these on the org — refresh their badges. Validate-only
       // lands nothing. Failure path deliberately skipped: deploys are atomic
@@ -3348,8 +3371,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           title: validateOnly
             ? `Validated ${items.length} component${items.length === 1 ? '' : 's'} against ${orgLabel}`
             : `Deployed ${items.length} component${items.length === 1 ? '' : 's'} to ${orgLabel}`,
-          meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${orgOnlySkipped.length > 0 ? ` · ${orgOnlySkipped.length} skipped` : ''}`,
-          lines: this.capForCard(`Deployed to ${orgLabel} — full component list`, [...lines, ...skipLines]),
+          meta: `${result.numberComponentsDeployed ?? successes.length}/${result.numberComponentsTotal ?? items.length} succeeded${testMeta}${skipMeta}`,
+          lines: this.cardWithSkips(`Deployed to ${orgLabel} — full component list`, skipGroups, lines),
           // Built from the ITEMS, not from the display lines: a manifest deploy
           // synthesizes its items straight from <members> (wildcards and all) and
           // a reattached job synthesizes them from the org's own report, so those
@@ -3357,8 +3380,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // keeps only the rows backed by local source — which for a normal run is
           // the whole set, so re-selection reproduces the run exactly.
           ...this.selectDeployedButtons(items),
-          ...(validateOnly && result.id
-            ? { quickDeploy: { jobId: result.id, label: `Quick Deploy ${items.length} validated component${items.length === 1 ? '' : 's'} to ${orgLabel}` } }
+          ...(quickId
+            ? { quickDeploy: { jobId: quickId, label: `Quick Deploy ${items.length} validated component${items.length === 1 ? '' : 's'} to ${orgLabel}` } }
             : {})
         }
       });
@@ -4650,7 +4673,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const { result, cmd } = await handle.promise;
         this.updateCmd(cmdId, cmd);
         return result;
-      });
+      }, { toast: true });
       this.endCmd(cmdId, true, Date.now() - start);
       const username = result?.username;
       // Always refresh the list — the org was added regardless of whether we got a
@@ -5142,10 +5165,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.postOrgs();
   }
 
-  /** `quiet` is set by the automatic Fetch Org on open (maybeAutoFetchOrg) — see
-   *  its own call site. A manual click ('fetchOrgMetadata' from the webview)
-   *  leaves it false and keeps the full cancellable Notification. */
-  private async loadOrgMetadata(quiet = false): Promise<void> {
+  private async loadOrgMetadata(): Promise<void> {
     // No await between this check and setBusy below (requireRoot/Org and config
     // reads are synchronous), so reserving here is race-free. reserveBusy keeps the
     // "already running" messaging consistent with the other ops.
@@ -5253,7 +5273,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         };
         await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
         if (fetchCancelled) throw new SfCliCancelledError();
-      }, { quiet });
+      });
 
       // If the user switched the target org while this fetch was in flight, the
       // result describes the wrong org — discard it rather than badge org B's tree
@@ -5519,25 +5539,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       : 'Another operation is already running.');
   }
 
-  /** Run `body` under a cancellable VS Code progress notification so operations
-   *  give feedback even when the panel is hidden (context-menu flows). The
-   *  notification's Cancel button maps onto the currently running sf command.
-   *
-   *  `quiet` swaps that for a status-bar spinner (ProgressLocation.Window) — no
-   *  toast, no Cancel button of its own — for background work nobody clicked:
-   *  the automatic Fetch Org on open and background type resolution. The
-   *  panel's own Cancel button still reaches the running command either way,
-   *  since cancelCurrent is wired independently of which progress UI is up. */
+  /** Run `body` under a status-bar spinner (ProgressLocation.Window): feedback
+   *  even when the panel is hidden, with the panel's progress card and Cancel
+   *  button as the controls (cancelCurrent is wired independently of this UI).
+   *  Not a notification: VS Code gives a progress toast no close button, so a
+   *  30-minute validate pinned one to the screen with a Cancel that kills the
+   *  org-side job one misclick away. `toast` keeps one for the browser login
+   *  alone — its Cancel only stops a local wait the user may abandon. */
   private withWindowProgress<T>(
     title: string,
     body: (report: (message: string) => void) => Promise<T>,
-    opts: { quiet?: boolean } = {}
+    opts: { toast?: boolean } = {}
   ): Promise<T> {
     return Promise.resolve(vscode.window.withProgress(
       {
-        location: opts.quiet ? vscode.ProgressLocation.Window : vscode.ProgressLocation.Notification,
+        location: opts.toast ? vscode.ProgressLocation.Notification : vscode.ProgressLocation.Window,
         title: `SF Deploy: ${title}`,
-        cancellable: !opts.quiet
+        cancellable: !!opts.toast
       },
       (progress, token) => {
         const sub = token.onCancellationRequested(() => this.cancelCurrent());
@@ -5843,6 +5861,36 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       this.output.appendLine(`[logResultLines] failed to log "${message}": ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /** A success card with skipped rows: their explanation and the first few names
+   *  lead, the deployed rows follow — thousands of skipped rows (a Select all on a
+   *  fetched org) must not push every deployed one off the card. The full list,
+   *  skipped rows included, goes to the Output channel whenever the card drops any. */
+  private cardWithSkips(header: string, groups: Array<{ head: string; rows: string[] }>, lines: string[]): Array<string | { text: string }> {
+    const SHOWN = 10;
+    const full = [...groups.flatMap(g => [g.head, ...g.rows]), ...lines];
+    const card = [...groups.flatMap(g => [g.head, ...(g.rows.length > SHOWN
+      ? [...g.rows.slice(0, SHOWN), `… and ${g.rows.length - SHOWN} more skipped — full list in the Output channel`]
+      : g.rows)]), ...lines];
+    if (groups.some(g => g.rows.length > SHOWN) || full.length > CARD_LINE_CAP) this.logResultLines(header, full);
+    return capLines(card);
+  }
+
+  /** Selected rows with no local file, split by whether this panel can list their
+   *  type from the project at all. A readable type with no local file really is on
+   *  the org only; any other type (bots, object translations…) may be in the
+   *  project unseen, so "only on the org" would be a guess. */
+  private splitSkipped(skipped: MetadataItem[]): { orgOnly: MetadataItem[]; unread: MetadataItem[] } {
+    if (!skipped.length) return { orgOnly: [], unread: [] };
+    const readable = new Set<string>([...RULES.map(r => r.type), ...this.ruleSet(true).map(r => r.type), 'CustomObject', ...OBJECT_CHILD_TYPES]);
+    return { orgOnly: skipped.filter(i => readable.has(i.type)), unread: skipped.filter(i => !readable.has(i.type)) };
+  }
+
+  /** The confirm modal's view of splitSkipped. */
+  private skipCounts(skipped: MetadataItem[]): { skipped: number; unread: { count: number; types: string[] } } {
+    const { orgOnly, unread } = this.splitSkipped(skipped);
+    return { skipped: orgOnly.length, unread: { count: unread.length, types: [...new Set(unread.map(i => i.type))].sort() } };
   }
 
   /** Cap a status card's `lines` for capLines/CARD_LINE_CAP, mirroring the FULL
@@ -7023,7 +7071,7 @@ function isTestLevel(v: unknown): v is TestLevel {
 }
 
 /** Map well-known sf CLI failures to a one-line actionable hint for the error card. */
-function hintForError(err: unknown): string | undefined {
+export function hintForError(err: unknown): string | undefined {
   const name = err instanceof SfCliError ? err.errorName ?? '' : '';
   const message = err instanceof Error ? err.message : String(err);
   const txt = `${name} ${message}`.toLowerCase();
@@ -7036,8 +7084,13 @@ function hintForError(err: unknown): string | undefined {
   if (/namedorgnotfound|noauthinfofound|invalid_grant|expired|refreshtokenauth/.test(txt)) {
     return 'Org authentication looks expired or missing — run `sf org login web` and retry.';
   }
-  if (/requiresproject|sfdx-project\.json/.test(txt)) {
+  // sf quotes sfdx-project.json in plenty of errors about a project it DID find
+  // (replacements, package dirs, schema) — only these two mean there is none.
+  if (/requiresproject|invalidprojectworkspace|does not contain a valid salesforce dx project/.test(txt)) {
     return 'This workspace is not a Salesforce DX project (sfdx-project.json not found).';
+  }
+  if (txt.includes('replacewithenv')) {
+    return 'sf runs with VS Code\'s environment, not your terminal\'s: set the variable where VS Code inherits it (your shell profile), then restart VS Code.';
   }
   if (/nonexistent flag|is not a sf command|command [^\s]+ not found/.test(txt)) {
     return 'Your sf CLI looks outdated for this command — run `sf update` (or reinstall @salesforce/cli), then reload VS Code.';

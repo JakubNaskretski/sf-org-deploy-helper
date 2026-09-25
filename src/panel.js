@@ -64,7 +64,10 @@
     activeFileKey: null,
     statusCards: [],
     cmdLog: [],
-    cmdLogCollapsed: !!persisted.cmdLogCollapsed,
+    // Collapsed unless the user opened it. A new key: the old `cmdLogCollapsed`
+    // was written as false on every save, so it would keep the log open for
+    // everyone who never touched it.
+    cmdLogCollapsed: !persisted.cmdLogOpen,
     // Fraction of the body given to the Status pane (right/bottom). null = CSS default.
     statusRatio: typeof persisted.statusRatio === 'number' ? persisted.statusRatio : null,
     banner: '',
@@ -89,7 +92,7 @@
     // the prune in the `files` handler.
     scannedOnce: false,
     orgAsOf: null,           // ms — when the membership on screen was listed (snapshot stamp, or now)
-    sourceFilter: 'all',     // 'all' | 'local-only' | 'org-only' | 'both'
+    sourceFilter: 'all',     // 'all' | 'local' | 'local-only' | 'org-only' | 'both'
     // View mode: one tree, three lenses. 'selected' shows only checked items
     // (replaces the old chip tray), 'changed' only git-modified components.
     viewMode: ['all', 'selected', 'changed'].includes(persisted.viewMode) ? persisted.viewMode : 'all',
@@ -138,7 +141,7 @@
       filter: state.filter,
       typeFilter: Array.from(state.typeFilter),
       seenTypes: Array.from(state.seenTypes),
-      cmdLogCollapsed: state.cmdLogCollapsed,
+      cmdLogOpen: !state.cmdLogCollapsed,
       statusRatio: state.statusRatio,
       scanBannerDismissed: state.scanBannerDismissed,
       viewMode: state.viewMode,
@@ -230,6 +233,13 @@
   // Tree Expand all / Collapse all (static row above the tree, panelHtml.ts).
   $('expandAll').addEventListener('click', () => setAllGroups(true));
   $('collapseAll').addEventListener('click', () => setAllGroups(false));
+  // Select all (All view): additive, like the Changed header's — every row the
+  // filters leave, org-only included, the same keys ticking each group would.
+  $('selectAllRows').addEventListener('click', () => {
+    const { objectMap, flatGroups } = buildGroups();
+    for (const k of keysInGroups(objectMap, flatGroups)) state.selected.add(k);
+    selectionChanged();
+  });
   document.querySelectorAll('#viewModes button').forEach((btn) => {
     btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
   });
@@ -315,6 +325,7 @@
     savePersisted();
     renderCmdLog();
   });
+  renderCmdLog(); // the markup's default must not win until the first command
   $('clearStatus').addEventListener('click', () => {
     state.statusCards = [];
     send('clearStatusHistory'); // also drop the persisted history, or it resurrects on reload
@@ -979,6 +990,7 @@
 
   function isSourceAllowed(source) {
     if (!state.orgLoaded || state.sourceFilter === 'all') return true;
+    if (state.sourceFilter === 'local') return source !== 'org'; // everything in the project
     if (state.sourceFilter === 'local-only') return source === 'local';
     if (state.sourceFilter === 'org-only') return source === 'org';
     if (state.sourceFilter === 'both') return source === 'both';
@@ -1426,16 +1438,13 @@
   // GROUP data rather than the DOM, so the render's NODE_CAP doesn't silently
   // shrink the set the button promises.
   function localKeysInGroups(objectMap, flatGroups) {
+    return keysInGroups(objectMap, flatGroups).filter(k => state.localKeys.has(k));
+  }
+
+  function keysInGroups(objectMap, flatGroups) {
     const keys = [];
-    for (const o of objectMap.values()) {
-      for (const k of keysUnderObject(o)) if (state.localKeys.has(k)) keys.push(k);
-    }
-    for (const arr of flatGroups.values()) {
-      for (const it of arr) {
-        const k = `${it.type}:${it.name}`;
-        if (state.localKeys.has(k)) keys.push(k);
-      }
-    }
+    for (const o of objectMap.values()) keys.push(...keysUnderObject(o));
+    for (const arr of flatGroups.values()) for (const it of arr) keys.push(`${it.type}:${it.name}`);
     return keys;
   }
 
@@ -1500,6 +1509,11 @@
     co.disabled = false;
     ex.title = 'Expand every group';
     co.title = state.viewMode === 'changed' && changedSections() ? 'Collapse every section' : 'Collapse every group';
+    // All view only: Changed has its own in its header, Selected is the selection.
+    const sa = $('selectAllRows');
+    const n = state.viewMode === 'all' ? keysInGroups(objectMap, flatGroups).length : 0;
+    sa.style.display = n ? '' : 'none';
+    sa.textContent = `Select all (${n})`;
   }
 
   function renderTree() {
@@ -1811,7 +1825,7 @@
     const queueTip = state.busy && hasLocalSelectedNow ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
     deployBtn.title = pendingTip || queueTip || orgOnlyTip;
     if (validateBtn) {
-      validateBtn.title = pendingTip || queueTip || orgOnlyTip || 'Check-only deploy: validate + run tests without deploying. A successful validation can be quick-deployed.';
+      validateBtn.title = pendingTip || queueTip || orgOnlyTip || 'Check-only deploy: nothing is deployed. With a test level it runs the tests and can be quick-deployed; with no tests it cannot.';
     }
 
     // Selection helpers stay VISIBLE while busy, just disabled — a control that
@@ -2463,7 +2477,7 @@
     const queueTip = state.busy ? `Will queue behind ${state.busyAction || 'the current operation'}` : '';
     const items = [
       { label: 'Deploy', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — retrieve it first (no local source to deploy)' : queueTip), run: () => runKeys('deploy', arr) },
-      { label: 'Validate', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : (queueTip || 'Check-only deploy: validates and runs tests without deploying')), run: () => runKeys('validate', arr) },
+      { label: 'Validate', disabled: !queueBase || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to validate' : (queueTip || 'Check-only deploy: nothing is deployed; the Tests picker decides which tests run')), run: () => runKeys('validate', arr) },
       { label: 'Retrieve', disabled: !base, title: orgTip, run: () => runKeys('retrieve', arr) },
       { label: 'Diff', disabled: !base || !hasLocal, title: orgTip || (!hasLocal ? 'Org-only — nothing local to diff' : ''), run: () => runKeys('diff', arr) },
     ];
