@@ -242,12 +242,12 @@ check('a type this panel never reads locally is not called "only on the org"', a
   warns.length = 0;
   await runDeploy(p, [...keysOf(items), ...skipped]);
   const confirm = warns.find(w => w.modal);
-  assert.ok(/1 more is a type this panel can't read from your project \(Bot\) — skipped; if you have them locally, deploy their folder via right-click\./.test(confirm.detail), confirm.detail);
+  assert.ok(/1 more is of a type this panel can't read from your project \(Bot\) — skipped; if you have it locally, deploy it from the Explorer \(right-click the -meta\.xml\) or with a package\.xml\./.test(confirm.detail), confirm.detail);
   assert.ok(/1 more selected exists only on the org/.test(confirm.detail), confirm.detail);
   const card = statusCards(p).find(c => c.kind === 'warn');
   assert.ok(/ · 1 skipped \(org only\) · 1 skipped \(not read locally\)$/.test(card.meta), card.meta);
   assert.ok(/^1 skipped — this panel can't read Bot from your project: if you have it locally, it was NOT deployed/.test(card.lines[0]), card.lines[0]);
-  assert.strictEqual(card.lines[1], '— Bot:AcmeBot — not read from your project, skipped (deploy its folder via right-click)');
+  assert.strictEqual(card.lines[1], '— Bot:AcmeBot — not read from your project, skipped (right-click its -meta.xml to deploy)');
   assert.ok(/^1 skipped — selected, but it exists only on the org/.test(card.lines[2]), card.lines[2]);
   assert.deepStrictEqual(card.lines.slice(4), keysOf(items));
 });

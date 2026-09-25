@@ -543,7 +543,7 @@ check('the confirm says how many selected rows will be skipped, and why', () => 
   assert.ok(/1 more selected exists only on the org — no local file to deploy, so it is skipped\./.test(modal({ skipped: 1 }).options.detail));
   const both = modal({ skipped: 3, unread: { count: 2, types: ['Bot', 'CustomObjectTranslation'] } }).options.detail.split('\n');
   assert.deepStrictEqual(both, [
-    "2 more are of types this panel can't read from your project (Bot, CustomObjectTranslation) — skipped; if you have them locally, deploy their folder via right-click.",
+    "2 more are of types this panel can't read from your project (Bot, CustomObjectTranslation) — skipped; if you have them locally, deploy them from the Explorer (right-click the -meta.xml) or with a package.xml.",
     '3 more selected exist only on the org — no local file to deploy, so they are skipped.'
   ], 'the unread ones first: they are the ones that may be yours');
 });

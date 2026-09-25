@@ -3095,7 +3095,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // Said BEFORE the run: selected org-only rows (a group checkbox ticks them)
     // have no local file, and "N skipped" on the card explained nothing.
     const skipLine = [
-      unread?.count ? `${unread.count} more ${unread.count === 1 ? 'is a type' : 'are of types'} this panel can't read from your project (${unread.types.join(', ')}) — skipped; if you have them locally, deploy their folder via right-click.` : '',
+      unread?.count ? `${unread.count} more ${unread.count === 1 ? 'is' : 'are'} of ${unread.types.length === 1 ? 'a type' : 'types'} this panel can't read from your project (${unread.types.join(', ')}) — skipped; if you have ${unread.count === 1 ? 'it' : 'them'} locally, deploy ${unread.count === 1 ? 'it' : 'them'} from the Explorer (right-click the -meta.xml) or with a package.xml.` : '',
       skipped ? `${skipped} more selected ${skipped === 1 ? 'exists' : 'exist'} only on the org — no local file to deploy, so ${skipped === 1 ? 'it is' : 'they are'} skipped.` : ''
     ].filter(Boolean).join('\n') || undefined;
     if (isProd && !validateOnly) {
@@ -3333,8 +3333,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const unreadTypes = [...new Set(unread.map(i => i.type))].sort();
     const skipGroups = [
       ...(unread.length ? [{
-        head: `${unread.length} skipped — this panel can't read ${unreadTypes.join(', ')} from your project: if you have ${unread.length === 1 ? 'it' : 'them'} locally, ${unread.length === 1 ? 'it was' : 'they were'} NOT deployed — deploy the folder via right-click:`,
-        rows: unread.map(i => `— ${i.type}:${i.name} — not read from your project, skipped (deploy its folder via right-click)`)
+        head: `${unread.length} skipped — this panel can't read ${unreadTypes.join(', ')} from your project: if you have ${unread.length === 1 ? 'it' : 'them'} locally, ${unread.length === 1 ? 'it was' : 'they were'} NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml:`,
+        rows: unread.map(i => `— ${i.type}:${i.name} — not read from your project, skipped (right-click its -meta.xml to deploy)`)
       }] : []),
       ...(orgOnly.length ? [{
         head: `${orgOnly.length} skipped — selected, but ${orgOnly.length === 1 ? 'it exists' : 'they exist'} only on the org, so there was no local file to deploy:`,

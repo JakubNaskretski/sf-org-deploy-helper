@@ -36,7 +36,8 @@ This file starts at the current release; earlier history predates it.
   its 100-line cap cut them off, leaving a bare "N skipped". The confirm now says how many
   will be skipped and why, and the card leads with them. Types this panel can't read from your
   project (bots, object translations, Experience bundles…) are called out separately: if you have
-  them locally they were not deployed — deploy their folder via right-click.
+  them locally they were not deployed — deploy them from the Explorer (right-click the
+  `-meta.xml`) or with a package.xml.
 - Fixed: **Validate with "Overwrite org changes" on.** `sf project deploy validate` has no
   `--ignore-conflicts` flag — it ignores conflicts on its own — so every Validate that ran tests
   failed with "Nonexistent flag", and the hint blamed an outdated CLI.
