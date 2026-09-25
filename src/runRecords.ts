@@ -65,6 +65,10 @@ export interface TestRow {
  *  of what was skipped before the reload. */
 export type RunCounts = Partial<Record<Outcome, number>> & {
   sent?: number;
+  /** Of the skipped rows, those whose type this panel can't read from the
+   *  project (the rest exist only on the org) — kept as a count, because only
+   *  some of the rows survive a reload. */
+  skippedUnread?: number;
   testsRun?: number;
   testsFailed?: number;
   orgDeployed?: number;
@@ -115,6 +119,9 @@ export interface RunRecord {
   /** The dependency suggestion this failure produced; the suggestion itself is
    *  live state the provider merges in when it posts the run. */
   suggestId?: string;
+  /** What the failure's missing dependencies are, in words — shown whenever no
+   *  live suggestion says it (after a reload, or once it expires). */
+  diagnosis?: string[];
   /** A quick deploy's validation. */
   fromRunId?: string;
 }
@@ -136,11 +143,10 @@ export const RUN_ID_RE = /^[a-z0-9]{6,24}$/;
 /** A Metadata API deploy id — the only job id a button may hand back to the CLI. */
 export const DEPLOY_JOB_ID_RE = /^0Af[A-Za-z0-9]{12,15}$/;
 
-/** Setting bounds for how many runs are kept (sfOrgDeployWrapper.statusHistoryRuns). */
+/** Setting bounds for how many runs — and, apart from them, how many notices
+ *  (Fetch Org, diff, delete, login…) — are kept (sfOrgDeployWrapper.statusHistoryRuns). */
 export const RUN_CAP_DEFAULT = 3;
 export const RUN_CAP_MAX = 10;
-/** Notices (Fetch Org, diff, delete, login…) are kept apart from runs, at most this many. */
-export const NOTICES_MAX = 10;
 
 export const ROW_MESSAGE_MAX = 500;
 const KEY_MAX = 600;
@@ -412,6 +418,9 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
   const counts: RunCounts = {};
   for (const o of seededOutcomes(input.op, status)) counts[o] = 0;
   if (input.skipped) counts.skipped = 0;
+  // Only when there are some: with none, the rows (however few are kept) say so.
+  const unreadSkipped = rows.filter(r => r.o === 'skipped' && r.why === 'unread').length;
+  if (unreadSkipped) counts.skippedUnread = unreadSkipped;
   for (const r of rows) counts[r.o] = (counts[r.o] ?? 0) + 1;
   counts.sent = rows.filter(r => r.s === 1).length;
   // The org's own tally, when it has one and the rows could not say it: a
@@ -484,6 +493,8 @@ export function beginRun(input: BeginRunInput): RunRecord {
   for (const i of input.skipped?.orgOnly ?? []) skip(i, 'org');
   const counts: RunCounts = { pending: input.items.length, sent: input.items.length };
   if (input.skipped) counts.skipped = rows.length - input.items.length;
+  const unreadSkipped = rows.filter(r => r.why === 'unread').length;
+  if (unreadSkipped) counts.skippedUnread = unreadSkipped;
   const run: RunRecord = {
     v: 1, id: input.id, op: input.op, status: 'running',
     org: input.org, orgLabel: input.orgLabel, orgKind: input.orgKind,
@@ -620,6 +631,7 @@ export function summarizeRun(run: RunRecord, opts: { latest: boolean }): RunReco
     if (run.conflict) out.conflict = true;
     if (run.backupDir) out.backupDir = run.backupDir;
     if (run.suggestId) out.suggestId = run.suggestId;
+    if (run.diagnosis?.length) out.diagnosis = run.diagnosis.slice(0, NOTES_MAX).map(n => orgText(n, NOTE_MAX));
   }
   // The caps bound the counts of things; a pathological run (hundreds of long
   // messages) can still overshoot the byte budget. Shorten messages first, then
@@ -714,7 +726,7 @@ function normalizeTest(raw: unknown): TestRow | undefined {
   return row;
 }
 
-const COUNT_KEYS: readonly string[] = [...OUTCOMES, 'sent', 'testsRun', 'testsFailed', 'orgDeployed', 'orgTotal', 'orgErrors'];
+const COUNT_KEYS: readonly string[] = [...OUTCOMES, 'sent', 'skippedUnread', 'testsRun', 'testsFailed', 'orgDeployed', 'orgTotal', 'orgErrors'];
 
 function stringList(v: unknown, max: number, each: number): string[] | undefined {
   if (!Array.isArray(v)) return undefined;
@@ -769,6 +781,8 @@ export function normalizeRun(raw: unknown): RunRecord | undefined {
   if (cliActions) run.cliActions = cliActions;
   const notes = stringList(r.notes, NOTES_MAX, NOTE_MAX);
   if (notes) run.notes = notes;
+  const diagnosis = stringList(r.diagnosis, NOTES_MAX, NOTE_MAX);
+  if (diagnosis) run.diagnosis = diagnosis;
   if (r.retry !== undefined) {
     if (!r.retry || typeof r.retry !== 'object') return undefined;
     const q = r.retry as Record<string, unknown>;
@@ -848,17 +862,17 @@ export function noticeFromCard(card: Record<string, unknown>): Record<string, un
  * The notices and runs to start from, given what workspaceState holds.
  *
  * With no run history yet (the first start after an upgrade) the old card
- * history is carried over as notices: the newest NOTICES_MAX, with their buttons
+ * history is carried over as notices: the newest `noticeCap`, with their buttons
  * stripped — a card never becomes a run, its text is not parsed back into one —
  * and an empty run history is created (`migrated`, so the caller writes it).
  * Every later start reads the same way minus the write, so older cards that
  * still carry buttons heal on read and running it twice changes nothing.
  */
-export function migrateCardHistory(rawCards: unknown, rawRuns: unknown): { notices: Array<Record<string, unknown>>; runsState: RunsState; migrated: boolean } {
+export function migrateCardHistory(rawCards: unknown, rawRuns: unknown, noticeCap: unknown): { notices: Array<Record<string, unknown>>; runsState: RunsState; migrated: boolean } {
   const cards = Array.isArray(rawCards)
     ? rawCards.filter((c): c is Record<string, unknown> => !!c && typeof c === 'object' && !Array.isArray(c))
     : [];
-  const notices = cards.slice(0, NOTICES_MAX).map(noticeFromCard);
+  const notices = cards.slice(0, clampRunCap(noticeCap)).map(noticeFromCard);
   if (rawRuns === undefined) return { notices, runsState: { v: 1, runs: [] }, migrated: true };
   return { notices, runsState: normalizeRunsState(rawRuns), migrated: false };
 }

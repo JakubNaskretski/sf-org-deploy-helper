@@ -345,14 +345,16 @@ const LEGACY = () => Array.from({ length: 50 }, (_, i) => ({
   quickDeploy: { jobId: '0AfAc000001kM7pSAE' }
 }));
 
-check('first start after an upgrade: 50 old cards become the 10 newest, button-less; the new history is written', () => {
+check('first start after an upgrade: 50 old cards become the N newest (the setting), button-less; the new history is written', () => {
   const x = host({ state: { [NOTICES_KEY]: LEGACY() } });
   const s = x.store();
-  assert.deepStrictEqual(s.notices().map(n => n.title), LEGACY().slice(0, 10).map(c => c.title));
+  assert.deepStrictEqual(s.notices().map(n => n.title), LEGACY().slice(0, 3).map(c => c.title));
   assert.ok(s.notices().every(n => !('buttons' in n) && !('quickDeploy' in n)));
   assert.deepStrictEqual(x.state[RUNS_KEY], { v: 1, runs: [] });
-  assert.strictEqual(x.state[NOTICES_KEY].length, 10, 'the carried-over notices are written back, bounded');
+  assert.strictEqual(x.state[NOTICES_KEY].length, 3, 'the carried-over notices are written back, bounded');
   assert.ok(RR.packedSize(x.state[NOTICES_KEY]) < 5000, 'no old Retry key list survives');
+  const ten = host({ state: { [NOTICES_KEY]: LEGACY() }, cap: 10 });
+  assert.strictEqual(ten.store().notices().length, 10, 'with the setting at 10, ten of them');
 });
 
 check('the carry-over happens once: a second start rewrites nothing', () => {
@@ -395,8 +397,12 @@ check('a run left running by a reload is marked interrupted (and persisted); the
   assert.strictEqual(live.store().runs()[0].status, 'running');
 });
 
-check('notices are bounded to 10, newest first, buttons and Quick Deploy stripped, the live card untouched', () => {
-  const x = host();
+check('notices are bounded like runs (the setting), newest first, buttons and Quick Deploy stripped, the live card untouched', () => {
+  const small = host();
+  const s3 = small.store();
+  for (let i = 0; i < 5; i++) s3.pushNotice({ kind: 'ok', title: `N${i}` });
+  assert.deepStrictEqual(small.state[NOTICES_KEY].map(n => n.title), ['N4', 'N3', 'N2'], 'three by default');
+  const x = host({ cap: 10 });
   const s = x.store();
   const live = { kind: 'ok', title: 'Retrieved 2', quickDeploy: { jobId: 'x' }, buttons: [{ label: 'Restore backup…', send: { type: 'restoreBackup', dir: '/b' } }], errText: 'e'.repeat(9000), lines: Array.from({ length: 150 }, (_, i) => `line ${i}`) };
   for (let i = 0; i < 11; i++) s.pushNotice({ kind: 'ok', title: `N${i}` });
@@ -446,6 +452,7 @@ check('ready posts the notices, then the runs with the newest run\'s full list f
     const r = reload.posted.find(m => m.type === 'runs');
     assert.strictEqual(r.runs[0].id, 'runready');
     assert.strictEqual(r.latestRows.rows.length, 21);
+    assert.strictEqual(reload.posted.find(m => m.type === 'statusHistory').cap, 3, 'the replay says how many notices the pane keeps');
   } finally { await fsp.rm(dir, { recursive: true, force: true }); }
 });
 
@@ -463,9 +470,13 @@ check('the statusHistoryRuns setting trims the history when it changes (read thr
   const p = provider({});
   cfgRuns = 3;
   for (let i = 1; i <= 3; i++) p.s.runStore.finish(run(`runset0${i}`, { at: T0 + i }));
+  for (let i = 1; i <= 3; i++) p.s.runStore.pushNotice({ kind: 'ok', title: `Diff ${i}`, at: T0 + i });
   cfgRuns = 1;
   p.s.runStore.setCap();
   assert.deepStrictEqual(p.state[RUNS_KEY].runs.map(r => r.id), ['runset03']);
+  assert.deepStrictEqual(p.state[NOTICES_KEY].map(n => n.title), ['Diff 3'], 'the notices follow the same setting');
+  const replay = p.posted.filter(m => m.type === 'statusHistory').slice(-1)[0];
+  assert.deepStrictEqual([replay.cards.map(c => c.title), replay.cap], [['Diff 3'], 1], 'and the pane is told');
   cfgRuns = undefined;
 });
 

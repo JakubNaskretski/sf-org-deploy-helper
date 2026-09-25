@@ -265,6 +265,18 @@ check('thousands of failures on one component, and a pathological stack trace, s
   assert.strictEqual(tr.tests[0].l, undefined);
 });
 
+check('the skipped split is counted when the run is made, so a summary that keeps 50 rows still knows it', () => {
+  const unread = Array.from({ length: 60 }, (_, i) => item('Bot', `AcmeBot${i}`));
+  const orgOnly = Array.from({ length: 40 }, (_, i) => item('Report', `AcmeReport${i}`));
+  const begun = RR.beginRun({ id: 'rsplit001', op: 'deploy', org: 'acme-dev-user', orgLabel: 'acme-dev', orgKind: 'sandbox', startedAt: T0, target: 'selection', items: ITEMS, skipped: { unread, orgOnly } });
+  assert.deepStrictEqual([begun.counts.skipped, begun.counts.skippedUnread], [100, 60]);
+  const done = RR.deployRunFromResult(ok(), BASE({ skipped: { unread, orgOnly } }));
+  assert.deepStrictEqual([done.counts.skipped, done.counts.skippedUnread], [100, 60]);
+  const [kept] = RR.normalizeRunsState({ v: 1, runs: [RR.summarizeRun(done, { latest: true })] }).runs;
+  assert.strictEqual(kept.rows.filter(r => r.o === 'skipped').length, 50, 'only some rows survive');
+  assert.strictEqual(kept.counts.skippedUnread, 60, 'the count does');
+});
+
 check('an unmapped failure is its own failed row (Type:Name as the org spelled it) and is NOT sent', () => {
   const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { componentFailures: [
     { componentType: 'ApexClass', fullName: 'AcmeDependent', problem: 'Dependent class is invalid and needs recompilation' }
@@ -518,6 +530,14 @@ check('normalize keeps the first of two runs with one id, sorts newest first, ke
   assert.ok(!back.some(r => r.startedAt === T0 + 99_000), 'the duplicate id must not replace the first copy');
 });
 
+check('the dependency diagnosis kept beside a suggestion survives storage, bounded like notes', () => {
+  const run = { ...GOOD(), status: 'failed', suggestId: 'sug-1-0', diagnosis: ['Missing but available locally: CustomObject:AcmeRate__mdt — add them to the deploy by hand.', 7, 'x'.repeat(900)] };
+  const [back] = RR.normalizeRunsState(state(run)).runs;
+  assert.strictEqual(back.diagnosis[0], run.diagnosis[0]);
+  assert.ok(back.diagnosis.every(d => typeof d === 'string' && d.length <= 500), JSON.stringify(back.diagnosis).slice(0, 200));
+  assert.deepStrictEqual(RR.summarizeRun(back, { latest: true }).diagnosis, back.diagnosis);
+});
+
 // ============================================================ 6) migration
 const legacyCards = () => Array.from({ length: 14 }, (_, i) => ({
   kind: i % 2 ? 'err' : 'ok', title: `Card ${i}`, at: T0 - i * 1000, lines: [`line ${i}`],
@@ -525,26 +545,28 @@ const legacyCards = () => Array.from({ length: 14 }, (_, i) => ({
   quickDeploy: { jobId: '0AfAc000001kM7pSAE', label: 'Quick Deploy' }
 }));
 
-check('first start after an upgrade: the 10 newest cards become button-less notices and an empty run history is created', () => {
-  const { notices, runsState, migrated } = RR.migrateCardHistory(legacyCards(), undefined);
+check('first start after an upgrade: the newest cards, as many as the setting keeps, become button-less notices and an empty run history is created', () => {
+  const { notices, runsState, migrated } = RR.migrateCardHistory(legacyCards(), undefined, 10);
   assert.strictEqual(migrated, true);
   assert.deepStrictEqual(runsState, { v: 1, runs: [] });
-  assert.strictEqual(notices.length, RR.NOTICES_MAX);
+  assert.strictEqual(notices.length, 10);
   assert.deepStrictEqual(notices.map(n => n.title), legacyCards().slice(0, 10).map(c => c.title));
+  assert.strictEqual(RR.migrateCardHistory(legacyCards(), undefined, undefined).notices.length, 3, 'the default is 3');
+  assert.strictEqual(RR.migrateCardHistory(legacyCards(), undefined, 99).notices.length, 10, 'clamped like the runs');
   assert.ok(notices.every(n => !('buttons' in n) && !('quickDeploy' in n)), 'a notice is a record, never an action');
   assert.ok(RR.packedSize(notices) < 5_000, 'the Retry key lists of old failure cards must not be carried over');
 });
 
 check('migration is idempotent: reading its own output changes nothing and writes nothing', () => {
-  const first = RR.migrateCardHistory(legacyCards(), undefined);
-  const again = RR.migrateCardHistory(JSON.parse(JSON.stringify(first.notices)), JSON.parse(JSON.stringify(first.runsState)));
+  const first = RR.migrateCardHistory(legacyCards(), undefined, 10);
+  const again = RR.migrateCardHistory(JSON.parse(JSON.stringify(first.notices)), JSON.parse(JSON.stringify(first.runsState)), 10);
   assert.strictEqual(again.migrated, false);
   assert.deepStrictEqual(again.notices, first.notices);
   assert.deepStrictEqual(again.runsState, first.runsState);
 });
 
 check('a later start heals cards that still carry buttons and normalizes the runs', () => {
-  const { notices, runsState, migrated } = RR.migrateCardHistory([...legacyCards(), null, 'x', [1]], state(GOOD(), { op: 'nope' }));
+  const { notices, runsState, migrated } = RR.migrateCardHistory([...legacyCards(), null, 'x', [1]], state(GOOD(), { op: 'nope' }), 10);
   assert.strictEqual(migrated, false);
   assert.strictEqual(notices.length, 10);
   assert.ok(notices.every(n => !('buttons' in n)));

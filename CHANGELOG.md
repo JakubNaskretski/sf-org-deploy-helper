@@ -17,10 +17,10 @@ This file starts at the current release; earlier history predates it.
   them, but they lose their Retry, Select and backup buttons — an older retrieve's backup is
   still restorable with **SF Deploy: Restore Retrieve Backup**. Cards kept by earlier versions
   come back as notices, without their buttons.
-- **The history keeps your last 3 runs** — set how many with the new
-  `sfOrgDeployWrapper.statusHistoryRuns` (1–10). The newest keeps its full list across reloads.
-  Other results (diff, delete, Fetch Org…) are notices, and the pane keeps 10 of them instead
-  of 50.
+- **The history keeps your last 3 runs, and 3 other results** — set how many with the new
+  `sfOrgDeployWrapper.statusHistoryRuns` (1–10). The newest run keeps its full list across
+  reloads. Other results (diff, delete, Fetch Org…) are notices, and the pane keeps the same
+  number of them — 3 by default, where it used to keep 50 cards.
 - **A deploy running when the window reloads keeps its card.** The panel picks the job up
   again, as before, and now finishes the same run — keeping what it skipped and the test level
   a Retry uses. A run whose result could not be recorded says so and points you to Deployment

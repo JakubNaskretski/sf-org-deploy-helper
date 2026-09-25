@@ -4,12 +4,6 @@
   // Run-card view logic (src/runView.js), loaded by its own script tag first.
   const RV = window.RunView;
 
-  // Cap on the notices (status cards that are not runs) kept in the webview —
-  // mirrors the provider's NOTICES_MAX (runRecords.ts) so the live view and the
-  // persisted history trim to the same length. Used by both the live 'status'
-  // unshift and the 'statusHistory' replay below.
-  const STATUS_HISTORY_MAX = 10;
-
   // Cap on the SELECTION copy written to webview state. One click on the Objects
   // group checkbox ticks every field of every object, and this object is
   // re-serialized on every subsequent toggle, so an unbounded key list would be
@@ -69,6 +63,8 @@
     // it always was; with some, the newest run is drawn in full and everything
     // else — older runs and statusCards alike — is a one-liner.
     runs: [],
+    // How many runs — and notices — the history keeps (statusHistoryRuns, as
+    // the provider sends it): the live list trims to the saved one's length.
     runCap: 3,
     // The newest run's full row list, when the provider sent it; the run itself
     // may carry only a summary (failures and a few skipped rows).
@@ -763,7 +759,7 @@
           if (!r.counts || typeof r.counts !== 'object') r.counts = {};
         }
         state.runs = runs;
-        if (typeof msg.cap === 'number') state.runCap = msg.cap;
+        takeCap(msg.cap);
         const latest = runs[0];
         const lr = msg.latestRows;
         if (latest && lr && lr.runId === latest.id && Array.isArray(lr.rows)) {
@@ -841,13 +837,14 @@
       case 'status':
         // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint, at }
         state.statusCards.unshift(msg.card);
-        if (state.statusCards.length > STATUS_HISTORY_MAX) state.statusCards.length = STATUS_HISTORY_MAX;
+        if (state.statusCards.length > state.runCap) state.statusCards.length = state.runCap;
         renderStatus();
         return;
       case 'statusHistory':
         // Persisted card history replayed by the provider on ready (newest first) —
         // the Status pane doubles as the deployment history across window reloads.
-        state.statusCards = (msg.cards || []).slice(0, STATUS_HISTORY_MAX);
+        takeCap(msg.cap);
+        state.statusCards = (msg.cards || []).slice(0, state.runCap);
         renderStatus();
         return;
       case 'cmd':
@@ -869,6 +866,13 @@
         renderQueue();
         return;
     }
+  }
+
+  /** The history's length from the provider (1–10), trimming the notices to it. */
+  function takeCap(cap) {
+    if (typeof cap !== 'number' || !Number.isFinite(cap)) return;
+    state.runCap = Math.min(10, Math.max(1, Math.floor(cap)));
+    if (state.statusCards.length > state.runCap) state.statusCards.length = state.runCap;
   }
 
   // ---- Renderers ----
@@ -2449,10 +2453,15 @@
     if (counts.length) body.appendChild(mk('div', 'run-sub', counts.join(' · ')));
     const failures = run.rows.filter(r => r.o === 'failed').slice(0, OLDER_FAILURES_SHOWN);
     const tests = run.tests.slice(0, OLDER_TESTS_SHOWN);
-    if (failures.length || tests.length) {
+    // An older run keeps a few of each; the counts say how many there were.
+    const moreFailed = (run.counts.failed || 0) - failures.length;
+    const moreTests = (run.counts.testsFailed || 0) - tests.length;
+    if (failures.length || tests.length || moreFailed > 0 || moreTests > 0) {
       const ul = mk('ul', 'run-older-rows');
       for (const r of failures) ul.appendChild(olderRowEl(r.k, `${r.k}${r.m ? ' — ' + r.m.split('\n')[0] : ''}`, r.l, r.c));
+      if (moreFailed > 0) ul.appendChild(mk('li', 'run-older-more', `… ${RV.fmtN(moreFailed)} more ${RV.plural(moreFailed, 'failure')} not kept`));
       for (const t of tests) ul.appendChild(olderRowEl(`ApexClass:${t.cls}`, `${t.cls}.${t.method} — ${t.m.split('\n')[0]}`, t.l, t.c));
+      if (moreTests > 0) ul.appendChild(mk('li', 'run-older-more', `… ${RV.fmtN(moreTests)} more test ${RV.plural(moreTests, 'failure')} not kept`));
       body.appendChild(ul);
     }
     const acts = mk('div', 'run-acts');

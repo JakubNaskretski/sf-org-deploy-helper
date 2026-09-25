@@ -560,6 +560,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 .run-older-rows { margin: 4px 0 0; padding-left: 16px; font-size: 11px; }
 .run-older-rows li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-older-rows li.nav { cursor: pointer; }
+.run-older-rows li.run-older-more { list-style: none; margin-left: -16px; color: var(--muted); font-style: italic; }
 .run-older-rows li.nav:hover { text-decoration: underline; }
 .run-foot { margin-top: 4px; font-size: 10px; color: var(--muted); font-style: italic; }
 .run-notice > .status-card { margin: 2px 0 4px 16px; }

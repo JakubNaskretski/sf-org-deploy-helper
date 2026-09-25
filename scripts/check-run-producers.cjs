@@ -489,6 +489,23 @@ check('a reattach that loses contact again, after a reload: the summary\'s 50 sk
   assert.ok(notes.length && /not listed/.test(notes[0].text), JSON.stringify(notes));
 });
 
+check('a reattach keeps the skipped split too: rows of a type the panel can\'t read are never called org-only', async () => {
+  const BOTS = Array.from({ length: 60 }, (_, i) => `Bot:AcmeBot${String(i).padStart(2, '0')}`);
+  const REPORTS = SKIPS.slice(0, 20);
+  const members = new Map([...BOTS, ...REPORTS].map(k => [k, {}]));
+  let state;
+  const p1 = provider({ fields: { orgMembers: members }, poll: async function () { state = JSON.parse(JSON.stringify(p1.kept)); return { kind: 'lost' }; } });
+  await deploy(p1, [...KEYS, ...BOTS, ...REPORTS]);
+  const p = provider({ state, fields: { orgMembers: members } });
+  await proto.reattachDeployJob.call(p.s, proto.readActiveJob.call(p.s));
+  const { runs: [run], latestRows } = last(p);
+  assert.deepStrictEqual([run.counts.skipped, run.counts.skippedUnread], [80, 60]);
+  assert.strictEqual(latestRows.rows.filter(r => r.o === 'skipped').length, 50, 'only the summary\'s rows came through the reload');
+  const text = RV.explainFor(run, 'skipped', latestRows.rows).text;
+  assert.ok(text.startsWith('60 skipped — this panel can\'t read Bot, … from your project'), text);
+  assert.ok(text.includes('20 skipped — selected, but they exist only on the org'), text);
+});
+
 check('a reattach retries with everything the run ran with: its test classes, its source folder', async () => {
   const specified = await stateMidRun({ validateOnly: true, testLevel: 'RunSpecifiedTests', runTests: ['AcmeOrderServiceTest'] });
   const a = provider({ state: specified.state, fields: { orgMembers: MEMBERS }, report: FAILED_VALIDATION });

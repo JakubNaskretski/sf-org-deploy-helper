@@ -28,7 +28,8 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {
   window: { showInformationMessage: () => Promise.resolve(undefined) },
-  workspace: { getConfiguration: () => ({ get: (_k, f) => f }) },
+  // Ten notices kept (the most the setting allows), so every kind of old button is seen healing.
+  workspace: { getConfiguration: () => ({ get: (k, f) => (k === 'statusHistoryRuns' ? 10 : f) }) },
   commands: { executeCommand: () => Promise.resolve(undefined) },
   Uri: { file: (fsPath) => ({ fsPath }) }
 } : origLoad(req, ...rest));

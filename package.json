@@ -310,7 +310,7 @@
           "default": 3,
           "minimum": 1,
           "maximum": 10,
-          "markdownDescription": "How many deploy/validate/quick-deploy/retrieve runs the Status pane keeps across reloads. The newest is the full result; older ones are one-line summaries. VS Code doesn't enforce the `minimum`/`maximum` below at runtime, so the extension itself clamps whatever you set here."
+          "markdownDescription": "How many deploy/validate/quick-deploy/retrieve runs the Status pane keeps across reloads — and how many other results (diff, delete, Fetch Org…) it keeps beside them. The newest run is the full result; older ones are one-line summaries. VS Code doesn't enforce the `minimum`/`maximum` below at runtime, so the extension itself clamps whatever you set here."
         },
         "skrety.salesforce.targetOrg": {
           "type": "string",

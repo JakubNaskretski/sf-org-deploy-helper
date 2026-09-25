@@ -504,6 +504,21 @@ check('an error after the org had the job reads as "no result", never "didn\'t s
   assert.ok(/rolled back/.test(plain(base({ status: 'running', finishedAt: undefined }), { cancelRequested: true }).join(' ')), 'a deploy\'s cancel still says it');
 });
 
+check('the skipped legend takes its split from the run\'s counts, not the rows a summary kept, and formats every number', () => {
+  const rows = Array.from({ length: 50 }, (_, i) => ({ k: `Bot:AcmeBot${i}`, o: 'skipped', why: 'unread' }));
+  const r = base({ counts: { deployed: 9047, skipped: 2535, skippedUnread: 90 }, rows, rowsComplete: false });
+  assert.strictEqual(RV.explainFor(r, 'skipped', rows).text,
+    "90 skipped — this panel can't read Bot, … from your project: if you have them locally, they were NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml. 2,445 skipped — selected, but they exist only on the org, so there was no local file to deploy.");
+});
+
+check('the dependency diagnosis shows only once no live suggestion says it', () => {
+  const d = 'Missing but available locally: CustomObject:AcmeRate__mdt — add them to the deploy by hand.';
+  const r = base({ status: 'failed', counts: { failed: 1, rolledback: 0 }, rows: [{ k: 'ApexClass:AcmeA', o: 'failed', s: 1, m: 'Invalid type: AcmeRate__mdt' }], diagnosis: [d], suggestId: 'sug-1-0' });
+  const live = Object.assign({}, r, { suggest: { id: 'sug-1-0', candidates: [{ key: 'CustomObject:AcmeRate__mdt' }], unresolved: [] } });
+  assert.ok(!plain(live).includes(d), 'the live suggestion says it with its own choices');
+  assert.ok(plain(r).includes(d), 'after a reload, the words');
+});
+
 check('this harness is registered in package.json "check"', () => {
   assert.ok(pkg.scripts.check.includes('node ./scripts/check-run-view.cjs'));
 });

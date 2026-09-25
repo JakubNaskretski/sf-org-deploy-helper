@@ -339,8 +339,10 @@ check('Earlier (k) lists the older runs and notices; an older run expands read-o
   const notices = F.buildNotices(NOW);
   const p = boot({ scenario: 'fxdeployfail', notices });
   const eb = p.el('statusEarlier');
-  const newer = notices.filter(n => n.at > S('fxdeployfail').run.startedAt).length;
-  const k = 2 + notices.length - newer;
+  // The pane keeps as many notices as runs (3 here), the newest ones.
+  const kept = notices.slice(0, 3);
+  const newer = kept.filter(n => n.at > S('fxdeployfail').run.startedAt).length;
+  const k = 2 + kept.length - newer;
   assert.strictEqual(eb.style.display, '');
   assert.strictEqual(eb.textContent, `Earlier (${k}) ▸`);
   assert.ok(!p.el('status').find(e => has(e, 'run-earlier')), 'closed by default');
@@ -359,6 +361,21 @@ check('Earlier (k) lists the older runs and notices; an older run expands read-o
   assert.ok(sent(p, 'copyText').length === 1);
   // The newest run still has its own actions.
   assert.ok(actBtn(p, 'retry'));
+});
+
+check('an expanded older run says how many failures and test failures it did not keep', () => {
+  const p = boot({ scenario: 'fxbigdeploy' });
+  p.deliver({ type: 'runs', cap: 3, runs: [
+    RR.summarizeRun(S('fxbigdeploy').run, { latest: true }),
+    RR.summarizeRun(S('fxdeployfail').run, { latest: false }),
+    RR.summarizeRun(S('fxtestsfail').run, { latest: false })
+  ] });
+  click(p.el('statusEarlier'));
+  const olders = p.el('status').find(e => has(e, 'run-earlier')).children.filter(e => has(e, 'run-older'));
+  for (const o of olders) click(o.children[0]);
+  const bodies = p.el('status').findAll(e => has(e, 'run-older-body')).map(text);
+  assert.ok(bodies.some(t => t.includes('… 16 more failures not kept')), bodies.join(' || ').slice(0, 400));
+  assert.ok(bodies.some(t => t.includes('… 4 more test failures not kept')), bodies.join(' || ').slice(0, 400));
 });
 
 check('a notice newer than the newest run leads as a one-liner and expands to its card body', () => {
@@ -392,7 +409,7 @@ check('a runs post without the full list keeps it only while the same run is the
 check('with no runs the pane is the plain card list: no run card, no Earlier toggle', () => {
   const p = boot({ notices: F.buildNotices(NOW) });
   assert.ok(!p.el('status').find(e => has(e, 'run-card')));
-  assert.strictEqual(p.el('status').children.filter(e => has(e, 'status-card')).length, 4);
+  assert.strictEqual(p.el('status').children.filter(e => has(e, 'status-card')).length, 3, 'as many notices as the history keeps');
   assert.strictEqual(p.el('statusEarlier').style.display, 'none');
   p.deliver(runsMsg('fxbigdeploy'));
   assert.ok(p.el('status').find(e => has(e, 'run-card')), 'the first run switches the pane over');
@@ -444,18 +461,24 @@ check('a poll tick never rebuilds the card, and a rebuild keeps what was typed i
   assert.strictEqual(again.value, 'acme ord', 'half-typed text survives the rebuild');
 });
 
-check('the pane keeps the provider\'s 10 newest notices — replayed or live — and a notice has no buttons', () => {
-  const RR_NOTICES = RR.NOTICES_MAX;
-  assert.strictEqual(RR_NOTICES, 10);
+check('the pane keeps as many notices as the provider does — 3 by default, the setting when it says so — and a notice has no buttons', () => {
   const cards = Array.from({ length: 12 }, (_, i) => ({ kind: 'ok', title: `Diff ${i}`, at: NOW - i * 1000 }));
-  const p = boot({ notices: cards });
-  const shown = () => p.el('status').children.filter(e => has(e, 'status-card')).map(e => text(e));
-  assert.strictEqual(shown().length, 10);
-  assert.ok(shown()[0].includes('Diff 0') && shown()[9].includes('Diff 9'));
+  const shown = (p) => p.el('status').children.filter(e => has(e, 'status-card')).map(e => text(e));
+  const d = boot({ notices: cards });
+  assert.strictEqual(shown(d).length, 3);
+  d.deliver({ type: 'status', card: { kind: 'ok', title: 'Diff live', at: NOW + 500 } });
+  assert.strictEqual(shown(d).length, 3, 'a live notice keeps the same length');
+  const p = boot();
+  p.deliver({ type: 'statusHistory', cards, cap: 10 });
+  assert.strictEqual(shown(p).length, 10);
+  assert.ok(shown(p)[0].includes('Diff 0') && shown(p)[9].includes('Diff 9'));
   p.deliver({ type: 'status', card: { kind: 'warn', title: 'Diff new', at: NOW + 1000, buttons: [{ label: 'Stale', send: { type: 'retryDeploy' } }] } });
-  assert.strictEqual(shown().length, 10);
-  assert.ok(shown()[0].includes('Diff new') && shown()[9].includes('Diff 8'));
+  assert.strictEqual(shown(p).length, 10);
+  assert.ok(shown(p)[0].includes('Diff new') && shown(p)[9].includes('Diff 8'));
   assert.ok(!p.el('status').find(e => e.tagName === 'BUTTON' && e.textContent === 'Stale'), 'a card\'s buttons are never drawn');
+  // The setting lowered: the next runs post says so, and the list follows.
+  p.deliver({ type: 'runs', runs: [], cap: 2 });
+  assert.strictEqual(shown(p).length, 2);
 });
 
 check('Clear keeps a run that is still running', () => {

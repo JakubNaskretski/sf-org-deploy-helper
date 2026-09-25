@@ -6,7 +6,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import {
-  INTERRUPTED_NOTES, NOTICES_MAX, RunRecord, RunRow, RunStatus, TestRow, clampRunCap, interruptedRun, migrateCardHistory,
+  INTERRUPTED_NOTES, RunRecord, RunRow, RunStatus, TestRow, clampRunCap, interruptedRun, migrateCardHistory,
   noticeFromCard, normalizeRows, normalizeTests, summarizeRun, trimRuns
 } from './runRecords';
 
@@ -79,7 +79,7 @@ export class RunStore {
     } catch (err) {
       this.host.log(`[history] read failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const { notices, runsState, migrated } = migrateCardHistory(rawCards ?? [], rawRuns);
+    const { notices, runsState, migrated } = migrateCardHistory(rawCards ?? [], rawRuns, this.host.cap());
     this.noticeList = notices;
     const active = this.host.activeRunId?.();
     let interrupted = false;
@@ -102,11 +102,17 @@ export class RunStore {
     return this.noticeList;
   }
 
-  /** Keep a status card as a notice: bounded, without buttons, newest first. */
+  /** Keep a status card as a notice: as many as runs are kept, without
+   *  buttons, newest first. */
   pushNotice(card: Record<string, unknown>): void {
     this.load();
-    this.noticeList = [noticeFromCard(card), ...this.noticeList].slice(0, NOTICES_MAX);
+    this.noticeList = [noticeFromCard(card), ...this.noticeList].slice(0, this.cap());
     this.persistNotices();
+  }
+
+  /** How many runs, and how many notices, the history keeps (the setting, clamped). */
+  cap(): number {
+    return clampRunCap(this.host.cap());
   }
 
   /** A run starting: the newest, with every row known before the org answers
@@ -208,11 +214,15 @@ export class RunStore {
     this.post(false);
   }
 
-  /** The setting changed: keep that many (never evicting a running run). */
+  /** The setting changed: keep that many runs (never evicting a running one)
+   *  and that many notices. */
   setCap(): void {
     this.load();
     this.list = trimRuns(this.list, this.host.cap());
+    this.noticeList = this.noticeList.slice(0, this.cap());
     this.persistRuns();
+    this.persistNotices();
+    this.host.post({ type: 'statusHistory', cards: this.noticeList, cap: this.cap() });
     this.post(false);
   }
 
@@ -257,7 +267,7 @@ export class RunStore {
     const msg: Record<string, unknown> = {
       type: 'runs',
       runs: head ? [{ ...head, ...(this.host.live?.(head) ?? {}) }, ...rest] : [],
-      cap: clampRunCap(this.host.cap())
+      cap: this.cap()
     };
     if (withRows && head && this.full?.runId === head.id) {
       msg.latestRows = { runId: head.id, rows: this.full.rows, tests: this.full.tests };

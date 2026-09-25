@@ -73,10 +73,10 @@ open and copy them, but they have no buttons; an older retrieve's backup is stil
 with **SF Deploy: Restore Retrieve Backup**. Other results (diff, delete, Fetch Org…) are short
 notices in the same history.
 
-The pane keeps your last `sfOrgDeployWrapper.statusHistoryRuns` runs (default 3) and 10
-notices across reloads, the newest run with its full list. Quick Deploy is offered until the
-window reloads. If the window reloads while a deploy runs, the panel picks the job up again and
-finishes the same run.
+The pane keeps your last `sfOrgDeployWrapper.statusHistoryRuns` runs (default 3) across
+reloads, the newest with its full list, and as many notices beside them. Quick Deploy is
+offered until the window reloads. If the window reloads while a deploy runs, the panel picks
+the job up again and finishes the same run.
 
 ## Requirements
 
@@ -103,4 +103,4 @@ finishes the same run.
 - `sfOrgDeployWrapper.debugTiming` — log click-to-modal timing to the **SF Deploy** Output channel, to diagnose a slow confirmation dialog (default off).
 - `sfOrgDeployWrapper.dependencyMaxDepth` — how many reference layers **Deploy File + Dependencies** follows below the file(s) you picked (default 2, 1–3).
 - `sfOrgDeployWrapper.dependencyMaxComponents` — cap on how many components **Deploy File + Dependencies** may auto-include (default 40, 5–200).
-- `sfOrgDeployWrapper.statusHistoryRuns` — how many deploy/validate/quick-deploy/retrieve runs the Status pane keeps across reloads (default 3, 1–10). The newest is the full result; older ones are one-line summaries.
+- `sfOrgDeployWrapper.statusHistoryRuns` — how many deploy/validate/quick-deploy/retrieve runs the Status pane keeps across reloads, and how many other results (diff, delete, Fetch Org…) beside them (default 3, 1–10). The newest run is the full result; older ones are one-line summaries.

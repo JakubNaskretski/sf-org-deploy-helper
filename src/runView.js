@@ -226,6 +226,8 @@
   }
   function withNotes(out, run) {
     for (const n of run.notes || []) out.plain.push({ kind: 'muted', text: n });
+    // A live suggestion says it with its own choices; once it is gone, the words.
+    if (!run.suggest) for (const d of run.diagnosis || []) out.plain.push({ kind: 'muted', text: d });
     return out;
   }
   /** The title as plain text (Copy, tooltips). */
@@ -260,14 +262,18 @@
   function skippedSentences(run, rows) {
     const total = cnt(run, 'skipped');
     const unreadRows = (rows || []).filter((r) => r.o === 'skipped' && r.why === 'unread');
-    const unread = unreadRows.length;
+    // The split is counted when the run is made: after a reload only some of
+    // the rows are left to count from.
+    const c = run.counts || {};
+    const unread = Math.min(total, typeof c.skippedUnread === 'number' ? c.skippedUnread : unreadRows.length);
     const orgOnly = Math.max(0, total - unread);
     const out = [];
     if (unread) {
       const types = [...new Set(unreadRows.map((r) => splitKey(r.k).type))].sort();
-      out.push(unread + ' skipped — this panel can\'t read ' + types.join(', ') + ' from your project: if you have ' + (unread === 1 ? 'it' : 'them') + ' locally, ' + (unread === 1 ? 'it was' : 'they were') + ' NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml.');
+      const what = !types.length ? 'their types' : types.join(', ') + (unreadRows.length < unread ? ', …' : '');
+      out.push(fmtN(unread) + ' skipped — this panel can\'t read ' + what + ' from your project: if you have ' + (unread === 1 ? 'it' : 'them') + ' locally, ' + (unread === 1 ? 'it was' : 'they were') + ' NOT deployed — deploy them from the Explorer (right-click the -meta.xml) or with a package.xml.');
     }
-    if (orgOnly) out.push(orgOnly + ' skipped — selected, but ' + (orgOnly === 1 ? 'it exists' : 'they exist') + ' only on the org, so there was no local file to deploy.');
+    if (orgOnly) out.push(fmtN(orgOnly) + ' skipped — selected, but ' + (orgOnly === 1 ? 'it exists' : 'they exist') + ' only on the org, so there was no local file to deploy.');
     return out.join(' ');
   }
 

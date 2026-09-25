@@ -216,6 +216,10 @@ interface ActiveDeployJob {
   testLevel?: TestLevel;
 }
 
+/** The skipped rows a run picked up again still holds, with the exact counts
+ *  (all of them, and those whose type the panel can't read). */
+interface KeptSkipped { rows: RunRow[]; count: number; unread?: number }
+
 /** How a poll loop ended: `terminal` (the org finished — render the result),
  *  `cancelled` (the user cancelled; the org was asked to stop but the final state
  *  couldn't be confirmed), or `lost` (contact lost — keep the job for reattach). */
@@ -1022,7 +1026,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Replay the Status history into the freshly-built webview — it survives
         // reloads, newest first: the notices, then the runs (with the newest run's
         // full list, from this window or the rows file).
-        if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory() });
+        if (this.cardHistory().length) this.post({ type: 'statusHistory', cards: this.cardHistory(), cap: this.runStore.cap() });
         // A suggestion still alive server-side comes back with the newest run
         // (liveRunPayload), so a rebuilt webview can act on it again.
         await this.runStore.postReady();
@@ -3319,8 +3323,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  reports through here too). */
       op?: 'deploy' | 'validate' | 'quickDeploy';
       /** Skipped rows a run picked up after a reload still knows (and their
-       *  exact count): the report cannot say what never reached the org. */
-      keptSkipped?: { rows: RunRow[]; count: number };
+       *  exact counts): the report cannot say what never reached the org. */
+      keptSkipped?: KeptSkipped;
       /** A quick deploy's validation. */
       fromRunId?: string;
     }
@@ -3365,6 +3369,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const have = new Set(run.rows.map(r => r.k));
       for (const r of kept.rows) if (!have.has(r.k)) run.rows.push({ ...r });
       run.counts.skipped = kept.count;
+      if (kept.unread !== undefined) run.counts.skippedUnread = kept.unread;
       return run;
     };
     if (success) {
@@ -3480,11 +3485,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // time the user acts on the suggestion.
       this.rememberSuggestion(suggestId, { candidates: suggest, unresolved: deps.unresolved, retry: ctx.retry, orgLabel, org });
     }
-    // The diagnosis becomes the run's notes when there is no suggestion view to
-    // carry it (nothing resolved locally, or manifest/sourceDir deploys) — it's
-    // the only feedback in that case, and it survives a reload the way the live
-    // suggestion does not.
-    const guidanceLines = suggestId ? [] : [
+    // The diagnosis in words. With no suggestion view to carry it (nothing
+    // resolved locally, or manifest/sourceDir deploys) it is the run's notes —
+    // the only feedback in that case. With one, it is kept aside and shown once
+    // the live suggestion is gone (after a reload), so the reason survives.
+    const diagnosis = [
       // A sourceDir-pinned retry can't be extended automatically (--source-dir
       // beats --metadata) and a manifest retry has no key list — but the user
       // still deserves to KNOW what's missing.
@@ -3493,8 +3498,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         ? [`Referenced but not found in your workspace: ${deps.unresolved.join(', ')} — retrieve it from an org that has it, or fix the reference.`]
         : [])
     ];
+    const guidanceLines = suggestId ? [] : diagnosis;
     const run = withKept(deployRunFromResult(result, { ...runInput, notes: [...guidanceLines, ...(ctx.notes ?? [])] }));
-    if (suggestId) run.suggestId = suggestId;
+    if (suggestId) {
+      run.suggestId = suggestId;
+      if (diagnosis.length) run.diagnosis = diagnosis;
+    }
     this.runStore.finish(run);
     const failureSummary = `${validateOnly ? 'Validation' : 'Deploy'} failed against ${orgLabel} — ${failures.length ? `${failures.length} component failure${failures.length === 1 ? '' : 's'}` : `${testFailures.length} test failure${testFailures.length === 1 ? '' : 's'}`}.`;
     // Details also mirror into the output channel so "Show Output" opens a log
@@ -3679,7 +3688,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     ctx: {
       items: MetadataItem[]; orgOnlySkipped: MetadataItem[]; orgLabel: string; org: string; noun: string; cmdId: string; start: number;
       validateOnly: boolean; verb: DeployVerb; retry?: RetryRequest; runId?: string; runStartedAt?: number; target?: RunTarget; notes?: string[];
-      op?: 'deploy' | 'validate' | 'quickDeploy'; keptSkipped?: { rows: RunRow[]; count: number }; fromRunId?: string;
+      op?: 'deploy' | 'validate' | 'quickDeploy'; keptSkipped?: KeptSkipped; fromRunId?: string;
     }
   ): MissingDependencies | undefined {
     return this.reportDeployResult(result, ctx);
@@ -3889,9 +3898,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** What a run that is picked up again still knows about its skipped rows:
    *  the ones this window holds (all of them, or after a reload the ones its
    *  summary kept), and the exact count. Undefined when it never knew. */
-  private keptSkipped(run: RunRecord): { rows: RunRow[]; count: number } | undefined {
+  private keptSkipped(run: RunRecord): KeptSkipped | undefined {
     if (typeof run.counts.skipped !== 'number') return undefined;
-    return { rows: this.runStore.rowsOf(run.id).filter(r => r.o === 'skipped'), count: run.counts.skipped };
+    return {
+      rows: this.runStore.rowsOf(run.id).filter(r => r.o === 'skipped'), count: run.counts.skipped,
+      unread: typeof run.counts.skippedUnread === 'number' ? run.counts.skippedUnread : undefined
+    };
   }
 
   /** Quick-deploy a previously-validated deployment by its job id — no re-run of

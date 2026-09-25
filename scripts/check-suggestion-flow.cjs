@@ -56,6 +56,7 @@ const vscodeStub = {
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 const { DeployPanelProvider, autoIncludedNotice } = require(path.join(ROOT, 'out', 'panelProvider.js'));
+const RV = require(path.join(ROOT, 'src', 'runView.js'));
 const proto = DeployPanelProvider.prototype;
 
 let failed = 0;
@@ -342,6 +343,14 @@ check('a hidden/rebuilt panel: the kept run carries the suggestion\'s id, never 
   assert.ok((kept.message || '').includes('Invalid type: smth__mdt'), `the org's message must survive: ${JSON.stringify(kept.message)}`);
   assert.ok(!(kept.notes || []).some(n => n.includes('Missing but available locally')),
     'with a live suggestion the guidance is the suggestion itself, not a note');
+  // ...but the diagnosis is kept beside it, so a reload (no live suggestion
+  // any more) still says what was missing — the way the kept card used to.
+  assert.ok((kept.diagnosis || []).some(n => n.startsWith('Missing but available locally: CustomObject:smth__mdt')), JSON.stringify(kept.diagnosis));
+  const live = lastRunsPost(p).runs[0];
+  assert.ok(live.suggest, 'the live run carries the suggestion');
+  const said = (run) => RV.verdictFor(run, { now: Date.now() }).plain.map(x => x.text);
+  assert.ok(!said(live).some(t => t.startsWith('Missing but available locally')), 'not twice while the suggestion is live');
+  assert.ok(said(kept).some(t => t.startsWith('Missing but available locally')), 'said once it is gone');
 });
 
 check('without a suggestion view to carry it, the diagnosis is kept as the run\'s notes', () => {
