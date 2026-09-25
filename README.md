@@ -76,7 +76,7 @@ the component whose source pulled it in. `sfOrgDeployWrapper.dependencyMaxDepth`
 - `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
 - `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
-- `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org).
+- `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org, remembered per VS Code window).
 - `sfOrgDeployWrapper.debugTiming` — log click-to-modal timing to the **SF Deploy** Output channel, to diagnose a slow confirmation dialog (default off).
 - `sfOrgDeployWrapper.dependencyMaxDepth` — how many reference layers **Deploy File + Dependencies** follows below the file(s) you picked (default 2, 1–3).
 - `sfOrgDeployWrapper.dependencyMaxComponents` — cap on how many components **Deploy File + Dependencies** may auto-include (default 40, 5–200).

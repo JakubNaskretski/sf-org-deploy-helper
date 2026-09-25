@@ -3,6 +3,16 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.27.0
+
+- **Your target org is now per window.** Each VS Code window remembers its own target org, so
+  two projects open side by side deploy to two different orgs, and picking an org in one
+  window no longer retargets the other. On the first start after updating every window begins
+  on the org this extension last used on this machine, so nothing changes until you pick — check the status
+  bar in each window (it still flags production) and pick once where it differs; from then on
+  each window keeps its choice. With `sfOrgDeployWrapper.syncOrgWithFamily` on, the shared org
+  is still machine-wide, so all windows follow it together.
+
 ## 0.26.0
 
 - **Paste a list into the search box.** A deploy error names five classes; paste them —
