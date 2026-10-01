@@ -3,6 +3,18 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.30.0
+
+- **Run tests with SF Test Runner.** With SF Test Runner installed, a **Run tests** button sits
+  next to Validate whenever Apex classes or triggers are ticked, and a successful deploy that
+  sent Apex offers **Run tests** on its Status card. The tests run in SF Test Runner on the org
+  you deployed to, its Results view opens, and a one-line pass/fail summary lands in this
+  Status pane.
+- **Deploy on SF Test Runner's request.** When SF Test Runner finds a test that isn't in the
+  org yet, its **Deploy first…** brings this panel forward and asks you to confirm the deploy as
+  usual — the dialog says SF Test Runner asked and names the classes — and the run starts by
+  itself once the deploy lands. The production guard applies as always.
+
 ## 0.29.0
 
 - **The Status pane shows runs.** A deploy, validation, quick deploy or retrieve appears the
