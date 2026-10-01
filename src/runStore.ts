@@ -24,6 +24,10 @@ export const ROWS_FILE = path.join('status', 'latest-run.json');
 export interface RunLive {
   suggest?: { id: string; candidates: unknown[]; unresolved: string[] };
   quick?: { jobId: string; until: number };
+  /** The newest deploy's "Run tests" offer (sf-test-runner installed, this run
+   *  sent Apex) — just the count; the provider re-resolves the actual class
+   *  names from lastDeployedApex when the button is clicked. */
+  runTests?: { count: number };
 }
 
 export interface RunStoreHost {

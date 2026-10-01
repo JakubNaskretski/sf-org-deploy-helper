@@ -125,7 +125,7 @@ const IDS = [
   'actionsBar', 'addOrg', 'banner', 'cancelBtn', 'clearCmdLog', 'clearSel', 'clearStatus', 'cmdlog',
   'cmdlogBody', 'cmdlogCaret', 'cmdlogHeader', 'deployBtn', 'diffBtn', 'fetchOrgBtn',
   'ignoreConflictsControl', 'ignoreDeployConflicts', 'modeAll', 'modeChanged', 'modeSelected',
-  'orgSelect', 'queueStrip', 'refreshFiles', 'refreshOrgs', 'retrieveBtn', 'scanBanner', 'search',
+  'orgSelect', 'queueStrip', 'refreshFiles', 'refreshOrgs', 'retrieveBtn', 'runTestsBtn', 'scanBanner', 'search',
   'selCount', 'sourceFilter', 'sourceFilterRow', 'splitter', 'status', 'statusHeader', 'testClasses',
   'testLevel', 'tree', 'typeFilterDetails', 'typeFilterLabel', 'typeFilterList', 'typeFilterRow',
   'useActive', 'useOpenTabs', 'validateBtn', 'viewModes',

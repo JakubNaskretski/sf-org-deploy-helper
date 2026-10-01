@@ -563,6 +563,14 @@
           : 'Quick Deploy isn\'t offered after the window reloads — validate again to deploy this set without re-running tests.';
       }
     }
+    // The deploy-side counterpart of Quick Deploy above: offered only while the
+    // provider still has the record of what THIS run sent (run.runTests, a live-
+    // only field — see runStore.ts's RunLive), never stored on the run itself.
+    // `via: 'send'`, like Select below — it posts straight to the provider and
+    // does not take this plugin's own busy slot, so it needs no slotBusy gate.
+    if (run.op === 'deploy' && run.status === 'succeeded' && run.runTests && run.runTests.count) {
+      buttons.push({ id: 'runTests', label: 'Run tests (' + fmtN(run.runTests.count) + ')', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: false, title: 'Run the Apex tests for what this deploy sent, in SF Test Runner' });
+    }
     if (run.status === 'lost' && run.jobId) {
       buttons.push({ id: 'resume', label: 'Resume monitoring', primary: true, message: { type: 'resumeDeploy', jobId: run.jobId }, via: 'action', disabled: slotBusy, title: slotTitle('Check the same job again — it does not deploy again') });
     }

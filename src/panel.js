@@ -148,6 +148,10 @@
     // Machine-scoped provider setting. Never persisted in webview state: the
     // provider re-sends the authoritative value on ready and on Settings changes.
     ignoreDeployConflicts: false,
+    // Which sibling extensions the provider sees installed (vscode.extensions),
+    // re-sent on every ready since one can be added/removed without reloading
+    // this panel. Gates the "Run tests" toolbar button.
+    peers: { testRunner: false },
   };
 
   function savePersisted() {
@@ -317,6 +321,15 @@
   $('validateBtn').addEventListener('click', () => action('validate'));
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
   $('diffBtn').addEventListener('click', () => action('diff'));
+  // "Run tests": fire-and-forget on the host side (sf-test-runner's own run can
+  // take minutes), so this only needs the ordinary pendingAction/busy guard —
+  // no org check here, the host's own requireOrg() covers it.
+  $('runTestsBtn').addEventListener('click', () => {
+    if (state.pendingAction || state.busy) return;
+    const apexSel = Array.from(state.selected).filter(k => /^Apex(Class|Trigger):/.test(k) && state.localKeys.has(k));
+    if (!apexSel.length) return;
+    sendAction('runTests', { keys: apexSel });
+  });
   // One Cancel per operation. sendAction's pending lock is the wrong shape here:
   // the provider answers the message in milliseconds while the cancel itself
   // takes seconds. The lock set here holds until a `busy` post says otherwise —
@@ -710,6 +723,10 @@
         return;
       case 'debugTiming':
         debugTiming = msg.enabled === true;
+        return;
+      case 'peers':
+        state.peers = { testRunner: msg.testRunner === true };
+        renderActions();
         return;
       case 'activeFile':
         state.activeFileKey = msg.key || null;
@@ -1911,6 +1928,18 @@
     useActive.title = state.busy ? busyTip : 'Select the file currently open in editor';
     useOpenTabs.disabled = state.busy;
     useOpenTabs.title = state.busy ? busyTip : 'Select every open editor tab that maps to a metadata component';
+    // "Run tests": only when sf-test-runner is installed and something Apex +
+    // local is selected — independent of busy, like Deploy/Validate above (a
+    // click is fire-and-forget on the host side); disabled like Diff.
+    const runTestsBtn = $('runTestsBtn');
+    const apexSel = Array.from(state.selected).filter(k => /^Apex(Class|Trigger):/.test(k) && state.localKeys.has(k));
+    const showRunTests = !!(state.peers && state.peers.testRunner) && apexSel.length > 0;
+    runTestsBtn.style.display = showRunTests ? '' : 'none';
+    if (showRunTests) {
+      runTestsBtn.textContent = `Run tests (${apexSel.length})`;
+      runTestsBtn.disabled = state.busy || pending;
+      runTestsBtn.title = pendingTip || (state.busy ? busyTip : 'Run these Apex tests in SF Test Runner');
+    }
     if (state.busy) {
       retrieveBtn.style.display = 'none';
       retrieveBtn.disabled = true;

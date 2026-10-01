@@ -42,7 +42,8 @@ const vscodeStub = {
   commands: { executeCommand: async () => {} },
   Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) },
   ProgressLocation: { Notification: 15, Window: 10 },
-  ConfigurationTarget: { Global: 1 }
+  ConfigurationTarget: { Global: 1 },
+  extensions: { getExtension: () => undefined }
 };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));

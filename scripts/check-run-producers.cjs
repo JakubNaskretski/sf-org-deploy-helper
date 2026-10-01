@@ -47,7 +47,8 @@ const vscodeStub = {
   Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) },
   ProgressLocation: { Notification: 15, Window: 10 },
   ConfigurationTarget: { Global: 1 },
-  env: { clipboard: { writeText: async () => {} } }
+  env: { clipboard: { writeText: async () => {} } },
+  extensions: { getExtension: () => undefined }
 };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
