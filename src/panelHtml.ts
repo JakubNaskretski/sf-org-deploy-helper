@@ -310,7 +310,7 @@ body.resizing { cursor: row-resize; user-select: none; }
   background: var(--vscode-inputValidation-warningBackground, transparent);
 }
 .conflict-toggle.disabled { opacity: 0.5; cursor: not-allowed; }
-#diffBtn, #retrieveBtn, #validateBtn, #deployBtn {
+#diffBtn, #retrieveBtn, #runTestsBtn, #validateBtn, #deployBtn {
   flex: 1 1 0; min-width: 68px; white-space: nowrap;
 }
 /* Cancel carries the active operation name (for example "Cancel Fetch Org").
@@ -697,6 +697,7 @@ body.resizing { cursor: row-resize; user-select: none; }
         </label>
         <button id="diffBtn" class="secondary" disabled>Diff</button>
         <button id="retrieveBtn" disabled>Retrieve</button>
+        <button id="runTestsBtn" class="secondary" style="display:none;" title="Run the Apex tests for the selected classes/triggers in SF Test Runner">Run tests</button>
         <button id="validateBtn" class="secondary" disabled title="Check-only deploy: nothing is deployed. With a test level it runs the tests and can be quick-deployed; with no tests it cannot.">Validate</button>
         <button id="deployBtn" class="primary" disabled>Deploy</button>
         <button id="cancelBtn" class="danger" style="display:none;">Cancel</button>

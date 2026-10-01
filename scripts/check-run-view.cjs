@@ -392,6 +392,28 @@ check('what the newest run offers in each state', () => {
   assert.deepStrictEqual(ids(RV.actionsFor(base({ op: 'quickDeploy', status: 'failed', counts: { failed: 1 } }), LATEST(base()))), ['copy'], 'a failed quick deploy has no request to retry');
 });
 
+check('Run tests: offered on a succeeded deploy that sent Apex (run.runTests, a live-only field — see runStore.ts), naming the count and carrying the run id; never on a validate/quickDeploy/failed run, and never locked by busy/pending (fire-and-forget on the host side)', () => {
+  const r = Object.assign({}, run('fxbigdeploy'), { runTests: { count: 7 } });
+  const btn = RV.actionsFor(r, LATEST(r)).buttons.find((b) => b.id === 'runTests');
+  assert.ok(btn, 'runTests button expected');
+  assert.strictEqual(btn.label, 'Run tests (7)');
+  assert.deepStrictEqual(btn.message, { type: 'runTests', runId: r.id });
+  assert.strictEqual(btn.via, 'send');
+  assert.strictEqual(btn.disabled, false);
+  for (const over of [{ busy: true }, { pending: true }]) {
+    assert.strictEqual(RV.actionsFor(r, LATEST(r, over)).buttons.find((b) => b.id === 'runTests').disabled, false, JSON.stringify(over));
+  }
+  assert.ok(!ids(RV.actionsFor(run('fxbigdeploy'), LATEST(run('fxbigdeploy')))).includes('runTests'), 'no runTests field — no button');
+  const validateWithField = Object.assign({}, S('fxvalidateqd').run, { runTests: { count: 3 } });
+  assert.ok(!ids(RV.actionsFor(validateWithField, LATEST(validateWithField, { quick: S('fxvalidateqd').live.quick }))).includes('runTests'), 'a validate run never offers it, even with the field set');
+  const quickDeployWithField = Object.assign({}, run('fxquickdeploy'), { runTests: { count: 2 } });
+  assert.ok(!ids(RV.actionsFor(quickDeployWithField, LATEST(quickDeployWithField))).includes('runTests'), 'a quickDeploy run never offers it either');
+  const failedWithField = base({ status: 'failed', counts: { failed: 1 }, runTests: { count: 1 } });
+  assert.ok(!ids(RV.actionsFor(failedWithField, LATEST(failedWithField))).includes('runTests'), 'a failed deploy never offers it — nothing landed to test');
+  const zeroCount = Object.assign({}, run('fxbigdeploy'), { runTests: { count: 0 } });
+  assert.ok(!ids(RV.actionsFor(zeroCount, LATEST(zeroCount))).includes('runTests'), 'a zero count is no offer either');
+});
+
 check('Retry re-sends exactly the sent rows with the run\'s own options; + overwrite adds ignoreConflicts, never on a validation', () => {
   const r = run('fxconflict');
   const a = RV.actionsFor(r, LATEST(r));

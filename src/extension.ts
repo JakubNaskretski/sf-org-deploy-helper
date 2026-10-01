@@ -62,7 +62,13 @@ export function activate(context: vscode.ExtensionContext): void {
     registerSafe('sfOrgDeployWrapper.loginOrg', () => provider.loginOrg()),
     registerSafe('sfOrgDeployWrapper.openInOrg', (uri?: vscode.Uri) => provider.openInOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
     registerSafe('sfOrgDeployWrapper.deleteFromOrg', (uri?: vscode.Uri) => provider.deleteFromOrg(uri ?? vscode.window.activeTextEditor?.document.uri as vscode.Uri)),
-    registerSafe('sfOrgDeployWrapper.help', () => showHelp(context))
+    registerSafe('sfOrgDeployWrapper.help', () => showHelp(context)),
+    // Cross-extension handoff (sf-test-runner's "Deploy first"): the one command
+    // here whose caller needs the ACTUAL result back, not just error handling —
+    // registerSafe below returns the handler's promise instead of discarding it,
+    // so `vscode.commands.executeCommand` resolves with whatever deployComponents
+    // resolves to.
+    registerSafe('sfOrgDeployWrapper.deployComponents', (args?: unknown) => provider.deployComponents(args))
   );
 
   // Settle the remembered org (one-time adoption of the family setting, then a
@@ -75,15 +81,21 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // A rejected command handler (e.g. the status-bar org pick failing to save this
   // plugin's remembered org — or, with syncOrgWithFamily on, to publish it to the
-  // family) is otherwise an unhandled rejection the user never sees.
-  function registerSafe(id: string, fn: (...args: [vscode.Uri?, vscode.Uri[]?]) => Promise<void> | void): vscode.Disposable {
-    return vscode.commands.registerCommand(id, (...args: [vscode.Uri?, vscode.Uri[]?]) => {
-      void Promise.resolve(fn(...args)).catch(err => {
+  // family) is otherwise an unhandled rejection the user never sees. Generic over
+  // the handler's own argument tuple (rather than fixed to the uri/uris every
+  // file-scoped command takes) so deployComponents' single untrusted object
+  // argument still type-checks; the RETURN value is now propagated too — a
+  // throw still only logs/toasts (returning undefined), but deployComponents'
+  // caller (sf-test-runner, via executeCommand) needs the real result back.
+  function registerSafe<A extends unknown[]>(id: string, fn: (...args: A) => Promise<unknown> | unknown): vscode.Disposable {
+    return vscode.commands.registerCommand(id, (...args: A) => {
+      return Promise.resolve(fn(...args)).catch(err => {
         const msg = err instanceof Error ? err.message : String(err);
         output.appendLine(`[${id}] ${msg}`);
         void vscode.window.showErrorMessage(`SF Deploy: ${msg}`, 'Show Output').then(choice => {
           if (choice === 'Show Output') output.show(true);
         });
+        return undefined;
       });
     });
   }
@@ -103,7 +115,8 @@ async function showHelp(context: vscode.ExtensionContext): Promise<void> {
 5. Right-click a metadata file in the Explorer or editor for Deploy, Retrieve, Diff, Compare, Deploy File + Dependencies, Open in Org, Delete from Org.
 6. Most actions are also in the Command Palette under "SF Deploy:", including Restore Retrieve Backup, which otherwise appears only on a retrieve's result card.
 7. Destructive actions confirm first and production orgs get an extra guard; long runs can be cancelled.
-8. Needs the Salesforce CLI (sf) on PATH, a logged-in org, and exactly one sfdx-project.json somewhere under the opened folder.`;
+8. Needs the Salesforce CLI (sf) on PATH, a logged-in org, and exactly one sfdx-project.json somewhere under the opened folder.
+9. With SF Test Runner installed, Run tests (toolbar, or on a deploy's Status card) hands the selected/deployed Apex classes to it.`;
   const choice = await vscode.window.showInformationMessage('SF Deploy Wrapper', { modal: true, detail: HELP }, 'Open README');
   if (choice === 'Open README') {
     // vsce ships the file as readme.md while the dev host has README.md: open whichever exists

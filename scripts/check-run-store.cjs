@@ -31,7 +31,8 @@ Module._load = (req, ...rest) => (req === 'vscode' ? {
   window: { showInformationMessage: () => Promise.resolve(undefined), setStatusBarMessage: () => ({ dispose() {} }) },
   workspace: { getConfiguration: () => ({ get: (k, f) => (k === 'statusHistoryRuns' && cfgRuns !== undefined ? cfgRuns : f) }) },
   commands: { executeCommand: () => Promise.resolve(undefined) },
-  Uri: { file: (fsPath) => ({ fsPath }) }
+  Uri: { file: (fsPath) => ({ fsPath }) },
+  extensions: { getExtension: () => undefined }
 } : origLoad(req, ...rest));
 
 const OUT = path.join(__dirname, '..', 'out');

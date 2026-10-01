@@ -24,6 +24,10 @@ export const ROWS_FILE = path.join('status', 'latest-run.json');
 export interface RunLive {
   suggest?: { id: string; candidates: unknown[]; unresolved: string[] };
   quick?: { jobId: string; until: number };
+  /** The newest deploy's "Run tests" offer (sf-test-runner installed, this run
+   *  sent Apex) — just the count; the provider re-resolves the actual class
+   *  names from lastDeployedApex when the button is clicked. */
+  runTests?: { count: number };
 }
 
 export interface RunStoreHost {
@@ -223,6 +227,16 @@ export class RunStore {
     this.persistRuns();
     this.persistNotices();
     this.host.post({ type: 'statusHistory', cards: this.noticeList, cap: this.cap() });
+    this.post(false);
+  }
+
+  /** Re-send the newest run with a FRESH live payload (RunStoreHost.live),
+   *  without otherwise changing or persisting anything — for when something
+   *  outside any run's own lifecycle changes what `live()` would return (a
+   *  sibling extension installed/removed, say, which flips whether its
+   *  button shows on an already-finished run). */
+  refreshLive(): void {
+    this.load();
     this.post(false);
   }
 

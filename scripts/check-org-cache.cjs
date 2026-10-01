@@ -48,7 +48,8 @@ const vscodeStub = {
   },
   Uri: { file: fsPath => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
-  ProgressLocation: { Notification: 15 }
+  ProgressLocation: { Notification: 15 },
+  extensions: { getExtension: () => undefined, onDidChange: () => ({ dispose: () => {} }) }
 };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));

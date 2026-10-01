@@ -19,6 +19,7 @@ import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
 import { DeployRunInput, OrgKind, RUN_ID_RE, RunItem, RunRecord, RunRow, RunTarget, beginRun, deployRunFromResult, deploySuccessRows, envelopeProblem, fmtCount, newRunId, retrieveRunFromResult, runRetryFrom } from './runRecords';
 import { RunLive, RunStore } from './runStore';
+import { parseHandoffShape } from './handoff';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
 export { deploySuccessRows, envelopeProblem };
@@ -80,6 +81,10 @@ type Inbound =
   // backup root. Omitted only if a hand-built message reaches us some other way.
   | { type: 'restoreBackup'; dir?: string }
   | { type: 'discardBackup'; dir?: string }
+  // "Run tests" — the toolbar (keys = the selected Apex with local source) or
+  // the newest deploy's Status card button (runId, re-resolved against
+  // lastDeployedApex server-side — the webview never names the classes itself).
+  | { type: 'runTests'; keys?: string[]; runId?: string }
   | { type: 'cancel' };
 
 // Minimal structural slice of the built-in vscode.git extension's API (v1) —
@@ -134,6 +139,15 @@ const SUGGESTION_LOG_KEY = 'sfOrgDeployWrapper.suggestionLog';
 /** How long the org keeps a validation that ran tests available for Quick
  *  Deploy — shown on the run as "available until". */
 const QUICK_DEPLOY_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
+
+/** sf-test-runner's extension id and its cross-extension handoff command —
+ *  gates the toolbar/Status-card "Run tests" buttons and names what they call. */
+const TEST_RUNNER_EXTENSION_ID = 'Skrety.sf-test-runner';
+const TEST_RUNNER_COMMAND = 'sfTestRunner.runTestsFor';
+/** sf-test-runner's own cap on `classNames` (its handoff.ts) — enforced here
+ *  too, so an over-the-cap selection gets a readable card instead of a round
+ *  trip that just comes back as a generic validation error. */
+const RUN_TESTS_FOR_MAX_CLASSES = 200;
 
 /** Command-log entries kept for the `ready` replay — the webview's own cap, so a
  *  rebuilt panel is handed exactly the list it would have kept. */
@@ -288,6 +302,14 @@ interface AutoIncludedInfo {
   maxComponents?: number;
 }
 
+/** Display-only — who asked for a handoff deploy and which names (runDeploy's
+ *  `requestedBy`, see its own doc comment): the confirm modal names the
+ *  ACTUAL requester instead of reading like any other Deploy click. */
+interface HandoffRequestInfo {
+  source: string;
+  names: string[];
+}
+
 const ABORTED: DeployOutcome = { status: 'aborted' };
 const ABORTED_CONFIRMED: DeployOutcome = { status: 'aborted', confirmed: true };
 
@@ -424,6 +446,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private currentDeployOrg?: string;
   /** Last successful validate-only deployment, offered for quick-deploy on its run. */
   private lastValidated?: { jobId: string; org: string; label: string; count: number; runId: string };
+  /** The Apex classes/triggers a real (non-validate) deploy actually sent, for the
+   *  newest run's "Run tests" button — the run's own rows drop deployed keys once
+   *  summarized, so this is the only source once that happens. In memory only,
+   *  like lastValidated: the offer ends with this window. */
+  private lastDeployedApex?: { runId: string; org: string; keys: string[] };
   /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
   private orgMembers = new Map<string, true>();
   /** The org username `orgMembers` was fetched from — guards against using a stale
@@ -538,6 +565,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration('sfOrgDeployWrapper.ignoreDeployConflicts')) this.postIgnoreDeployConflicts();
       if (e.affectsConfiguration('sfOrgDeployWrapper.debugTiming')) this.postDebugTiming();
       if (e.affectsConfiguration('sfOrgDeployWrapper.statusHistoryRuns')) this.runStore.setCap();
+    }));
+    // sf-test-runner installed or removed mid-session: re-sync the "Run tests"
+    // buttons' gate without waiting for a reload. Fires for ANY extension
+    // change, not just this one — cheap (one re-check of the id), so it isn't
+    // worth narrowing. The toolbar button reacts to `peers` alone, but the
+    // newest run's Status-card button is a LIVE payload (liveRunPayload,
+    // gated on this same testRunnerAvailable()) that is otherwise only
+    // recomputed when a run starts/finishes — refreshLive re-sends it now
+    // too, so that button appears/disappears without waiting for the next run.
+    context.subscriptions.push(vscode.extensions.onDidChange(() => {
+      this.post({ type: 'peers', testRunner: this.testRunnerAvailable() });
+      this.runStore.refreshLive();
     }));
     // Files created or deleted OUTSIDE the panel's own operations (a new Apex
     // class, a branch switch, a deleted component) used to be invisible until a
@@ -685,6 +724,90 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** Command-palette parity for the webview's 'loginOrg' message. No uri: `sf org
    *  login web` isn't file-scoped. */
   async loginOrg(): Promise<void> { return this.runLogin(); }
+
+  /**
+   * `sfOrgDeployWrapper.deployComponents` — the cross-extension handoff a
+   * sibling extension (sf-test-runner's "Deploy first" offer) calls to get a
+   * set of Apex classes/triggers onto an org before it tries to run their
+   * tests. Contributed, so callable by anyone — every argument is validated
+   * by parseHandoffShape before any of it reaches a component lookup or the
+   * org store. The deploy itself goes through runDeploy exactly as the
+   * panel's own Deploy button does: the confirm modal and the PROD guard
+   * always run (never `preConfirmed`), pinned to the CALLER's org via
+   * `orgOverride` rather than whatever the panel's own selector shows — and
+   * it names the requester, so the modal never reads like an ordinary click
+   * nobody asked for.
+   */
+  async deployComponents(raw: unknown): Promise<{ status: 'ok' | 'failed' | 'aborted' | 'busy' | 'error'; message?: string }> {
+    // Shape first, before either load — a garbage call (bad classNames, no
+    // targetOrg) must cost no `sf`/file-scan spawn at all.
+    const shape = parseHandoffShape(raw);
+    if (!shape.ok) return { status: 'error', message: shape.message };
+    const { classNames, targetOrg } = shape.value;
+
+    if (!this.items.length) await this.loadFiles();
+    if (!this.orgs.length) await this.loadOrgs();
+
+    // The org-membership check is split from the shape check above so a
+    // caller whose list is simply stale (an org added after this window's
+    // last listing) gets ONE reload-and-retry before being told no — not a
+    // re-validation of everything else already checked.
+    if (!this.orgs.some(o => o.username === targetOrg)) {
+      await this.loadOrgs();
+      if (!this.orgs.some(o => o.username === targetOrg)) {
+        return { status: 'error', message: `${targetOrg} is not a known org.` };
+      }
+    }
+
+    // Checked up front: runDeploy would otherwise ENQUEUE a deploy that
+    // arrives while the slot is held, behind a "Queue:" modal, and return
+    // `aborted` — the caller needs an honest `busy` instead of a silent
+    // queue it never asked for.
+    if (this.busy || this.confirmOpen) {
+      return { status: 'busy', message: 'SF Deploy Wrapper is busy with another operation.' };
+    }
+
+    const keys: string[] = [];
+    for (const name of classNames) {
+      const lower = name.toLowerCase();
+      const item = this.items.find(i => (i.type === 'ApexClass' || i.type === 'ApexTrigger') && i.name.toLowerCase() === lower);
+      // Missing even one name refuses the whole call rather than deploying a
+      // partial set the caller never asked for.
+      if (!item) return { status: 'error', message: `${name} is not a known Apex class or trigger in this workspace.` };
+      keys.push(`${item.type}:${item.name}`);
+    }
+
+    // Bring the panel forward so the user watches this land in the Status
+    // pane, same as if they had clicked Deploy themselves — otherwise the
+    // confirm modal (and everything after it) can pop up behind a sidebar
+    // the user never opened. Every contributed view gets this command for
+    // free; best-effort, since a failure here costs only the reveal.
+    try { await vscode.commands.executeCommand(`${DeployPanelProvider.viewType}.focus`); } catch { /* the deploy still runs */ }
+
+    // Re-checked: the ABOVE await is the one window where something else
+    // (a webview click, a queued drain) can take the slot before this call
+    // ever reaches runDeploy. Without this, runDeploy would see itself as
+    // the SECOND request and enqueue it — behind a "Queue:" modal, and
+    // against whatever org the panel's own selector shows, not this
+    // caller's orgOverride/requestedBy.
+    if (this.busy || this.confirmOpen) {
+      return { status: 'busy', message: 'SF Deploy Wrapper is busy with another operation.' };
+    }
+
+    const outcome = await this.runDeploy(keys, {
+      orgOverride: targetOrg,
+      requestedBy: { source: 'SF Test Runner (Deploy first)', names: classNames }
+    });
+    // `aborted` + `confirmed` means the user said yes but nothing landed
+    // (lost contact, a submit-time error, an org-side cancel) — sf-test-
+    // runner reads a plain `aborted` as "the user declined" and stays
+    // silent, which would bury a real failure. Report it as `failed` instead.
+    if (outcome.status === 'failed' || (outcome.status === 'aborted' && outcome.confirmed)) {
+      const orgLabel = this.orgs.find(o => o.username === targetOrg)?.alias ?? targetOrg;
+      return { status: 'failed', message: `Deploy to ${orgLabel} failed — see SF Deploy's Status pane.` };
+    }
+    return { status: outcome.status };
+  }
 
   /**
    * "Deploy File + Dependencies" (context menu / palette): resolve the
@@ -1023,6 +1146,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.postIgnoreDeployConflicts();
         // Tell the webview whether to stamp/log click timings — see debugTiming.
         this.postDebugTiming();
+        // Whether the "Run tests" buttons (toolbar, Status card) have anyone to
+        // call — checked fresh every ready, since sf-test-runner can be installed
+        // or removed without reloading this panel.
+        this.post({ type: 'peers', testRunner: this.testRunnerAvailable() });
         // Replay the Status history into the freshly-built webview — it survives
         // reloads, newest first: the notices, then the runs (with the newest run's
         // full list, from this window or the rows file).
@@ -1162,6 +1289,53 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.logReceiveTiming('diff', msg.clickedAt, msg.clickSpan);
         await this.runDiff(msg.keys);
         return;
+      case 'runTests': {
+        let names: string[];
+        let org: string | undefined;
+        // Only the card path can truthfully claim the classes are already on
+        // the target org — they are exactly what THAT deploy just sent there.
+        // The toolbar's selection makes no such claim: it may include classes
+        // never deployed at all.
+        let deployed = false;
+        if (msg.runId) {
+          // The newest run's Status-card button: resolve against what THAT
+          // deploy actually sent and the org it sent it to — never the
+          // webview's own names, and never the panel's live org selection,
+          // which may have moved on since.
+          const apex = this.lastDeployedApex;
+          if (!apex || apex.runId !== msg.runId) return;
+          names = [...new Set(apex.keys.map(k => k.slice(k.indexOf(':') + 1)))];
+          org = apex.org;
+          deployed = true;
+        } else {
+          // The toolbar button: whatever Apex is both selected and local.
+          const keySet = new Set((Array.isArray(msg.keys) ? msg.keys : []).filter((k): k is string => typeof k === 'string'));
+          names = [...new Set(
+            this.items
+              .filter(i => (i.type === 'ApexClass' || i.type === 'ApexTrigger') && !!i.filePath && keySet.has(`${i.type}:${i.name}`))
+              .map(i => i.name)
+          )];
+          org = this.requireOrg();
+        }
+        if (!names.length || !org) return;
+        // The same cap sf-test-runner's own handoff enforces — refuse HERE
+        // with a card the user can read, rather than let the call through and
+        // have it come back as a generic validation error.
+        if (names.length > RUN_TESTS_FOR_MAX_CLASSES) {
+          this.post({
+            type: 'status',
+            card: { kind: 'warn', title: `${names.length} classes selected — SF Test Runner accepts at most ${RUN_TESTS_FOR_MAX_CLASSES} at a time. Select fewer and try again.` }
+          });
+          return;
+        }
+        // NOT awaited: handleMessage's own `.finally(() => this.postBusy())`
+        // (resolveWebviewView) clears the webview's pendingAction lock the
+        // moment THIS handler returns — a test run lasts minutes, and this
+        // button must not hold that lock for the whole thing. sf-test-runner
+        // owns its own busy guard, production confirm and "not deployed" prompt.
+        void this.runTestsInRunner(names, org, deployed);
+        return;
+      }
       case 'openFile': {
         const it = this.resolveKeys([msg.key])[0];
         if (!it?.filePath) {
@@ -2677,6 +2851,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
        *  nothing about what deploys, so unlike orgOverride/preConfirmed a forged
        *  value could not widen anything. */
       autoIncluded?: AutoIncludedInfo;
+      /** Display only, same trust level as autoIncluded above — who asked for
+       *  this deploy and which names, named in the confirm modal so a handoff
+       *  deploy never reads like an ordinary click nobody asked for. Set ONLY
+       *  by deployComponents; every other caller leaves it undefined. */
+      requestedBy?: HandoffRequestInfo;
       /** One-off override of the machine-scoped ignoreDeployConflicts setting,
        *  for exactly this run. Set only via a "Retry + overwrite" card button
        *  (deployOptsFromRetry reading RetryRequest.ignoreConflicts) — every other
@@ -2788,7 +2967,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const modal = this.deployConfirmModal(
           {
             noun, orgLabel, isProd, validateOnly: !!opts.validateOnly, testNote,
-            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, useManifest,
+            instanceUrl: orgInfo?.instanceUrl, ignoreConflicts, autoIncluded: opts.autoIncluded, requestedBy: opts.requestedBy, useManifest,
             ...this.skipCounts(orgOnlySkipped)
           },
           false
@@ -3081,15 +3260,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     args: {
       noun: string; orgLabel: string; isProd: boolean; validateOnly: boolean; testNote: string;
       instanceUrl?: string; ignoreConflicts: boolean; autoIncluded?: AutoIncludedInfo;
+      requestedBy?: HandoffRequestInfo;
       useManifest?: boolean; skipped?: number; unread?: { count: number; types: string[] };
     },
     queued: boolean
   ): { message: string; options: vscode.MessageOptions; confirmLabel: string } {
-    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, useManifest, skipped, unread } = args;
+    const { noun, orgLabel, isProd, validateOnly, testNote, instanceUrl, ignoreConflicts, autoIncluded, requestedBy, useManifest, skipped, unread } = args;
     const prefix = queued ? 'Queue: ' : '';
     const confirmLabel = validateOnly ? 'Validate' : (isProd ? 'Deploy to PROD' : 'Deploy');
     const queueNote = queued ? 'Runs after the current operation finishes.' : undefined;
     const overwriteLine = overwriteNotice(ignoreConflicts, validateOnly, queued);
+    const requestedByLine = handoffRequestNotice(requestedBy);
     const autoLine = autoIncludedNotice(autoIncluded);
     const manifestLine = manifestNotice(useManifest);
     // Said BEFORE the run: selected org-only rows (a group checkbox ticks them)
@@ -3101,13 +3282,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (isProd && !validateOnly) {
       return {
         message: `${prefix}⚠ Deploy ${noun} to PRODUCTION (${orgLabel})?\n\n${queued ? 'This change will be live on PRODUCTION as soon as it runs.' : 'This change will be live immediately.'}${testNote}`,
-        options: { modal: true, detail: [instanceUrl ?? '', autoLine, manifestLine, skipLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
+        options: { modal: true, detail: [instanceUrl ?? '', requestedByLine, autoLine, manifestLine, skipLine, overwriteLine, queueNote].filter(Boolean).join('\n') },
         confirmLabel
       };
     }
     // Below prod: keep the pre-existing shape — with no lines to show at all the
     // `detail` key stays absent rather than becoming an empty string.
-    const rest = [autoLine, manifestLine, skipLine, overwriteLine, queueNote].filter(Boolean);
+    const rest = [requestedByLine, autoLine, manifestLine, skipLine, overwriteLine, queueNote].filter(Boolean);
     const detail = isProd
       ? [instanceUrl ?? '', ...rest].filter(Boolean).join('\n')
       : (rest.length > 0 ? rest.join('\n') : undefined);
@@ -3390,6 +3571,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // (rollbackOnError is never disabled by this extension), so a failed run
       // leaves org membership as it was.
       if (!validateOnly) this.confirmDeployedOnOrg(successes, items, org, orgLabel);
+      // What the newest run's "Run tests" button hands to sf-test-runner: the
+      // Apex this deploy actually SENT, pinned to this run and this org — a
+      // summarized run drops its deployed rows, so this is the only source
+      // once that happens. In memory only, like lastValidated above.
+      if (!validateOnly) {
+        const apexKeys = items.filter(i => i.type === 'ApexClass' || i.type === 'ApexTrigger').map(i => `${i.type}:${i.name}`);
+        if (apexKeys.length) this.lastDeployedApex = { runId: runInput.id, org, keys: apexKeys };
+      }
       this.runStore.finish(withKept(deployRunFromResult(result, runInput)));
       this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}`
         : `${ctx.op === 'quickDeploy' ? 'Quick-deployed' : 'Deployed'} ${ctx.noun} to ${orgLabel}`);
@@ -3533,7 +3722,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const v = this.lastValidated;
       if (v && v.jobId === run.jobId) out.quick = { jobId: v.jobId, until: (run.finishedAt ?? Date.now()) + QUICK_DEPLOY_WINDOW_MS };
     }
-    return out.suggest || out.quick ? out : undefined;
+    const apex = this.lastDeployedApex;
+    if (run.op === 'deploy' && run.status === 'succeeded' && apex && apex.runId === run.id && apex.keys.length && this.testRunnerAvailable()) {
+      out.runTests = { count: apex.keys.length };
+    }
+    return out.suggest || out.quick || out.runTests ? out : undefined;
   }
 
   // ---- Async deploy: poll / cancel / reattach ----
@@ -4721,6 +4914,55 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       this.endCmd(cmdId, false, Date.now() - start);
       this.reportError('Open in Org', err);
     }
+  }
+
+  /** Whether sf-test-runner is installed AND new enough to answer the
+   *  handoff — checked fresh every time (the "Run tests" buttons' gate, both
+   *  toolbar and Status card), since it can be installed, removed or
+   *  upgraded without a reload of this panel. Installed alone is not enough:
+   *  an older version with no `runTestsFor` command would otherwise show
+   *  both buttons and then fail the call — read its OWN manifest instead of
+   *  assuming every installed copy is current. */
+  private testRunnerAvailable(): boolean {
+    const ext = vscode.extensions.getExtension(TEST_RUNNER_EXTENSION_ID);
+    const commands: unknown = ext?.packageJSON?.contributes?.commands;
+    return Array.isArray(commands) && commands.some(c => !!c && typeof c === 'object' && (c as { command?: unknown }).command === TEST_RUNNER_COMMAND);
+  }
+
+  /** "Run tests" (toolbar or the newest deploy's Status card): hand `names` to
+   *  sf-test-runner's cross-extension handoff and post exactly one Status
+   *  card with its outcome. Deliberately outside this plugin's OWN busy slot,
+   *  like openComponentInOrg above — sf-test-runner owns its own single-run
+   *  guard, its own production confirm, and its own "not deployed" prompt;
+   *  holding our slot for a run that can take minutes would freeze every
+   *  other button in this panel for no reason. */
+  private async runTestsInRunner(names: string[], org: string, deployed?: boolean): Promise<void> {
+    const orgInfo = this.orgs.find(o => o.username === org);
+    const orgLabel = orgInfo?.alias ?? org;
+    // Set only when executeCommand itself threw (command missing, or
+    // sf-test-runner's own handler errored) — distinct from a reply that
+    // came back but failed validation, so testsCard can say which happened.
+    let callFailed = false;
+    const call = (async (): Promise<RunTestsForResult | undefined> => {
+      let raw: unknown;
+      try {
+        // `deployed` is sf-test-runner's own flag ("these are on targetOrg
+        // right now") — true only for the Status-card path, which just
+        // deployed exactly these classes there; omitted (not merely false)
+        // for the toolbar path, which makes no such claim.
+        raw = await vscode.commands.executeCommand(TEST_RUNNER_COMMAND, {
+          classNames: names, targetOrg: org, ...(deployed ? { deployed: true } : {})
+        });
+      } catch (err) {
+        callFailed = true;
+        this.output.appendLine(`[runTests] ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+      }
+      return parseRunTestsForResult(raw);
+    })();
+    vscode.window.setStatusBarMessage('$(beaker) SF Deploy: running tests in SF Test Runner…', call);
+    const result = await call;
+    this.post({ type: 'status', card: testsCard(result, orgLabel, callFailed) });
   }
 
   /** `focusFile` — the exact file a context-menu diff was invoked on. Only used for
@@ -6694,6 +6936,23 @@ function manifestNotice(useManifest: boolean | undefined): string | undefined {
   return useManifest ? 'Large selection — sent via a generated package.xml manifest, not one --metadata flag per component.' : undefined;
 }
 
+/** Cap on how many names handoffRequestNotice lists inline before summarizing
+ *  the rest — a confirm modal has to stay readable even for a 200-name
+ *  handoff (sf-test-runner's own cap on `classNames`). */
+const HANDOFF_NOTICE_NAME_CAP = 20;
+
+/** Modal detail line for a handoff deploy (deployComponents' `requestedBy`):
+ *  names who asked and which classes, so the confirm modal reads as "SF Test
+ *  Runner wants this deployed" rather than an unexplained Deploy click.
+ *  Absent for every other caller (requestedBy undefined). */
+function handoffRequestNotice(req: HandoffRequestInfo | undefined): string | undefined {
+  if (!req || req.names.length === 0) return undefined;
+  const shown = req.names.slice(0, HANDOFF_NOTICE_NAME_CAP);
+  const more = req.names.length - shown.length;
+  const list = more > 0 ? `${shown.join(', ')}, … (+${more} more)` : shown.join(', ');
+  return `Requested by ${req.source}: ${list}`;
+}
+
 /** Cap on the per-key attribution lines autoIncludedNotice renders in the
  *  MODAL — a confirm dialog (unlike the post-deploy card) has to stay readable
  *  on a PROD warning too, so this is far tighter than CARD_LINE_CAP; the
@@ -6834,6 +7093,95 @@ export function isConflictFailure(errOrResult: unknown): boolean {
     if (typeof r.errorMessage === 'string') text = r.errorMessage;
   }
   return !!text && CONFLICT_TEXT_PATTERNS.some(re => re.test(text));
+}
+
+/** `sfTestRunner.runTestsFor`'s reply shape (sf-test-runner's own src/handoff.ts
+ *  defines the contract; this is this side's copy of it). Crosses an extension
+ *  boundary, so it is trusted no further than any other outside input — see
+ *  parseRunTestsForResult. */
+export interface RunTestsForResult {
+  status: 'passed' | 'failed' | 'cancelled' | 'noTests' | 'busy' | 'error';
+  orgAlias?: string;
+  testClasses: string[];
+  passed: number;
+  failed: number;
+  message?: string;
+}
+
+const RUN_TESTS_FOR_STATUSES = new Set(['passed', 'failed', 'cancelled', 'noTests', 'busy', 'error']);
+/** Defensive cap on the echoed class list — display only (testsCard's `meta`),
+ *  so a hostile or buggy reply can't grow the persisted Status history. */
+const RUN_TESTS_FOR_CLASSES_CAP = 500;
+/** A test class name that doesn't look like a plain Apex identifier, or is
+ *  absurdly long, is dropped from the echoed list rather than failing the
+ *  whole reply over one bad entry — the run itself already happened. */
+const RUN_TESTS_FOR_CLASS_NAME = /^\w+$/;
+const RUN_TESTS_FOR_CLASS_NAME_MAX = 255;
+/** Cap on `message`/`orgAlias` — both are shown verbatim in a Status card
+ *  (and kept in its persisted history), so they get the same string cap any
+ *  other outside text does. */
+const RUN_TESTS_FOR_TEXT_CAP = 500;
+
+/** A validated `runTestsFor` reply, or undefined for anything that does not
+ *  look like one. A thrown executeCommand (sf-test-runner uninstalled mid-
+ *  session, or it threw) and a malformed reply both reach testsCard the same
+ *  way — as "no result to read" — since neither names a real run. */
+export function parseRunTestsForResult(raw: unknown): RunTestsForResult | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const { status, orgAlias, testClasses, passed, failed, message } = raw as Record<string, unknown>;
+  if (typeof status !== 'string' || !RUN_TESTS_FOR_STATUSES.has(status)) return undefined;
+  if (orgAlias !== undefined && typeof orgAlias !== 'string') return undefined;
+  if (!Array.isArray(testClasses)) return undefined;
+  if (typeof passed !== 'number' || !Number.isFinite(passed) || passed < 0) return undefined;
+  if (typeof failed !== 'number' || !Number.isFinite(failed) || failed < 0) return undefined;
+  if (message !== undefined && typeof message !== 'string') return undefined;
+  return {
+    status: status as RunTestsForResult['status'],
+    orgAlias: orgAlias === undefined ? undefined : orgAlias.slice(0, RUN_TESTS_FOR_TEXT_CAP),
+    testClasses: testClasses
+      .filter((n): n is string => typeof n === 'string' && n.length <= RUN_TESTS_FOR_CLASS_NAME_MAX && RUN_TESTS_FOR_CLASS_NAME.test(n))
+      .slice(0, RUN_TESTS_FOR_CLASSES_CAP),
+    passed,
+    failed,
+    message: message === undefined ? undefined : message.slice(0, RUN_TESTS_FOR_TEXT_CAP)
+  };
+}
+
+/** The ONE Status card runTestsInRunner posts for a "Run tests" click — `kind`
+ *  is exactly 'ok'/'err'/'warn' (panel.js's CARD_ICONS); `post()` keeps every
+ *  status card as a notice automatically, so nothing else is needed to make
+ *  this survive a reload. `passed`/`failed` name the title for the two
+ *  statuses that actually ran something; every other status speaks in its own
+ *  (or a generic) message — there is no count to report. */
+export function testsCard(result: RunTestsForResult | undefined, orgLabel: string, callFailed?: boolean): { kind: 'ok' | 'err' | 'warn'; title: string; meta?: string } {
+  if (!result) {
+    // Two different "nothing to read" causes get two different words: a
+    // THROW (command not found, or sf-test-runner itself errored) names the
+    // call and hints at a version mismatch; a reply that came back but
+    // failed validation keeps the old "unexpected result" wording — the call
+    // itself worked, the shape just didn't.
+    return {
+      kind: 'warn',
+      title: callFailed
+        ? `Tests on ${orgLabel}: the call to SF Test Runner failed — check that it's up to date.`
+        : `Tests on ${orgLabel}: SF Test Runner returned an unexpected result.`
+    };
+  }
+  const alias = result.orgAlias || orgLabel;
+  const classesLine = result.testClasses.length ? `Classes: ${result.testClasses.join(', ')}` : undefined;
+  switch (result.status) {
+    case 'passed':
+    case 'failed': {
+      // Only these two actually ran something — the per-method breakdown
+      // lives in sf-test-runner's own Results view, not in this one-line card.
+      const meta = [classesLine, 'Details in SF Tests → Results.'].filter(Boolean).join(' · ');
+      return { kind: result.status === 'passed' ? 'ok' : 'err', title: `Tests on ${alias}: ${result.passed} passed, ${result.failed} failed`, meta };
+    }
+    case 'busy': return { kind: 'warn', title: result.message || `Tests on ${alias}: a test run is already in progress.`, meta: classesLine };
+    case 'noTests': return { kind: 'warn', title: result.message || `Tests on ${alias}: no matching test class found.`, meta: classesLine };
+    case 'cancelled': return { kind: 'warn', title: result.message || `Tests on ${alias}: run cancelled.`, meta: classesLine };
+    case 'error': default: return { kind: 'err', title: result.message || `Tests on ${alias}: the test run could not be started.`, meta: classesLine };
+  }
 }
 
 /** The check-only mode implied by a persisted job's verb. The verb is the ONLY
