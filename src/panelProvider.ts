@@ -569,9 +569,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // sf-test-runner installed or removed mid-session: re-sync the "Run tests"
     // buttons' gate without waiting for a reload. Fires for ANY extension
     // change, not just this one — cheap (one re-check of the id), so it isn't
-    // worth narrowing.
+    // worth narrowing. The toolbar button reacts to `peers` alone, but the
+    // newest run's Status-card button is a LIVE payload (liveRunPayload,
+    // gated on this same testRunnerAvailable()) that is otherwise only
+    // recomputed when a run starts/finishes — refreshLive re-sends it now
+    // too, so that button appears/disappears without waiting for the next run.
     context.subscriptions.push(vscode.extensions.onDidChange(() => {
       this.post({ type: 'peers', testRunner: this.testRunnerAvailable() });
+      this.runStore.refreshLive();
     }));
     // Files created or deleted OUTSIDE the panel's own operations (a new Apex
     // class, a branch switch, a deleted component) used to be invisible until a
@@ -734,11 +739,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * nobody asked for.
    */
   async deployComponents(raw: unknown): Promise<{ status: 'ok' | 'failed' | 'aborted' | 'busy' | 'error'; message?: string }> {
-    if (!this.items.length) await this.loadFiles();
-    if (!this.orgs.length) await this.loadOrgs();
+    // Shape first, before either load — a garbage call (bad classNames, no
+    // targetOrg) must cost no `sf`/file-scan spawn at all.
     const shape = parseHandoffShape(raw);
     if (!shape.ok) return { status: 'error', message: shape.message };
     const { classNames, targetOrg } = shape.value;
+
+    if (!this.items.length) await this.loadFiles();
+    if (!this.orgs.length) await this.loadOrgs();
 
     // The org-membership check is split from the shape check above so a
     // caller whose list is simply stale (an org added after this window's
@@ -776,11 +784,25 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // free; best-effort, since a failure here costs only the reveal.
     try { await vscode.commands.executeCommand(`${DeployPanelProvider.viewType}.focus`); } catch { /* the deploy still runs */ }
 
+    // Re-checked: the ABOVE await is the one window where something else
+    // (a webview click, a queued drain) can take the slot before this call
+    // ever reaches runDeploy. Without this, runDeploy would see itself as
+    // the SECOND request and enqueue it — behind a "Queue:" modal, and
+    // against whatever org the panel's own selector shows, not this
+    // caller's orgOverride/requestedBy.
+    if (this.busy || this.confirmOpen) {
+      return { status: 'busy', message: 'SF Deploy Wrapper is busy with another operation.' };
+    }
+
     const outcome = await this.runDeploy(keys, {
       orgOverride: targetOrg,
       requestedBy: { source: 'SF Test Runner (Deploy first)', names: classNames }
     });
-    if (outcome.status === 'failed') {
+    // `aborted` + `confirmed` means the user said yes but nothing landed
+    // (lost contact, a submit-time error, an org-side cancel) — sf-test-
+    // runner reads a plain `aborted` as "the user declined" and stays
+    // silent, which would bury a real failure. Report it as `failed` instead.
+    if (outcome.status === 'failed' || (outcome.status === 'aborted' && outcome.confirmed)) {
       const orgLabel = this.orgs.find(o => o.username === targetOrg)?.alias ?? targetOrg;
       return { status: 'failed', message: `Deploy to ${orgLabel} failed — see SF Deploy's Status pane.` };
     }
@@ -4894,11 +4916,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Whether sf-test-runner is installed — checked fresh every time (the "Run
-   *  tests" buttons' gate, both toolbar and Status card), since it can be
-   *  installed or removed without a reload of this panel. */
+  /** Whether sf-test-runner is installed AND new enough to answer the
+   *  handoff — checked fresh every time (the "Run tests" buttons' gate, both
+   *  toolbar and Status card), since it can be installed, removed or
+   *  upgraded without a reload of this panel. Installed alone is not enough:
+   *  an older version with no `runTestsFor` command would otherwise show
+   *  both buttons and then fail the call — read its OWN manifest instead of
+   *  assuming every installed copy is current. */
   private testRunnerAvailable(): boolean {
-    return vscode.extensions.getExtension(TEST_RUNNER_EXTENSION_ID) !== undefined;
+    const ext = vscode.extensions.getExtension(TEST_RUNNER_EXTENSION_ID);
+    const commands: unknown = ext?.packageJSON?.contributes?.commands;
+    return Array.isArray(commands) && commands.some(c => !!c && typeof c === 'object' && (c as { command?: unknown }).command === TEST_RUNNER_COMMAND);
   }
 
   /** "Run tests" (toolbar or the newest deploy's Status card): hand `names` to
@@ -4911,24 +4939,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   private async runTestsInRunner(names: string[], org: string, deployed?: boolean): Promise<void> {
     const orgInfo = this.orgs.find(o => o.username === org);
     const orgLabel = orgInfo?.alias ?? org;
+    // Set only when executeCommand itself threw (command missing, or
+    // sf-test-runner's own handler errored) — distinct from a reply that
+    // came back but failed validation, so testsCard can say which happened.
+    let callFailed = false;
     const call = (async (): Promise<RunTestsForResult | undefined> => {
+      let raw: unknown;
       try {
         // `deployed` is sf-test-runner's own flag ("these are on targetOrg
         // right now") — true only for the Status-card path, which just
         // deployed exactly these classes there; omitted (not merely false)
         // for the toolbar path, which makes no such claim.
-        const raw = await vscode.commands.executeCommand(TEST_RUNNER_COMMAND, {
+        raw = await vscode.commands.executeCommand(TEST_RUNNER_COMMAND, {
           classNames: names, targetOrg: org, ...(deployed ? { deployed: true } : {})
         });
-        return parseRunTestsForResult(raw);
       } catch (err) {
+        callFailed = true;
         this.output.appendLine(`[runTests] ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
       }
+      return parseRunTestsForResult(raw);
     })();
     vscode.window.setStatusBarMessage('$(beaker) SF Deploy: running tests in SF Test Runner…', call);
     const result = await call;
-    this.post({ type: 'status', card: testsCard(result, orgLabel) });
+    this.post({ type: 'status', card: testsCard(result, orgLabel, callFailed) });
   }
 
   /** `focusFile` — the exact file a context-menu diff was invoked on. Only used for
@@ -7119,8 +7153,20 @@ export function parseRunTestsForResult(raw: unknown): RunTestsForResult | undefi
  *  this survive a reload. `passed`/`failed` name the title for the two
  *  statuses that actually ran something; every other status speaks in its own
  *  (or a generic) message — there is no count to report. */
-export function testsCard(result: RunTestsForResult | undefined, orgLabel: string): { kind: 'ok' | 'err' | 'warn'; title: string; meta?: string } {
-  if (!result) return { kind: 'warn', title: `Tests on ${orgLabel}: SF Test Runner returned an unexpected result.` };
+export function testsCard(result: RunTestsForResult | undefined, orgLabel: string, callFailed?: boolean): { kind: 'ok' | 'err' | 'warn'; title: string; meta?: string } {
+  if (!result) {
+    // Two different "nothing to read" causes get two different words: a
+    // THROW (command not found, or sf-test-runner itself errored) names the
+    // call and hints at a version mismatch; a reply that came back but
+    // failed validation keeps the old "unexpected result" wording — the call
+    // itself worked, the shape just didn't.
+    return {
+      kind: 'warn',
+      title: callFailed
+        ? `Tests on ${orgLabel}: the call to SF Test Runner failed — check that it's up to date.`
+        : `Tests on ${orgLabel}: SF Test Runner returned an unexpected result.`
+    };
+  }
   const alias = result.orgAlias || orgLabel;
   const classesLine = result.testClasses.length ? `Classes: ${result.testClasses.join(', ')}` : undefined;
   switch (result.status) {

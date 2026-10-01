@@ -230,6 +230,16 @@ export class RunStore {
     this.post(false);
   }
 
+  /** Re-send the newest run with a FRESH live payload (RunStoreHost.live),
+   *  without otherwise changing or persisting anything — for when something
+   *  outside any run's own lifecycle changes what `live()` would return (a
+   *  sibling extension installed/removed, say, which flips whether its
+   *  button shows on an already-finished run). */
+  refreshLive(): void {
+    this.load();
+    this.post(false);
+  }
+
   /** Resolves once every rows-file write or delete issued so far has landed. */
   whenWritten(): Promise<void> {
     return this.fileChain;

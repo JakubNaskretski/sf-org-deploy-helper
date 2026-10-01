@@ -1928,9 +1928,11 @@
     useActive.title = state.busy ? busyTip : 'Select the file currently open in editor';
     useOpenTabs.disabled = state.busy;
     useOpenTabs.title = state.busy ? busyTip : 'Select every open editor tab that maps to a metadata component';
-    // "Run tests": only when sf-test-runner is installed and something Apex +
-    // local is selected — independent of busy, like Deploy/Validate above (a
-    // click is fire-and-forget on the host side); disabled like Diff.
+    // "Run tests": shown only when sf-test-runner is installed and something
+    // Apex + local is selected — whether it SHOWS is independent of busy,
+    // like Deploy/Validate above, but unlike them it IS disabled while busy,
+    // same as Diff (a click is fire-and-forget on the host side, so there is
+    // nothing to gain by letting it queue).
     const runTestsBtn = $('runTestsBtn');
     const apexSel = Array.from(state.selected).filter(k => /^Apex(Class|Trigger):/.test(k) && state.localKeys.has(k));
     const showRunTests = !!(state.peers && state.peers.testRunner) && apexSel.length > 0;

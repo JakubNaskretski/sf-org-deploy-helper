@@ -31,7 +31,14 @@ const Module = require('module');
 const warns = [];
 const infos = [];
 const statusBar = [];
-let extensionIds = new Set(); // which ids vscode.extensions.getExtension finds
+const TEST_RUNNER_ID = 'Skrety.sf-test-runner';
+// sf-test-runner's OWN manifest shape (packageJSON), the way testRunnerAvailable
+// reads it — not just "installed or not": a current copy declares runTestsFor;
+// an older one (version skew) is installed but doesn't, and must read as
+// unavailable the same as not installed at all.
+const TR_CURRENT = { contributes: { commands: [{ command: 'sfTestRunner.runSelected' }, { command: 'sfTestRunner.runTestsFor' }] } };
+const TR_OLD = { contributes: { commands: [{ command: 'sfTestRunner.runSelected' }] } };
+let testRunnerInstalled; // undefined = not installed; else TR_CURRENT/TR_OLD/a test's own shape
 let execImpl = async () => undefined; // commands.executeCommand, per check
 const execCalls = [];
 const vscodeStub = {
@@ -58,7 +65,7 @@ const vscodeStub = {
   ProgressLocation: { Notification: 15, Window: 10 },
   ConfigurationTarget: { Global: 1 },
   env: { clipboard: { writeText: async () => {} } },
-  extensions: { getExtension: (id) => (extensionIds.has(id) ? {} : undefined) }
+  extensions: { getExtension: (id) => (id === TEST_RUNNER_ID && testRunnerInstalled ? { packageJSON: testRunnerInstalled } : undefined) }
 };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
@@ -140,6 +147,20 @@ check('deployComponents: a parse error never reaches runDeploy', async () => {
   assert.strictEqual(runDeployCalls.length, 0);
 });
 
+// ---- mutation target: the shape is validated BEFORE either load — a garbage
+// call must cost no `sf`/file-scan spawn at all.
+check('deployComponents: shape is validated BEFORE loadFiles/loadOrgs — a garbage call never spawns either, even with empty items/orgs to "justify" a load', async () => {
+  const { s } = dcProvider({ items: [], orgs: [] });
+  let loadFilesCalled = 0;
+  let loadOrgsCalled = 0;
+  s.loadFiles = async () => { loadFilesCalled++; s.items = ITEMS; };
+  s.loadOrgs = async () => { loadOrgsCalled++; s.orgs = ORGS; };
+  const r = await s.deployComponents({ classNames: [], targetOrg: ORG }); // bad shape
+  assert.strictEqual(r.status, 'error');
+  assert.strictEqual(loadFilesCalled, 0, 'a bad shape must never trigger loadFiles');
+  assert.strictEqual(loadOrgsCalled, 0, 'a bad shape must never trigger loadOrgs');
+});
+
 check('deployComponents: an unknown org is an error, never a runDeploy call', async () => {
   const { s, runDeployCalls } = dcProvider();
   const r = await s.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: 'nobody@example.com' });
@@ -205,6 +226,22 @@ check('deployComponents: busy (or an open confirm modal) is an honest `busy`, an
   assert.strictEqual(c3.length, 1);
 });
 
+// ---- mutation target: the busy/confirmOpen slot is RE-CHECKED after the
+// panel-focus await, right before runDeploy — that await is the one window
+// where something else can take the slot before this call ever reaches it.
+check('deployComponents: free when the call starts, but busy by the time the panel-focus await resolves — refused as `busy`, never reaches runDeploy', async () => {
+  resetToasts();
+  const { s, runDeployCalls } = dcProvider();
+  execImpl = async (cmd) => {
+    if (cmd === `${P.DeployPanelProvider.viewType}.focus`) s.busy = true; // raced during the await
+    return undefined;
+  };
+  const r = await s.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: ORG });
+  assert.strictEqual(r.status, 'busy');
+  assert.strictEqual(runDeployCalls.length, 0);
+  execImpl = async () => undefined; // restore the default for later checks
+});
+
 // ---- mutation target: name → key mapping
 check('deployComponents: maps each name to its ApexClass/ApexTrigger item, case-insensitively', async () => {
   const { s, runDeployCalls } = dcProvider();
@@ -263,14 +300,26 @@ check('deployComponents: a failed reveal (focus command missing/throws) still le
 });
 
 // ---- item 3: outcome mapping — a message only for `failed`
-check('deployComponents: outcome mapping — ok/aborted pass through with no message; failed adds one naming the Status pane', async () => {
-  for (const status of ['ok', 'aborted']) {
-    const { s } = dcProvider({ outcome: { status, confirmed: true } });
-    const r = await s.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: ORG });
-    assert.deepStrictEqual(r, { status });
-  }
+check('deployComponents: outcome mapping — ok passes through bare; a plain (unconfirmed) aborted passes through bare too; failed adds a message naming the Status pane', async () => {
+  const { s: ok } = dcProvider({ outcome: { status: 'ok' } });
+  assert.deepStrictEqual(await ok.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: ORG }), { status: 'ok' });
+
+  // aborted WITHOUT confirmed: the modal was simply declined/dismissed —
+  // nothing was asked of the org, so this stays `aborted` (TR reads it as
+  // "the user said no" and stays silent, correctly).
+  const { s: declined } = dcProvider({ outcome: { status: 'aborted' } });
+  assert.deepStrictEqual(await declined.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: ORG }), { status: 'aborted' });
+
   const { s: failing } = dcProvider({ outcome: { status: 'failed' } });
   const r = await failing.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: ORG });
+  assert.deepStrictEqual(r, { status: 'failed', message: "Deploy to acme-dev failed — see SF Deploy's Status pane." });
+});
+
+// ---- mutation target: aborted + confirmed (lost contact / submit error / org
+// cancel AFTER the user said yes) must read as `failed`, not a silent `aborted`
+check('deployComponents: aborted + confirmed (the user said yes, but nothing landed) reports `failed` with a Status-pane message — TR reads a plain `aborted` as "user declined" and would otherwise stay silent about a real failure', async () => {
+  const { s } = dcProvider({ outcome: { status: 'aborted', confirmed: true } });
+  const r = await s.deployComponents({ classNames: ['AcmeOrderService'], targetOrg: ORG });
   assert.deepStrictEqual(r, { status: 'failed', message: "Deploy to acme-dev failed — see SF Deploy's Status pane." });
 });
 
@@ -367,7 +416,7 @@ function rtProvider(extra = {}) {
 
 check('runTests (toolbar): resolves only the selected ApexClass/ApexTrigger WITH local source, de-duped, calls sfTestRunner.runTestsFor with them and the live org, and omits `deployed`', async () => {
   resetToasts();
-  extensionIds = new Set();
+  testRunnerInstalled = undefined;
   let seenRaw;
   execImpl = async (cmd, raw) => { seenRaw = { cmd, raw }; return { status: 'passed', orgAlias: 'acme-dev', testClasses: ['AcmeOrderServiceTest'], passed: 3, failed: 0 }; };
   const { s, posted } = rtProvider();
@@ -489,7 +538,7 @@ check('runTests: resolves BEFORE the stubbed executeCommand settles — fire-and
   await new Promise((r) => setTimeout(r, 0));
 });
 
-check('runTests: a malformed reply is one warn card, not a throw', async () => {
+check('runTests: a malformed reply (the call worked, the shape didn\'t) is one warn card that still says "unexpected result" — not the executeCommand-failed wording', async () => {
   resetToasts();
   execImpl = async () => ({ status: 'passed' }); // missing testClasses/passed/failed
   const { s, posted } = rtProvider();
@@ -497,9 +546,11 @@ check('runTests: a malformed reply is one warn card, not a throw', async () => {
   await new Promise((r) => setTimeout(r, 0));
   assert.strictEqual(posted.length, 1);
   assert.strictEqual(posted[0].card.kind, 'warn');
+  assert.ok(/unexpected result/.test(posted[0].card.title), posted[0].card.title);
+  assert.ok(!/call to SF Test Runner failed/.test(posted[0].card.title), posted[0].card.title);
 });
 
-check('runTests: executeCommand throwing (sf-test-runner uninstalled mid-session) is the same one warn card, not a throw out of the handler', async () => {
+check('runTests: executeCommand throwing (sf-test-runner uninstalled mid-session) is one warn card naming the CALL itself, not a throw out of the handler', async () => {
   resetToasts();
   execImpl = async () => { throw new Error('command not found'); };
   const { s, posted } = rtProvider();
@@ -507,6 +558,29 @@ check('runTests: executeCommand throwing (sf-test-runner uninstalled mid-session
   await new Promise((r) => setTimeout(r, 0));
   assert.strictEqual(posted.length, 1);
   assert.strictEqual(posted[0].card.kind, 'warn');
+  assert.ok(/call to SF Test Runner failed/.test(posted[0].card.title), posted[0].card.title);
+});
+
+// ---- mutation target: version skew — installed alone is not enough
+check('testRunnerAvailable: not installed → false; installed but missing runTestsFor (an older SF Test Runner) → false; installed and current → true', () => {
+  const stub = {};
+  testRunnerInstalled = undefined;
+  assert.strictEqual(proto.testRunnerAvailable.call(stub), false, 'not installed at all');
+  testRunnerInstalled = TR_OLD;
+  assert.strictEqual(proto.testRunnerAvailable.call(stub), false, 'installed, but its manifest has no runTestsFor command — version skew');
+  testRunnerInstalled = TR_CURRENT;
+  assert.strictEqual(proto.testRunnerAvailable.call(stub), true, 'installed and its manifest declares runTestsFor');
+  testRunnerInstalled = undefined;
+});
+
+check('testsCard: a thrown executeCommand names the call and hints at a version mismatch; a malformed-but-received reply keeps "unexpected result"', () => {
+  const thrown = P.testsCard(undefined, 'acme-dev', true);
+  assert.strictEqual(thrown.kind, 'warn');
+  assert.ok(/call to SF Test Runner failed/.test(thrown.title) && /up to date/.test(thrown.title), thrown.title);
+  const malformed = P.testsCard(undefined, 'acme-dev', false);
+  assert.strictEqual(malformed.kind, 'warn');
+  assert.ok(/unexpected result/.test(malformed.title), malformed.title);
+  assert.ok(!/call to SF Test Runner failed/.test(malformed.title), malformed.title);
 });
 
 // =============================================== 5) liveRunPayload / lastDeployedApex
@@ -519,7 +593,7 @@ const deployRun = (id = 'run-live-1') => ({ id, op: 'deploy', status: 'succeeded
 const validateRun = (id = 'run-live-1') => ({ id, op: 'validate', status: 'succeeded', orgLabel: 'acme-dev' });
 
 check('liveRunPayload: emits runTests only for the matching succeeded DEPLOY run, with sf-test-runner installed', () => {
-  extensionIds = new Set(['Skrety.sf-test-runner']);
+  testRunnerInstalled = TR_CURRENT;
   const run = deployRun();
   const s1 = liveProvider({ lastDeployedApex: { runId: run.id, org: ORG, keys: ['ApexClass:AcmeOrderService'] } });
   assert.deepStrictEqual(proto.liveRunPayload.call(s1, run), { runTests: { count: 1 } });
@@ -529,12 +603,12 @@ check('liveRunPayload: emits runTests only for the matching succeeded DEPLOY run
   assert.strictEqual(proto.liveRunPayload.call(s2, run), undefined);
 
   // sf-test-runner not installed: nothing, even with a matching record.
-  extensionIds = new Set();
+  testRunnerInstalled = undefined;
   const s3 = liveProvider({ lastDeployedApex: { runId: run.id, org: ORG, keys: ['ApexClass:AcmeOrderService'] } });
   assert.strictEqual(proto.liveRunPayload.call(s3, run), undefined);
 
   // A validate run, even with a (stray) matching record: never — validate never deploys.
-  extensionIds = new Set(['Skrety.sf-test-runner']);
+  testRunnerInstalled = TR_CURRENT;
   const s4 = liveProvider({ lastDeployedApex: { runId: run.id, org: ORG, keys: ['ApexClass:AcmeOrderService'] } });
   assert.strictEqual(proto.liveRunPayload.call(s4, validateRun(run.id)), undefined);
 
@@ -658,14 +732,14 @@ function readyProvider() {
   return { s, posted };
 }
 check('handleMessage(ready): posts `peers` with the CURRENT testRunner availability — checked fresh, not cached', async () => {
-  extensionIds = new Set(['Skrety.sf-test-runner']);
+  testRunnerInstalled = TR_CURRENT;
   const { s, posted } = readyProvider();
   await proto.handleMessage.call(s, { type: 'ready' });
   const peersMsgs = posted.filter((m) => m.type === 'peers');
   assert.strictEqual(peersMsgs.length, 1);
   assert.strictEqual(peersMsgs[0].testRunner, true);
 
-  extensionIds = new Set();
+  testRunnerInstalled = undefined;
   const { s: s2, posted: posted2 } = readyProvider();
   await proto.handleMessage.call(s2, { type: 'ready' });
   assert.strictEqual(posted2.find((m) => m.type === 'peers').testRunner, false);
