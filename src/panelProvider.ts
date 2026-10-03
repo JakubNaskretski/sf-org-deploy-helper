@@ -144,6 +144,7 @@ const QUICK_DEPLOY_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
  *  gates the toolbar/Status-card "Run tests" buttons and names what they call. */
 const TEST_RUNNER_EXTENSION_ID = 'Skrety.sf-test-runner';
 const TEST_RUNNER_COMMAND = 'sfTestRunner.runTestsFor';
+const TEST_RUNNER_FOLLOW_COMMAND = 'sfTestRunner.followOrg';
 /** sf-test-runner's own cap on `classNames` (its handoff.ts) — enforced here
  *  too, so an over-the-cap selection gets a readable card instead of a round
  *  trip that just comes back as a generic validation error. */
@@ -3577,7 +3578,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // once that happens. In memory only, like lastValidated above.
       if (!validateOnly) {
         const apexKeys = items.filter(i => i.type === 'ApexClass' || i.type === 'ApexTrigger').map(i => `${i.type}:${i.name}`);
-        if (apexKeys.length) this.lastDeployedApex = { runId: runInput.id, org, keys: apexKeys };
+        if (apexKeys.length) {
+          this.lastDeployedApex = { runId: runInput.id, org, keys: apexKeys };
+          this.followInTestRunner(org);
+        }
       }
       this.runStore.finish(withKept(deployRunFromResult(result, runInput)));
       this.notifySuccessIfPanelHidden(validateOnly ? `Validated ${ctx.noun} against ${orgLabel}`
@@ -4923,10 +4927,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  an older version with no `runTestsFor` command would otherwise show
    *  both buttons and then fail the call — read its OWN manifest instead of
    *  assuming every installed copy is current. */
-  private testRunnerAvailable(): boolean {
+  private testRunnerAvailable(command: string = TEST_RUNNER_COMMAND): boolean {
     const ext = vscode.extensions.getExtension(TEST_RUNNER_EXTENSION_ID);
     const commands: unknown = ext?.packageJSON?.contributes?.commands;
-    return Array.isArray(commands) && commands.some(c => !!c && typeof c === 'object' && (c as { command?: unknown }).command === TEST_RUNNER_COMMAND);
+    return Array.isArray(commands) && commands.some(c => !!c && typeof c === 'object' && (c as { command?: unknown }).command === command);
+  }
+
+  /** After a real deploy that sent Apex: point sf-test-runner at the org it
+   *  went to, so its own Run / CodeLens right after lands there too instead of
+   *  on whatever its picker last held. Fire-and-forget and silent on failure —
+   *  a missing or older sf-test-runner just keeps its own org. */
+  private followInTestRunner(org: string): void {
+    if (!this.testRunnerAvailable(TEST_RUNNER_FOLLOW_COMMAND)) return;
+    void Promise.resolve(vscode.commands.executeCommand(TEST_RUNNER_FOLLOW_COMMAND, { targetOrg: org }))
+      .catch(err => this.output.appendLine(`[followOrg] ${err instanceof Error ? err.message : String(err)}`));
   }
 
   /** "Run tests" (toolbar or the newest deploy's Status card): hand `names` to

@@ -676,6 +676,29 @@ check('reportDeployResult: a VALIDATE (check-only) run never sets lastDeployedAp
   assert.strictEqual(outcome.status, 'ok');
   assert.strictEqual(s.lastDeployedApex, undefined);
 });
+// A real Apex deploy points sf-test-runner at the deployed org, so its own
+// Run / CodeLens right after can't land on a different org — but only when
+// the installed copy declares followOrg, and never for a check-only run.
+check('reportDeployResult: a successful Apex deploy calls sfTestRunner.followOrg with the deploy\'s org — only when the installed sf-test-runner declares it, never for a validate', async () => {
+  const TR_FOLLOW = { contributes: { commands: [...TR_CURRENT.contributes.commands, { command: 'sfTestRunner.followOrg' }] } };
+  const follows = () => execCalls.filter((c) => c[0] === 'sfTestRunner.followOrg');
+  const prev = testRunnerInstalled;
+  try {
+    testRunnerInstalled = TR_FOLLOW; execCalls.length = 0;
+    await proto.runDeploy.call(fullDeployProvider().s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG });
+    assert.deepStrictEqual(follows(), [['sfTestRunner.followOrg', { targetOrg: ORG }]]);
+
+    execCalls.length = 0;
+    await proto.runDeploy.call(fullDeployProvider().s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG, validateOnly: true, testLevel: 'NoTestRun' });
+    assert.strictEqual(follows().length, 0, 'a validate deploys nothing — nothing to follow');
+
+    testRunnerInstalled = TR_CURRENT; execCalls.length = 0;
+    await proto.runDeploy.call(fullDeployProvider().s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG });
+    assert.strictEqual(follows().length, 0, 'an sf-test-runner without followOrg is never called with it');
+  } finally {
+    testRunnerInstalled = prev;
+  }
+});
 
 // ===================================================== 6) webview: the toolbar button + peers
 check('panel.js: "Run tests" shows only with peers.testRunner + an Apex/local selection, labels/disables like Diff, clears on peers:false, and sends exactly those keys', () => {
