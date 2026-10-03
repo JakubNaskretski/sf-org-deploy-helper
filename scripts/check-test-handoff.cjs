@@ -389,8 +389,11 @@ check('parseRunTestsForResult: caps message/orgAlias at 500 chars rather than re
 });
 
 check('testsCard: passed/failed name the counts, the org and point at SF Tests → Results; busy/noTests/cancelled/error speak their own message or a fallback', () => {
-  assert.deepStrictEqual(P.testsCard({ status: 'passed', testClasses: [], passed: 4, failed: 0 }, 'acme-dev'), { kind: 'ok', title: 'Tests on acme-dev: 4 passed, 0 failed', meta: 'Details in SF Tests → Results.' });
-  assert.deepStrictEqual(P.testsCard({ status: 'failed', orgAlias: 'acme-prod', testClasses: ['A'], passed: 1, failed: 1 }, 'acme-dev'), { kind: 'err', title: 'Tests on acme-prod: 1 passed, 1 failed', meta: 'Classes: A · Details in SF Tests → Results.' });
+  assert.deepStrictEqual(P.testsCard({ status: 'passed', testClasses: [], passed: 4, failed: 0 }, 'acme-dev'), { kind: 'ok', title: 'Tests on acme-dev: 4 methods passed, 0 failed', meta: 'Details in SF Tests → Results.' });
+  assert.deepStrictEqual(P.testsCard({ status: 'failed', orgAlias: 'acme-prod', testClasses: ['A'], passed: 1, failed: 1 }, 'acme-dev'), { kind: 'err', title: 'Tests on acme-prod: 1 test class, 1 method passed, 1 failed', meta: 'Classes: A · Details in SF Tests → Results.' });
+  // One deployed test class with seven methods must not read as "7 tests".
+  assert.strictEqual(P.testsCard({ status: 'passed', testClasses: ['AcmeServiceTest'], passed: 7, failed: 0 }, 'acme-dev').title, 'Tests on acme-dev: 1 test class, 7 methods passed, 0 failed');
+  assert.strictEqual(P.testsCard({ status: 'passed', testClasses: ['A', 'B'], passed: 9, failed: 0 }, 'acme-dev').title, 'Tests on acme-dev: 2 test classes, 9 methods passed, 0 failed');
   assert.strictEqual(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').kind, 'warn');
   assert.strictEqual(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').title, 'A test run is already in progress.');
   assert.strictEqual(P.testsCard({ status: 'noTests', testClasses: [], passed: 0, failed: 0 }, 'acme-dev').kind, 'warn', 'no message from TR here — this side still needs a title');

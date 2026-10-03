@@ -7175,7 +7175,12 @@ export function testsCard(result: RunTestsForResult | undefined, orgLabel: strin
       // Only these two actually ran something — the per-method breakdown
       // lives in sf-test-runner's own Results view, not in this one-line card.
       const meta = [classesLine, 'Details in SF Tests → Results.'].filter(Boolean).join(' · ');
-      return { kind: result.status === 'passed' ? 'ok' : 'err', title: `Tests on ${alias}: ${result.passed} passed, ${result.failed} failed`, meta };
+      // The counts are test METHODS; lead with the class count so one deployed
+      // test class with seven methods doesn't read as "7 tests".
+      const n = result.testClasses.length;
+      const classes = n ? `${n} test ${n === 1 ? 'class' : 'classes'}, ` : '';
+      const methods = `${result.passed} ${result.passed === 1 ? 'method' : 'methods'} passed, ${result.failed} failed`;
+      return { kind: result.status === 'passed' ? 'ok' : 'err', title: `Tests on ${alias}: ${classes}${methods}`, meta };
     }
     case 'busy': return { kind: 'warn', title: result.message || `Tests on ${alias}: a test run is already in progress.`, meta: classesLine };
     case 'noTests': return { kind: 'warn', title: result.message || `Tests on ${alias}: no matching test class found.`, meta: classesLine };
