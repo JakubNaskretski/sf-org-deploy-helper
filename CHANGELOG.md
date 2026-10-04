@@ -3,6 +3,14 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.30.1
+
+- **The tests card counts classes and methods.** One test class with seven methods now reads
+  "1 test class, 7 methods passed, 0 failed" instead of "7 passed".
+- **SF Test Runner follows your deploy.** After a deploy that sent Apex, SF Test Runner switches
+  to the org it went to (version 0.16.1 or later), so running tests there right afterwards can't
+  land on a different org.
+
 ## 0.30.0
 
 - **Run tests with SF Test Runner.** With SF Test Runner installed, a **Run tests** button sits
