@@ -389,8 +389,11 @@ check('parseRunTestsForResult: caps message/orgAlias at 500 chars rather than re
 });
 
 check('testsCard: passed/failed name the counts, the org and point at SF Tests → Results; busy/noTests/cancelled/error speak their own message or a fallback', () => {
-  assert.deepStrictEqual(P.testsCard({ status: 'passed', testClasses: [], passed: 4, failed: 0 }, 'acme-dev'), { kind: 'ok', title: 'Tests on acme-dev: 4 passed, 0 failed', meta: 'Details in SF Tests → Results.' });
-  assert.deepStrictEqual(P.testsCard({ status: 'failed', orgAlias: 'acme-prod', testClasses: ['A'], passed: 1, failed: 1 }, 'acme-dev'), { kind: 'err', title: 'Tests on acme-prod: 1 passed, 1 failed', meta: 'Classes: A · Details in SF Tests → Results.' });
+  assert.deepStrictEqual(P.testsCard({ status: 'passed', testClasses: [], passed: 4, failed: 0 }, 'acme-dev'), { kind: 'ok', title: 'Tests on acme-dev: 4 methods passed, 0 failed', meta: 'Details in SF Tests → Results.' });
+  assert.deepStrictEqual(P.testsCard({ status: 'failed', orgAlias: 'acme-prod', testClasses: ['A'], passed: 1, failed: 1 }, 'acme-dev'), { kind: 'err', title: 'Tests on acme-prod: 1 test class, 1 method passed, 1 failed', meta: 'Classes: A · Details in SF Tests → Results.' });
+  // One deployed test class with seven methods must not read as "7 tests".
+  assert.strictEqual(P.testsCard({ status: 'passed', testClasses: ['AcmeServiceTest'], passed: 7, failed: 0 }, 'acme-dev').title, 'Tests on acme-dev: 1 test class, 7 methods passed, 0 failed');
+  assert.strictEqual(P.testsCard({ status: 'passed', testClasses: ['A', 'B'], passed: 9, failed: 0 }, 'acme-dev').title, 'Tests on acme-dev: 2 test classes, 9 methods passed, 0 failed');
   assert.strictEqual(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').kind, 'warn');
   assert.strictEqual(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').title, 'A test run is already in progress.');
   assert.strictEqual(P.testsCard({ status: 'noTests', testClasses: [], passed: 0, failed: 0 }, 'acme-dev').kind, 'warn', 'no message from TR here — this side still needs a title');
@@ -672,6 +675,29 @@ check('reportDeployResult: a VALIDATE (check-only) run never sets lastDeployedAp
   const outcome = await proto.runDeploy.call(s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG, validateOnly: true, testLevel: 'NoTestRun' });
   assert.strictEqual(outcome.status, 'ok');
   assert.strictEqual(s.lastDeployedApex, undefined);
+});
+// A real Apex deploy points sf-test-runner at the deployed org, so its own
+// Run / CodeLens right after can't land on a different org — but only when
+// the installed copy declares followOrg, and never for a check-only run.
+check('reportDeployResult: a successful Apex deploy calls sfTestRunner.followOrg with the deploy\'s org — only when the installed sf-test-runner declares it, never for a validate', async () => {
+  const TR_FOLLOW = { contributes: { commands: [...TR_CURRENT.contributes.commands, { command: 'sfTestRunner.followOrg' }] } };
+  const follows = () => execCalls.filter((c) => c[0] === 'sfTestRunner.followOrg');
+  const prev = testRunnerInstalled;
+  try {
+    testRunnerInstalled = TR_FOLLOW; execCalls.length = 0;
+    await proto.runDeploy.call(fullDeployProvider().s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG });
+    assert.deepStrictEqual(follows(), [['sfTestRunner.followOrg', { targetOrg: ORG }]]);
+
+    execCalls.length = 0;
+    await proto.runDeploy.call(fullDeployProvider().s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG, validateOnly: true, testLevel: 'NoTestRun' });
+    assert.strictEqual(follows().length, 0, 'a validate deploys nothing — nothing to follow');
+
+    testRunnerInstalled = TR_CURRENT; execCalls.length = 0;
+    await proto.runDeploy.call(fullDeployProvider().s, ['ApexClass:AcmeOrderService'], { orgOverride: ORG });
+    assert.strictEqual(follows().length, 0, 'an sf-test-runner without followOrg is never called with it');
+  } finally {
+    testRunnerInstalled = prev;
+  }
 });
 
 // ===================================================== 6) webview: the toolbar button + peers
