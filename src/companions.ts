@@ -60,8 +60,14 @@ export interface CompanionPlan {
   leftOut: Record<string, string[]>;
 }
 
-/** What an org-wide Translations file translates. */
-export const TRANSLATIONS_COMPANION_TYPES: readonly string[] = ['CustomLabels', 'CustomApplication', 'CustomTab', 'Flow', 'QuickAction', 'ReportType'];
+/** What an org-wide Translations file translates — every part of it the org
+ *  fills only for components named in the same request: labels, apps, tabs,
+ *  flows, quick actions, report types, home-page custom links, bots and
+ *  in-app guidance prompts. */
+export const TRANSLATIONS_COMPANION_TYPES: readonly string[] = [
+  'CustomLabels', 'CustomApplication', 'CustomTab', 'Flow', 'QuickAction', 'ReportType',
+  'CustomPageWebLink', 'Bot', 'Prompt'
+];
 
 /** Decomposed CustomObject children (metadataScanner's OBJECT_CHILD_RULES —
  *  check-companions.cjs pins the two lists equal). */
@@ -120,7 +126,8 @@ type Item = Pick<MetadataItem, 'type' | 'name'>;
 const TYPE_LABELS: Readonly<Record<string, string>> = {
   CustomLabels: 'Labels', CustomApplication: 'Apps', CustomTab: 'Tabs', Flow: 'Flows', QuickAction: 'Quick actions',
   ReportType: 'Report types', CustomObject: 'Objects', ApexClass: 'Apex classes', ApexPage: 'Visualforce pages',
-  Layout: 'Layouts', CustomPermission: 'Custom permissions', ExternalDataSource: 'External data sources'
+  Layout: 'Layouts', CustomPermission: 'Custom permissions', ExternalDataSource: 'External data sources',
+  CustomPageWebLink: 'Custom page links', Bot: 'Bots', Prompt: 'Prompts (in-app guidance)'
 };
 
 /** The picker's heading for a companion type (`Tabs`, `Apex classes`). */
@@ -365,7 +372,8 @@ const NOUNS: Readonly<Record<string, readonly [string, string]>> = {
   CustomPermission: ['custom permission', 'custom permissions'], ExternalDataSource: ['data source', 'data sources'],
   ListView: ['list view', 'list views'], WebLink: ['button or link', 'buttons and links'], ValidationRule: ['validation rule', 'validation rules'],
   CompactLayout: ['compact layout', 'compact layouts'], BusinessProcess: ['business process', 'business processes'],
-  FieldSet: ['field set', 'field sets'], Index: ['index', 'indexes'], SharingReason: ['sharing reason', 'sharing reasons']
+  FieldSet: ['field set', 'field sets'], Index: ['index', 'indexes'], SharingReason: ['sharing reason', 'sharing reasons'],
+  CustomPageWebLink: ['custom page link', 'custom page links'], Bot: ['bot', 'bots'], Prompt: ['prompt', 'prompts']
 };
 
 function noun(type: string, n: number): string {
@@ -387,7 +395,9 @@ export function countPhrase(companions: readonly Companion[]): string {
 
 /**
  * One line per selected context item saying what it is fetched with — the
- * dialog's, the run's and a diff card's promise, so it has to be exact:
+ * dialog's, the run's and a diff card's promise, so it has to be exact (it is
+ * built from the item's own picks, and contextGroups keeps every request to
+ * files with identical picks; files whose lines read the same share one):
  *   - a picker item: the labels, this project's members (`11 tabs (project)`),
  *     the types fetched whole (`all flows on the org`), and what was left out
  *     (`— apps, quick actions and report types left out`). "complete" ONLY when
@@ -397,21 +407,24 @@ export function countPhrase(companions: readonly Companion[]): string {
  *     actions — complete; without the org list, only for what the project knows.
  */
 export function describeContext(selected: readonly Item[], plan: CompanionPlan): string[] {
-  const lines: string[] = [];
+  // Per file first; files whose lines read the same (the same picks, the same
+  // request) then share one line — `Profile:Admin, Profile:Sales: fetched with…`.
+  const entries: Array<{ key: string; tail: string }> = [];
   for (const item of selected.filter(i => CONTEXT_TYPES.has(i.type))) {
     const key = `${item.type}:${item.name}`;
+    if (entries.some(e => e.key === key)) continue;
     if (item.type === 'CustomObjectTranslation') {
       const extra = (plan.own[key] ?? []).filter(c => c.type !== 'CustomObject');
-      lines.push(plan.partial.includes(key)
-        ? `${key}: fetched with its object${extra.length ? ` and ${countPhrase(extra)}` : ''} — complete only for what the project knows`
-        : `${key}: fetched with its object${extra.length ? ` and the org's ${countPhrase(extra)}` : ''} so it comes back complete`);
+      entries.push({ key, tail: plan.partial.includes(key)
+        ? `fetched with its object${extra.length ? ` and ${countPhrase(extra)}` : ''} — complete only for what the project knows`
+        : `fetched with its object${extra.length ? ` and the org's ${countPhrase(extra)}` : ''} so it comes back complete` });
       continue;
     }
     if (!pickTypesFor(item.type)) continue;
     const chosen = plan.chosen[key] ?? [];
     const leftOut = plan.leftOut[key] ?? [];
     if (chosen.length === 0) {
-      lines.push(`${key}: fetched alone — nothing ticked to fetch it with, so it comes back nearly empty`);
+      entries.push({ key, tail: 'fetched alone — nothing ticked to fetch it with, so it comes back nearly empty' });
       continue;
     }
     const parts: string[] = [];
@@ -420,12 +433,47 @@ export function describeContext(selected: readonly Item[], plan: CompanionPlan):
     if (project.length) parts.push(`${countPhrase(project.flatMap(c => c.companions))} (project)`);
     const org = chosen.filter(c => c.kind === 'org' && c.type !== 'CustomLabels');
     if (org.length) parts.push(`all ${joinAnd(org.map(c => noun(c.type, 2)))} on the org`);
-    let line = `${key}: fetched with ${parts.join(', ')}`;
-    if (leftOut.length) line += ` — ${joinAnd(leftOut.map(t => noun(t, 2)))} left out`;
-    else if (project.length === 0) line += plan.partial.includes(key) ? ' — complete only for what the project knows' : ' so it comes back complete';
-    lines.push(line);
+    let tail = `fetched with ${parts.join(', ')}`;
+    if (leftOut.length) tail += ` — ${joinAnd(leftOut.map(t => noun(t, 2)))} left out`;
+    else if (project.length === 0) tail += plan.partial.includes(key) ? ' — complete only for what the project knows' : ' so it comes back complete';
+    entries.push({ key, tail });
+  }
+  const lines: string[] = [];
+  const done = new Set<string>();
+  for (const { tail } of entries) {
+    if (done.has(tail)) continue;
+    done.add(tail);
+    const keys = entries.filter(e => e.tail === tail).map(e => e.key);
+    lines.push(`${keys.slice(0, 3).join(', ')}${keys.length > 3 ? ` +${keys.length - 3} more` : ''}: ${tail}`);
   }
   return lines;
+}
+
+/**
+ * The context items split into retrieve requests. The org fills EVERY
+ * profile or translation in a request for everything named in it, so two
+ * files with different picks must never share one: Profile:Admin with only
+ * its classes ticked beside an object translation would come back with that
+ * object's field permissions, a translation beside a profile that ticked
+ * "all flows" with every flow. Files whose own companions are identical
+ * share a request (one per set of choices); the object translations go
+ * together — each describes only its own object, so another object's
+ * companions add nothing to it. First-appearance order.
+ */
+export function contextGroups(
+  selected: readonly Item[],
+  ctx: { picks?: Readonly<Record<string, readonly string[]>>; localItems: readonly Item[]; orgItems?: readonly Item[] }
+): Array<{ items: Item[]; plan: CompanionPlan }> {
+  const groups: Array<{ sig: string; items: Item[] }> = [];
+  for (const item of selected.filter(i => CONTEXT_TYPES.has(i.type))) {
+    const sig = item.type === 'CustomObjectTranslation'
+      ? '\u0000objectTranslations'
+      : companionsFor([item], ctx).companions.map(c => `${c.type}:${c.name}`).sort().join('\n');
+    const group = groups.find(g => g.sig === sig);
+    if (!group) groups.push({ sig, items: [item] });
+    else if (!group.items.some(i => i.type === item.type && i.name === item.name)) group.items.push(item);
+  }
+  return groups.map(g => ({ items: g.items, plan: companionsFor(g.items, ctx) }));
 }
 
 /** True when a picker item is fetched with less than everything on the org — a

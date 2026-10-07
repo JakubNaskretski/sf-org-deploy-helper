@@ -49,8 +49,8 @@ builds them on request, and fills in only the parts that describe components nam
 request. Retrieved alone, `Profile:Admin` comes back with its user permissions and nothing else,
 and `Translations:pl` as an empty stub — overwriting a complete local file. So Retrieve and Diff
 send these types together with their **companions**: an object translation with its object (and
-its layouts and quick actions), a translation with the labels, apps, tabs, flows, quick actions
-and report types it translates, a profile with the objects, fields, classes, pages, apps, tabs,
+its layouts and quick actions), a translation with the labels, apps, tabs, flows, quick actions,
+report types, home-page custom links, bots and in-app guidance prompts it translates, a profile with the objects, fields, classes, pages, apps, tabs,
 layouts, custom permissions, flows and external data sources it grants access to (custom metadata
 types come with their objects).
 
@@ -59,16 +59,19 @@ translation itself is copied back (an object translation folder is merged: files
 overwritten, a file only you have is kept). For a translation or a profile **you choose what rides
 along**, per type: before the retrieve (or diff) a picker lists each companion type twice —
 *this project's (N)*, the ones you have, by name, and *all on the org*, everything of that type
-(slower on a big org) — and the labels once. The first time every *this project's* row is ticked,
-so Enter fetches the file for what your project has; your choice is remembered per file and
-ticked again next time; Escape cancels the whole retrieve or diff before anything is fetched.
-Tick both rows of a type and the org row wins; tick neither and that type is left out. The
-confirm dialog, the run and a diff's card say what each file was fetched with and what was left
-out — `Translations:pl: fetched with the labels, 11 tabs (project), all flows on the org — apps,
-quick actions and report types left out` — and call it complete only when every type came whole
-from the org (a profile's standard objects such as Account need **Fetch Org** for that: a
-wildcard can't name them). With `sfOrgDeployWrapper.contextCompanionPrompt` at `remembered` the
-picker asks once per file. An object translation needs no picker: it always brings its object and
+(slower on a big org) — and the labels once. There is one picker for all the profiles you
+selected and one for all the translations, however many files. The first time every *this
+project's* row is ticked, so Enter fetches the files for what your project has; your choice is
+remembered for each of those files and ticked again next time (an empty choice is not
+remembered); Escape cancels the whole retrieve or diff before anything is fetched. Tick both rows
+of a type and the org row wins; tick neither and that type is left out. Files with different
+choices are fetched in separate requests, so each comes back with exactly what was ticked for
+it. The confirm dialog, the run and a diff's card say what each file was fetched with and what
+was left out — `Translations:pl: fetched with the labels, 11 tabs (project), all flows on the
+org — apps, quick actions, report types, custom page links, bots and prompts left out` — and call
+it complete only when every type came whole from the org (a profile's standard objects such as
+Account need **Fetch Org** for that: a wildcard can't name them). With
+`sfOrgDeployWrapper.contextCompanionPrompt` at `remembered` the picker asks once per file. An object translation needs no picker: it always brings its object and
 that object's layouts and quick actions (from the Fetch Org list, or the project's without it).
 Object translations are listed in the tree as one folder each, and deploy, validate and diff like
 any other component; a diff opens only the files that differ. Deploy and validate need no
@@ -133,7 +136,7 @@ the job up again and finishes the same run.
 - `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
 - `sfOrgDeployWrapper.diffEditorCap` — how many diff editors one Diff may open (default 10, 1–100). Everything selected is compared with the org first and only files that differ get an editor; identical files (line endings ignored) are counted on the result card, and differing files past the cap are listed there as "differs (not opened)".
 - `sfOrgDeployWrapper.contextCompanions` — Retrieve and Diff of a profile, an org-wide translation (`translations/pl.translation-meta.xml`) or an object translation also ask the org for the components it describes, so it comes back filled in (default on). The companions land in a temporary project and are never written to yours; only the profile or translation is copied back. Off: these types are retrieved alone, nearly empty, with no picker, and the result says so. See **Translations & profiles** above.
-- `sfOrgDeployWrapper.contextCompanionPrompt` — when the companion picker for a translation or a profile appears: `always` (default) — before every Retrieve and Diff of one, ticked as you last chose for that file (first time: everything this project has), so Enter repeats it; `remembered` — only until a file has a remembered choice, which is then used without asking (the confirm dialog and the result still name it; a remembered row that no longer exists brings the picker back). Escape in the picker cancels the whole retrieve or diff.
+- `sfOrgDeployWrapper.contextCompanionPrompt` — when the companion picker for translations or profiles appears (one picker for all the selected profiles, one for all the translations): `always` (default) — before every Retrieve and Diff of them, ticked as you last chose (when all the selected files of that type chose the same; first time: everything this project has), so Enter repeats it; `remembered` — only until every selected file of that type has a remembered choice, and each file's own is then used without asking (the confirm dialog and the result still name it; a remembered row that no longer exists brings the picker back; an empty choice is never remembered). Escape in the picker cancels the whole retrieve or diff.
 - `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
 - `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org, remembered per VS Code window).

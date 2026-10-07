@@ -9,7 +9,7 @@ import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInf
 import { isLikelyProduction } from './kit/orgs';
 import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolveDefaultPackageDir, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
-import { CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, companionsFor, defaultPicks, describeContext, fetchedPartly, hasWildcard, isCompanionMessage, pickRows, pickTypesFor, typeLabel } from './companions';
+import { CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, contextGroups, defaultPicks, describeContext, fetchedPartly, hasWildcard, isCompanionMessage, pickRows, pickTypesFor, typeLabel } from './companions';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
 const DISCOVERY_RETRY_DELAYS_MS = [1500, 4000, 10000];
@@ -4230,11 +4230,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const picked = await this.pickCompanions(allItems, org, orgLabel);
       if (!picked) { this.reportPickerCancelled(`Retrieve from ${orgLabel}`); return; }
       // A Profile, Translations or CustomObjectTranslation comes back complete only
-      // beside the components it describes (src/companions.ts). With companions to
-      // send, those items take a throwaway project and only their own files are
-      // copied back (`ctxItems`); everything else (`items`) retrieves straight into
-      // the project exactly as before.
-      const context = this.contextPlanFor(allItems, org, false, picked.picks);
+      // beside the components it describes (src/companions.ts). Those items take
+      // a throwaway project — one per set of companions — and only their own
+      // files are copied back (`ctxItems`); everything else (`items`) retrieves
+      // straight into the project exactly as before.
+      const context = this.contextPlanFor(allItems, org, picked.picks);
       const ctxItems = context.split ? allItems.filter(i => CONTEXT_TYPES.has(i.type)) : [];
       const items = context.split ? allItems.filter(i => !CONTEXT_TYPES.has(i.type)) : allItems;
       // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
@@ -4333,14 +4333,21 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           messages.push(...(result.messages ?? []));
         }
         const written: string[] = [];
-        // Set when the context half was cancelled or timed out AFTER the project
-        // retrieve had already written its files.
+        // Set when the context half was cancelled or timed out AFTER something
+        // (the project retrieve, an earlier request) had already written files —
+        // and the context files it never got to.
         let ctxStopped: string | undefined;
-        if (ctxItems.length > 0) {
+        let stopped: MetadataItem[] = [];
+        // One temporary project per request: files whose companions are
+        // identical share one, files with different ones never do — the org
+        // fills every file for everything named in its request (contextGroups).
+        // The command log shows each.
+        for (let g = 0; ctxItems.length > 0 && g < context.groups.length; g++) {
+          const group = context.groups[g];
           let ctx: ContextRetrieveOutcome;
           try {
             if (cancelled) throw new SfCliCancelledError();
-            ctx = await this.retrieveContextItems(ctxItems, context.plan.companions, org, root, {
+            ctx = await this.retrieveContextItems(group.items, group.plan.companions, org, root, {
               setInFlight: c => { inFlight = c; },
               isCancelled: () => cancelled,
               setOpen: o => { open = o; },
@@ -4349,31 +4356,38 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           } catch (err) {
             // A failed, cancelled or timed-out CLI call copies nothing. A failure of
             // the copy itself can stop partway through a folder — that is what the
-            // backup taken above is for. With no project retrieve before it, this IS
-            // the retrieve's failure (or cancel, or timeout); after one, those files
-            // are already written — fail the context items alone, keep the rest of
+            // backup taken above is for. With nothing written before it, a cancel
+            // or timeout IS the retrieve's (and a failure is, when this was the only
+            // request); after the project retrieve or an earlier request those files
+            // are already written — fail the files it covers alone, keep the rest of
             // the answer honest, and still rescan.
-            if (items.length === 0) throw err;
+            const stop = err instanceof SfCliCancelledError ? 'cancelled' : isTimeoutError(err) ? 'timed out' : undefined;
+            if (items.length === 0 && g === 0 && (stop || context.groups.length === 1)) throw err;
             if (open) { this.endCmd(open.id, false, Date.now() - open.start); open = undefined; }
-            ctxStopped = err instanceof SfCliCancelledError ? 'cancelled' : isTimeoutError(err) ? 'timed out' : undefined;
             // The Output channel gets the CLI's own words, as reportError /
             // reportDeployTimeout would have given it.
             if (!(err instanceof SfCliCancelledError)) this.handleError(`Retrieve from ${orgLabel}`, err);
+            // A cancel or a timeout stops the requests after this one too; a
+            // failure fails this request's files alone, and the next one runs.
+            const hit = stop ? context.groups.slice(g).flatMap(x => x.items) : group.items;
             // Per row, per shape: a folder (an object translation) has FILES.
-            const why = (i: MetadataItem): string => ctxStopped
-              ? `${ctxStopped} before ${CONTEXT_SHAPES[i.type]?.dir ? 'its files were copied — its local files were left as they were' : 'its file was copied — its local file was left as it was'}`
+            const why = (i: MetadataItem): string => stop
+              ? `${stop} before ${CONTEXT_SHAPES[i.type]?.dir ? 'its files were copied — its local files were left as they were' : 'its file was copied — its local file was left as it was'}`
               : err instanceof Error ? err.message : String(err);
-            ctx = { files: ctxItems.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why(i) })), messages: [], written: [] };
-            if (ctxStopped) {
-              const list = ctxItems.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctxItems.length > 3 ? ` +${ctxItems.length - 3} more` : '');
-              const one = ctxItems.length === 1;
-              const what = one ? (CONTEXT_SHAPES[ctxItems[0].type]?.dir ? 'its files were' : 'its file was') : 'their files were';
-              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before ${what} copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${ctxTimeoutHint(ctxStopped)}` });
+            ctx = { files: hit.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why(i) })), messages: [], written: [] };
+            if (stop) {
+              ctxStopped = stop;
+              stopped = hit;
+              const list = hit.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (hit.length > 3 ? ` +${hit.length - 3} more` : '');
+              const one = hit.length === 1;
+              const what = one ? (CONTEXT_SHAPES[hit[0].type]?.dir ? 'its files were' : 'its file was') : 'their files were';
+              ctx.messages.push({ fileName: list, problem: `${stop} before ${what} copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${ctxTimeoutHint(stop)}` });
             }
           }
           files.push(...ctx.files);
           messages.push(...ctx.messages);
           written.push(...ctx.written);
+          if (ctxStopped) break;
         }
         const result: RetrieveResult = { status: 0, success: true, inboundFiles: files, messages };
         const ok = files.filter(f => !retrieveProblem(f) && (f.state === undefined || f.state !== 'Failed'));
@@ -4386,10 +4400,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // Fetch Org predates the component. The local side ('On org' → 'In both')
         // is covered by the loadFiles() rescan below.
         this.confirmOnOrg(ok, org, orgLabel);
+        // The backup and what landed in the project first: the run keeps a few
+        // notes, and these two are what the user acts on.
         const notes = [
           ...(backupNote ? [backupNote] : []),
-          ...context.notes,
-          ...(written.length ? [`copied into your project: ${written.join(', ')}`] : [])
+          ...(written.length ? [`copied into your project: ${written.join(', ')}`] : []),
+          ...context.notes
         ];
         this.runStore.finish(retrieveRunFromResult(result, {
           id: runId, org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, finishedAt: Date.now(),
@@ -4402,7 +4418,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const count = (rows: RetrieveFileResult[]): number => new Set(rows.map(f => rowOwnerKey(f, allItems))).size;
         const okCount = count(ok);
         const failedCount = count(failed);
-        const ctxKeys = new Set(ctxItems.map(i => `${i.type}:${i.name}`));
+        const ctxKeys = new Set(stopped.map(i => `${i.type}:${i.name}`));
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
           this.notifySuccessIfPanelHidden(`Retrieved ${okCount} component${okCount === 1 ? '' : 's'} from ${orgLabel}`);
         } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
@@ -4410,8 +4426,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         } else if (ctxStopped && failed.every(f => ctxKeys.has(rowOwnerKey(f, allItems)))) {
           // The user's own Cancel (or the timeout) on the second half, and nothing
           // ELSE failed: no failure toast. Any other failed row still gets one.
-          const filesOf = ctxItems.length > 1 || CONTEXT_SHAPES[ctxItems[0].type]?.dir ? 'local files left as they were' : 'local file left as it was';
-          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${ctxItems.length} ${ctxStopped} (${filesOf}).${ctxTimeoutHint(ctxStopped)}`, 'warn');
+          const filesOf = stopped.length > 1 || CONTEXT_SHAPES[stopped[0].type]?.dir ? 'local files left as they were' : 'local file left as it was';
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${stopped.length} ${ctxStopped} (${filesOf}).${ctxTimeoutHint(ctxStopped)}`, 'warn');
         } else if (failed.length > 0) {
           this.failureToast(`Retrieve from ${orgLabel}: ${failedCount} component${failedCount === 1 ? '' : 's'} failed.`, [
             ...failed.map(f => `✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`), ...msgLines
@@ -4440,8 +4456,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * The context half of a retrieve: `ctxItems` (Profile / Translations /
-   * CustomObjectTranslation) plus their companions go to a THROWAWAY source
+   * One request of the context half of a retrieve: `ctxItems` (Profile /
+   * Translations / CustomObjectTranslation files with identical companions,
+   * contextGroups) plus those companions go to a THROWAWAY source
    * project, and only the selected items' own files come back — a profile or
    * translation file, an object translation folder merged in (files overwritten,
    * a file only the project has is never deleted, as the CLI itself does). Each
@@ -4579,66 +4596,71 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** The companions a Retrieve or Diff of `items` sends with its context items
    *  (src/companions.ts): the picker's rows (`picks`) for a Translations file or
-   *  a Profile, the fixed set for an object translation. `split`: there are
-   *  companions to send, so the context items take the temporary-project route.
-   *  `notes` go on the retrieve's run, `diffNotes` on a diff's card; `modalLine`
-   *  is the confirm's disclosure — what each item is fetched with, and what is
-   *  left out, BEFORE the overwrite. `sameRequest`: the companions travel in the
-   *  SAME retrieve as all of `items` (Diff), so a selected component is never
-   *  asked for twice. A Retrieve sends the context items on their own, so there
-   *  they are checked against those alone — a selected CustomLabels still has to
-   *  ride with Translations:pl. */
-  private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean, picks: Record<string, string[]>): { plan: CompanionPlan; split: boolean; notes: string[]; diffNotes: string[]; modalLine?: string } {
+   *  a Profile, the fixed set for an object translation — as REQUESTS
+   *  (`groups`): files with identical companions share one temporary-project
+   *  retrieve, files with different ones never do (the org fills every file for
+   *  everything named in its request). `split`: the context items take the
+   *  temporary-project route (always, unless companions are off). `notes` go on
+   *  the retrieve's run, `diffNotes` on a diff's card; `modalLine` is the
+   *  confirm's disclosure — what each file is fetched with, and what is left
+   *  out, BEFORE the overwrite. */
+  private contextPlanFor(items: MetadataItem[], org: string, picks: Record<string, string[]>): { groups: ContextGroup[]; split: boolean; notes: string[]; diffNotes: string[]; modalLine?: string } {
     const ctx = items.filter(i => CONTEXT_TYPES.has(i.type));
-    const none: CompanionPlan = { companions: [], note: [], incomplete: [], partial: [], own: {}, chosen: {}, leftOut: {} };
-    if (ctx.length === 0) return { plan: none, split: false, notes: [], diffNotes: [] };
+    if (ctx.length === 0) return { groups: [], split: false, notes: [], diffNotes: [] };
     const names = ctx.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctx.length > 3 ? ` +${ctx.length - 3} more` : '');
     const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
     if (cfg.get<boolean>('contextCompanions', true) === false) {
       return {
-        plan: none, split: false, notes: ['retrieved without companions'], diffNotes: ['retrieved without companions'],
+        groups: [], split: false, notes: ['retrieved without companions'], diffNotes: ['retrieved without companions'],
         modalLine: `${names}: retrieved without companions (sfOrgDeployWrapper.contextCompanions is off) — may come back nearly empty.`
       };
     }
-    const plan = companionsFor(sameRequest ? items : ctx, { picks, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
-    // What each item is fetched with — "complete" only where every type is
+    const found = contextGroups(ctx, { picks, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
+    const groups: ContextGroup[] = found.map(g => ({
+      items: g.items.map(i => ctx.find(c => c.type === i.type && c.name === i.name)!), plan: g.plan
+    }));
+    // What each file is fetched with — "complete" only where every type is
     // fetched whole from the org; what was left out, named; nothing ticked at
-    // all, "nearly empty".
-    const itemLines = describeContext(ctx, plan);
+    // all, "nearly empty". Built per request, so a line never borrows another
+    // file's companions.
+    const itemLines = groups.flatMap(g => describeContext(g.items, g.plan));
+    const unique = (lines: string[]): string[] => lines.filter((l, n) => lines.indexOf(l) === n);
     // Every other note (org-list fallbacks) — never the summary twice.
-    const other = plan.note.filter(l => !l.startsWith('companions: '));
+    const other = unique(groups.flatMap(g => g.plan.note.filter(l => !l.startsWith('companions: '))));
+    const summary = groups.flatMap(g => g.plan.note.filter(l => l.startsWith('companions: ')));
     // A diff of a file fetched with less than everything on the org: the org's
     // copy says nothing about the rest, so the local entries for it read local-only.
-    const partly = fetchedPartly(plan) ? [PARTIAL_FETCH_DIFF_LINE] : [];
-    const n = plan.companions.length;
-    if (n === 0) {
-      const lines = [...itemLines, ...other];
-      return { plan, split: false, notes: lines, diffNotes: [...itemLines, ...partly, ...other], modalLine: lines.join('\n') || undefined };
-    }
-    const summary = plan.note.filter(l => l.startsWith('companions: '));
-    // The count is everything that rides along, for all the items together — so
+    const partly = groups.some(g => fetchedPartly(g.plan)) ? [PARTIAL_FETCH_DIFF_LINE] : [];
+    // The count is everything that rides along, for all the files together — so
     // it stands on its own line, never beside a subset of them.
-    const head = `${n} companion${n === 1 ? '' : 's'} ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`;
+    const n = groups.reduce((sum, g) => sum + g.plan.companions.length, 0);
+    const where = groups.length === 1 ? 'into a temporary project' : `in ${groups.length} temporary projects, one per set of choices`;
+    const head = n > 0 ? `${n} companion${n === 1 ? '' : 's'} ${n === 1 ? 'is' : 'are'} retrieved alongside, ${where}, never written to yours.` : undefined;
     return {
-      plan, split: true,
-      // The per-item lines ARE the run's caveat (the run keeps 5 notes).
+      groups, split: true,
+      // The per-file lines ARE the run's caveat.
       notes: [...itemLines, ...other],
       diffNotes: [...summary, ...itemLines, ...partly, ...other],
-      modalLine: [head, ...itemLines, ...other].join('\n')
+      modalLine: [head, ...itemLines, ...other].filter((l): l is string => !!l).join('\n') || undefined
     };
   }
 
   /**
-   * The companion picker: for each selected Translations / Profile item, in
-   * order, ONE multi-select quick pick of its companion types — this project's
-   * members, or all on the org, two rows per type, one for the labels
-   * (companions.ts pickRows) — ticked as remembered for that file, else every
-   * `this project's` row. Escape on any of them answers undefined: the caller
-   * drops the whole retrieve / diff before anything is fetched. With
-   * `contextCompanionPrompt: "remembered"` a file whose remembered rows all
-   * still exist is not asked again. `remember()` stores the answers — called
-   * once the run is committed (after a retrieve's confirm; a diff has none).
-   * Nothing to ask (no such item, or companions off): empty picks.
+   * The companion picker: ONE multi-select quick pick per picker TYPE in the
+   * selection — at most two, "Fetch 4 profiles (Admin, …) with…" and "Fetch 3
+   * translations with…" — since its rows depend on the type alone: each
+   * companion type as this project's members or all on the org, the labels once
+   * (companions.ts pickRows). Ticked: the remembered choice when every selected
+   * file of that type remembers the same rows, else every `this project's`
+   * row. The answer applies to each of those files. Escape on either answers
+   * undefined: the caller drops the whole retrieve / diff before anything is
+   * fetched, and nothing is remembered. With `contextCompanionPrompt:
+   * "remembered"` a type is not asked when every one of its files has a
+   * remembered choice whose rows all still exist — each file then keeps its
+   * own. An empty answer (nothing ticked) is used but never remembered, and an
+   * empty memory counts as none. `remember()` stores the answers per file —
+   * called once the run is committed (after a retrieve's confirm; a diff has
+   * none). Nothing to ask (no such item, or companions off): empty picks.
    */
   private async pickCompanions(items: MetadataItem[], org: string, orgLabel: string): Promise<{ picks: Record<string, string[]>; remember: () => void } | undefined> {
     const picks: Record<string, string[]> = {};
@@ -4648,17 +4670,30 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const silent = cfg.get<string>('contextCompanionPrompt', 'always') === 'remembered';
     const stored = readCompanionPicks(this.context?.workspaceState.get<unknown>(COMPANION_PICKS_KEY));
     const orgItems = this.orgListFor(org);
+    // The files of each picker type, in first-appearance order, each once.
+    const byType = new Map<string, string[]>();
+    for (const i of pickable) {
+      const names = byType.get(i.type) ?? [];
+      if (!names.includes(i.name)) names.push(i.name);
+      byType.set(i.type, names);
+    }
     const asked: string[] = [];
-    for (const item of pickable) {
-      const key = `${item.type}:${item.name}`;
-      if (key in picks) continue;
-      const rows = pickRows(item, { localItems: this.items ?? [], orgItems, orgLabel });
-      const kept = stored[key];
-      // A remembered row that no longer exists (the project lost its tabs)
-      // changes what the choice means: asked again, even in "remembered" mode.
-      const valid = kept?.filter(id => rows.some(r => r.id === id));
-      if (silent && kept && valid && valid.length === kept.length) { picks[key] = valid; continue; }
-      const ticked = new Set(valid ?? defaultPicks(rows));
+    for (const [type, names] of byType) {
+      const keys = names.map(n => `${type}:${n}`);
+      const rows = pickRows({ type, name: names[0] }, { localItems: this.items ?? [], orgItems, orgLabel });
+      const exists = (id: string): boolean => rows.some(r => r.id === id);
+      // A file's memory: none, or an empty one (never stored, but an older
+      // state could hold it) — ask. A remembered row that no longer exists (the
+      // project lost its tabs) changes what the choice means — ask, even in
+      // "remembered" mode, with what is left of it ticked.
+      const memory = keys.map(k => (stored[k]?.length ? stored[k] : undefined));
+      if (silent && memory.every(m => m && m.every(exists))) {
+        keys.forEach((k, n) => { picks[k] = [...memory[n]!]; });
+        continue;
+      }
+      const valid = memory.map(m => m?.filter(exists));
+      const same = valid.every(v => v && v.length === valid[0]!.length && v.every(id => valid[0]!.includes(id)));
+      const ticked = new Set(same && valid[0] ? valid[0] : defaultPicks(rows));
       const options: Array<vscode.QuickPickItem & { rowId?: string }> = [];
       let heading: string | undefined;
       for (const r of rows) {
@@ -4668,16 +4703,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
         options.push({ label: r.label, description: r.description, picked: ticked.has(r.id), rowId: r.id });
       }
+      const plural = type === 'Profile' ? 'profiles' : 'translations';
       const answer = await vscode.window.showQuickPick(options, {
         canPickMany: true,
         ignoreFocusOut: true,
         matchOnDescription: true,
-        title: `Fetch ${key} with…`,
+        title: keys.length === 1
+          ? `Fetch ${keys[0]} with…`
+          : `Fetch ${keys.length} ${plural} (${names.slice(0, 3).join(', ')}${names.length > 3 ? ` +${names.length - 3} more` : ''}) with…`,
         placeHolder: 'Enter = the ticked rows (remembered); Escape cancels'
       });
       if (!answer) return undefined;
-      picks[key] = answer.map(a => a.rowId).filter((id): id is string => typeof id === 'string');
-      asked.push(key);
+      const ids = answer.map(a => a.rowId).filter((id): id is string => typeof id === 'string');
+      for (const k of keys) picks[k] = ids;
+      // Nothing ticked is a one-off: remembered, it would fetch the file alone
+      // without asking from then on in "remembered" mode.
+      if (ids.length > 0) asked.push(...keys);
     }
     return {
       picks,
@@ -4687,8 +4728,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const next = readCompanionPicks(state.get<unknown>(COMPANION_PICKS_KEY));
         // Newest last; the oldest files fall off past the cap.
         for (const key of asked) { delete next[key]; next[key] = picks[key]; }
-        const keys = Object.keys(next);
-        for (const k of keys.slice(0, Math.max(0, keys.length - COMPANION_PICKS_MAX))) delete next[k];
+        const all = Object.keys(next);
+        for (const k of all.slice(0, Math.max(0, all.length - COMPANION_PICKS_MAX))) delete next[k];
         void Promise.resolve(state.update(COMPANION_PICKS_KEY, next)).catch(() => undefined);
       }
     };
@@ -5640,58 +5681,74 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // was written at that version, and the org renders newer-API elements
           // (a profile's `<viewAllFields>`) that file cannot have — compared at the
           // org's max, a component retrieved a minute ago would read "differs".
-          const proj = path.join(tmpRoot, 'proj');
-          await scaffoldSourceProject(proj, await resolveApiVersion(root));
           // A Profile / Translations / CustomObjectTranslation is only complete
           // beside the components it describes (src/companions.ts) — without them
-          // every fieldPermission of a profile reads "only local". Companions ride
-          // in the same retrieve, get no editor and are never "not on org".
-          const context = this.contextPlanFor(slowItems, org, true, picked.picks);
+          // every fieldPermission of a profile reads "only local". The org fills
+          // every such file for everything named in its request, so each set of
+          // companions gets a request of its own (contextGroups), and the other
+          // components theirs: a profile is never compared with permissions for
+          // what another file's picks — or the rest of the selection — asked for.
+          // Companions get no editor and are never "not on org".
+          const context = this.contextPlanFor(slowItems, org, picked.picks);
           companionNotes.push(...context.diffNotes);
-          const diffTargets: MetadataItem[] = [...slowItems, ...context.plan.companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
-          // Same rule as a retrieve: above MANIFEST_THRESHOLD the `--metadata`
-          // argv blows Windows' ~32 KB command line, and a `*` member only
-          // travels in a package.xml.
-          let diffManifest: { path: string; dir: string } | undefined;
-          if (diffTargets.length > MANIFEST_THRESHOLD || hasWildcard(context.plan.companions)) {
-            diffManifest = await this.writeTempManifest(diffTargets);
-            tmpPaths.push(diffManifest.dir);
-          }
-          if (diffCancelled) throw new SfCliCancelledError();
-          const rStart = Date.now();
-          const rCmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(undefined, diffTargets, diffManifest?.path)} --target-org ${org}`);
-          const handle = this.sf.retrieveMetadata(
-            diffTargets.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs(), manifest: diffManifest?.path }
-          );
-          this.currentCancel = () => { diffCancelled = true; handle.cancel(); };
-          let result: RetrieveResult;
-          try {
-            const r = await handle.promise;
-            result = r.result;
-            this.updateCmd(rCmdId, r.cmd);
-          } catch (e) {
-            this.endCmd(rCmdId, false, Date.now() - rStart);
-            throw e;
-          }
-
-          const sfFailures = (result.messages ?? []).filter(m => m.problem);
+          const plain = context.split ? slowItems.filter(i => !CONTEXT_TYPES.has(i.type)) : slowItems;
+          const requests: Array<{ items: MetadataItem[]; companions: Companion[] }> = [
+            ...(plain.length > 0 ? [{ items: plain, companions: [] as Companion[] }] : []),
+            ...(context.split ? context.groups.map(g => ({ items: g.items, companions: g.plan.companions })) : [])
+          ];
+          const apiVersion = await resolveApiVersion(root);
+          // Which temporary project each compared item's org copy landed in.
+          const projOf = new Map<MetadataItem, string>();
           let companionMessages = 0;
-          for (const f of sfFailures) {
-            // One about a companion alone (a local tab never deployed) says
-            // nothing about what was compared: logged, not an error.
-            if (isCompanionMessage(f.problem!, context.plan.companions, slowItems)) {
-              companionMessages++;
-              this.output.appendLine(`[Diff] companion: ${f.fileName ?? '?'}: ${f.problem}`);
-              continue;
+          for (const [n, req] of requests.entries()) {
+            const proj = path.join(tmpRoot, requests.length === 1 ? 'proj' : `proj${n + 1}`);
+            await scaffoldSourceProject(proj, apiVersion);
+            for (const i of req.items) projOf.set(i, proj);
+            const diffTargets: MetadataItem[] = [...req.items, ...req.companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
+            // Same rule as a retrieve: above MANIFEST_THRESHOLD the `--metadata`
+            // argv blows Windows' ~32 KB command line, and a `*` member only
+            // travels in a package.xml.
+            let diffManifest: { path: string; dir: string } | undefined;
+            if (diffTargets.length > MANIFEST_THRESHOLD || hasWildcard(req.companions)) {
+              diffManifest = await this.writeTempManifest(diffTargets);
+              tmpPaths.push(diffManifest.dir);
             }
-            errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
+            if (diffCancelled) throw new SfCliCancelledError();
+            const rStart = Date.now();
+            const rCmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(undefined, diffTargets, diffManifest?.path)} --target-org ${org}`);
+            const handle = this.sf.retrieveMetadata(
+              diffTargets.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs(), manifest: diffManifest?.path }
+            );
+            this.currentCancel = () => { diffCancelled = true; handle.cancel(); };
+            let result: RetrieveResult;
+            try {
+              const r = await handle.promise;
+              result = r.result;
+              this.updateCmd(rCmdId, r.cmd);
+            } catch (e) {
+              this.endCmd(rCmdId, false, Date.now() - rStart);
+              throw e;
+            }
+
+            const errorsBefore = errors.length;
+            for (const f of (result.messages ?? []).filter(m => m.problem)) {
+              // One about a companion alone (a local tab never deployed) says
+              // nothing about what was compared: logged, not an error.
+              if (isCompanionMessage(f.problem!, req.companions, req.items)) {
+                companionMessages++;
+                this.output.appendLine(`[Diff] companion: ${f.fileName ?? '?'}: ${f.problem}`);
+                continue;
+              }
+              errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
+            }
+            this.endCmd(rCmdId, errors.length === errorsBefore, Date.now() - rStart);
           }
           if (companionMessages > 0) companionNotes.push(`${companionMessages} message${companionMessages === 1 ? '' : 's'} about companions only (e.g. one not on the org) — see the SF Deploy output`);
-          this.endCmd(rCmdId, errors.length === 0, Date.now() - rStart);
 
           report('comparing with your local files…');
           for (const item of slowItems) {
             if (diffCancelled) throw new SfCliCancelledError();
+            const proj = projOf.get(item)!;
             if (item !== focused && DEFINITION_FILE_DIFF_TYPES.has(item.type)) {
               // An object ROW compares its definition file, through the same
               // compare/cap path; the folder itself never reaches vscode.diff.
@@ -8075,6 +8132,13 @@ export function folderState(states: ReadonlyArray<'Created' | 'Changed' | 'Uncha
   if (states.length > 0 && states.every(st => st === 'Created')) return 'Created';
   if (states.every(st => st === 'Unchanged')) return 'Unchanged';
   return 'Changed';
+}
+
+/** One temporary-project request of context files: the files whose companions
+ *  are identical, and their plan (src/companions.ts contextGroups). */
+interface ContextGroup {
+  items: MetadataItem[];
+  plan: CompanionPlan;
 }
 
 /** What the context half of a retrieve hands back: rows for the selected items

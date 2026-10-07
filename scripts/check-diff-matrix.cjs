@@ -352,10 +352,12 @@ check('BATCH: types the org does not have report as missing, not as opened', asy
   assert.ok(card, `expected a verdict card: ${JSON.stringify(cards(posted))}`);
   assert.deepStrictEqual(card.lines.filter(l => l.startsWith('— ')), batch.map(f => `— ${f.type}:${f.name} — not on org`));
   // The batch holds a Profile: Enter in its picker ticks this project's rows —
-  // here the tab, layout and flow already in the batch, so nothing more rides
-  // along — and the card says what it was fetched with: informational lines,
-  // never a "not on org" verdict.
+  // here the tab, layout and flow of the batch, which ride along in the
+  // profile's OWN request (never the batch's: the org would fill it for every
+  // component named there) — and the card says what it was fetched with:
+  // informational lines, never a "not on org" verdict.
   assert.deepStrictEqual(card.lines.filter(l => !l.startsWith('— ')), [
+    'companions: CustomTab:Widget__c, Layout:Widget__c-Widget Layout, Flow:Widget_Flow',
     'Profile:Widget User: fetched with 1 tab, 1 layout, 1 flow (project) — objects, classes, pages, apps, custom permissions and data sources left out',
     PARTIAL_FETCH_DIFF_LINE
   ]);

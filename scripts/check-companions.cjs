@@ -107,7 +107,8 @@ check('rows, Translations: ONE labels row, then two rows per type — this proje
   assert.deepStrictEqual(rows.map(r => r.id), [
     'CustomLabels:org',
     'CustomApplication:project', 'CustomApplication:org', 'CustomTab:project', 'CustomTab:org',
-    'Flow:project', 'Flow:org', 'QuickAction:project', 'QuickAction:org', 'ReportType:project', 'ReportType:org'
+    'Flow:project', 'Flow:org', 'QuickAction:project', 'QuickAction:org', 'ReportType:project', 'ReportType:org',
+    'CustomPageWebLink:org', 'Bot:org', 'Prompt:org'
   ]);
   assert.strictEqual(rows.filter(r => r.type === 'CustomLabels').length, 1, 'the labels are ONE row: the project\'s file and the org\'s are the same request');
   const [labels] = rows;
@@ -126,10 +127,26 @@ check('rows: no project row for a type the project has none of; up to 3 names, t
   const local = ['A', 'B', 'C', 'D', 'E'].map(n => it('CustomTab', `Acme_${n}`));
   const rows = pickRows(TR, { localItems: local, orgLabel: 'acme-dev' });
   assert.deepStrictEqual(rows.map(r => r.id), [
-    'CustomLabels:org', 'CustomApplication:org', 'CustomTab:project', 'CustomTab:org', 'Flow:org', 'QuickAction:org', 'ReportType:org'
+    'CustomLabels:org', 'CustomApplication:org', 'CustomTab:project', 'CustomTab:org', 'Flow:org', 'QuickAction:org', 'ReportType:org',
+    'CustomPageWebLink:org', 'Bot:org', 'Prompt:org'
   ]);
   const tabs = rows.find(r => r.id === 'CustomTab:project');
   assert.deepStrictEqual([tabs.label, tabs.description], ['Tabs: this project\'s (5)', 'Acme_A, Acme_B, Acme_C +2 more']);
+});
+
+check('rows, Translations: every place the org fills it for — home-page custom links, bots and in-app prompts too, a project row when the project has them', () => {
+  assert.deepStrictEqual(C.TRANSLATIONS_COMPANION_TYPES.slice(-3), ['CustomPageWebLink', 'Bot', 'Prompt']);
+  const local = [it('CustomPageWebLink', 'Acme_Home_Link'), it('Bot', 'Acme_Helper'), it('Prompt', 'Acme_Welcome')];
+  const rows = pickRows(TR, { localItems: local, orgLabel: 'acme-dev' }).filter(r => ['CustomPageWebLink', 'Bot', 'Prompt'].includes(r.type));
+  assert.deepStrictEqual(rows.map(r => [r.id, r.label, r.description]), [
+    ['CustomPageWebLink:project', 'Custom page links: this project\'s (1)', 'Acme_Home_Link'],
+    ['CustomPageWebLink:org', 'Custom page links: all on the org', 'every custom page link on acme-dev'],
+    ['Bot:project', 'Bots: this project\'s (1)', 'Acme_Helper'],
+    ['Bot:org', 'Bots: all on the org', 'every bot on acme-dev'],
+    ['Prompt:project', 'Prompts (in-app guidance): this project\'s (1)', 'Acme_Welcome'],
+    ['Prompt:org', 'Prompts (in-app guidance): all on the org', 'every prompt on acme-dev']
+  ]);
+  assert.deepStrictEqual(keys(companionsFor([TR], { localItems: local })), ['CustomPageWebLink:Acme_Home_Link', 'Bot:Acme_Helper', 'Prompt:Acme_Welcome']);
 });
 
 check('default ticks: every project row, and the labels only when the project has a labels file', () => {
@@ -197,7 +214,7 @@ check('the org row wins over the project row of the same type — sent, and said
   assert.deepStrictEqual(keys(plan), ['CustomTab:*', 'Flow:Acme_Onboard']);
   assert.deepStrictEqual(plan.chosen['Translations:pl'].map(c => [c.type, c.kind]), [['CustomTab', 'org'], ['Flow', 'project']]);
   assert.deepStrictEqual(describeContext([TR], plan), [
-    'Translations:pl: fetched with 1 flow (project), all tabs on the org — labels, apps, quick actions and report types left out'
+    'Translations:pl: fetched with 1 flow (project), all tabs on the org — labels, apps, quick actions, report types, custom page links, bots and prompts left out'
   ]);
   // A profile's objects: the org row has no list views, so a project-row child
   // the wildcards can't absorb shows whether the project row was dropped.
@@ -209,8 +226,8 @@ check('the org row wins over the project row of the same type — sent, and said
 check('a type with nothing ticked is left out — and the line names it', () => {
   const plan = planFor([TR], { 'Translations:pl': ['CustomLabels:org'] });
   assert.deepStrictEqual(keys(plan), ['CustomLabels:CustomLabels']);
-  assert.deepStrictEqual(plan.leftOut['Translations:pl'], ['CustomApplication', 'CustomTab', 'Flow', 'QuickAction', 'ReportType']);
-  assert.deepStrictEqual(describeContext([TR], plan), ['Translations:pl: fetched with the labels — apps, tabs, flows, quick actions and report types left out']);
+  assert.deepStrictEqual(plan.leftOut['Translations:pl'], ['CustomApplication', 'CustomTab', 'Flow', 'QuickAction', 'ReportType', 'CustomPageWebLink', 'Bot', 'Prompt']);
+  assert.deepStrictEqual(describeContext([TR], plan), ['Translations:pl: fetched with the labels — apps, tabs, flows, quick actions, report types, custom page links, bots and prompts left out']);
   assert.ok(C.fetchedPartly(plan));
 });
 
@@ -230,19 +247,19 @@ check('a remembered id with no row any more (the project lost its tabs) is ignor
   assert.ok(plan.leftOut['Translations:pl'].includes('CustomTab'));
 });
 
-check('describe: the plan\'s own example, word for word', () => {
+check('describe: the plan\'s own example, word for word (with the three types 0.31.1 added to what is left out)', () => {
   const local = [it('CustomLabels', 'CustomLabels'), ...Array.from({ length: 11 }, (_, n) => it('CustomTab', `Acme_Tab${n}__c`)), it('Flow', 'Acme_Onboard')];
   const plan = companionsFor([TR], { picks: { 'Translations:pl': ['CustomLabels:org', 'CustomTab:project', 'Flow:org'] }, localItems: local });
   assert.deepStrictEqual(describeContext([TR], plan), [
-    'Translations:pl: fetched with the labels, 11 tabs (project), all flows on the org — apps, quick actions and report types left out'
+    'Translations:pl: fetched with the labels, 11 tabs (project), all flows on the org — apps, quick actions, report types, custom page links, bots and prompts left out'
   ]);
 });
 
 const ALL_ORG = (item, extra = {}) => pickRows(item, { localItems: LOCAL, ...extra }).filter(r => r.kind === 'org').map(r => r.id);
 check('"complete" ONLY when every type is an org row — one project row or one type left out, and it is not said', () => {
   const all = planFor([TR], { 'Translations:pl': ALL_ORG(TR) });
-  assert.deepStrictEqual(keys(all), ['CustomLabels:CustomLabels', 'CustomApplication:*', 'CustomTab:*', 'Flow:*', 'QuickAction:*', 'ReportType:*']);
-  assert.deepStrictEqual(describeContext([TR], all), ['Translations:pl: fetched with the labels, all apps, tabs, flows, quick actions and report types on the org so it comes back complete']);
+  assert.deepStrictEqual(keys(all), ['CustomLabels:CustomLabels', 'CustomApplication:*', 'CustomTab:*', 'Flow:*', 'QuickAction:*', 'ReportType:*', 'CustomPageWebLink:*', 'Bot:*', 'Prompt:*']);
+  assert.deepStrictEqual(describeContext([TR], all), ['Translations:pl: fetched with the labels, all apps, tabs, flows, quick actions, report types, custom page links, bots and prompts on the org so it comes back complete']);
   assert.ok(!C.fetchedPartly(all));
   const oneProject = planFor([TR], { 'Translations:pl': [...ALL_ORG(TR).filter(id => id !== 'Flow:org'), 'Flow:project'] });
   const noLabels = planFor([TR], { 'Translations:pl': ALL_ORG(TR).filter(id => id !== 'CustomLabels:org') });
@@ -251,7 +268,7 @@ check('"complete" ONLY when every type is an org row — one project row or one 
     assert.ok(!/complete/.test(line), line);
     assert.ok(C.fetchedPartly(plan));
   }
-  assert.strictEqual(describeContext([TR], noLabels)[0], 'Translations:pl: fetched with all apps, tabs, flows, quick actions and report types on the org — labels left out');
+  assert.strictEqual(describeContext([TR], noLabels)[0], 'Translations:pl: fetched with all apps, tabs, flows, quick actions, report types, custom page links, bots and prompts on the org — labels left out');
 });
 
 check('profile, every org row: complete with the org list\'s standard objects; without them, "only for what the project knows"', () => {
@@ -319,6 +336,51 @@ check('object translation, a loaded list with NO Layout at all (its fetch failed
   assert.deepStrictEqual(keys(plan), ['CustomObject:Product2', 'Layout:Product2-Product Layout', 'Layout:Product2-Acme Layout', 'QuickAction:Product2.Org_Only_Action']);
   assert.deepStrictEqual(plan.partial, ['CustomObjectTranslation:Product2-pl']);
   assert.ok(plan.note.includes('no Layout entries in the org list — layouts for Product2-pl were taken from the project; Fetch Org again for the org\'s full set'), plan.note.join('\n'));
+});
+
+// ================================================================ requests
+const sigOf = (group) => keys(group.plan).sort();
+check('contextGroups: files with identical companions share a request; different picks NEVER do; object translations go together', () => {
+  const P2 = it('Profile', 'Acme_Support');
+  const P3 = it('Profile', 'Acme_Ops');
+  const TR2 = it('Translations', 'fr');
+  const COT2 = it('CustomObjectTranslation', 'Account-pl');
+  const picks = {
+    'Profile:Admin': ['ApexClass:project'], 'Profile:Acme_Support': ['ApexClass:project'], 'Profile:Acme_Ops': ['ApexClass:project', 'Flow:org'],
+    'Translations:pl': ['CustomLabels:org', 'Flow:org'], 'Translations:fr': ['CustomLabels:org', 'Flow:org']
+  };
+  const groups = C.contextGroups([PROFILE, COT, TR, P2, P3, TR2, COT2, it('ApexClass', 'AcmeService')], { picks, localItems: LOCAL, orgItems: ORG_LIST });
+  assert.deepStrictEqual(groups.map(g => g.items.map(i => `${i.type}:${i.name}`)), [
+    ['Profile:Admin', 'Profile:Acme_Support'],
+    ['CustomObjectTranslation:Product2-pl', 'CustomObjectTranslation:Account-pl'],
+    ['Translations:pl', 'Translations:fr'],
+    ['Profile:Acme_Ops']
+  ], 'first-appearance order; a plain component is in none');
+  // Each request carries its own files' companions — the profile never rides
+  // with the object translation's object or the translation's flows.
+  assert.deepStrictEqual(sigOf(groups[0]), ['ApexClass:AcmeService']);
+  assert.deepStrictEqual(sigOf(groups[1]), sorted(['CustomObject:Product2', 'Layout:Product2-Product Layout', 'Layout:Product2-Org Only Layout', 'QuickAction:Product2.Org_Only_Action', 'CustomObject:Account', 'Layout:Account-Account Layout']));
+  assert.deepStrictEqual(sigOf(groups[2]), ['CustomLabels:CustomLabels', 'Flow:*']);
+  assert.deepStrictEqual(sigOf(groups[3]), ['ApexClass:AcmeService', 'Flow:*']);
+  // …so each file's line is exactly its own picks.
+  assert.deepStrictEqual(describeContext(groups[0].items, groups[0].plan), [
+    'Profile:Admin, Profile:Acme_Support: fetched with 1 class (project) — objects, pages, apps, tabs, layouts, custom permissions, flows and data sources left out'
+  ]);
+  // Nothing ticked is a set of its own, too: never filled by another file's companions.
+  const alone = C.contextGroups([TR, PROFILE], { picks: { 'Translations:pl': [], 'Profile:Admin': ['ApexClass:project'] }, localItems: LOCAL });
+  assert.deepStrictEqual(alone.map(g => [g.items.map(i => i.name), keys(g.plan)]), [[['pl'], []], [['Admin'], ['ApexClass:AcmeService']]]);
+});
+
+check('describe: files whose lines read the same share ONE line — up to 3 names, then +N more', () => {
+  const profiles = ['Admin', 'Acme_A', 'Acme_B', 'Acme_C'].map(n => it('Profile', n));
+  const picks = Object.fromEntries(profiles.map(p => [`Profile:${p.name}`, ['ApexClass:org']]));
+  const plan = companionsFor(profiles, { picks, localItems: LOCAL });
+  assert.deepStrictEqual(describeContext(profiles, plan), [
+    'Profile:Admin, Profile:Acme_A, Profile:Acme_B +1 more: fetched with all classes on the org — objects, pages, apps, tabs, layouts, custom permissions, flows and data sources left out'
+  ]);
+  // Different lines stay apart, in order.
+  const mixed = companionsFor([TR, PROFILE], { picks: { 'Translations:pl': [], 'Profile:Admin': ['ApexClass:org'] }, localItems: LOCAL });
+  assert.strictEqual(describeContext([TR, PROFILE], mixed).length, 2);
 });
 
 // ================================================================== dedupe
