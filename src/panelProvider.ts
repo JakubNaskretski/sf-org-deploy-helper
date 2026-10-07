@@ -4344,13 +4344,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             if (items.length === 0) throw err;
             if (open) { this.endCmd(open.id, false, Date.now() - open.start); open = undefined; }
             ctxStopped = err instanceof SfCliCancelledError ? 'cancelled' : isTimeoutError(err) ? 'timed out' : undefined;
-            const why = ctxStopped
-              ? `${ctxStopped} before the org answered — the local file was left as it was`
+            // The Output channel gets the CLI's own words, as reportError /
+            // reportDeployTimeout would have given it.
+            if (!(err instanceof SfCliCancelledError)) this.handleError(`Retrieve from ${orgLabel}`, err);
+            // Per row: a folder (an object translation) has local FILES.
+            const why = (i: MetadataItem): string => ctxStopped
+              ? `${ctxStopped} before its files were copied — ${CONTEXT_SHAPES[i.type]?.dir ? 'its local files were left as they were' : 'its local file was left as it was'}`
               : err instanceof Error ? err.message : String(err);
-            ctx = { files: ctxItems.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why })), messages: [], written: [] };
+            ctx = { files: ctxItems.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why(i) })), messages: [], written: [] };
             if (ctxStopped) {
               const list = ctxItems.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctxItems.length > 3 ? ` +${ctxItems.length - 3} more` : '');
-              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before the org answered — ${ctxItems.length === 1 ? 'its local file was' : 'their local files were'} left as ${ctxItems.length === 1 ? 'it was' : 'they were'}` });
+              const one = ctxItems.length === 1;
+              const timeoutHint = ctxStopped === 'timed out' ? ' Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.' : '';
+              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before ${one ? 'its' : 'their'} files were copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${timeoutHint}` });
             }
           }
           files.push(...ctx.files);
@@ -4377,9 +4383,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           id: runId, org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, finishedAt: Date.now(),
           target, items: allItems, backupDir, notes: notes.length ? notes : undefined
         }));
-        // Components, not files: a translation folder answers with one row per file.
-        const okCount = new Set(ok.map(f => `${f.type}:${f.fullName}`)).size;
-        const failedCount = new Set(failed.map(f => `${f.type}:${f.fullName}`)).size;
+        // SELECTED components, not result rows: a translation folder answers with
+        // one row per file, an object with one per field — the confirm said N.
+        const picked = (rows: RetrieveFileResult[]): number => allItems.filter(i => rows.some(f => f.type === i.type && f.fullName === i.name)).length;
+        const okCount = picked(ok);
+        const failedCount = picked(failed) || new Set(failed.map(f => `${f.type}:${f.fullName}`)).size;
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
           this.notifySuccessIfPanelHidden(`Retrieved ${okCount} component${okCount === 1 ? '' : 's'} from ${orgLabel}`);
         } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
@@ -4563,14 +4571,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  alone — a selected CustomLabels still has to ride with Translations:pl. */
   private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean): { plan: CompanionPlan; split: boolean; notes: string[]; modalLine?: string } {
     const ctx = items.filter(i => CONTEXT_TYPES.has(i.type));
-    if (ctx.length === 0) return { plan: { companions: [], note: [], incomplete: [] }, split: false, notes: [] };
+    if (ctx.length === 0) return { plan: { companions: [], note: [], incomplete: [], partial: [] }, split: false, notes: [] };
     const nameList = (list: MetadataItem[]): string =>
       list.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (list.length > 3 ? ` +${list.length - 3} more` : '');
     const names = nameList(ctx);
     const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
     if (cfg.get<boolean>('contextCompanions', true) === false) {
       return {
-        plan: { companions: [], note: [], incomplete: [] }, split: false, notes: ['retrieved without companions'],
+        plan: { companions: [], note: [], incomplete: [], partial: [] }, split: false, notes: ['retrieved without companions'],
         modalLine: `${names}: retrieved without companions (sfOrgDeployWrapper.contextCompanions is off) — may come back nearly empty.`
       };
     }
@@ -4582,11 +4590,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // scope found nothing for comes back nearly empty — over a full local file —
     // and its note says so HERE, before the overwrite, not only on the run. The
     // fallback and org-scope notes ride along for the same reason.
-    const complete = ctx.filter(i => !plan.incomplete.includes(`${i.type}:${i.name}`));
+    // Scope org without the org list fills an item only from the project:
+    // complete for what the project knows, never "complete".
+    const key = (i: MetadataItem): string => `${i.type}:${i.name}`;
+    const complete = ctx.filter(i => !plan.incomplete.includes(key(i)) && !plan.partial.includes(key(i)));
+    const partial = ctx.filter(i => plan.partial.includes(key(i)));
     const head = `${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours`;
-    const lines = [complete.length > 0
-      ? `${nameList(complete)}: ${head} — so ${complete.length === 1 ? 'it comes' : 'they come'} back complete.`
-      : `${names}: ${head}.`];
+    // There are companions, so at least one item is complete or partial: an
+    // item project scope found nothing for brings none.
+    const lines: string[] = [];
+    if (complete.length > 0) lines.push(`${nameList(complete)}: ${head} — so ${complete.length === 1 ? 'it comes' : 'they come'} back complete.`);
+    if (partial.length > 0) lines.push(`${nameList(partial)}: ${complete.length > 0 ? 'retrieved the same way' : head} — complete for what the project knows; Fetch Org for the org's full set.`);
+    // Every other note (empty scope, org-list fallback, scope org), not the
+    // companions summary the line above already gives.
     lines.push(...plan.note.filter(l => !l.startsWith('companions: ')));
     return { plan, split: true, notes: plan.note, modalLine: lines.join('\n') };
   }

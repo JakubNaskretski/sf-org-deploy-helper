@@ -284,6 +284,7 @@ function provider(proj, items, extra = {}) {
   const backups = [];
   const calls = [];
   const counters = { loads: 0 };
+  const output = [];
   const notices = [];
   const s = Object.create(proto);
   Object.assign(s, {
@@ -294,7 +295,7 @@ function provider(proj, items, extra = {}) {
     orgStore: { get: () => ORG, set: async () => {}, setFromUserPick: async () => {} },
     loadFiles: async () => { counters.loads++; },
     maybeBackupBeforeRetrieve: async (_root, candidates) => { backups.push([...candidates]); return { note: 'Backed up — restore via \'SF Deploy: Restore Retrieve Backup\'.', dir: path.join(tmp, 'backup') }; },
-    output: { appendLine: () => {} },
+    output: { appendLine: (l) => output.push(l) },
     context: { workspaceState: { get: k => kept[k], update: async (k, v) => { kept[k] = v === undefined ? undefined : JSON.parse(JSON.stringify(v)); } }, globalState: { get: () => undefined, update: async () => {} } },
     view: { visible: true, webview: { postMessage() {} } },
     post: m => posted.push(JSON.parse(JSON.stringify(m))),
@@ -303,7 +304,7 @@ function provider(proj, items, extra = {}) {
   s.sf = fakeSf(calls, extra.hooks);
   s.notifySuccessIfPanelHidden = (m) => notices.push(['ok', m]);
   s.notifyIfPanelHidden = (m, kind) => notices.push([kind, m]);
-  return { s, posted, kept, toasts, backups, calls, counters, notices };
+  return { s, posted, kept, toasts, backups, calls, counters, notices, output };
 }
 const lastRun = (p) => p.posted.filter(m => m.type === 'runs').slice(-1)[0];
 const retrieve = (p, keys) => proto.runRetrieve.call(p.s, keys);
@@ -412,8 +413,9 @@ async function assertStoppedAfterClass(p, proj, before, word) {
   const rows = Object.fromEntries(latestRows.rows.map(r => [r.k, r]));
   assert.strictEqual(rows['ApexClass:Foo'].o, 'created', 'the class the first call wrote stays on the run');
   assert.strictEqual(rows['Translations:pl'].o, 'failed');
-  assert.ok(rows['Translations:pl'].m.startsWith(`${word} before the org answered — the local file was left as it was`), rows['Translations:pl'].m);
-  assert.ok(run.notes.includes(`Translations:pl: ${word} before the org answered — its local file was left as it was`), JSON.stringify(run.notes));
+  assert.strictEqual(rows['Translations:pl'].m, `${word} before its files were copied — its local file was left as it was`);
+  const hint = word === 'timed out' ? ' Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.' : '';
+  assert.ok(run.notes.includes(`Translations:pl: ${word} before its files were copied — its local copy was left as it was.${hint}`), JSON.stringify(run.notes));
   const after = await snapshot(proj);
   assert.strictEqual(after[rel(p, 'translations', 'pl.translation-meta.xml')], before[rel(p, 'translations', 'pl.translation-meta.xml')]);
   assert.ok(path.join('app', 'main', 'default', 'classes', 'Foo.cls') in after, 'the class is on disk');
@@ -451,6 +453,58 @@ check('retrieve: the temp call timing out after the project one — partial, the
   const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined) } });
   await retrieve(p, ['Translations:pl', 'ApexClass:Foo']);
   await assertStoppedAfterClass(p, proj, before, 'timed out');
+  assert.ok(p.output.includes('[Retrieve from acme-dev] sf project retrieve start timed out after 180000ms'), 'the CLI\'s own words reach the Output channel: ' + p.output.join(' | '));
+});
+
+check('retrieve: a Cancel between the calls with a folder and a file — each row worded for its shape, the note for both', async () => {
+  reset();
+  const { proj, items } = await makeProject('r5d', { cot: true });
+  const p = provider(proj, items, { hooks: { before: (call, n) => { if (n === 1) proto.cancelCurrent.call(p.s); } } });
+  await retrieve(p, ['Translations:pl', 'CustomObjectTranslation:Product2-pl', 'ApexClass:Foo']);
+  assert.strictEqual(p.calls.length, 1);
+  const { runs: [run], latestRows } = lastRun(p);
+  const rows = Object.fromEntries(latestRows.rows.map(r => [r.k, r]));
+  assert.strictEqual(rows['CustomObjectTranslation:Product2-pl'].m, 'cancelled before its files were copied — its local files were left as they were');
+  assert.strictEqual(rows['Translations:pl'].m, 'cancelled before its files were copied — its local file was left as it was');
+  assert.ok(run.notes.includes('Translations:pl, CustomObjectTranslation:Product2-pl: cancelled before their files were copied — their local copies were left as they were.'), JSON.stringify(run.notes));
+  assert.deepStrictEqual(p.notices, [['warn', 'Retrieve from acme-dev: 1 retrieved · 2 cancelled (local files left as they were)']]);
+});
+
+check('retrieve: the hidden-panel toast counts the components selected, not the rows the org answered with', async () => {
+  reset();
+  const { proj, items } = await makeProject('r15', { pl: false, labels: false, tab: false });
+  const p = provider(proj, items, { orgOnly: ['CustomObject:Product2'] });
+  await retrieve(p, ['CustomObject:Product2']);
+  assert.strictEqual(new Set(finished[0].result.inboundFiles.map(f => `${f.type}:${f.fullName}`)).size, 2, 'the object and its field: two keys');
+  assert.deepStrictEqual(p.notices, [['ok', 'Retrieved 1 component from acme-dev']]);
+});
+
+check('retrieve, scope org without the org list: partial items are never "complete", and every note is in the dialog — once', async () => {
+  reset();
+  config.contextScope = 'org';
+  const { proj, items } = await makeProject('r16', { profile: 'LOCAL PROFILE', cot: true });
+  const p = provider(proj, items, { orgOnly: [] }); // a list with nothing in it — and for another org below
+  p.s.orgMembersOrg = 'someone-else';
+  await retrieve(p, ['Profile:Admin', 'CustomObjectTranslation:Product2-pl', 'Translations:pl']);
+  const lines = ui.warns.find(w => w.modal).detail.split('\n');
+  assert.ok(lines.some(l => /^Translations:pl: \d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours — so it comes back complete\.$/.test(l)), lines.join('\n'));
+  assert.ok(lines.includes('Profile:Admin, CustomObjectTranslation:Product2-pl: retrieved the same way — complete for what the project knows; Fetch Org for the org\'s full set.'), lines.join('\n'));
+  assert.ok(!lines.some(l => (l.includes('Profile:Admin') || l.includes('Product2-pl')) && l.includes('back complete')), lines.join('\n'));
+  assert.ok(lines.includes('org list not loaded — layouts and quick actions for Product2-pl were taken from the project; Fetch Org for the org\'s full set'), lines.join('\n'));
+  assert.ok(lines.includes('org list not loaded — standard objects for Profile:Admin were taken from the project; Fetch Org to include the org\'s standard objects'), lines.join('\n'));
+  assert.ok(lines.some(l => l.startsWith('scope "org" asks for every component of the profile\'s types')), lines.join('\n'));
+  assert.ok(!lines.some(l => l.startsWith('companions: ')), 'the summary is in the first line already, never twice');
+});
+
+check('retrieve, scope org, only partial items: the first line still says what rides along', async () => {
+  reset();
+  config.contextScope = 'org';
+  const { proj, items } = await makeProject('r17', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
+  const p = provider(proj, items);
+  p.s.orgMembersOrg = 'someone-else';
+  await retrieve(p, ['Profile:Admin']);
+  const lines = ui.warns.find(w => w.modal).detail.split('\n');
+  assert.ok(lines.some(l => /^Profile:Admin: \d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours — complete for what the project knows; Fetch Org for the org's full set\.$/.test(l)), lines.join('\n'));
 });
 
 check('retrieve: an item project scope can\'t fill is never promised "complete" — the dialog says it comes back nearly empty', async () => {

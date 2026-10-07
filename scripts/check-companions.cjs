@@ -190,10 +190,24 @@ check('profile, org scope with the org list: its standard objects are named besi
   const plan = companionsFor([it('Profile', 'Admin')], { scope: 'org', localItems: LOCAL, orgItems });
   const objects = keys(plan).filter(k => k.startsWith('CustomObject:'));
   assert.deepStrictEqual(objects, ['CustomObject:*', 'CustomObject:Account', 'CustomObject:Opportunity', 'CustomObject:Product2']);
-  assert.ok(!plan.note.some(n => n.startsWith('org list not loaded')), plan.note.join('\n'));
-  // A loaded list that never listed CustomObject can't name them: the project's, said so.
-  const noObjects = companionsFor([it('Profile', 'Admin')], { scope: 'org', localItems: LOCAL, orgItems: ORG_LIST });
-  assert.ok(noObjects.note.some(n => n.startsWith('org list not loaded — standard objects for Profile:Admin')), noObjects.note.join('\n'));
+  assert.ok(!plan.note.some(n => n.includes('standard objects for')), plan.note.join('\n'));
+  assert.deepStrictEqual(plan.partial, [], 'with the org list, the profile is complete');
+  // A loaded list naming no STANDARD object (none listed, or custom ones only)
+  // can't fill them: the project's, said so, and the profile is only partial.
+  for (const list of [ORG_LIST, [...ORG_LIST, it('CustomObject', 'Acme_Other__c')]]) {
+    const noStd = companionsFor([it('Profile', 'Admin')], { scope: 'org', localItems: LOCAL, orgItems: list });
+    assert.ok(noStd.note.includes('no standard objects in the org list — standard objects for Profile:Admin were taken from the project; Fetch Org to include the org\'s standard objects'), noStd.note.join('\n'));
+    assert.deepStrictEqual(noStd.partial, ['Profile:Admin']);
+  }
+});
+
+check('partial: scope org items filled only from the project — never promised complete', () => {
+  const plan = companionsFor([it('Profile', 'Admin'), it('CustomObjectTranslation', 'Product2-pl'), it('Translations', 'pl')], { scope: 'org', localItems: LOCAL });
+  assert.deepStrictEqual(plan.partial, ['Profile:Admin', 'CustomObjectTranslation:Product2-pl'], 'Translations goes as `*` and needs no list');
+  assert.deepStrictEqual(plan.incomplete, []);
+  const withList = companionsFor([it('CustomObjectTranslation', 'Product2-pl')], { scope: 'org', localItems: LOCAL, orgItems: ORG_LIST });
+  assert.deepStrictEqual(withList.partial, []);
+  assert.deepStrictEqual(companionsFor([it('Profile', 'Admin')], { scope: 'project', localItems: LOCAL }).partial, [], 'project scope is never "partial"');
 });
 
 check('incomplete: exactly the items project scope found nothing for', () => {
@@ -210,6 +224,7 @@ check('profile, project scope, nothing to send → the LOUD note', () => {
   assert.strictEqual(plan.note.length, 1);
   assert.ok(plan.note[0].startsWith('project scope found no CustomObject/ApexClass/'), plan.note[0]);
   assert.ok(plan.note[0].includes('Profile:Admin will come back nearly empty; set sfOrgDeployWrapper.contextScope to "org"'), plan.note[0]);
+  assert.deepStrictEqual(plan.incomplete, ['Profile:Admin']);
 });
 
 // ------------------------------------------------------------------ dedupe
@@ -240,7 +255,7 @@ check('dedupe: a `*` suppresses that type\'s names — a CUSTOM object too, a st
 check('nothing for a selection without context types — PermissionSet included', () => {
   for (const scope of ['project', 'org']) {
     const plan = companionsFor([it('PermissionSet', 'Acme_Access'), it('ApexClass', 'AcmeService'), it('GlobalValueSetTranslation', 'ProductForm-pl')], { scope, localItems: LOCAL, orgItems: ORG_LIST });
-    assert.deepStrictEqual(plan, { companions: [], note: [], incomplete: [] });
+    assert.deepStrictEqual(plan, { companions: [], note: [], incomplete: [], partial: [] });
   }
 });
 

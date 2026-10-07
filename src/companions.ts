@@ -26,6 +26,10 @@ export interface CompanionPlan {
   /** `Type:Name` of each selected item that will come back nearly empty: project
    *  scope found nothing it describes. Never to be promised "complete". */
   incomplete: string[];
+  /** `Type:Name` of each selected item scope org could fill only from the
+   *  project, because the org list was not loaded (or named none of what it
+   *  needed): complete for what the project knows, not for the org. */
+  partial: string[];
 }
 
 /** What an org-wide Translations file translates. */
@@ -99,7 +103,7 @@ export function companionsFor(
   }
 ): CompanionPlan {
   const context = selected.filter(i => CONTEXT_TYPES.has(i.type));
-  if (context.length === 0) return { companions: [], note: [], incomplete: [] };
+  if (context.length === 0) return { companions: [], note: [], incomplete: [], partial: [] };
   const scope: Scope = ctx.scope === 'org' ? 'org' : 'project';
   const local = ctx.localItems;
   const localOf = (type: string): Array<Pick<MetadataItem, 'type' | 'name'>> => local.filter(i => i.type === type);
@@ -108,6 +112,7 @@ export function companionsFor(
   const add = (type: string, name: string): void => { wanted.push({ type, name }); };
   const note: string[] = [];
   const incomplete: string[] = [];
+  const partial: string[] = [];
   const fallbackObjects: string[] = [];
   const fallbackProfiles: string[] = [];
   let profileOrgNote = false;
@@ -123,7 +128,10 @@ export function companionsFor(
       // entries of a type (none on the org, or the type never listed) can't
       // name any; the project's then. No list at all: the project's, said so.
       const org = scope === 'org' ? ctx.orgItems : undefined;
-      if (scope === 'org' && !org) fallbackObjects.push(item.name);
+      if (scope === 'org' && !org) {
+        fallbackObjects.push(item.name);
+        partial.push(`${item.type}:${item.name}`);
+      }
       const from = (type: string): ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>> =>
         org && org.some(i => i.type === type) ? org : local;
       for (const i of from('Layout')) if (isLayout(i)) add(i.type, i.name);
@@ -146,10 +154,13 @@ export function companionsFor(
         // The wildcard misses standard objects: name the org list's (Account,
         // Product2 — their objectPermissions and standard-field permissions come
         // with nothing else), plus the ones the project knows, as an object file
-        // or as the parent of a scanned child. No org list (or one that never
-        // listed CustomObject): the project's alone, and the note says so.
+        // or as the parent of a scanned child. No org list, or one that names no
+        // standard object: the project's alone, and the note says so.
         const orgObjects = (ctx.orgItems ?? []).filter(i => i.type === 'CustomObject');
-        if (orgObjects.length === 0) fallbackProfiles.push(`${item.type}:${item.name}`);
+        if (!orgObjects.some(i => isStandardObject(i.name))) {
+          fallbackProfiles.push(`${item.type}:${item.name}`);
+          partial.push(`${item.type}:${item.name}`);
+        }
         for (const i of orgObjects) if (isStandardObject(i.name)) add('CustomObject', i.name);
         for (const i of local) {
           if (i.type === 'CustomObject' && isStandardObject(i.name)) add('CustomObject', i.name);
@@ -189,12 +200,12 @@ export function companionsFor(
     note.push(`org list not loaded — layouts and quick actions for ${fallbackObjects.join(', ')} were taken from the project; Fetch Org for the org's full set`);
   }
   if (fallbackProfiles.length > 0) {
-    note.push(`org list not loaded — standard objects for ${fallbackProfiles.join(', ')} were taken from the project; Fetch Org to include the org's standard objects`);
+    note.push(`${ctx.orgItems ? 'no standard objects in the org list' : 'org list not loaded'} — standard objects for ${fallbackProfiles.join(', ')} were taken from the project; Fetch Org to include the org's standard objects`);
   }
   if (profileOrgNote) {
     note.push('scope "org" asks for every component of the profile\'s types on the org — slow on big orgs; a CustomObject wildcard covers custom objects only, so standard objects are named one by one');
   }
-  return { companions, note, incomplete };
+  return { companions, note, incomplete, partial };
 }
 
 /** The loud one: project scope had nothing to send, so the org will answer with
