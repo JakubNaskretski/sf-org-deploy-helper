@@ -69,7 +69,7 @@ const RR = require(path.join(ROOT, 'out', 'runRecords.js'));
 const finished = [];
 const realFromResult = RR.retrieveRunFromResult;
 RR.retrieveRunFromResult = (result, input) => { finished.push(JSON.parse(JSON.stringify({ result, input }))); return realFromResult(result, input); };
-const { DeployPanelProvider, folderState } = require(path.join(ROOT, 'out', 'panelProvider.js'));
+const { DeployPanelProvider, folderState, rowOwnerKey } = require(path.join(ROOT, 'out', 'panelProvider.js'));
 const { SfCliError, SfCliCancelledError } = require(path.join(ROOT, 'out', 'sfCliService.js'));
 const proto = DeployPanelProvider.prototype;
 
@@ -190,6 +190,7 @@ function fakeSf(calls, hooks = {}) {
           await fsp.writeFile(abs, f.body, 'utf8');
           files.push({ type: f.type, fullName: f.fullName, state: existing ? 'Changed' : 'Created', filePath: abs });
         }
+        if (hooks.extraRows) files.push(...hooks.extraRows(call, n));
         const messages = missing.map(([t, nm]) => ({ fileName: 'unpackaged/package.xml', problem: `Entity of type '${t}' named '${nm}' cannot be found` }));
         for (const [t, nm] of missing) files.push({ type: t, fullName: nm, state: 'Failed', filePath: null });
         return { result: { status: 0, success: true, inboundFiles: files, messages }, cmd: `sf project retrieve start ${opts.manifest ? `--manifest ${opts.manifest}` : metadata.map(m => `--metadata ${m}`).join(' ')} --target-org ${ORG} --json` };
@@ -351,7 +352,10 @@ check('retrieve: the backup covers the translation; the modal discloses the comp
   assert.strictEqual(p.backups.length, 1);
   assert.ok(p.backups[0].includes(path.join(proj, rel(p, 'translations', 'pl.translation-meta.xml'))), JSON.stringify(p.backups[0]));
   const modal = ui.warns.find(w => w.modal);
-  assert.ok(modal && modal.detail.includes('Translations:pl: 2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours — so it comes back complete.'), modal && modal.detail);
+  const mlines = modal.detail.split('\n');
+  // The count is for everything that rides along — on its own line, never beside a subset.
+  assert.ok(mlines.includes('2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours.'), modal.detail);
+  assert.ok(mlines.includes('Translations:pl: comes back complete.'), modal.detail);
 });
 
 check('retrieve: the run carries project paths, the companion note and what was copied — no companion row, no temp path', async () => {
@@ -413,15 +417,15 @@ async function assertStoppedAfterClass(p, proj, before, word) {
   const rows = Object.fromEntries(latestRows.rows.map(r => [r.k, r]));
   assert.strictEqual(rows['ApexClass:Foo'].o, 'created', 'the class the first call wrote stays on the run');
   assert.strictEqual(rows['Translations:pl'].o, 'failed');
-  assert.strictEqual(rows['Translations:pl'].m, `${word} before its files were copied — its local file was left as it was`);
+  assert.strictEqual(rows['Translations:pl'].m, `${word} before its file was copied — its local file was left as it was`);
   const hint = word === 'timed out' ? ' Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.' : '';
-  assert.ok(run.notes.includes(`Translations:pl: ${word} before its files were copied — its local copy was left as it was.${hint}`), JSON.stringify(run.notes));
+  assert.ok(run.notes.includes(`Translations:pl: ${word} before its file was copied — its local copy was left as it was.${hint}`), JSON.stringify(run.notes));
   const after = await snapshot(proj);
   assert.strictEqual(after[rel(p, 'translations', 'pl.translation-meta.xml')], before[rel(p, 'translations', 'pl.translation-meta.xml')]);
   assert.ok(path.join('app', 'main', 'default', 'classes', 'Foo.cls') in after, 'the class is on disk');
   assert.strictEqual(p.counters.loads, 1, 'the project is rescanned');
   assert.deepStrictEqual(p.toasts, [], 'the user\'s own Cancel (or the timeout) is no failure toast');
-  assert.deepStrictEqual(p.notices, [['warn', `Retrieve from acme-dev: 1 retrieved · 1 ${word} (local file left as it was)`]]);
+  assert.deepStrictEqual(p.notices, [['warn', `Retrieve from acme-dev: 1 retrieved · 1 ${word} (local file left as it was).${hint}`]]);
 }
 
 check('retrieve: a Cancel landing as the first call finishes stops the second — the class stays, the translation is left as it was', async () => {
@@ -465,9 +469,54 @@ check('retrieve: a Cancel between the calls with a folder and a file — each ro
   const { runs: [run], latestRows } = lastRun(p);
   const rows = Object.fromEntries(latestRows.rows.map(r => [r.k, r]));
   assert.strictEqual(rows['CustomObjectTranslation:Product2-pl'].m, 'cancelled before its files were copied — its local files were left as they were');
-  assert.strictEqual(rows['Translations:pl'].m, 'cancelled before its files were copied — its local file was left as it was');
+  assert.strictEqual(rows['Translations:pl'].m, 'cancelled before its file was copied — its local file was left as it was');
   assert.ok(run.notes.includes('Translations:pl, CustomObjectTranslation:Product2-pl: cancelled before their files were copied — their local copies were left as they were.'), JSON.stringify(run.notes));
-  assert.deepStrictEqual(p.notices, [['warn', 'Retrieve from acme-dev: 1 retrieved · 2 cancelled (local files left as they were)']]);
+  assert.deepStrictEqual(p.notices, [['warn', 'Retrieve from acme-dev: 1 retrieved · 2 cancelled (local files left as they were).']]);
+});
+
+check('retrieve: a folder alone stopped after the project retrieve — the toast and note say "files"', async () => {
+  reset();
+  const { proj, items } = await makeProject('r5e', { cot: true, pl: false, labels: false, tab: false });
+  const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined) } });
+  await retrieve(p, ['CustomObjectTranslation:Product2-pl', 'ApexClass:Foo']);
+  const { runs: [run] } = lastRun(p);
+  assert.ok(run.notes.includes('CustomObjectTranslation:Product2-pl: timed out before its files were copied — its local copy was left as it was. Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.'), JSON.stringify(run.notes));
+  assert.deepStrictEqual(p.notices, [['warn', 'Retrieve from acme-dev: 1 retrieved · 1 timed out (local files left as they were). Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.']]);
+});
+
+check('retrieve: a failed CHILD row of a selected object is never swallowed by the soft toast of a stopped second half', async () => {
+  reset();
+  const { proj, items } = await makeProject('r18', { labels: false, tab: true });
+  const p = provider(proj, items, { orgOnly: ['CustomObject:Product2'], hooks: {
+    fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined),
+    extraRows: (_c, n) => (n === 1 ? [{ type: 'CustomField', fullName: 'Product2.Acme_Broken__c', state: 'Failed', problem: 'bad formula', filePath: null }] : [])
+  } });
+  await retrieve(p, ['CustomObject:Product2', 'Translations:pl']);
+  assert.strictEqual(p.calls.length, 2);
+  assert.deepStrictEqual(p.notices, [], 'no soft "timed out" toast when something else failed');
+  assert.deepStrictEqual(p.toasts.map(t => t.message), ['Retrieve from acme-dev: 2 components failed.'], 'the object (through its field) and the translation');
+});
+
+check('retrieve: failed rows count the components selected — three failed fields of one object are "1 component failed"', async () => {
+  reset();
+  const { proj, items } = await makeProject('r19', { pl: false, labels: false, tab: false });
+  const broken = ['A', 'B', 'C'].map(x => ({ type: 'CustomField', fullName: `Product2.Acme_${x}__c`, state: 'Failed', problem: 'bad', filePath: null }));
+  const p = provider(proj, items, { orgOnly: ['CustomObject:Product2'], hooks: { extraRows: () => broken } });
+  await retrieve(p, ['CustomObject:Product2']);
+  assert.deepStrictEqual(p.toasts.map(t => t.message), ['Retrieve from acme-dev: 1 component failed.']);
+});
+
+check('rowOwnerKey: the item itself, an object child → its object, a file inside a folder → the folder, else itself', () => {
+  const sel = [
+    { type: 'CustomObject', name: 'Product2', filePath: '/p/objects/Product2', files: [] },
+    { type: 'CustomObjectTranslation', name: 'Product2-pl', filePath: '/p/objectTranslations/Product2-pl', files: [] },
+    { type: 'ApexClass', name: 'Foo', filePath: '/p/classes/Foo.cls', files: [] }
+  ];
+  assert.strictEqual(rowOwnerKey({ type: 'ApexClass', fullName: 'Foo' }, sel), 'ApexClass:Foo');
+  assert.strictEqual(rowOwnerKey({ type: 'CustomField', fullName: 'Product2.Status__c' }, sel), 'CustomObject:Product2');
+  assert.strictEqual(rowOwnerKey({ type: 'CustomField', fullName: 'Account.Status__c' }, sel), 'CustomField:Account.Status__c', 'an unselected object\'s field is its own');
+  assert.strictEqual(rowOwnerKey({ type: 'CustomFieldTranslation', fullName: 'Product2-pl.Status__c', filePath: '/p/objectTranslations/Product2-pl/Status__c.fieldTranslation-meta.xml' }, sel), 'CustomObjectTranslation:Product2-pl');
+  assert.strictEqual(rowOwnerKey({ type: 'ApexClass', fullName: 'Bar', filePath: '/p/classes/Bar.cls' }, sel), 'ApexClass:Bar');
 });
 
 check('retrieve: the hidden-panel toast counts the components selected, not the rows the org answered with', async () => {
@@ -487,8 +536,9 @@ check('retrieve, scope org without the org list: partial items are never "comple
   p.s.orgMembersOrg = 'someone-else';
   await retrieve(p, ['Profile:Admin', 'CustomObjectTranslation:Product2-pl', 'Translations:pl']);
   const lines = ui.warns.find(w => w.modal).detail.split('\n');
-  assert.ok(lines.some(l => /^Translations:pl: \d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours — so it comes back complete\.$/.test(l)), lines.join('\n'));
-  assert.ok(lines.includes('Profile:Admin, CustomObjectTranslation:Product2-pl: retrieved the same way — complete for what the project knows; Fetch Org for the org\'s full set.'), lines.join('\n'));
+  assert.ok(lines.some(l => /^\d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours\.$/.test(l)), lines.join('\n'));
+  assert.ok(lines.includes('Translations:pl: comes back complete.'), lines.join('\n'));
+  assert.ok(lines.includes('Profile:Admin, CustomObjectTranslation:Product2-pl: complete only for what the project knows.'), lines.join('\n'));
   assert.ok(!lines.some(l => (l.includes('Profile:Admin') || l.includes('Product2-pl')) && l.includes('back complete')), lines.join('\n'));
   assert.ok(lines.includes('org list not loaded — layouts and quick actions for Product2-pl were taken from the project; Fetch Org for the org\'s full set'), lines.join('\n'));
   assert.ok(lines.includes('org list not loaded — standard objects for Profile:Admin were taken from the project; Fetch Org to include the org\'s standard objects'), lines.join('\n'));
@@ -504,7 +554,9 @@ check('retrieve, scope org, only partial items: the first line still says what r
   p.s.orgMembersOrg = 'someone-else';
   await retrieve(p, ['Profile:Admin']);
   const lines = ui.warns.find(w => w.modal).detail.split('\n');
-  assert.ok(lines.some(l => /^Profile:Admin: \d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours — complete for what the project knows; Fetch Org for the org's full set\.$/.test(l)), lines.join('\n'));
+  assert.ok(lines.some(l => /^\d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours\.$/.test(l)), lines.join('\n'));
+  assert.ok(lines.includes('Profile:Admin: complete only for what the project knows.'), lines.join('\n'));
+  assert.ok(!lines.some(l => l.includes('back complete')), lines.join('\n'));
 });
 
 check('retrieve: an item project scope can\'t fill is never promised "complete" — the dialog says it comes back nearly empty', async () => {
@@ -514,7 +566,8 @@ check('retrieve: an item project scope can\'t fill is never promised "complete" 
   const p = provider(proj, items);
   await retrieve(p, ['Translations:pl', 'Profile:Admin']);
   const lines = ui.warns.find(w => w.modal).detail.split('\n');
-  assert.ok(lines.includes('Profile:Admin: 2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours — so it comes back complete.'), lines.join('\n'));
+  assert.ok(lines.includes('2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours.'), lines.join('\n'));
+  assert.ok(lines.includes('Profile:Admin: comes back complete.'), lines.join('\n'));
   assert.ok(!lines.some(l => l.includes('Translations:pl') && l.includes('complete.')), lines.join('\n'));
   assert.ok(lines.includes('project scope found no CustomLabels/CustomApplication/CustomTab/Flow/QuickAction/ReportType in this project — Translations:pl will come back nearly empty; set sfOrgDeployWrapper.contextScope to "org"'), lines.join('\n'));
 });
@@ -579,7 +632,7 @@ check('retrieve: an object translation folder is MERGED — org files overwrite,
   await retrieve(p, ['CustomObjectTranslation:Product2-pl']);
   assert.strictEqual(p.calls.length, 1);
   assert.deepStrictEqual(p.calls[0].requested, ['CustomObjectTranslation:Product2-pl', 'CustomObject:Product2']);
-  assert.ok(ui.warns.find(w => w.modal).detail.includes('CustomObjectTranslation:Product2-pl: 1 companion (scope: project) is retrieved alongside, into a temporary project, never written to yours — so it comes back complete.'));
+  assert.ok(ui.warns.find(w => w.modal).detail.includes('1 companion (scope: project) is retrieved alongside, into a temporary project, never written to yours.\nCustomObjectTranslation:Product2-pl: comes back complete.'));
   // The hidden-panel toast counts components, not the folder's three file rows.
   assert.deepStrictEqual(p.notices, [['ok', 'Retrieved 1 component from acme-dev']]);
   const dir = rel(p, 'objectTranslations', 'Product2-pl');

@@ -4347,16 +4347,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             // The Output channel gets the CLI's own words, as reportError /
             // reportDeployTimeout would have given it.
             if (!(err instanceof SfCliCancelledError)) this.handleError(`Retrieve from ${orgLabel}`, err);
-            // Per row: a folder (an object translation) has local FILES.
+            // Per row, per shape: a folder (an object translation) has FILES.
             const why = (i: MetadataItem): string => ctxStopped
-              ? `${ctxStopped} before its files were copied — ${CONTEXT_SHAPES[i.type]?.dir ? 'its local files were left as they were' : 'its local file was left as it was'}`
+              ? `${ctxStopped} before ${CONTEXT_SHAPES[i.type]?.dir ? 'its files were copied — its local files were left as they were' : 'its file was copied — its local file was left as it was'}`
               : err instanceof Error ? err.message : String(err);
             ctx = { files: ctxItems.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why(i) })), messages: [], written: [] };
             if (ctxStopped) {
               const list = ctxItems.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctxItems.length > 3 ? ` +${ctxItems.length - 3} more` : '');
               const one = ctxItems.length === 1;
-              const timeoutHint = ctxStopped === 'timed out' ? ' Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.' : '';
-              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before ${one ? 'its' : 'their'} files were copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${timeoutHint}` });
+              const what = one ? (CONTEXT_SHAPES[ctxItems[0].type]?.dir ? 'its files were' : 'its file was') : 'their files were';
+              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before ${what} copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${ctxTimeoutHint(ctxStopped)}` });
             }
           }
           files.push(...ctx.files);
@@ -4384,17 +4384,22 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           target, items: allItems, backupDir, notes: notes.length ? notes : undefined
         }));
         // SELECTED components, not result rows: a translation folder answers with
-        // one row per file, an object with one per field — the confirm said N.
-        const picked = (rows: RetrieveFileResult[]): number => allItems.filter(i => rows.some(f => f.type === i.type && f.fullName === i.name)).length;
-        const okCount = picked(ok);
-        const failedCount = picked(failed) || new Set(failed.map(f => `${f.type}:${f.fullName}`)).size;
+        // one row per file, an object with one per field — the confirm said N. A
+        // row counts for the selected item it belongs to (rowOwnerKey); one that
+        // belongs to none counts as itself.
+        const count = (rows: RetrieveFileResult[]): number => new Set(rows.map(f => rowOwnerKey(f, allItems))).size;
+        const okCount = count(ok);
+        const failedCount = count(failed);
+        const ctxKeys = new Set(ctxItems.map(i => `${i.type}:${i.name}`));
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
           this.notifySuccessIfPanelHidden(`Retrieved ${okCount} component${okCount === 1 ? '' : 's'} from ${orgLabel}`);
         } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
           this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
-        } else if (ctxStopped && failedCount === ctxItems.length) {
-          // The user's own Cancel (or the timeout) on the second half: no failure toast.
-          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${ctxItems.length} ${ctxStopped} (local file${ctxItems.length === 1 ? '' : 's'} left as ${ctxItems.length === 1 ? 'it was' : 'they were'})`, 'warn');
+        } else if (ctxStopped && failed.every(f => ctxKeys.has(rowOwnerKey(f, allItems)))) {
+          // The user's own Cancel (or the timeout) on the second half, and nothing
+          // ELSE failed: no failure toast. Any other failed row still gets one.
+          const filesOf = ctxItems.length > 1 || CONTEXT_SHAPES[ctxItems[0].type]?.dir ? 'local files left as they were' : 'local file left as it was';
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${ctxItems.length} ${ctxStopped} (${filesOf}).${ctxTimeoutHint(ctxStopped)}`, 'warn');
         } else if (failed.length > 0) {
           this.failureToast(`Retrieve from ${orgLabel}: ${failedCount} component${failedCount === 1 ? '' : 's'} failed.`, [
             ...failed.map(f => `✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`), ...msgLines
@@ -4595,12 +4600,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const key = (i: MetadataItem): string => `${i.type}:${i.name}`;
     const complete = ctx.filter(i => !plan.incomplete.includes(key(i)) && !plan.partial.includes(key(i)));
     const partial = ctx.filter(i => plan.partial.includes(key(i)));
-    const head = `${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours`;
-    // There are companions, so at least one item is complete or partial: an
-    // item project scope found nothing for brings none.
-    const lines: string[] = [];
-    if (complete.length > 0) lines.push(`${nameList(complete)}: ${head} — so ${complete.length === 1 ? 'it comes' : 'they come'} back complete.`);
-    if (partial.length > 0) lines.push(`${nameList(partial)}: ${complete.length > 0 ? 'retrieved the same way' : head} — complete for what the project knows; Fetch Org for the org's full set.`);
+    // The count is everything that rides along, for all the items together — so
+    // it stands on its own line, never beside a subset of them.
+    const lines = [`${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`];
+    if (complete.length > 0) lines.push(`${nameList(complete)}: ${complete.length === 1 ? 'comes' : 'come'} back complete.`);
+    // The note below says why, and what to do.
+    if (partial.length > 0) lines.push(`${nameList(partial)}: complete only for what the project knows.`);
     // Every other note (empty scope, org-list fallback, scope org), not the
     // companions summary the line above already gives.
     lines.push(...plan.note.filter(l => !l.startsWith('companions: ')));
@@ -7878,6 +7883,29 @@ export async function listFilesUnder(dir: string): Promise<string[]> {
   };
   await walk(dir, 0);
   return out.sort();
+}
+
+/** The run-note / toast tail for a context half that timed out. */
+function ctxTimeoutHint(stopped: string | undefined): string {
+  return stopped === 'timed out' ? ' Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.' : '';
+}
+
+/** The selected component a retrieve row answers for, as `Type:Name`: the item
+ *  itself; an object child (`CustomField:Product2.Status__c`) → its selected
+ *  object; a file inside a selected folder (bundle, object, translation) → that
+ *  folder. A row that belongs to no selected item is its own key. */
+export function rowOwnerKey(f: Pick<RetrieveFileResult, 'type' | 'fullName' | 'filePath'>, selected: ReadonlyArray<MetadataItem>): string {
+  const own = `${f.type}:${f.fullName}`;
+  if (selected.some(i => `${i.type}:${i.name}` === own)) return own;
+  if (OBJECT_CHILD_TYPES.has(f.type) && f.fullName.includes('.')) {
+    const parent = `CustomObject:${f.fullName.slice(0, f.fullName.indexOf('.'))}`;
+    if (selected.some(i => `${i.type}:${i.name}` === parent)) return parent;
+  }
+  if (f.filePath) {
+    const folder = selected.find(i => DIRECTORY_ITEM_TYPES.has(i.type) && i.filePath && isUnder(i.filePath, f.filePath!));
+    if (folder) return `${folder.type}:${folder.name}`;
+  }
+  return own;
 }
 
 /** A merged folder's state from its files' (what happened to the PROJECT copy):

@@ -114,6 +114,7 @@ export function companionsFor(
   const incomplete: string[] = [];
   const partial: string[] = [];
   const fallbackObjects: string[] = [];
+  const noLayoutObjects: string[] = [];
   const fallbackProfiles: string[] = [];
   let profileOrgNote = false;
 
@@ -134,6 +135,13 @@ export function companionsFor(
       }
       const from = (type: string): ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>> =>
         org && org.some(i => i.type === type) ? org : local;
+      // Every object has a layout, so a loaded list with NO Layout at all never
+      // listed the type (its fetch failed): not complete. Zero quick actions is
+      // an ordinary org, and says nothing.
+      if (org && !org.some(i => i.type === 'Layout')) {
+        noLayoutObjects.push(item.name);
+        partial.push(`${item.type}:${item.name}`);
+      }
       for (const i of from('Layout')) if (isLayout(i)) add(i.type, i.name);
       for (const i of from('QuickAction')) if (isAction(i)) add(i.type, i.name);
     } else if (item.type === 'Translations') {
@@ -198,6 +206,9 @@ export function companionsFor(
   if (companions.length > 0) note.unshift(`companions: ${summarize(companions)} (scope: ${scope})`);
   if (fallbackObjects.length > 0) {
     note.push(`org list not loaded — layouts and quick actions for ${fallbackObjects.join(', ')} were taken from the project; Fetch Org for the org's full set`);
+  }
+  if (noLayoutObjects.length > 0) {
+    note.push(`no Layout entries in the org list — layouts for ${noLayoutObjects.join(', ')} were taken from the project; Fetch Org again for the org's full set`);
   }
   if (fallbackProfiles.length > 0) {
     note.push(`${ctx.orgItems ? 'no standard objects in the org list' : 'org list not loaded'} — standard objects for ${fallbackProfiles.join(', ')} were taken from the project; Fetch Org to include the org's standard objects`);

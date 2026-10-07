@@ -201,6 +201,18 @@ check('profile, org scope with the org list: its standard objects are named besi
   }
 });
 
+check('object translation, org scope, a loaded list with NO Layout at all (its fetch failed) → partial, and said so', () => {
+  const noLayouts = [it('QuickAction', 'Product2.Org_Only_Action'), it('ApexClass', 'OrgOnlyClass')];
+  const plan = companionsFor([it('CustomObjectTranslation', 'Product2-pl')], { scope: 'org', localItems: LOCAL, orgItems: noLayouts });
+  assert.deepStrictEqual(keys(plan), ['CustomObject:Product2', 'Layout:Product2-Product Layout', 'Layout:Product2-Acme Layout', 'QuickAction:Product2.Org_Only_Action']);
+  assert.deepStrictEqual(plan.partial, ['CustomObjectTranslation:Product2-pl']);
+  assert.ok(plan.note.includes('no Layout entries in the org list — layouts for Product2-pl were taken from the project; Fetch Org again for the org\'s full set'), plan.note.join('\n'));
+  // Zero quick actions is an ordinary org: never partial for that.
+  const noActions = companionsFor([it('CustomObjectTranslation', 'Product2-pl')], { scope: 'org', localItems: LOCAL, orgItems: [it('Layout', 'Product2-Org Only Layout')] });
+  assert.deepStrictEqual(noActions.partial, []);
+  assert.ok(!noActions.note.some(n => n.startsWith('no Layout')), noActions.note.join('\n'));
+});
+
 check('partial: scope org items filled only from the project — never promised complete', () => {
   const plan = companionsFor([it('Profile', 'Admin'), it('CustomObjectTranslation', 'Product2-pl'), it('Translations', 'pl')], { scope: 'org', localItems: LOCAL });
   assert.deepStrictEqual(plan.partial, ['Profile:Admin', 'CustomObjectTranslation:Product2-pl'], 'Translations goes as `*` and needs no list');
