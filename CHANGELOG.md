@@ -3,6 +3,27 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.31.1
+
+- **You choose what a translation or profile is fetched with.** The `sfOrgDeployWrapper.contextScope`
+  switch is gone: one answer for every file meant either waiting for everything on the org to fetch
+  one translation, or a file filled in for only part of what you need. Now, before a Retrieve or
+  Diff of an org-wide translation or a profile, a picker lists what can ride along, per type —
+  *this project's* (the tabs, apps, classes… you have, by name) or *all on the org* (everything of
+  that type, slower on a big org) — and the labels once. Tick both rows of a type and the org one
+  wins; tick neither and that type is left out.
+- **Enter = this project's, and your choice is remembered.** The first time, every *this
+  project's* row is ticked, so one Enter fetches the file for what your project has. What you pick
+  is remembered per file and ticked again next time, on Diff too. Escape cancels the whole retrieve
+  or diff before anything is fetched.
+- **The dialog says what was left out.** The confirm dialog, the run and a diff's card name what
+  each file was fetched with and what was left out, and call it complete only when every type came
+  whole from the org.
+- **Or be asked once.** New setting `sfOrgDeployWrapper.contextCompanionPrompt`: `always`
+  (default) shows the picker every time with your last choice ticked; `remembered` asks only until
+  a file has a choice, then uses it without asking (the dialog still names it). Object
+  translations need no picker: they always bring their object and its layouts and quick actions.
+
 ## 0.31.0
 
 - **Profiles and translations come back complete.** Retrieving a profile, an org-wide
