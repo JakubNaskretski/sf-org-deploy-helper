@@ -228,8 +228,6 @@ export function envelopeProblem(result: DeployResult): string {
   return flat.length > ENVELOPE_PROBLEM_MAX ? `${flat.slice(0, ENVELOPE_PROBLEM_MAX - 1)}…` : flat;
 }
 
-/** Org text bound for storage: ANSI and control characters out (newlines stay —
- *  a test failure's message reads better on its own lines), then capped. */
 /** A run's notes, each cut at NOTE_MAX, at most NOTES_MAX of them — and none
  *  dropped: past the cap the rest are folded into the last one (` · `). A
  *  retrieve of several profiles and translations carries a line per request
@@ -241,6 +239,8 @@ export function fitNotes(raw: readonly unknown[]): string[] {
   return [...notes.slice(0, NOTES_MAX - 1), orgText(notes.slice(NOTES_MAX - 1).join(' · '), NOTE_MAX)];
 }
 
+/** Org text bound for storage: ANSI and control characters out (newlines stay —
+ *  a test failure's message reads better on its own lines), then capped. */
 function orgText(raw: unknown, max: number): string {
   const s = typeof raw === 'string' ? stripAnsi(raw).replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ' ').trim() : '';
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;

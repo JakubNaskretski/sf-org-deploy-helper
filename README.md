@@ -50,32 +50,33 @@ request. Retrieved alone, `Profile:Admin` comes back with its user permissions a
 and `Translations:pl` as an empty stub — overwriting a complete local file. So Retrieve and Diff
 send these types together with their **companions**: an object translation with its object (and
 its layouts and quick actions), a translation with the labels, apps, tabs, flows, quick actions,
-report types, home-page custom links, bots and in-app guidance prompts it translates, a profile with the objects, fields, classes, pages, apps, tabs,
-layouts, custom permissions, flows and external data sources it grants access to (custom metadata
-types come with their objects).
+report types, home-page custom links, bots and in-app guidance prompts it translates, a profile
+with the objects, fields, classes, pages, apps, tabs, layouts, custom permissions, flows and
+external data sources it grants access to (custom metadata types come with their objects).
 
 The companions go to a temporary project and are never written to yours — only the profile or
-translation itself is copied back (an object translation folder is merged: files the org sent are
-overwritten, a file only you have is kept). For a translation or a profile **you choose what rides
-along**, per type: before the retrieve (or diff) a picker lists each companion type twice —
-*this project's (N)*, the ones you have, by name, and *all on the org*, everything of that type
-(slower on a big org) — and the labels once. There is one picker for all the profiles you
+translation itself is copied back (an object translation folder is merged: files the org sent
+are overwritten, a file only you have is kept). For a translation or a profile **you choose what
+rides along**, per type: before the retrieve (or diff) a picker lists each companion type twice
+— *this project's (N)*, the ones you have, by name, and *all on the org*, everything of that
+type (slower on a big org) — and the labels once. There is one picker for all the profiles you
 selected and one for all the translations, however many files. The first time every *this
 project's* row is ticked, so Enter fetches the files for what your project has; your choice is
 remembered for each of those files and ticked again next time (an empty choice is not
-remembered); Escape cancels the whole retrieve or diff before anything is fetched. Tick both rows
-of a type and the org row wins; tick neither and that type is left out. Files with different
-choices are fetched in separate requests, so each comes back with exactly what was ticked for
-it. The confirm dialog, the run and a diff's card say what each file was fetched with and what
-was left out — `Translations:pl: fetched with the labels, 11 tabs (project), all flows on the
-org — apps, quick actions, report types, custom page links, bots and prompts left out` — and call
-it complete only when every type came whole from the org (a profile's standard objects such as
-Account need **Fetch Org** for that: a wildcard can't name them). With
-`sfOrgDeployWrapper.contextCompanionPrompt` at `remembered` the picker asks once per file. An object translation needs no picker: it always brings its object and
-that object's layouts and quick actions (from the Fetch Org list, or the project's without it).
-Object translations are listed in the tree as one folder each, and deploy, validate and diff like
-any other component; a diff opens only the files that differ. Deploy and validate need no
-companions — the full local file is sent.
+remembered); Escape cancels the whole retrieve or diff before anything is fetched. Tick both
+rows of a type and the org row wins; tick neither and that type is left out. Files with
+different choices are fetched in separate requests, so each comes back with exactly what was
+ticked for it. The confirm dialog, the run and a diff's card say what each file was fetched with
+and what was left out — `Translations:pl: fetched with the labels, 11 tabs (project), all flows
+on the org — apps, quick actions, report types, custom page links, bots and prompts left out` —
+and call it complete only when every type came whole from the org (a profile's standard objects
+such as Account need **Fetch Org** for that: a wildcard can't name them). With
+`sfOrgDeployWrapper.contextCompanionPrompt` at `remembered` the picker asks once per file. An
+object translation needs no picker: it always brings its object and that object's layouts and
+quick actions (from the Fetch Org list, or the project's without it). Object translations are
+listed in the tree as one folder each, and deploy, validate and diff like any other component; a
+diff opens only the files that differ. Deploy and validate need no companions — the full local
+file is sent.
 
 ## Deploy File + Dependencies
 

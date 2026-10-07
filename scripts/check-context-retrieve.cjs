@@ -885,7 +885,7 @@ check('picker: one per Translations / Profile item, in order and before the dial
   assert.deepStrictEqual([tr.options.title, prof.options.title], ['Fetch Translations:pl with…', 'Fetch Profile:Admin with…']);
   for (const c of qp.calls) {
     assert.strictEqual(c.options.canPickMany, true);
-    assert.strictEqual(c.options.placeHolder, 'Enter = the ticked rows (remembered); Escape cancels');
+    assert.strictEqual(c.options.placeHolder, 'Enter = the ticked rows (this project\'s); Escape cancels', 'nothing remembered: the placeholder says where the ticks come from');
   }
   // A separator per type, then its rows: this project's (when it has some) and
   // all on the org — and ONE row for the labels.
@@ -1052,22 +1052,41 @@ check('picker, several files: ONE picker per type for the whole selection — th
   assert.deepStrictEqual(qp.calls.map(c => c.options.title), ['Fetch 5 profiles (Admin, Acme_Support, Acme_A +2 more) with…']);
 });
 
-check('picker, several files: ticked = their remembered rows when they all remember the same, else this project\'s rows', async () => {
+check('picker, several files: ticked = the rows they all remember in common, else this project\'s rows — and the placeholder says which', async () => {
   reset();
   const { proj, items } = await makeProject('m2');
   await addContext(proj, items, ['Translations:fr']);
   const p = provider(proj, items);
   ui.modalAnswer = () => undefined; // the picker is the subject: no retrieve, nothing remembered
-  for (const [memory, want] of [
-    [{ 'Translations:pl': ['Flow:org', 'CustomLabels:org'], 'Translations:fr': ['CustomLabels:org', 'Flow:org'] }, ['CustomLabels:org', 'Flow:org']],
-    [{ 'Translations:pl': ['Flow:org'], 'Translations:fr': ['CustomTab:org'] }, ['CustomLabels:org', 'CustomTab:project']],
-    [{ 'Translations:pl': ['Flow:org'] }, ['CustomLabels:org', 'CustomTab:project']]
+  const PROJECT = 'Enter = the ticked rows (this project\'s); Escape cancels';
+  const COMMON = 'Enter = the ticked rows (remembered, common to the 2 files); Escape cancels';
+  for (const [memory, want, placeHolder] of [
+    [{ 'Translations:pl': ['Flow:org', 'CustomLabels:org'], 'Translations:fr': ['CustomLabels:org', 'Flow:org'] }, ['CustomLabels:org', 'Flow:org'], COMMON],
+    // Different memories: the rows they have in common.
+    [{ 'Translations:pl': ['CustomLabels:org', 'Flow:org'], 'Translations:fr': ['CustomLabels:org', 'CustomTab:org'] }, ['CustomLabels:org'], COMMON],
+    // Nothing in common, or a file with no memory: this project's rows.
+    [{ 'Translations:pl': ['Flow:org'], 'Translations:fr': ['CustomTab:org'] }, ['CustomLabels:org', 'CustomTab:project'], PROJECT],
+    [{ 'Translations:pl': ['Flow:org'] }, ['CustomLabels:org', 'CustomTab:project'], PROJECT],
+    // Every remembered row gone (no flows in this project any more): never an
+    // empty picker whose Enter would bring back a stub.
+    [{ 'Translations:pl': ['Flow:project'], 'Translations:fr': ['Flow:project'] }, ['CustomLabels:org', 'CustomTab:project'], PROJECT]
   ]) {
     p.kept.contextCompanionPicks = memory;
     qp.calls.length = 0;
     await retrieve(p, ['Translations:pl', 'Translations:fr']);
     assert.deepStrictEqual(tickedIn(qp.calls[0]), want, JSON.stringify(memory));
+    assert.strictEqual(qp.calls[0].options.placeHolder, placeHolder, JSON.stringify(memory));
   }
+  // One file whose memory has vanished entirely: the same fallback.
+  p.kept.contextCompanionPicks = { 'Translations:pl': ['Flow:project'] };
+  qp.calls.length = 0;
+  await retrieve(p, ['Translations:pl']);
+  assert.deepStrictEqual(tickedIn(qp.calls[0]), ['CustomLabels:org', 'CustomTab:project']);
+  assert.strictEqual(qp.calls[0].options.placeHolder, PROJECT);
+  p.kept.contextCompanionPicks = { 'Translations:pl': ['Flow:org'] };
+  qp.calls.length = 0;
+  await retrieve(p, ['Translations:pl']);
+  assert.strictEqual(qp.calls[0].options.placeHolder, 'Enter = the ticked rows (remembered); Escape cancels');
 });
 
 check('picker: nothing ticked is used once, NEVER remembered — "remembered" mode asks again, and an empty memory counts as none', async () => {
@@ -1161,6 +1180,66 @@ check('diff: one request per set of choices, the rest of the selection in its ow
   const org = fs.readFileSync(profileDiff.left, 'utf8');
   assert.ok(org.includes('<apexClass>AcmeService</apexClass>') && !org.includes('<field>Product2.Status__c</field>'), org);
   assert.ok(diffCards(p)[0].lines.includes('Profile:Admin: fetched with 1 class (project) — objects, pages, apps, tabs, layouts, custom permissions, flows and data sources left out'), diffCards(p)[0].lines.join('\n'));
+});
+
+
+check('requests: every one failing the same way (an expired session) IS the retrieve\'s failure — the error run with its hint, not "2 components failed"', async () => {
+  reset((items, o) => (o.title.includes('Translations') ? tick('CustomLabels:org') : tick('ApexClass:project'))(items));
+  const { proj, items } = await makeProject('e1', { profile: 'LOCAL PROFILE' });
+  const before = await snapshot(proj);
+  const p = provider(proj, items, { hooks: { fail: () => new SfCliError('RefreshTokenAuthError: expired access/refresh token') } });
+  await retrieve(p, ['Translations:pl', 'Profile:Admin']);
+  assert.strictEqual(p.calls.length, 2, 'both requests were tried');
+  const { runs: [run] } = lastRun(p);
+  assert.strictEqual(run.status, 'error', JSON.stringify(run));
+  assert.ok(/expired/.test(run.message) && /sf org login web/.test(run.hint), JSON.stringify(run));
+  assert.deepStrictEqual(p.toasts, [], 'no "2 components failed" toast');
+  assert.strictEqual(p.output.filter(l => l.includes('RefreshTokenAuthError')).length, 1, 'logged once: ' + p.output.join(' | '));
+  assert.deepStrictEqual(changes(before, await snapshot(proj)), { added: [], changed: [], removed: [] });
+});
+
+check('requests: one failing, one fine — partial: the good file is copied, the failure is a row and one Output line', async () => {
+  reset((items, o) => (o.title.includes('Translations') ? tick('CustomLabels:org') : tick('ApexClass:project'))(items));
+  const { proj, items } = await makeProject('e2', { profile: 'LOCAL PROFILE' });
+  const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('INVALID_CROSS_REFERENCE_KEY: something on the org') : undefined) } });
+  await retrieve(p, ['Translations:pl', 'Profile:Admin']);
+  const { runs: [run], latestRows } = lastRun(p);
+  assert.strictEqual(run.status, 'partial');
+  assert.deepStrictEqual(latestRows.rows.map(r => [r.k, r.o]).sort(), [['Profile:Admin', 'failed'], ['Translations:pl', 'changed']]);
+  assert.strictEqual(p.output.filter(l => l.includes('INVALID_CROSS_REFERENCE_KEY')).length, 1, p.output.join(' | '));
+});
+
+check('requests: each temporary project is deleted as soon as its files are copied — never stacked for the next request', async () => {
+  const seen = [];
+  reset((items, o) => (o.title.includes('Translations') ? tick('CustomLabels:org', 'Flow:org') : tick('ApexClass:org'))(items));
+  const { proj, items } = await makeProject('t1', { profile: 'LOCAL PROFILE' });
+  const p = provider(proj, items, { hooks: { before: (call, n) => { if (n === 2) seen.push(fs.existsSync(tempOf(p.calls[0])), fs.existsSync(path.dirname(p.calls[0].opts.manifest))); } } });
+  await retrieve(p, ['Translations:pl', 'Profile:Admin']);
+  assert.strictEqual(p.calls.length, 2);
+  assert.ok(p.calls[0].opts.manifest, 'a `*` request: a package.xml too');
+  assert.deepStrictEqual(seen, [false, false], 'the first request\'s project and package.xml are gone before the second starts');
+  assert.ok(!fs.existsSync(tempOf(p.calls[1])));
+});
+
+check('diff: one request failing, the others still compared — its files are ✗ lines; all failing is the diff\'s own error', async () => {
+  reset(tick('ApexClass:project'));
+  const { proj, items } = await makeProject('e3', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
+  const p = diffProvider(proj, items, { fail: (call) => (call.requested.includes('Profile:Admin') ? new SfCliError('INVALID_CROSS_REFERENCE_KEY: profile trouble') : undefined) });
+  await proto.runDiff.call(p.s, ['Profile:Admin', 'CustomField:Product2.Status__c']);
+  assert.strictEqual(p.calls.length, 2);
+  const card = diffCards(p)[0];
+  assert.ok(card.lines.includes('✗ Profile:Admin: INVALID_CROSS_REFERENCE_KEY: profile trouble'), card.lines.join('\n'));
+  assert.ok(card.lines.some(l => l.includes('CustomField:Product2.Status__c')) && !card.lines.includes('— Profile:Admin — not on org'), card.lines.join('\n'));
+  assert.strictEqual(card.kind, 'err', 'an error line makes the verdict an error');
+  assert.strictEqual(p.output.filter(l => l.includes('profile trouble')).length, 1);
+  // Every request failing: the diff's own failure card, as one request would give.
+  reset(tick('ApexClass:project'));
+  const q = diffProvider(proj, items, { fail: () => new SfCliError('RefreshTokenAuthError: expired access/refresh token') });
+  await proto.runDiff.call(q.s, ['Profile:Admin', 'CustomField:Product2.Status__c']);
+  assert.strictEqual(q.calls.length, 2);
+  const errCard = diffCards(q)[0];
+  assert.deepStrictEqual([errCard.kind, errCard.title], ['err', 'Diff against acme-dev failed'], JSON.stringify(errCard));
+  assert.ok(/sf org login web/.test(errCard.hint), JSON.stringify(errCard));
 });
 
 // ============================================================ the default

@@ -4338,6 +4338,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // and the context files it never got to.
         let ctxStopped: string | undefined;
         let stopped: MetadataItem[] = [];
+        // The requests' failures (not a cancel or timeout), logged once the loop
+        // knows whether one of them IS the retrieve's error (see below).
+        const ctxFailures: unknown[] = [];
         // One temporary project per request: files whose companions are
         // identical share one, files with different ones never do — the org
         // fills every file for everything named in its request (contextGroups).
@@ -4345,6 +4348,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         for (let g = 0; ctxItems.length > 0 && g < context.groups.length; g++) {
           const group = context.groups[g];
           let ctx: ContextRetrieveOutcome;
+          // This request's temporary project (and package.xml) go as soon as its
+          // files are copied: several `*` requests must not stack on disk.
+          const mark = tmpDirs.length;
           try {
             if (cancelled) throw new SfCliCancelledError();
             ctx = await this.retrieveContextItems(group.items, group.plan.companions, org, root, {
@@ -4366,7 +4372,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             if (open) { this.endCmd(open.id, false, Date.now() - open.start); open = undefined; }
             // The Output channel gets the CLI's own words, as reportError /
             // reportDeployTimeout would have given it.
-            if (!(err instanceof SfCliCancelledError)) this.handleError(`Retrieve from ${orgLabel}`, err);
+            if (stop === 'timed out') this.handleError(`Retrieve from ${orgLabel}`, err);
+            else if (!stop) ctxFailures.push(err);
             // A cancel or a timeout stops the requests after this one too; a
             // failure fails this request's files alone, and the next one runs.
             const hit = stop ? context.groups.slice(g).flatMap(x => x.items) : group.items;
@@ -4384,11 +4391,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               ctx.messages.push({ fileName: list, problem: `${stop} before ${what} copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${ctxTimeoutHint(stop)}` });
             }
           }
+          finally {
+            for (const d of tmpDirs.splice(mark)) await fs.rm(d, { recursive: true, force: true }).catch(() => undefined);
+          }
           files.push(...ctx.files);
           messages.push(...ctx.messages);
           written.push(...ctx.written);
           if (ctxStopped) break;
         }
+        // Every request failed the same way (an expired session, the CLI gone) and
+        // nothing else ran: that IS the retrieve's failure — the error path gives
+        // the run its message, re-login hint and CLI actions, as one request would.
+        if (ctxFailures.length > 0 && items.length === 0 && !ctxStopped
+          && !files.some(f => !retrieveProblem(f) && f.state !== 'Failed')) throw ctxFailures[0];
+        for (const err of ctxFailures) this.handleError(`Retrieve from ${orgLabel}`, err);
         const result: RetrieveResult = { status: 0, success: true, inboundFiles: files, messages };
         const ok = files.filter(f => !retrieveProblem(f) && (f.state === undefined || f.state !== 'Failed'));
         const failed = files.filter(f => retrieveProblem(f) || f.state === 'Failed');
@@ -4650,9 +4666,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * selection — at most two, "Fetch 4 profiles (Admin, …) with…" and "Fetch 3
    * translations with…" — since its rows depend on the type alone: each
    * companion type as this project's members or all on the org, the labels once
-   * (companions.ts pickRows). Ticked: the remembered choice when every selected
-   * file of that type remembers the same rows, else every `this project's`
-   * row. The answer applies to each of those files. Escape on either answers
+   * (companions.ts pickRows). Ticked: the rows every selected file of that type
+   * remembers in common, else every `this project's` row — the placeholder says
+   * which. The answer applies to each of those files. Escape on either answers
    * undefined: the caller drops the whole retrieve / diff before anything is
    * fetched, and nothing is remembered. With `contextCompanionPrompt:
    * "remembered"` a type is not asked when every one of its files has a
@@ -4691,9 +4707,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         keys.forEach((k, n) => { picks[k] = [...memory[n]!]; });
         continue;
       }
+      // Ticked: the rows every selected file of the type remembers (all of them
+      // when they agree); none in common, a file with no memory, or a memory
+      // whose rows have ALL vanished — this project's rows, never an empty
+      // picker whose Enter would bring back a stub.
       const valid = memory.map(m => m?.filter(exists));
-      const same = valid.every(v => v && v.length === valid[0]!.length && v.every(id => valid[0]!.includes(id)));
-      const ticked = new Set(same && valid[0] ? valid[0] : defaultPicks(rows));
+      const common = valid.every(v => v !== undefined)
+        ? valid.reduce<string[]>((acc, v) => acc.filter(id => v!.includes(id)), valid[0]!)
+        : [];
+      const fromMemory = common.length > 0;
+      const ticked = new Set(fromMemory ? common : defaultPicks(rows));
       const options: Array<vscode.QuickPickItem & { rowId?: string }> = [];
       let heading: string | undefined;
       for (const r of rows) {
@@ -4711,7 +4734,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         title: keys.length === 1
           ? `Fetch ${keys[0]} with…`
           : `Fetch ${keys.length} ${plural} (${names.slice(0, 3).join(', ')}${names.length > 3 ? ` +${names.length - 3} more` : ''}) with…`,
-        placeHolder: 'Enter = the ticked rows (remembered); Escape cancels'
+        placeHolder: `Enter = the ticked rows (${!fromMemory ? 'this project\'s' : keys.length === 1 ? 'remembered' : `remembered, common to the ${keys.length} files`}); Escape cancels`
       });
       if (!answer) return undefined;
       const ids = answer.map(a => a.rowId).filter((id): id is string => typeof id === 'string');
@@ -5700,6 +5723,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // Which temporary project each compared item's org copy landed in.
           const projOf = new Map<MetadataItem, string>();
           let companionMessages = 0;
+          // A request that failed (not a Cancel): its items are ✗ lines and the
+          // other requests are still compared — unless none succeeded, which is
+          // then the diff's own failure (the error card, with its hint).
+          const reqFailures: Array<{ items: MetadataItem[]; err: unknown }> = [];
           for (const [n, req] of requests.entries()) {
             const proj = path.join(tmpRoot, requests.length === 1 ? 'proj' : `proj${n + 1}`);
             await scaffoldSourceProject(proj, apiVersion);
@@ -5727,7 +5754,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               this.updateCmd(rCmdId, r.cmd);
             } catch (e) {
               this.endCmd(rCmdId, false, Date.now() - rStart);
-              throw e;
+              if (e instanceof SfCliCancelledError || diffCancelled || requests.length === 1) throw e;
+              for (const i of req.items) projOf.delete(i);
+              reqFailures.push({ items: req.items, err: e });
+              continue;
             }
 
             const errorsBefore = errors.length;
@@ -5744,11 +5774,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
             this.endCmd(rCmdId, errors.length === errorsBefore, Date.now() - rStart);
           }
           if (companionMessages > 0) companionNotes.push(`${companionMessages} message${companionMessages === 1 ? '' : 's'} about companions only (e.g. one not on the org) — see the SF Deploy output`);
+          if (reqFailures.length === requests.length) throw reqFailures[0].err;
+          for (const { items: failedItems, err } of reqFailures) {
+            this.handleError(`Diff against ${orgLabel}`, err);
+            const why = err instanceof Error ? err.message : String(err);
+            for (const i of failedItems) errors.push(`${i.type}:${i.name}: ${why}`);
+          }
 
           report('comparing with your local files…');
           for (const item of slowItems) {
             if (diffCancelled) throw new SfCliCancelledError();
-            const proj = projOf.get(item)!;
+            const proj = projOf.get(item);
+            // Its request failed: already a ✗ line, nothing to compare.
+            if (!proj) continue;
             if (item !== focused && DEFINITION_FILE_DIFF_TYPES.has(item.type)) {
               // An object ROW compares its definition file, through the same
               // compare/cap path; the folder itself never reaches vscode.diff.
