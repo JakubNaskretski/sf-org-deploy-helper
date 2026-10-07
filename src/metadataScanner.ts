@@ -63,6 +63,12 @@ export const RULES: FolderRule[] = [
   { folder: 'components', type: 'ApexComponent', primaryExt: ['.component'], metaSuffix: '.component-meta.xml' },
   { folder: 'lwc', type: 'LightningComponentBundle', bundle: true },
   { folder: 'aura', type: 'AuraDefinitionBundle', bundle: true },
+  // Decomposed (`topLevel`) in source format: one folder per `<Object>-<lang>`
+  // holding the `<Object>-<lang>.objectTranslation-meta.xml` parent and one
+  // `<Field>.fieldTranslation-meta.xml` per translated field, beside it — the
+  // folder IS the component, exactly like an object or a bundle. The registry
+  // calls the adapter "decomposed", so no registry-derived rule can describe it.
+  { folder: 'objectTranslations', type: 'CustomObjectTranslation', bundle: true },
   { folder: 'flows', type: 'Flow', primaryExt: ['.flow-meta.xml'] },
   { folder: 'layouts', type: 'Layout', primaryExt: ['.layout-meta.xml'] },
   { folder: 'permissionsets', type: 'PermissionSet', primaryExt: ['.permissionset-meta.xml'] },
@@ -156,7 +162,8 @@ export type LearnedRule = FolderRule & { learnedAt: number };
 export const OBJECT_CHILD_TYPES: ReadonlySet<string> = new Set(OBJECT_CHILD_RULES.map(r => r.type));
 
 /** Types whose scanned `filePath` is a DIRECTORY — the bundle folder (`lwc/<name>`,
- *  `aura/<name>`) or the object folder (`objects/<Object>`) — rather than a file.
+ *  `aura/<name>`, `objectTranslations/<Object>-<lang>`) or the object folder
+ *  (`objects/<Object>`) — rather than a file.
  *  That is deliberate: deploy targeting, diff, retrieve backups and findItemForPath
  *  all address the folder. Anything that hands `filePath` to an editor or to a
  *  file-only CLI flag must resolve a real file first (bundleDefinitionFile).
@@ -558,11 +565,12 @@ export function findItemForPath(items: MetadataItem[], absPath: string, platform
 /** Extensions that spell a bundle's OWN definition file, best first. One list for
  *  every directory-typed component, because the resolution rule is the same in
  *  each case: the file named after the folder. `.object-meta.xml` is the whole of
- *  CustomObject (there is no `<Object>.object` in source format); `.js` beats
+ *  CustomObject (there is no `<Object>.object` in source format), and
+ *  `.objectTranslation-meta.xml` the parent of a CustomObjectTranslation; `.js` beats
  *  `.html` for an LWC because the module is where the component is declared and
  *  its imports are; the Aura entries are the four mutually-exclusive bundle roots
  *  plus the two token/design bundles that have no `.cmp`. */
-const BUNDLE_DEFINITION_EXTS = ['.object-meta.xml', '.js', '.html', '.cmp', '.app', '.evt', '.intf', '.tokens', '.design'];
+const BUNDLE_DEFINITION_EXTS = ['.object-meta.xml', '.objectTranslation-meta.xml', '.js', '.html', '.cmp', '.app', '.evt', '.intf', '.tokens', '.design'];
 
 /**
  * The concrete FILE to open for a component whose `filePath` is a directory (see
@@ -629,7 +637,8 @@ export function inferItemForPath(absPath: string, extraRules: FolderRule[] = [])
     if (base.endsWith('.object-meta.xml')) return item('CustomObject', objectName);
   }
 
-  // 2. Bundle types (LWC/Aura): the component is the bundle directory under lwc/ or aura/.
+  // 2. Folder-typed rules (LWC, Aura, CustomObjectTranslation): the component is the
+  // folder directly under the type folder, whichever file inside it was named.
   for (const rule of rules) {
     if (!rule.bundle) continue;
     const bi = lastSeg(rule.folder);
@@ -1432,16 +1441,17 @@ async function walkForFilesMatching(dir: string, exts: string[]): Promise<string
 }
 
 /** Marker -meta.xml suffixes per bundle type. A folder is a bundle iff it contains a file
- *  named `<folderName><suffix>` for one of these suffixes. */
+ *  named `<folderName><suffix>` for one of these suffixes. Exported for
+ *  scripts/check-registry-names.cjs: a marker for a type the registry gives a
+ *  suffix (CustomObjectTranslation) is pinned to `.<suffix>-meta.xml`, because a
+ *  misspelt marker silently scans the folder to nothing. */
+export const BUNDLE_MARKERS: Readonly<Record<string, readonly string[]>> = {
+  LightningComponentBundle: ['.js-meta.xml'],
+  AuraDefinitionBundle: ['.cmp-meta.xml', '.app-meta.xml', '.evt-meta.xml', '.intf-meta.xml', '.tokens-meta.xml', '.svg-meta.xml', '.design-meta.xml'],
+  CustomObjectTranslation: ['.objectTranslation-meta.xml']
+};
 function bundleMarkersForType(type: string): string[] {
-  switch (type) {
-    case 'LightningComponentBundle':
-      return ['.js-meta.xml'];
-    case 'AuraDefinitionBundle':
-      return ['.cmp-meta.xml', '.app-meta.xml', '.evt-meta.xml', '.intf-meta.xml', '.tokens-meta.xml', '.svg-meta.xml', '.design-meta.xml'];
-    default:
-      return [];
-  }
+  return [...(BUNDLE_MARKERS[type] ?? [])];
 }
 
 /** Walk the tree under `root`. Returns directories that look like a bundle:

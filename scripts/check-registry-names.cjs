@@ -35,8 +35,8 @@ Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, 
 
 const out = p => path.join(__dirname, '..', 'out', p);
 const { locateRegistry } = require(out('registryRules.js'));
-const { RULES, OBJECT_CHILD_RULES, OBJECT_CHILD_TYPES, DIRECTORY_ITEM_TYPES } = require(out('metadataScanner.js'));
-const { FETCH_ORG_TYPES, FOLDERED_TYPES, DIFF_UNSUPPORTED, FAST_DIFF_FIELD } = require(out('panelProvider.js'));
+const { RULES, OBJECT_CHILD_RULES, OBJECT_CHILD_TYPES, DIRECTORY_ITEM_TYPES, BUNDLE_MARKERS } = require(out('metadataScanner.js'));
+const { FETCH_ORG_TYPES, FOLDERED_TYPES, DIFF_UNSUPPORTED, FAST_DIFF_FIELD, WHOLE_FOLDER_DIFF_TYPES } = require(out('panelProvider.js'));
 const { INDEXED_TYPES } = require(out('depGraph.js'));
 
 const failures = [];
@@ -64,12 +64,22 @@ const fail = msg => failures.push(msg);
 
   // 1. Static folder rules: folder = directoryName, suffixes = the registry suffix
   //    (`.<suffix>` content file and/or `.<suffix>-meta.xml`), all exact.
-  assert.ok(RULES.length >= 40, `RULES not exported / shrank: ${RULES.length}`); // 40 at 0.23.4 — raise as rules are added, never lower
+  assert.ok(RULES.length >= 41, `RULES not exported / shrank: ${RULES.length}`); // 41 at 0.31.0 (objectTranslations) — raise as rules are added, never lower
   for (const r of RULES) {
     const t = byName.get(r.type);
     if (!t) { fail(`RULES ${r.type}: type not in registry`); continue; }
     if (r.folder !== t.directoryName) fail(`RULES ${r.type}: folder '${r.folder}' ≠ registry directoryName '${t.directoryName}'`);
-    if (r.bundle) { if (r.primaryExt || r.metaSuffix) fail(`RULES ${r.type}: a bundle rule carries suffixes`); continue; }
+    if (r.bundle) {
+      if (r.primaryExt || r.metaSuffix) fail(`RULES ${r.type}: a bundle rule carries suffixes`);
+      // A folder is a bundle only when it holds `<folder><marker>`: a misspelt
+      // marker scans every such folder to nothing. Where the registry gives the
+      // type a suffix (CustomObjectTranslation's `objectTranslation`), the marker
+      // IS `.<suffix>-meta.xml`; LWC/Aura have none (their markers are per file kind).
+      const markers = BUNDLE_MARKERS[r.type] ?? [];
+      if (!markers.length) fail(`RULES ${r.type}: bundle rule has no BUNDLE_MARKERS entry`);
+      if (t.suffix && JSON.stringify(markers) !== JSON.stringify([`.${t.suffix}-meta.xml`])) fail(`RULES ${r.type}: bundle markers ${JSON.stringify(markers)} ≠ registry suffix ['.${t.suffix}-meta.xml']`);
+      continue;
+    }
     if (!t.suffix) { fail(`RULES ${r.type}: registry has no suffix, rule has ${JSON.stringify(r.primaryExt)}`); continue; }
     const allowed = [`.${t.suffix}`, `.${t.suffix}-meta.xml`];
     for (const ext of r.primaryExt ?? []) if (!allowed.includes(ext)) fail(`RULES ${r.type}: primaryExt '${ext}' ≠ registry suffix '${t.suffix}' (expected one of ${allowed.join(', ')})`);
@@ -92,6 +102,8 @@ const fail = msg => failures.push(msg);
     FETCH_ORG_TYPES: [...FETCH_ORG_TYPES],
     FOLDERED_TYPES: [...Object.keys(FOLDERED_TYPES), ...Object.values(FOLDERED_TYPES)],
     DIFF_UNSUPPORTED: [...DIFF_UNSUPPORTED],
+    WHOLE_FOLDER_DIFF_TYPES: [...WHOLE_FOLDER_DIFF_TYPES],
+    BUNDLE_MARKERS: Object.keys(BUNDLE_MARKERS),
     FAST_DIFF_FIELD: Object.keys(FAST_DIFF_FIELD),
     INDEXED_TYPES: [...INDEXED_TYPES],
     OBJECT_CHILD_TYPES: [...OBJECT_CHILD_TYPES],

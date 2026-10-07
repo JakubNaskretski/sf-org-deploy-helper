@@ -1,9 +1,9 @@
 // Runnable contract test for "the thing you clicked is a folder, not a file".
 //   1) npm run compile   2) node scripts/check-open-target.cjs
 //
-// metadataScanner records `filePath` as the bundle/object FOLDER for the three
+// metadataScanner records `filePath` as the bundle/object FOLDER for the four
 // directory-typed components (CustomObject, LightningComponentBundle,
-// AuraDefinitionBundle) — deliberately, because deploy targeting, diff, retrieve
+// AuraDefinitionBundle, CustomObjectTranslation) — deliberately, because deploy targeting, diff, retrieve
 // backups and findItemForPath all address that folder. The cost is that anything
 // handing `filePath` to an editor gets a directory: clicking an object row in the
 // tree produced VS Code's "cannot open ... that is actually a directory".
@@ -17,9 +17,9 @@
 //   2. The wiring, through the real openFile handler: a directory resolves to the
 //      definition file, a plain file is untouched, and a folder with nothing to
 //      open says so instead of throwing at the user.
-//   3. DIFF_UNSUPPORTED ⊇ DIRECTORY_ITEM_TYPES — runDiff hands `item.filePath`
-//      straight to `vscode.diff`, so that containment is the ONLY thing keeping
-//      the second caller off the same wall.
+//   3. DIFF_UNSUPPORTED ∪ WHOLE_FOLDER_DIFF_TYPES ⊇ DIRECTORY_ITEM_TYPES — runDiff's
+//      generic path hands `item.filePath` straight to `vscode.diff`, so that
+//      containment is the ONLY thing keeping the second caller off the same wall.
 const path = require('path');
 const assert = require('assert');
 const Module = require('module');
@@ -57,7 +57,7 @@ Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, 
 
 const { bundleDefinitionFile, DIRECTORY_ITEM_TYPES, scanWorkspace } =
   require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
-const { DeployPanelProvider, DIFF_UNSUPPORTED } =
+const { DeployPanelProvider, DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES } =
   require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 
 let failed = 0;
@@ -194,17 +194,31 @@ check('a folder with no files at all resolves to undefined, never a directory', 
 });
 
 // ------------------------------------------------------------- the type sets
-check('DIRECTORY_ITEM_TYPES is exactly the three folder-shaped types', () => {
+check('DIRECTORY_ITEM_TYPES is exactly the four folder-shaped types', () => {
   assert.deepStrictEqual([...DIRECTORY_ITEM_TYPES].sort(),
-    ['AuraDefinitionBundle', 'CustomObject', 'LightningComponentBundle']);
+    ['AuraDefinitionBundle', 'CustomObject', 'CustomObjectTranslation', 'LightningComponentBundle']);
 });
 
-check('every directory-typed component is DIFF_UNSUPPORTED', () => {
-  // runDiff passes item.filePath to vscode.diff with no directory handling of its
-  // own; this containment is what keeps that call off the same wall as openFile.
+check('every directory-typed component is DIFF_UNSUPPORTED or diffed file by file', () => {
+  // runDiff's generic path passes item.filePath to vscode.diff with no directory
+  // handling of its own; this containment is what keeps that call off the same
+  // wall as openFile. WHOLE_FOLDER_DIFF_TYPES never takes that path — diffFolderUnits
+  // hands vscode.diff files from inside the folder (check-object-translations.cjs).
   for (const t of DIRECTORY_ITEM_TYPES) {
-    assert.ok(DIFF_UNSUPPORTED.has(t), `${t} would reach vscode.diff with a directory path`);
+    assert.ok(DIFF_UNSUPPORTED.has(t) !== WHOLE_FOLDER_DIFF_TYPES.has(t),
+      `${t} would reach vscode.diff with a directory path (or sits in both sets)`);
   }
+  for (const t of WHOLE_FOLDER_DIFF_TYPES) assert.ok(DIRECTORY_ITEM_TYPES.has(t), `${t} is not folder-typed`);
+});
+
+check('a CustomObjectTranslation folder opens its parent .objectTranslation-meta.xml', () => {
+  const dir = p('ws', 'objectTranslations', 'Product2-pl');
+  const it = {
+    type: 'CustomObjectTranslation', name: 'Product2-pl', filePath: dir,
+    // Field translations listed first (filesystem order) — the parent must still win.
+    files: [p(dir, 'Acme__c.fieldTranslation-meta.xml'), p(dir, 'Product2-pl.objectTranslation-meta.xml')]
+  };
+  assert.strictEqual(bundleDefinitionFile(it), p(dir, 'Product2-pl.objectTranslation-meta.xml'));
 });
 
 // ------------------------------------------------------------- the real wiring

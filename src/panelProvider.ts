@@ -346,6 +346,17 @@ const DELETE_ARGV_LIMIT = 6000;
  *  time the run finishes. */
 const ECHO_METADATA_CAP = 20;
 
+/** sfOrgDeployWrapper.diffEditorCap: how many diff editors one Diff may open.
+ *  Only files that DIFFER from the org get an editor — identical ones are counted
+ *  on the card instead — so the cap bounds the editors, never the comparison: a
+ *  differing file past it is still named on the card ("differs (not opened)").
+ *  Clamped like the other numeric settings (a hand-edited settings.json skips
+ *  the schema's minimum/maximum). */
+const DIFF_EDITOR_CAP_DEFAULT = 10;
+const DIFF_EDITOR_CAP_MAX = 100;
+/** How many in-sync names the card spells out before "+N more". */
+const IN_SYNC_NAMES_SHOWN = 3;
+
 /** Cap on a status card's `lines` — a deploy/retrieve over a few thousand
  *  components would otherwise render (and persist) every single one. The kept
  *  copy (runRecords.noticeFromCard) bounds at the same 100, so a card capLines
@@ -5075,18 +5086,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Cap the number of diff editors we open in one go.
-      let items = diffable;
-      if (diffable.length > 5) {
-        const choice = await vscode.window.showWarningMessage(
-          `About to open ${diffable.length} diff editors.`,
-          { modal: true, detail: 'Opening many diff editors can slow the window down.' },
-          'Open All',
-          'First 5'
-        );
-        if (!choice) return;
-        if (choice === 'First 5') items = diffable.slice(0, 5);
-      }
+      // No "About to open N diff editors" gate before the org round trip: that
+      // trip IS the cost of a diff, and until it returns nothing is known about
+      // which files differ — selecting one object (254 children) asked to open 254
+      // editors when a handful differed. Only DIFFERING files get an editor, up to
+      // diffEditorCap; identical ones are counted on the card (see `consider`).
+      const items = diffable;
+      const cap = this.diffEditorCap();
 
       // Always isolate temp dir outside the workspace so git doesn't see it.
       const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deploy-diff-'));
@@ -5095,8 +5101,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       try {
       await this.withWindowProgress(`Comparing ${items.length} component${items.length === 1 ? '' : 's'} with ${orgLabel}`, async report => {
         const missing: MetadataItem[] = [];
-        const opened: string[] = [];
         const errors: string[] = [];
+        // What the card says was compared, one entry per file pair (a component
+        // is one pair; a CustomObjectTranslation folder is one pair per file).
+        const opened: string[] = [];
+        const notOpened: string[] = [];
+        const inSync: string[] = [];
+        const folderLines: string[] = [];
 
         // Float strategy: open the FIRST diff as a normal tab, then move JUST that
         // editor to a new window (`moveEditorToNewWindow` moves the active editor
@@ -5142,6 +5153,36 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // during the editor-opening phase used to lock the button as "Cancelling…"
         // while every remaining diff still opened.
         let diffCancelled = false;
+
+        /** The ONE compare/cap path every diff pair takes — fast-path bodies,
+         *  retrieved files, focused files and translation-folder files alike.
+         *  Identical (sameAfterEol: CRLF→LF, one missing final newline): no editor,
+         *  counted. Different (or present on
+         *  one side only): an editor while the cap allows, else named on the card.
+         *  A side that cannot be read is never called identical. */
+        const consider = async (u: DiffUnit): Promise<'same' | 'opened' | 'notOpened'> => {
+          if (diffCancelled) throw new SfCliCancelledError();
+          if (await diffUnitInSync(u)) { inSync.push(u.label); return 'same'; }
+          if (opened.length >= cap) { notOpened.push(u.label); return 'notOpened'; }
+          // The org side, LEFT. A file only the local side has diffs against an
+          // empty staged twin named like it (same syntax highlighting).
+          const localName = path.basename(u.local ?? u.org ?? u.item.filePath);
+          const left = u.org !== undefined ? await stageDiffCopy(u.org, u.item)
+            : await stageDiffText(u.orgText ?? '', u.item, localName);
+          tmpPaths.push(left.dir);
+          // The local side, RIGHT — an empty read-only stand-in when only the org has the file.
+          let right = u.local;
+          if (right === undefined) {
+            const empty = await stageDiffText('', u.item, localName);
+            tmpPaths.push(empty.dir);
+            right = empty.file;
+          }
+          await this.openDiff(u.item, left.file, orgLabel, diffColumn(), u.fileLabel, right);
+          opened.push(u.label);
+          await floatFirstDiff();
+          return 'opened';
+        };
+
         if (fastItems.length > 0) {
           report('querying org (Tooling API)…');
           this.postProgress(`Fetching ${fastItems.length} component${fastItems.length === 1 ? '' : 's'} from ${orgLabel} via Tooling API…`);
@@ -5181,12 +5222,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 const body = rec?.[field];
                 if (recs.length === 0) { missing.push(item); continue; }
                 if (typeof body !== 'string' || body === '(hidden)') { slowItems.push(item); continue; }
-                if (diffCancelled) throw new SfCliCancelledError();
-                const staged = await stageDiffText(body, item);
-                tmpPaths.push(staged.dir);
-                await this.openDiff(item, staged.file, orgLabel, diffColumn());
-                opened.push(`${item.type}:${item.name}`);
-                await floatFirstDiff();
+                await consider({ item, label: `${item.type}:${item.name}`, local: item.filePath, orgText: body });
               }
             } catch (e) {
               this.endCmd(qCmdId, false, Date.now() - qStart);
@@ -5238,9 +5274,16 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           }
           this.endCmd(rCmdId, sfFailures.length === 0, Date.now() - rStart);
 
-          report('opening diff editors…');
+          report('comparing with your local files…');
           for (const item of slowItems) {
             if (diffCancelled) throw new SfCliCancelledError();
+            if (item !== focused && WHOLE_FOLDER_DIFF_TYPES.has(item.type)) {
+              // A folder-typed component with a whole-component diff: pair every
+              // file of the local folder with its twin in the org's copy.
+              const line = await this.diffFolderUnits(item, proj, consider);
+              if (line === undefined) missing.push(item); else folderLines.push(line);
+              continue;
+            }
             const isChild = OBJECT_CHILD_TYPES.has(item.type);
             let remoteFile: string | undefined;
             if (item === focused) {
@@ -5272,32 +5315,49 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               missing.push(item === focused && focusLabel ? { ...item, name: `${item.name}/${focusLabel}` } : item);
               continue;
             }
-            const staged = await stageDiffCopy(remoteFile, item);
-            tmpPaths.push(staged.dir);
-            await this.openDiff(item, staged.file, orgLabel, diffColumn(), item === focused ? focusLabel : undefined);
-            opened.push(`${item.type}:${item.name}${item === focused && focusLabel ? `/${focusLabel}` : ''}`);
-            await floatFirstDiff();
+            await consider({
+              item,
+              label: `${item.type}:${item.name}${item === focused && focusLabel ? `/${focusLabel}` : ''}`,
+              fileLabel: item === focused ? focusLabel : undefined,
+              local: item.filePath,
+              org: remoteFile
+            });
           }
         }
 
         const lines: string[] = [];
         for (const k of opened) lines.push(`✓ opened diff: ${k}`);
+        if (notOpened.length) {
+          lines.push(`${notOpened.length} more differ${notOpened.length === 1 ? 's' : ''} — not opened (sfOrgDeployWrapper.diffEditorCap is ${cap}); diff ${notOpened.length === 1 ? 'it' : 'them'} on ${notOpened.length === 1 ? 'its' : 'their'} own:`);
+          for (const k of notOpened) lines.push(`— differs (not opened): ${k}`);
+        }
+        for (const l of folderLines) lines.push(l);
+        const syncLine = inSyncLine(inSync);
+        if (syncLine) lines.push(syncLine);
         for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
         for (const e of errors) lines.push(`✗ ${e}`);
         for (const w of preLines) lines.push(w);
+        // Hundreds of differing files would otherwise render (and persist) one
+        // line each; the full list goes to the Output channel capLines points at.
+        if (lines.length > CARD_LINE_CAP) for (const l of lines) this.output.appendLine(`[Diff] ${l}`);
 
         const outcome = classifyDiffOutcome({
-          opened: opened.length, missing: missing.length, errors: errors.length,
-          unsupported: unsupported.length, attempted: items.length
+          opened: opened.length, differ: opened.length + notOpened.length, inSync: inSync.length,
+          missing: missing.length, errors: errors.length, unsupported: unsupported.length, attempted: items.length
         }, orgLabel);
+        // All in sync: the one outcome that opens nothing on purpose — its first
+        // line says so, or an empty editor area reads as a dead click.
+        if (outcome.lead) lines.unshift(outcome.lead);
         this.post({
           type: 'status',
-          card: { kind: outcome.kind, title: outcome.title, meta: outcome.meta, lines }
+          card: { kind: outcome.kind, title: outcome.title, meta: outcome.meta, lines: capLines(lines) }
         });
         // The whole verdict lived in that card, so with the panel hidden a diff that
         // opened nothing was a dead click. Opened editors need no toast — they are
         // the feedback — which is why this is classified rather than unconditional.
+        // "Everything is in sync" opens nothing either, and is just as much an answer.
         if (outcome.notify === 'warn') this.notifyIfPanelHidden(outcome.title, 'warn');
+        else if (outcome.notify === 'ok') this.notifyIfPanelHidden(outcome.lead ? `${outcome.title} — ${outcome.lead}` : outcome.title, 'ok');
         // In-band retrieve errors get the failure treatment (details mirrored into
         // the output channel), but gated on the panel being hidden: unlike the
         // deploy/retrieve failure paths, this one never toasted, and a visible panel
@@ -5896,16 +5956,57 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.noticeDismissers?.clear();
   }
 
+  /** sfOrgDeployWrapper.diffEditorCap, clamped (see DIFF_EDITOR_CAP_DEFAULT). */
+  private diffEditorCap(): number {
+    const v = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('diffEditorCap', DIFF_EDITOR_CAP_DEFAULT);
+    return typeof v === 'number' && Number.isFinite(v)
+      ? Math.max(1, Math.min(DIFF_EDITOR_CAP_MAX, Math.floor(v)))
+      : DIFF_EDITOR_CAP_DEFAULT;
+  }
+
+  /** Whole-folder diff of a WHOLE_FOLDER_DIFF_TYPES component: every file of the
+   *  local folder (listed now, not from the scan — a file added since counts) is
+   *  paired with its twin in the org's copy of the SAME folder in the retrieve
+   *  tree (`<typeFolder>/<name>`, found by path suffix), and each pair goes
+   *  through `consider`, the one compare/cap path. Returns the card's per-folder
+   *  summary line, or undefined when the org has no copy of the folder at all
+   *  (the caller reports the component as not on the org). */
+  private async diffFolderUnits(
+    item: MetadataItem,
+    proj: string,
+    consider: (u: DiffUnit) => Promise<'same' | 'opened' | 'notOpened'>
+  ): Promise<string | undefined> {
+    const typeFolder = RULES.find(r => r.type === item.type && r.bundle)?.folder;
+    if (!typeFolder) return undefined;
+    const orgDir = await findDirBySuffix(proj, path.join(typeFolder, item.name));
+    if (!orgDir) return undefined;
+    const listed = await listFilesUnder(item.filePath);
+    const localFiles = listed.length ? listed : item.files.filter(f => isUnder(item.filePath, f));
+    const pairs = pairFolderFiles(item.filePath, localFiles, orgDir, await listFilesUnder(orgDir), item.name);
+    const key = `${item.type}:${item.name}`;
+    let same = 0, differ = 0, onlyOrg = 0, onlyLocal = 0;
+    for (const p of pairs) {
+      const file = p.rel.split(path.sep).join('/');
+      const side = p.local === undefined ? ' (only on org)' : p.org === undefined ? ' (only local)' : '';
+      const verdict = await consider({ item, label: `${key}/${file}${side}`, fileLabel: `${file}${side}`, local: p.local, org: p.org });
+      if (verdict === 'same') same++;
+      else if (p.local === undefined) onlyOrg++;
+      else if (p.org === undefined) onlyLocal++;
+      else differ++;
+    }
+    return `${key} — ${same} identical · ${differ} differ · ${onlyOrg} only on org · ${onlyLocal} only local`;
+  }
+
   /** `fileLabel` names the single file when the item is a folder-typed component
    *  diffed through one of its files — `Type:Name` alone wouldn't say which. */
-  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn, fileLabel?: string): Promise<void> {
+  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn, fileLabel?: string, localFile: string = item.filePath): Promise<void> {
     // Org copy LEFT (read-only staged temp), local file RIGHT (the editable side) —
     // matches git / the official Salesforce extension, and makes the diff editor's
     // copy-block arrows pull org changes INTO the local file. The reverse order made
     // the arrows "copy" local blocks into a doomed temp file that never reaches the
     // org (deploy is the only upload path).
     const title = `${item.type}:${item.name}${fileLabel ? `/${fileLabel}` : ''} — ${orgLabel} ↔ Local`;
-    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(item.filePath), title, { preview: false, viewColumn });
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(localFile), title, { preview: false, viewColumn });
   }
 
   /** `runId`: the run this cancel ends — its card says it, instead of a card of
@@ -6778,13 +6879,22 @@ function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
 
 /** Metadata types whose MDAPI-format retrieve differs structurally from source format,
  *  making `vscode.diff` against the local source-format file misleading. Exported
- *  because it is load-bearing beyond diff quality: runDiff hands `item.filePath`
- *  straight to `vscode.diff`, so every DIRECTORY_ITEM_TYPES member has to be in
- *  here or that call would pass a folder to an editor — the same wall the openFile
- *  handler hit. check-open-target.cjs pins the containment. The one way past this
+ *  because it is load-bearing beyond diff quality: runDiff's generic path hands
+ *  `item.filePath` straight to `vscode.diff`, so every DIRECTORY_ITEM_TYPES member
+ *  has to be in here — or in WHOLE_FOLDER_DIFF_TYPES, which never takes that path —
+ *  or that call would pass a folder to an editor, the same wall the openFile
+ *  handler hit. check-open-target.cjs pins the containment. The other way past this
  *  set is runDiff's `focusFile`, which first rewrites `filePath` to a real file
  *  inside the folder. */
 export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
+
+/** The other way past that wall: folder-typed components whose WHOLE folder is
+ *  compared file by file (diffFolderUnits) — every `vscode.diff` call gets a file
+ *  from inside the folder, never the folder. A CustomObjectTranslation is nothing
+ *  but its folder of small XML files, so per-file pairing is the whole answer;
+ *  an LWC or an object has a single "the file you clicked" story instead.
+ *  check-open-target.cjs pins DIRECTORY_ITEM_TYPES ⊆ DIFF_UNSUPPORTED ∪ this. */
+export const WHOLE_FOLDER_DIFF_TYPES = new Set<string>(['CustomObjectTranslation']);
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
  *  one REST query instead of a Metadata API retrieve round-trip. */
@@ -6812,27 +6922,107 @@ export function notifyHeadline(message: string): string {
   return collapsed.length > NOTIFY_HEADLINE_MAX ? `${collapsed.slice(0, NOTIFY_HEADLINE_MAX - 1)}…` : collapsed;
 }
 
+/** The all-identical card's line, and the toast's second half. "Line endings
+ *  ignored" is the whole of the normalisation (sameAfterEol) — whitespace inside
+ *  a line still counts, so the text claims no more than was checked. */
+export const ALL_IN_SYNC_LINE = 'Nothing opened — the org copy and your local copy are byte-identical (line endings ignored)';
+
 /**
  * Card presentation for a finished diff run, plus whether the verdict needs a
  * native notification when the panel is hidden. Pure, so the "which outcome may
  * stay silent" rule is assertable: an opened diff editor IS the feedback, while a
- * run that opened nothing, or one the org failed part of, would otherwise be a
- * dead click from the context menu.
- * `attempted` is the diffable set actually processed (after the >5 cap), which is
- * what "everything was missing" has to be measured against.
+ * run that opened nothing — every file in sync, nothing on the org, or one the
+ * org failed part of — would otherwise be a dead click from the context menu.
+ * Counts are per compared FILE PAIR (a component is one pair, a translation
+ * folder one per file); `differ` includes the pairs past the editor cap.
+ * `attempted` is the diffable set of components, which is what "everything was
+ * missing" has to be measured against. `lead` (all in sync only) goes first on
+ * the card and into the toast: an outcome that opens no editor must say so.
  */
 export function classifyDiffOutcome(
-  counts: { opened: number; missing: number; errors: number; unsupported: number; attempted: number },
+  counts: { opened: number; differ: number; inSync: number; missing: number; errors: number; unsupported: number; attempted: number },
   orgLabel: string
-): { kind: 'ok' | 'warn' | 'err'; title: string; meta: string; notify: 'none' | 'warn' | 'err' } {
-  const { opened, missing, errors, unsupported, attempted } = counts;
+): { kind: 'ok' | 'warn' | 'err'; title: string; meta: string; notify: 'none' | 'ok' | 'warn' | 'err'; lead?: string } {
+  const { opened, differ, inSync, missing, errors, unsupported, attempted } = counts;
   const kind = errors > 0 ? 'err' : ((missing > 0 || unsupported > 0) ? 'warn' : 'ok');
+  const allInSync = kind === 'ok' && differ === 0 && inSync > 0;
   const title = opened > 0
-    ? `Diff opened for ${opened} component${opened === 1 ? '' : 's'} against ${orgLabel}`
+    ? `Diff opened for ${opened} differing file${opened === 1 ? '' : 's'} against ${orgLabel}`
+    : allInSync ? `All ${inSync} in sync with ${orgLabel}`
     : (missing === attempted ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues against ${orgLabel}`);
-  const meta = `${opened} opened · ${missing} missing · ${errors} errors${unsupported ? ` · ${unsupported} unsupported` : ''}`;
-  const notify = errors > 0 ? 'err' : (opened === 0 && kind === 'warn' ? 'warn' : 'none');
-  return { kind, title, meta, notify };
+  const meta = `${differ} differ · ${inSync} in sync · ${missing} not on org${errors ? ` · ${errors} error${errors === 1 ? '' : 's'}` : ''}${unsupported ? ` · ${unsupported} unsupported` : ''}`;
+  const notify = errors > 0 ? 'err' : opened > 0 ? 'none' : kind === 'warn' ? 'warn' : 'ok';
+  return { kind, title, meta, notify, ...(allInSync ? { lead: ALL_IN_SYNC_LINE } : {}) };
+}
+
+/** `in sync: A, B, C, +N more` — every identical pair on ONE card line. */
+export function inSyncLine(labels: string[]): string | undefined {
+  if (labels.length === 0) return undefined;
+  const shown = labels.slice(0, IN_SYNC_NAMES_SHOWN);
+  const rest = labels.length - shown.length;
+  return `in sync: ${shown.join(', ')}${rest > 0 ? `, +${rest} more` : ''}`;
+}
+
+/** One local↔org file pair a diff compares. One side may be absent — a file only
+ *  one copy of a translation folder has — and then diffs against an empty staged
+ *  file. `orgText` is the Tooling fast path's body, in place of `org`. */
+export interface DiffUnit {
+  item: MetadataItem;
+  /** What the card names: `Type:Name`, or `Type:Name/<file>` inside a folder. */
+  label: string;
+  /** Editor-title suffix naming the file (folder-typed components). */
+  fileLabel?: string;
+  local?: string;
+  org?: string;
+  orgText?: string;
+}
+
+/** Equal after `\r\n`→`\n` and ignoring ONE missing final newline — nothing
+ *  else: a whitespace change inside a line is a real difference. Latin-1 maps
+ *  bytes 1:1, so a binary file is compared byte for byte, never through a lossy
+ *  UTF-8 decode that could call two different files equal. */
+export function sameAfterEol(a: Buffer, b: Buffer): boolean {
+  const norm = (buf: Buffer): string => buf.toString('latin1').replace(/\r\n/g, '\n').replace(/\n$/, '');
+  return norm(a) === norm(b);
+}
+
+/** Whether a pair is identical. A one-sided pair, or a side that cannot be read
+ *  (a local file gone since the scan), is NOT — that is a difference to show. */
+export async function diffUnitInSync(u: Pick<DiffUnit, 'local' | 'org' | 'orgText'>): Promise<boolean> {
+  if (u.local === undefined || (u.org === undefined && u.orgText === undefined)) return false;
+  try {
+    const local = await fs.readFile(u.local);
+    const org = u.org !== undefined ? await fs.readFile(u.org) : Buffer.from(u.orgText!, 'utf8');
+    return sameAfterEol(local, org);
+  } catch {
+    return false;
+  }
+}
+
+/** Pair a local component folder's files with its org copy's, by path RELATIVE to
+ *  each folder — never by basename across the retrieve tree, where every
+ *  translation of one object carries the same `<Field>.fieldTranslation-meta.xml`.
+ *  Case-insensitive (the local disk's spelling vs the CLI's). The definition file
+ *  `<name>.*` sorts first, then by path. Pure. */
+export function pairFolderFiles(
+  localDir: string, localFiles: string[], orgDir: string, orgFiles: string[], name = ''
+): Array<{ rel: string; local?: string; org?: string }> {
+  const keyOf = (rel: string): string => rel.split(path.sep).join('/').toLowerCase();
+  const inside = (rel: string): boolean => !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  const pairs = new Map<string, { rel: string; local?: string; org?: string }>();
+  for (const f of localFiles) {
+    const rel = path.relative(localDir, f);
+    if (inside(rel) && !pairs.has(keyOf(rel))) pairs.set(keyOf(rel), { rel, local: f });
+  }
+  for (const f of orgFiles) {
+    const rel = path.relative(orgDir, f);
+    if (!inside(rel)) continue;
+    const hit = pairs.get(keyOf(rel));
+    if (!hit) pairs.set(keyOf(rel), { rel, org: f });
+    else if (hit.org === undefined) hit.org = f;
+  }
+  const first = (rel: string): number => (name && rel.toLowerCase().startsWith(`${name.toLowerCase()}.`) ? 0 : 1);
+  return [...pairs.values()].sort((a, b) => first(a.rel) - first(b.rel) || (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
 }
 
 /** Condensed reason for a diff that had nothing to compare at all. The toast has no
@@ -7337,6 +7527,46 @@ export async function findFileBySuffix(dir: string, suffixPath: string): Promise
   return findFile(dir, (_n, full) => { const f = full.toLowerCase(); return f === want || f.endsWith(path.sep + want); });
 }
 
+/** findFileBySuffix for a DIRECTORY (`objectTranslations/Product2-pl`): first
+ *  match, depth-first, case-insensitive for the same reason. */
+export async function findDirBySuffix(dir: string, suffixPath: string): Promise<string | undefined> {
+  const want = path.sep + suffixPath.toLowerCase();
+  const walk = async (d: string, depth: number): Promise<string | undefined> => {
+    if (depth > 20) return undefined;
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return undefined; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(d, e.name);
+      if (full.toLowerCase().endsWith(want)) return full;
+      const nested = await walk(full, depth + 1);
+      if (nested) return nested;
+    }
+    return undefined;
+  };
+  return walk(dir, 0);
+}
+
+/** Every regular file below `dir`, sorted. Dot-entries (`.DS_Store`, editor
+ *  scratch) are not metadata and would read as "only local"; links are skipped,
+ *  as the scanner skips them. */
+export async function listFilesUnder(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (d: string, depth: number): Promise<void> => {
+    if (depth > 20) return;
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) await walk(full, depth + 1);
+      else if (e.isFile()) out.push(full);
+    }
+  };
+  await walk(dir, 0);
+  return out.sort();
+}
+
 /** Scaffold a throwaway SFDX project so a source-format retrieve has somewhere to
  *  land without touching the user's workspace. `sourceApiVersion` is deliberately
  *  omitted so the retrieve uses the org's max API version (what we want for a diff). */
@@ -7370,9 +7600,9 @@ async function stageDiffCopy(srcPath: string, item: MetadataItem): Promise<{ fil
 
 /** Write org-side text (a tooling-query body) into a diff-staging file named like the
  *  local file so the diff editor gets the right syntax highlighting. */
-async function stageDiffText(content: string, item: MetadataItem): Promise<{ file: string; dir: string }> {
+async function stageDiffText(content: string, item: MetadataItem, basename: string = path.basename(item.filePath)): Promise<{ file: string; dir: string }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-diff-stage-'));
-  const file = path.join(dir, safeStagedName(item, path.basename(item.filePath)));
+  const file = path.join(dir, safeStagedName(item, basename));
   await fs.writeFile(file, content, 'utf8');
   await fs.chmod(file, 0o444); // read-only — see stageDiffCopy
   return { file, dir };

@@ -58,7 +58,7 @@ check('the three new commands are declared with the expected titles', () => {
   assert.strictEqual(byId['sfOrgDeployWrapper.deleteFromOrg'], 'SF Deploy: Delete from Org');
 });
 
-const FILE_WHEN = "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/";
+const FILE_WHEN = "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/";
 check('openInOrg and deleteFromOrg carry the SAME context-menu `when` as diffFile, in both menus', () => {
   const diffFileWhens = pkg.contributes.menus['explorer/context']
     .concat(pkg.contributes.menus['editor/context'])
