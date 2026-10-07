@@ -16,11 +16,13 @@ This file starts at the current release; earlier history predates it.
   written to yours; only the profile or translation itself is copied back, and an object
   translation folder is merged so a file only you have is kept. The confirm dialog says how many
   companions ride along, and the run names what was copied into your project.
-- **Choose how far companions reach.** New setting `sfOrgDeployWrapper.contextScope`: `project`
-  (default) sends what this project has; `org` sends everything of those types on the org —
-  complete once Fetch Org has listed the org (standard objects such as Account come from that
-  list), but slow on a big org. If the project has none of them, the confirm dialog says so
-  before anything is overwritten, instead of quietly bringing back a stub.
+- **Choose how far companions reach.** New setting `sfOrgDeployWrapper.contextScope`: `org`
+  (default) sends everything of those types on the org, so the file comes back complete once
+  Fetch Org has listed the org (standard objects such as Account come from that list); on a big
+  org that can take minutes, and the confirm dialog says what is fetched. `project` sends only
+  what this project has: faster, but the file is completed for this project's components only,
+  and the dialog, the run and a diff's card say so. If the project has none of them, the dialog
+  says so before anything is overwritten, instead of quietly bringing back a stub.
   `sfOrgDeployWrapper.contextCompanions` (default on) turns the whole behaviour off.
 - **Object translations are in the tree.** `objectTranslations/<Object>-<lang>/` folders are
   listed as one component each and deploy, validate, retrieve and diff like any other; a diff
@@ -31,6 +33,10 @@ This file starts at the current release; earlier history predates it.
   "About to open N diff editors" question is gone. At most `sfOrgDeployWrapper.diffEditorCap`
   editors open (default 10); the rest are listed on the card. When nothing differs the card
   says "All N in sync" so a diff that opens nothing never looks like a dead click.
+- **An object's row diffs its definition file.** Ticking an object's group selects the object
+  row too; it now compares the object's own `.object-meta.xml` (its fields and rules are rows of
+  their own) instead of ending an all-identical diff as "1 unsupported". A standard object the
+  project has only fields for says so on the card without turning the result into a warning.
 
 ## 0.30.1
 

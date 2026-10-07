@@ -347,7 +347,10 @@ check('BATCH: types the org does not have report as missing, not as opened', asy
   assert.strictEqual(ui.diffs.length, 0);
   const card = cards(posted).find(c => c.title.startsWith('Nothing to diff'));
   assert.ok(card, `expected a verdict card: ${JSON.stringify(cards(posted))}`);
-  assert.deepStrictEqual(card.lines, batch.map(f => `— ${f.type}:${f.name} — not on org`));
+  assert.deepStrictEqual(card.lines.filter(l => l.startsWith('— ')), batch.map(f => `— ${f.type}:${f.name} — not on org`));
+  // The batch holds a Profile: its companions ride along (default scope org) and
+  // the card names them — informational lines, never a "not on org" verdict.
+  assert.deepStrictEqual(card.lines.filter(l => !l.startsWith('— ')).map(l => l.split(':')[0]), ['companions', 'org list not loaded — standard objects for Profile']);
 });
 
 // The fixture table is the contract; this keeps it honest as types are added.

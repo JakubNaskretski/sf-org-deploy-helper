@@ -287,11 +287,11 @@
             "org"
           ],
           "enumDescriptions": [
-            "Send only the companions this project has (its labels, tabs, objects, fields, classes…). Fast; the profile or translation comes back complete for what the project contains.",
-            "Send every component of the companion types on the org (`*`), and the standard objects from the Fetch Org list. Complete once Fetch Org has listed the org (without it, standard objects come from the project); slow on big orgs."
+            "Send only the companions this project has (its labels, tabs, objects, fields, classes…). Fast, but the profile or translation is then completed for this project's components only — the org's other entries are left out, and the dialog says so.",
+            "Send every component of the companion types on the org (`*`), and the standard objects from the Fetch Org list, so the file comes back complete (once Fetch Org has listed the org — without it, standard objects come from the project). Can take minutes on a big org; the dialog says what is fetched."
           ],
-          "default": "project",
-          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `project` (default) — only what this project has; `org` — everything of those types on the org, complete once **Fetch Org** has listed it (a wildcard can't name standard objects, so they come from that list — or, without it, from the project). An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list too."
+          "default": "org",
+          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `org` (default) — everything of those types on the org, so the file comes back complete once **Fetch Org** has listed the org; it can take minutes on a big org, and the dialog says what is fetched (a wildcard can't name standard objects, so they come from that list — or, without it, from the project). `project` — only what this project has: faster, but the file is completed for this project's components only and the org's other entries are left out (the dialog and the run say so). An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list too."
         },
         "sfOrgDeployWrapper.defaultTestLevel": {
           "type": "string",

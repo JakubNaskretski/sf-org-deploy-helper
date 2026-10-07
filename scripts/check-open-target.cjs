@@ -17,7 +17,7 @@
 //   2. The wiring, through the real openFile handler: a directory resolves to the
 //      definition file, a plain file is untouched, and a folder with nothing to
 //      open says so instead of throwing at the user.
-//   3. DIFF_UNSUPPORTED ∪ WHOLE_FOLDER_DIFF_TYPES ⊇ DIRECTORY_ITEM_TYPES — runDiff's
+//   3. DIFF_UNSUPPORTED ∪ WHOLE_FOLDER_DIFF_TYPES ∪ DEFINITION_FILE_DIFF_TYPES ⊇ DIRECTORY_ITEM_TYPES — runDiff's
 //      generic path hands `item.filePath` straight to `vscode.diff`, so that
 //      containment is the ONLY thing keeping the second caller off the same wall.
 const path = require('path');
@@ -57,7 +57,7 @@ Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, 
 
 const { bundleDefinitionFile, DIRECTORY_ITEM_TYPES, scanWorkspace } =
   require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
-const { DeployPanelProvider, DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES } =
+const { DeployPanelProvider, DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES, DEFINITION_FILE_DIFF_TYPES } =
   require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 
 let failed = 0;
@@ -199,16 +199,19 @@ check('DIRECTORY_ITEM_TYPES is exactly the four folder-shaped types', () => {
     ['AuraDefinitionBundle', 'CustomObject', 'CustomObjectTranslation', 'LightningComponentBundle']);
 });
 
-check('every directory-typed component is DIFF_UNSUPPORTED or diffed file by file', () => {
+check('every directory-typed component is DIFF_UNSUPPORTED, diffed file by file, or diffed by its definition file', () => {
   // runDiff's generic path passes item.filePath to vscode.diff with no directory
   // handling of its own; this containment is what keeps that call off the same
   // wall as openFile. WHOLE_FOLDER_DIFF_TYPES never takes that path — diffFolderUnits
-  // hands vscode.diff files from inside the folder (check-object-translations.cjs).
+  // hands vscode.diff files from inside the folder (check-object-translations.cjs) —
+  // and neither does DEFINITION_FILE_DIFF_TYPES: an object row diffs its
+  // `.object-meta.xml` (check-context-retrieve.cjs).
   for (const t of DIRECTORY_ITEM_TYPES) {
-    assert.ok(DIFF_UNSUPPORTED.has(t) !== WHOLE_FOLDER_DIFF_TYPES.has(t),
-      `${t} would reach vscode.diff with a directory path (or sits in both sets)`);
+    const homes = [DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES, DEFINITION_FILE_DIFF_TYPES].filter(set => set.has(t)).length;
+    assert.strictEqual(homes, 1, `${t} would reach vscode.diff with a directory path (or sits in two sets)`);
   }
   for (const t of WHOLE_FOLDER_DIFF_TYPES) assert.ok(DIRECTORY_ITEM_TYPES.has(t), `${t} is not folder-typed`);
+  assert.deepStrictEqual([...DEFINITION_FILE_DIFF_TYPES], ['CustomObject']);
 });
 
 check('a CustomObjectTranslation folder opens its parent .objectTranslation-meta.xml', () => {

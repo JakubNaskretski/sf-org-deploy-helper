@@ -57,13 +57,15 @@ types come with their objects).
 The companions go to a temporary project and are never written to yours — only the profile or
 translation itself is copied back (an object translation folder is merged: files the org sent are
 overwritten, a file only you have is kept). The confirm dialog says how many companions ride
-along, and the run names what was copied into your project. With
-`sfOrgDeployWrapper.contextScope` at `project` (the default) the companions are what this project
-has, so the file comes back complete for what you work on; `org` asks for everything of those
-types on the org — complete once **Fetch Org** has listed the org (a wildcard can't name standard
-objects such as Account, so those come from that list, or from the project without it), and slow
-on a big org. If the project has none of them, the confirm dialog and the run say so loudly
-instead of quietly bringing back a stub. Object translations are listed in the tree as
+along and what each file comes back with, and the run names what was copied into your project.
+With `sfOrgDeployWrapper.contextScope` at `org` (the default) the companions are everything of
+those types on the org, so the file comes back complete — once **Fetch Org** has listed the org
+(a wildcard can't name standard objects such as Account, so those come from that list, or from the
+project without it). On a big org that can take minutes; the dialog says what is fetched. `project`
+sends only what this project has: faster, but the file is then completed for this project's
+components only — the org's other entries are left out, and the dialog, the run and a diff's card
+say so. If the project has none of them, they say that loudly instead of quietly bringing back a
+stub. Object translations are listed in the tree as
 one folder each, and deploy, validate and diff like any other component; a diff opens only the
 files that differ. Deploy and validate need no companions — the full local file is sent.
 
@@ -126,7 +128,7 @@ the job up again and finishes the same run.
 - `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
 - `sfOrgDeployWrapper.diffEditorCap` — how many diff editors one Diff may open (default 10, 1–100). Everything selected is compared with the org first and only files that differ get an editor; identical files (line endings ignored) are counted on the result card, and differing files past the cap are listed there as "differs (not opened)".
 - `sfOrgDeployWrapper.contextCompanions` — Retrieve and Diff of a profile, an org-wide translation (`translations/pl.translation-meta.xml`) or an object translation also ask the org for the components it describes, so it comes back complete (default on). The companions land in a temporary project and are never written to yours; only the profile or translation is copied back. Off: these types are retrieved alone, nearly empty, and the result says so. See **Translations & profiles** above.
-- `sfOrgDeployWrapper.contextScope` — which companions are sent: `project` (default) — only the labels, apps, tabs, flows, objects, fields, classes… this project has; `org` — every component of those types on the org, plus the standard objects from the Fetch Org list (complete once Fetch Org has run — without it standard objects come from the project; slow on big orgs). An object translation always brings its object; with `org`, its layouts and quick actions come from the Fetch Org list.
+- `sfOrgDeployWrapper.contextScope` — which companions are sent: `org` (default) — every component of those types on the org, plus the standard objects from the Fetch Org list, so the file comes back complete (once Fetch Org has run — without it standard objects come from the project; minutes on a big org); `project` — only the labels, apps, tabs, flows, objects, fields, classes… this project has, so the file is completed for this project's components only and the org's other entries are left out. An object translation always brings its object; with `org`, its layouts and quick actions come from the Fetch Org list.
 - `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
 - `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org, remembered per VS Code window).

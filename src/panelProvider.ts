@@ -9,7 +9,7 @@ import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInf
 import { isLikelyProduction } from './kit/orgs';
 import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolveDefaultPackageDir, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
-import { CONTEXT_SCOPE_DEFAULT, CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, Scope, companionsFor, hasWildcard, isCompanionMessage } from './companions';
+import { CONTEXT_SCOPE_DEFAULT, CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, Scope, companionsFor, describeContext, hasWildcard, isCompanionMessage } from './companions';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
 const DISCOVERY_RETRY_DELAYS_MS = [1500, 4000, 10000];
@@ -4568,48 +4568,46 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   /** The companions a Retrieve or Diff of `items` sends with its context items
    *  (src/companions.ts), as the two settings say. `split`: there are companions
    *  to send, so the context items take the temporary-project route. `notes` go
-   *  on the run / card; `modalLine` is the confirm's disclosure — a retrieve that
-   *  is about to ask the org for every flow must say so first.
+   *  on the retrieve's run, `diffNotes` on a diff's card; `modalLine` is the
+   *  confirm's disclosure — what each item comes back with, BEFORE the overwrite.
    *  `sameRequest`: the companions travel in the SAME retrieve as all of `items`
    *  (Diff), so a selected component is never asked for twice. A Retrieve sends
    *  the context items on their own, so there they are checked against those
    *  alone — a selected CustomLabels still has to ride with Translations:pl. */
-  private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean): { plan: CompanionPlan; split: boolean; notes: string[]; modalLine?: string } {
+  private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean): { plan: CompanionPlan; split: boolean; notes: string[]; diffNotes: string[]; modalLine?: string } {
     const ctx = items.filter(i => CONTEXT_TYPES.has(i.type));
-    if (ctx.length === 0) return { plan: { companions: [], note: [], incomplete: [], partial: [] }, split: false, notes: [] };
-    const nameList = (list: MetadataItem[]): string =>
-      list.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (list.length > 3 ? ` +${list.length - 3} more` : '');
-    const names = nameList(ctx);
+    const none: CompanionPlan = { companions: [], note: [], incomplete: [], partial: [], own: {} };
+    if (ctx.length === 0) return { plan: none, split: false, notes: [], diffNotes: [] };
+    const names = ctx.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctx.length > 3 ? ` +${ctx.length - 3} more` : '');
     const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
     if (cfg.get<boolean>('contextCompanions', true) === false) {
       return {
-        plan: { companions: [], note: [], incomplete: [], partial: [] }, split: false, notes: ['retrieved without companions'],
+        plan: none, split: false, notes: ['retrieved without companions'], diffNotes: ['retrieved without companions'],
         modalLine: `${names}: retrieved without companions (sfOrgDeployWrapper.contextCompanions is off) — may come back nearly empty.`
       };
     }
-    const scope: Scope = cfg.get<string>('contextScope', CONTEXT_SCOPE_DEFAULT) === 'org' ? 'org' : 'project';
+    const scope: Scope = cfg.get<string>('contextScope', CONTEXT_SCOPE_DEFAULT) === 'project' ? 'project' : 'org';
     const plan = companionsFor(sameRequest ? items : ctx, { scope, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
     const n = plan.companions.length;
-    if (n === 0) return { plan, split: false, notes: plan.note, modalLine: plan.note.join('\n') || undefined };
-    // "Complete" only for the items whose companions were found: one that project
-    // scope found nothing for comes back nearly empty — over a full local file —
-    // and its note says so HERE, before the overwrite, not only on the run. The
-    // fallback and org-scope notes ride along for the same reason.
-    // Scope org without the org list fills an item only from the project:
-    // complete for what the project knows, never "complete".
-    const key = (i: MetadataItem): string => `${i.type}:${i.name}`;
-    const complete = ctx.filter(i => !plan.incomplete.includes(key(i)) && !plan.partial.includes(key(i)));
-    const partial = ctx.filter(i => plan.partial.includes(key(i)));
+    if (n === 0) return { plan, split: false, notes: plan.note, diffNotes: plan.note, modalLine: plan.note.join('\n') || undefined };
+    // What each item comes back with — "complete" only where that is true (scope
+    // org, filled from the org); project scope says "this project's components
+    // only"; an item project scope found nothing for gets the LOUD note instead.
+    const itemLines = describeContext(ctx, plan, scope);
+    const summary = plan.note.filter(l => l.startsWith('companions: '));
+    // Every other note (empty scope, org-list fallback) — never the summary twice.
+    const other = plan.note.filter(l => !l.startsWith('companions: '));
     // The count is everything that rides along, for all the items together — so
     // it stands on its own line, never beside a subset of them.
-    const lines = [`${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`];
-    if (complete.length > 0) lines.push(`${nameList(complete)}: ${complete.length === 1 ? 'comes' : 'come'} back complete.`);
-    // The note below says why, and what to do.
-    if (partial.length > 0) lines.push(`${nameList(partial)}: complete only for what the project knows.`);
-    // Every other note (empty scope, org-list fallback, scope org), not the
-    // companions summary the line above already gives.
-    lines.push(...plan.note.filter(l => !l.startsWith('companions: ')));
-    return { plan, split: true, notes: plan.note, modalLine: lines.join('\n') };
+    const head = `${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`;
+    return {
+      plan, split: true,
+      // Project scope: the per-item lines ARE the run's caveat, so they replace
+      // the summary (the run keeps 5 notes).
+      notes: scope === 'project' ? [...itemLines, ...other] : [...summary, ...other],
+      diffNotes: [...summary, ...(scope === 'project' ? [PROJECT_SCOPE_DIFF_LINE] : []), ...other],
+      modalLine: [head, ...itemLines, ...other].join('\n')
+    };
   }
 
   /** The Fetch Org listing as items, only when it was fetched for `org`. */
@@ -5397,6 +5395,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         const folderLines: string[] = [];
         // What rode along with the retrieve (companions), for the card.
         const companionNotes: string[] = [];
+        // Informational lines that are not a problem (an object row with no
+        // definition file in the project), and how many items were ONLY that.
+        const infoLines: string[] = [];
+        let infoOnly = 0;
 
         // Float strategy: open the FIRST diff as a normal tab, then move JUST that
         // editor to a new window (`moveEditorToNewWindow` moves the active editor
@@ -5549,7 +5551,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // every fieldPermission of a profile reads "only local". Companions ride
           // in the same retrieve, get no editor and are never "not on org".
           const context = this.contextPlanFor(slowItems, org, true);
-          companionNotes.push(...context.notes);
+          companionNotes.push(...context.diffNotes);
           const diffTargets: MetadataItem[] = [...slowItems, ...context.plan.companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
           // Same rule as a retrieve: above MANIFEST_THRESHOLD the `--metadata`
           // argv blows Windows' ~32 KB command line, and a `*` member only
@@ -5594,6 +5596,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           report('comparing with your local files…');
           for (const item of slowItems) {
             if (diffCancelled) throw new SfCliCancelledError();
+            if (item !== focused && DEFINITION_FILE_DIFF_TYPES.has(item.type)) {
+              // An object ROW compares its definition file, through the same
+              // compare/cap path; the folder itself never reaches vscode.diff.
+              const def = await objectDefinitionFile(item);
+              if (!def) {
+                // A standard object the project only has fields for: nothing of
+                // its own to compare — said, but not a problem with the diff.
+                infoLines.push(`— ${item.type}:${item.name} — no object definition file in this project; its fields and rules are compared as their own rows`);
+                infoOnly++;
+                continue;
+              }
+              const defName = path.basename(def);
+              const remoteDef = await findFileBySuffix(proj, path.join('objects', path.basename(path.dirname(def)), defName));
+              if (!remoteDef) { missing.push(item); continue; }
+              await consider({ item: { ...item, filePath: def }, label: `${item.type}:${item.name}/${defName}`, fileLabel: defName, local: def, org: remoteDef });
+              continue;
+            }
             if (item !== focused && WHOLE_FOLDER_DIFF_TYPES.has(item.type)) {
               // A folder-typed component with a whole-component diff: pair every
               // file of the local folder with its twin in the org's copy.
@@ -5649,6 +5668,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           for (const k of notOpened) lines.push(`— differs (not opened): ${k}`);
         }
         for (const l of folderLines) lines.push(l);
+        for (const l of infoLines) lines.push(l);
         const syncLine = inSyncLine(inSync);
         if (syncLine) lines.push(syncLine);
         for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
@@ -5659,9 +5679,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // line each; the full list goes to the Output channel capLines points at.
         if (lines.length > CARD_LINE_CAP) for (const l of lines) this.output.appendLine(`[Diff] ${l}`);
 
+        if (infoOnly > 0 && infoOnly === items.length && errors.length === 0) {
+          // Only object rows with no definition file: nothing was compared at all.
+          this.post({ type: 'status', card: { kind: 'warn', title: 'Nothing to diff', meta: 'no object definition file in this project', lines: capLines(lines) } });
+          this.notifyIfPanelHidden('Nothing to diff — no object definition file in this project', 'warn');
+          return;
+        }
+        // An object row with no definition file was never a comparison: it is
+        // not counted, so it can't turn an all-identical diff into a warning.
         const outcome = classifyDiffOutcome({
           opened: opened.length, differ: opened.length + notOpened.length, inSync: inSync.length,
-          missing: missing.length, errors: errors.length, unsupported: unsupported.length, attempted: items.length
+          missing: missing.length, errors: errors.length, unsupported: unsupported.length, attempted: items.length - infoOnly
         }, orgLabel);
         // All in sync: the one outcome that opens nothing on purpose — its first
         // line says so, or an empty editor area reads as a dead click.
@@ -7204,7 +7232,7 @@ function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
  *  handler hit. check-open-target.cjs pins the containment. The other way past this
  *  set is runDiff's `focusFile`, which first rewrites `filePath` to a real file
  *  inside the folder. */
-export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
+export const DIFF_UNSUPPORTED = new Set<string>(['LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
 
 /** The other way past that wall: folder-typed components whose WHOLE folder is
  *  compared file by file (diffFolderUnits) — every `vscode.diff` call gets a file
@@ -7213,6 +7241,18 @@ export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningCompo
  *  an LWC or an object has a single "the file you clicked" story instead.
  *  check-open-target.cjs pins DIRECTORY_ITEM_TYPES ⊆ DIFF_UNSUPPORTED ∪ this. */
 export const WHOLE_FOLDER_DIFF_TYPES = new Set<string>(['CustomObjectTranslation']);
+
+/** The third way past it: a folder-typed component whose ROW diffs its own
+ *  definition file — an object's `<Obj>.object-meta.xml`. Its fields, rules and
+ *  record types are rows of their own (ticking an object's group selects them
+ *  all), so the definition file is the object row's whole share, and its label
+ *  names the file so nobody reads it as "fields compared too".
+ *  check-open-target.cjs pins DIRECTORY_ITEM_TYPES ⊆ one of the three sets. */
+export const DEFINITION_FILE_DIFF_TYPES = new Set<string>(['CustomObject']);
+
+/** A project-scope diff of a profile / translation compares what the org says
+ *  about THIS project's components only. */
+export const PROJECT_SCOPE_DIFF_LINE = 'compared for this project\'s components only (scope: project) — entries for components not in this project show as local-only';
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
  *  one REST query instead of a Metadata API retrieve round-trip. */
@@ -7906,6 +7946,17 @@ export function rowOwnerKey(f: Pick<RetrieveFileResult, 'type' | 'fullName' | 'f
     if (folder) return `${folder.type}:${folder.name}`;
   }
   return own;
+}
+
+/** An object item's own definition file: the item when it already IS that file
+ *  (inferItemForPath's shape), else `<folder>/<Obj>.object-meta.xml` when the
+ *  project has it. Undefined for a standard object the project has only
+ *  fields for. */
+async function objectDefinitionFile(item: MetadataItem): Promise<string | undefined> {
+  const isFile = (p: string): Promise<boolean> => fs.stat(p).then(st => st.isFile(), () => false);
+  if (item.filePath.endsWith('.object-meta.xml') && await isFile(item.filePath)) return item.filePath;
+  const inside = path.join(item.filePath, `${item.name}.object-meta.xml`);
+  return item.filePath && await isFile(inside) ? inside : undefined;
 }
 
 /** A merged folder's state from its files' (what happened to the PROJECT copy):

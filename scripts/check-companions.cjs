@@ -181,7 +181,6 @@ check('profile, org scope: `*` per type (fields and record types among the child
   ]);
   assert.ok(!keys(plan).includes('CustomObject:Acme_Widget__c'), 'a custom object IS covered by the wildcard');
   assert.ok(!keys(plan).includes('CustomMetadata:*'), 'never every custom metadata record on the org');
-  assert.ok(plan.note.some(n => n.startsWith('scope "org" asks for every component') && n.includes('slow on big orgs')), plan.note.join('\n'));
   assert.ok(plan.note.includes('org list not loaded — standard objects for Profile:Admin were taken from the project; Fetch Org to include the org\'s standard objects'), plan.note.join('\n'));
 });
 
@@ -267,7 +266,7 @@ check('dedupe: a `*` suppresses that type\'s names — a CUSTOM object too, a st
 check('nothing for a selection without context types — PermissionSet included', () => {
   for (const scope of ['project', 'org']) {
     const plan = companionsFor([it('PermissionSet', 'Acme_Access'), it('ApexClass', 'AcmeService'), it('GlobalValueSetTranslation', 'ProductForm-pl')], { scope, localItems: LOCAL, orgItems: ORG_LIST });
-    assert.deepStrictEqual(plan, { companions: [], note: [], incomplete: [], partial: [] });
+    assert.deepStrictEqual(plan, { companions: [], note: [], incomplete: [], partial: [], own: {} });
   }
 });
 
@@ -287,6 +286,54 @@ check('isCompanionMessage: a companion not on the org is noise, a selected one n
   assert.ok(!C.isCompanionMessage("Entity of type 'ApexClass' named 'AcmeService' cannot be found", companions, selected));
   assert.ok(!C.isCompanionMessage('INVALID_SESSION_ID: Session expired or invalid', companions, selected));
   assert.ok(!C.isCompanionMessage("Entity of type 'CustomTab' named 'Acme_Widget__c' cannot be found", [], selected), 'no companions, no noise');
+  // Named without the "type X named Y" shape — a standard object the org list
+  // brought along that the org can't retrieve.
+  const withObj = [...companions, it('CustomObject', 'ConversationEntryCopy')];
+  assert.ok(C.isCompanionMessage('Not a registered filter type: ConversationEntryCopy (see FilterType.java)', withObj, selected));
+  assert.ok(!C.isCompanionMessage('Not a registered filter type: ConversationEntryCopyX (see FilterType.java)', [it('CustomObject', 'ConversationEntryCopy')], selected), 'a whole name, not a prefix');
+  assert.ok(!C.isCompanionMessage('Admin: ConversationEntryCopy could not be read', withObj, selected), 'a message that names the selection is never noise');
+});
+
+// ----------------------------------------------------- what each item comes back with
+const { describeContext } = C;
+const TO_ORG = '(scope: project; set sfOrgDeployWrapper.contextScope to "org" for everything)';
+check('describe, scope org: "complete", and what is fetched wholesale — minutes on a big org', () => {
+  const orgItems = [...ORG_LIST, it('CustomObject', 'Account')];
+  const sel = [it('Profile', 'Admin'), it('Translations', 'pl'), it('CustomObjectTranslation', 'Product2-pl')];
+  const plan = companionsFor(sel, { scope: 'org', localItems: LOCAL, orgItems });
+  assert.deepStrictEqual(describeContext(sel, plan, 'org'), [
+    'Profile:Admin: fetched with every object, field, record type, class, page, app, tab, layout, custom permission, flow and external data source on the org so it comes back complete — minutes on a big org; set sfOrgDeployWrapper.contextScope to "project" to limit it to this project.',
+    'Translations:pl: fetched with every label, app, tab, flow, quick action and report type on the org so it comes back complete — minutes on a big org; set sfOrgDeployWrapper.contextScope to "project" to limit it to this project.',
+    'CustomObjectTranslation:Product2-pl: fetched with its object and the org\'s 2 layouts, 1 quick action so it comes back complete.'
+  ]);
+});
+
+check('describe, scope org without the org list: partial items "complete only for what the project knows"', () => {
+  const sel = [it('Profile', 'Admin'), it('Translations', 'pl')];
+  const plan = companionsFor(sel, { scope: 'org', localItems: LOCAL });
+  const lines = describeContext(sel, plan, 'org');
+  assert.strictEqual(lines[0], 'Profile:Admin: complete only for what the project knows.');
+  assert.ok(lines[1].startsWith('Translations:pl: fetched with every label'), lines[1]);
+});
+
+check('describe, scope project: NEVER "complete" — this project\'s components only, with what they are, and what is left out', () => {
+  const sel = [it('Translations', 'pl'), it('Profile', 'Admin'), it('CustomObjectTranslation', 'Product2-pl'), it('CustomObjectTranslation', 'Case-pl')];
+  const plan = companionsFor(sel, { scope: 'project', localItems: LOCAL });
+  const lines = describeContext(sel, plan, 'project');
+  assert.deepStrictEqual(lines, [
+    `Translations:pl: completed for this project's components only (the labels, 1 app, 1 tab, 1 flow, 2 quick actions, 1 report type) — the org's other translations are left out ${TO_ORG}.`,
+    `Profile:Admin: completed for this project's components only (2 objects, 1 class, 1 page, 1 app, 1 tab, 3 layouts, 1 custom permission, 1 flow, 1 data source, 2 fields, 1 list view, 1 record type) — the org's other permissions are left out ${TO_ORG}.`,
+    `CustomObjectTranslation:Product2-pl: completed for its object and this project's layouts and quick actions only (2 layouts, 1 quick action) — the org's other layout and quick-action translations are left out ${TO_ORG}.`,
+    `CustomObjectTranslation:Case-pl: completed for its object and this project's layouts and quick actions only (none in this project) — the org's other layout and quick-action translations are left out ${TO_ORG}.`
+  ]);
+  for (const l of lines) assert.ok(!/back complete/.test(l), l);
+  // An item project scope found nothing for gets no line — the LOUD note speaks for it.
+  const empty = companionsFor([it('Translations', 'pl')], { scope: 'project', localItems: [] });
+  assert.deepStrictEqual(describeContext([it('Translations', 'pl')], empty, 'project'), []);
+});
+
+check('countPhrase: the labels without a count, nouns pluralised', () => {
+  assert.strictEqual(C.countPhrase([it('CustomLabels', 'CustomLabels'), it('CustomTab', 'A'), it('CustomTab', 'B'), it('ApexClass', 'X')]), 'the labels, 2 tabs, 1 class');
 });
 
 // ------------------------------------------------------------- manifest
@@ -303,10 +350,10 @@ check('buildManifestXml keeps `*` verbatim beside named members', () => {
 // ------------------------------------------------------------- settings
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 const props = pkg.contributes.configuration.properties;
-check('settings: contextScope project|org, default project; contextCompanions boolean, default true', () => {
+check('settings: contextScope project|org, default ORG (complete is what was asked for); contextCompanions boolean, default true', () => {
   assert.deepStrictEqual(props['sfOrgDeployWrapper.contextScope'].enum, ['project', 'org']);
-  assert.strictEqual(props['sfOrgDeployWrapper.contextScope'].default, 'project');
-  assert.strictEqual(C.CONTEXT_SCOPE_DEFAULT, 'project', 'the code\'s fallback matches the declared default');
+  assert.strictEqual(props['sfOrgDeployWrapper.contextScope'].default, 'org');
+  assert.strictEqual(C.CONTEXT_SCOPE_DEFAULT, 'org', 'the code\'s fallback matches the declared default');
   assert.strictEqual(props['sfOrgDeployWrapper.contextCompanions'].type, 'boolean');
   assert.strictEqual(props['sfOrgDeployWrapper.contextCompanions'].default, true);
 });

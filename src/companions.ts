@@ -13,10 +13,12 @@ import type { MetadataItem } from './metadataScanner';
  *  GlobalValueSetTranslation was verified byte-identical alone and with its set. */
 export const CONTEXT_TYPES: ReadonlySet<string> = new Set(['CustomObjectTranslation', 'Translations', 'Profile']);
 
-/** `project`: only what the project itself has (fast, field-granular).
- *  `org`: every component of the companion types on the org (complete, slow). */
+/** `org` (default): every component of the companion types on the org — the
+ *  file comes back complete, at the cost of a bigger retrieve (disclosed).
+ *  `project`: only what the project itself has (fast, field-granular) — the
+ *  file is then completed for those components only, and says so. */
 export type Scope = 'project' | 'org';
-export const CONTEXT_SCOPE_DEFAULT: Scope = 'project';
+export const CONTEXT_SCOPE_DEFAULT: Scope = 'org';
 
 export interface Companion { type: string; name: string }
 export interface CompanionPlan {
@@ -26,6 +28,9 @@ export interface CompanionPlan {
   /** `Type:Name` of each selected item that will come back nearly empty: project
    *  scope found nothing it describes. Never to be promised "complete". */
   incomplete: string[];
+  /** Each selected context item's own companions (`Type:Name` key → list), for
+   *  the per-item lines describeContext() writes. */
+  own: Record<string, Companion[]>;
   /** `Type:Name` of each selected item scope org could fill only from the
    *  project, because the org list was not loaded (or named none of what it
    *  needed): complete for what the project knows, not for the org. */
@@ -103,22 +108,28 @@ export function companionsFor(
   }
 ): CompanionPlan {
   const context = selected.filter(i => CONTEXT_TYPES.has(i.type));
-  if (context.length === 0) return { companions: [], note: [], incomplete: [], partial: [] };
+  if (context.length === 0) return { companions: [], note: [], incomplete: [], partial: [], own: {} };
   const scope: Scope = ctx.scope === 'org' ? 'org' : 'project';
   const local = ctx.localItems;
   const localOf = (type: string): Array<Pick<MetadataItem, 'type' | 'name'>> => local.filter(i => i.type === type);
 
   const wanted: Companion[] = [];
-  const add = (type: string, name: string): void => { wanted.push({ type, name }); };
+  const own: Record<string, Companion[]> = {};
+  let current = '';
+  const add = (type: string, name: string): void => {
+    wanted.push({ type, name });
+    const mine = (own[current] ??= []);
+    if (!mine.some(c => c.type === type && c.name === name)) mine.push({ type, name });
+  };
   const note: string[] = [];
   const incomplete: string[] = [];
   const partial: string[] = [];
   const fallbackObjects: string[] = [];
   const noLayoutObjects: string[] = [];
   const fallbackProfiles: string[] = [];
-  let profileOrgNote = false;
 
   for (const item of context) {
+    current = `${item.type}:${item.name}`;
     if (item.type === 'CustomObjectTranslation') {
       const obj = translatedObject(item.name);
       if (!obj) continue;
@@ -177,7 +188,6 @@ export function companionsFor(
             if (parent && isStandardObject(parent)) add('CustomObject', parent);
           }
         }
-        profileOrgNote = true;
       } else {
         const found = [...PROFILE_TOP_TYPES, ...PROFILE_OBJECT_CHILD_TYPES].flatMap(t => localOf(t));
         for (const i of found) add(i.type, i.name);
@@ -213,10 +223,74 @@ export function companionsFor(
   if (fallbackProfiles.length > 0) {
     note.push(`${ctx.orgItems ? 'no standard objects in the org list' : 'org list not loaded'} — standard objects for ${fallbackProfiles.join(', ')} were taken from the project; Fetch Org to include the org's standard objects`);
   }
-  if (profileOrgNote) {
-    note.push('scope "org" asks for every component of the profile\'s types on the org — slow on big orgs; a CustomObject wildcard covers custom objects only, so standard objects are named one by one');
+  return { companions, note, incomplete, partial, own };
+}
+
+const NOUNS: Readonly<Record<string, readonly [string, string]>> = {
+  CustomApplication: ['app', 'apps'], CustomTab: ['tab', 'tabs'], Flow: ['flow', 'flows'],
+  QuickAction: ['quick action', 'quick actions'], ReportType: ['report type', 'report types'],
+  CustomObject: ['object', 'objects'], CustomField: ['field', 'fields'], RecordType: ['record type', 'record types'],
+  ApexClass: ['class', 'classes'], ApexPage: ['page', 'pages'], Layout: ['layout', 'layouts'],
+  CustomPermission: ['custom permission', 'custom permissions'], ExternalDataSource: ['data source', 'data sources'],
+  ListView: ['list view', 'list views'], WebLink: ['button or link', 'buttons and links'], ValidationRule: ['validation rule', 'validation rules'],
+  CompactLayout: ['compact layout', 'compact layouts'], BusinessProcess: ['business process', 'business processes'],
+  FieldSet: ['field set', 'field sets'], Index: ['index', 'indexes'], SharingReason: ['sharing reason', 'sharing reasons']
+};
+
+/** `the labels, 11 tabs, 33 apps` — what one item's companions are, by type. */
+export function countPhrase(companions: readonly Companion[]): string {
+  const byType = new Map<string, number>();
+  for (const c of companions) byType.set(c.type, (byType.get(c.type) ?? 0) + 1);
+  return [...byType].map(([type, n]) => {
+    if (type === 'CustomLabels') return 'the labels';
+    const noun = NOUNS[type];
+    return noun ? `${n} ${n === 1 ? noun[0] : noun[1]}` : `${n} ${type}`;
+  }).join(', ');
+}
+
+const ORG_WHOLESALE: Readonly<Record<string, string>> = {
+  Profile: 'every object, field, record type, class, page, app, tab, layout, custom permission, flow and external data source on the org',
+  Translations: 'every label, app, tab, flow, quick action and report type on the org'
+};
+const TO_PROJECT = 'set sfOrgDeployWrapper.contextScope to "project" to limit it to this project';
+const TO_ORG = 'scope: project; set sfOrgDeployWrapper.contextScope to "org" for everything';
+
+/**
+ * One line per selected context item saying what it comes back with — the
+ * dialog's (and, in project scope, the run's) promise, so it has to be exact:
+ *   - scope org, filled from the org: "complete", and what is fetched wholesale
+ *     (minutes on a big org);
+ *   - scope org, filled from the project only (no Fetch Org list): "complete only
+ *     for what the project knows" — the plan's note says why;
+ *   - scope project: never "complete" — completed for this project's components
+ *     only, with what they are, and what is left out;
+ *   - nothing to send (project scope found none): no line; the LOUD note speaks.
+ */
+export function describeContext(selected: ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>>, plan: CompanionPlan, scope: Scope): string[] {
+  const lines: string[] = [];
+  for (const item of selected.filter(i => CONTEXT_TYPES.has(i.type))) {
+    const key = `${item.type}:${item.name}`;
+    if (plan.incomplete.includes(key)) continue;
+    const mine = plan.own[key] ?? [];
+    if (scope === 'org') {
+      if (plan.partial.includes(key)) { lines.push(`${key}: complete only for what the project knows.`); continue; }
+      if (item.type === 'CustomObjectTranslation') {
+        const extra = mine.filter(c => c.type !== 'CustomObject');
+        lines.push(`${key}: fetched with its object${extra.length ? ` and the org's ${countPhrase(extra)}` : ''} so it comes back complete.`);
+      } else {
+        lines.push(`${key}: fetched with ${ORG_WHOLESALE[item.type]} so it comes back complete — minutes on a big org; ${TO_PROJECT}.`);
+      }
+      continue;
+    }
+    if (item.type === 'CustomObjectTranslation') {
+      const extra = mine.filter(c => c.type !== 'CustomObject');
+      lines.push(`${key}: completed for its object and this project's layouts and quick actions only (${extra.length ? countPhrase(extra) : 'none in this project'}) — the org's other layout and quick-action translations are left out (${TO_ORG}).`);
+    } else {
+      const leftOut = item.type === 'Profile' ? 'permissions' : 'translations';
+      lines.push(`${key}: completed for this project's components only (${countPhrase(mine)}) — the org's other ${leftOut} are left out (${TO_ORG}).`);
+    }
   }
-  return { companions, note, incomplete, partial };
+  return lines;
 }
 
 /** The loud one: project scope had nothing to send, so the org will answer with
@@ -273,6 +347,13 @@ export function isCompanionMessage(
     if (selectedKeys.has(key)) return false;
     return companions.some(c => c.type === named[1] && (c.name === named[2] || c.name === WILDCARD));
   }
+  // A message that names a component without the "type X named Y" shape ("Not a
+  // registered filter type: ConversationEntryCopy"): about a companion when it
+  // names one and nothing the user picked.
+  const mentions = (name: string): boolean =>
+    new RegExp(`(^|[^A-Za-z0-9_])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^A-Za-z0-9_]|$)`).test(problem);
+  if (selected.some(i => mentions(i.name))) return false;
+  if (companions.some(c => c.name !== WILDCARD && mentions(c.name))) return true;
   const selectedTypes = new Set(selected.map(i => i.type));
   return companions.some(c => !selectedTypes.has(c.type) && new RegExp(`\\b${c.type}\\b`).test(problem));
 }

@@ -69,7 +69,7 @@ const RR = require(path.join(ROOT, 'out', 'runRecords.js'));
 const finished = [];
 const realFromResult = RR.retrieveRunFromResult;
 RR.retrieveRunFromResult = (result, input) => { finished.push(JSON.parse(JSON.stringify({ result, input }))); return realFromResult(result, input); };
-const { DeployPanelProvider, folderState, rowOwnerKey } = require(path.join(ROOT, 'out', 'panelProvider.js'));
+const { DeployPanelProvider, folderState, rowOwnerKey, PROJECT_SCOPE_DIFF_LINE } = require(path.join(ROOT, 'out', 'panelProvider.js'));
 const { SfCliError, SfCliCancelledError } = require(path.join(ROOT, 'out', 'sfCliService.js'));
 const proto = DeployPanelProvider.prototype;
 
@@ -78,9 +78,12 @@ const queue = [];
 const check = (name, fn) => queue.push([name, fn]);
 
 const ORG = 'acme-dev-user';
-const reset = () => {
+/** Clean slate; `scope` pins contextScope for a check written for that scope
+ *  — without it the DEFAULT (org) is what runs. */
+const reset = (scope) => {
   ui.warns.length = 0; ui.diffs.length = 0; ui.notices.length = 0; finished.length = 0;
   for (const k of Object.keys(config)) delete config[k];
+  if (scope) config.contextScope = scope;
   for (const fn of editorListeners.splice(0)) fn([]);
 };
 
@@ -251,6 +254,16 @@ async function makeProject(name, opts = {}) {
     ];
     add('CustomObjectTranslation', 'Product2-pl', dir, files);
   }
+  if (opts.object) {
+    // true: the org's exact definition and field; 'differs': an older local
+    // definition; 'fieldsOnly': a standard object the project has only a field of.
+    const dir = path.join(proj, D, 'objects', 'Product2');
+    const field = await w(path.join(D, 'objects', 'Product2', 'fields', 'Status__c.field-meta.xml'), 'ORG FIELD');
+    const def = opts.object === 'fieldsOnly' ? undefined
+      : await w(path.join(D, 'objects', 'Product2', 'Product2.object-meta.xml'), opts.object === 'differs' ? 'LOCAL OBJECT' : 'ORG OBJECT');
+    add('CustomObject', 'Product2', dir, def ? [def, field] : [field]);
+    add('CustomField', 'Product2.Status__c', field);
+  }
   for (let n = 0; n < (opts.classes ?? 0); n++) {
     const cls = await w(path.join(D, 'classes', `AcmeBulk${n}.cls`), `public class AcmeBulk${n} {}`);
     add('ApexClass', `AcmeBulk${n}`, cls, [cls]);
@@ -311,10 +324,12 @@ const lastRun = (p) => p.posted.filter(m => m.type === 'runs').slice(-1)[0];
 const retrieve = (p, keys) => proto.runRetrieve.call(p.s, keys);
 const rel = (p, ...s) => path.join('core', 'main', 'default', ...s);
 const tempOf = (call) => path.dirname(call.cwd); // <tmp>/sf-deploy-retrieve-xxx
+const PROJECT_TAIL = '(scope: project; set sfOrgDeployWrapper.contextScope to "org" for everything)';
+const TO_PROJECT = 'set sfOrgDeployWrapper.contextScope to "project" to limit it to this project';
 
 // ================================================================ retrieve
 check('retrieve: Translations:pl + ApexClass:Foo → two calls; only the translation and the class reach the project', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r1');
   const before = await snapshot(proj);
   const p = provider(proj, items);
@@ -345,7 +360,7 @@ check('retrieve: Translations:pl + ApexClass:Foo → two calls; only the transla
 });
 
 check('retrieve: the backup covers the translation; the modal discloses the companions first', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r2');
   const p = provider(proj, items);
   await retrieve(p, ['Translations:pl', 'ApexClass:Foo']);
@@ -355,11 +370,13 @@ check('retrieve: the backup covers the translation; the modal discloses the comp
   const mlines = modal.detail.split('\n');
   // The count is for everything that rides along — on its own line, never beside a subset.
   assert.ok(mlines.includes('2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours.'), modal.detail);
-  assert.ok(mlines.includes('Translations:pl: comes back complete.'), modal.detail);
+  // Project scope never promises "complete": it says what the file is completed for.
+  assert.ok(mlines.includes(`Translations:pl: completed for this project's components only (the labels, 1 tab) — the org's other translations are left out ${PROJECT_TAIL}.`), modal.detail);
+  assert.ok(!mlines.some(l => l.includes('back complete')), modal.detail);
 });
 
 check('retrieve: the run carries project paths, the companion note and what was copied — no companion row, no temp path', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r3');
   const p = provider(proj, items);
   await retrieve(p, ['Translations:pl', 'ApexClass:Foo']);
@@ -367,7 +384,8 @@ check('retrieve: the run carries project paths, the companion note and what was 
   assert.strictEqual(run.status, 'succeeded');
   assert.deepStrictEqual(latestRows.rows.filter(r => r.s === 1).map(r => [r.k, r.o]).sort(), [['ApexClass:Foo', 'created'], ['Translations:pl', 'changed']]);
   assert.ok(!latestRows.rows.some(r => r.k.startsWith('CustomLabels:') || r.k.startsWith('CustomTab:')), JSON.stringify(latestRows.rows));
-  assert.ok(run.notes.includes('companions: CustomLabels:CustomLabels, CustomTab:Acme_Widget__c (scope: project)'), JSON.stringify(run.notes));
+  // …and the run carries the same caveat.
+  assert.ok(run.notes.includes(`Translations:pl: completed for this project's components only (the labels, 1 tab) — the org's other translations are left out ${PROJECT_TAIL}.`), JSON.stringify(run.notes));
   assert.ok(run.notes.includes(`copied into your project: ${rel(p, 'translations', 'pl.translation-meta.xml')}`), JSON.stringify(run.notes));
   // The merged result the run was built from: the translation at its project path.
   const { result } = finished[0];
@@ -387,7 +405,7 @@ check('retrieve: the run carries project paths, the companion note and what was 
 });
 
 check('retrieve, scope org: a NEW translation lands in the default package dir; the temp call is a package.xml with `*`', async () => {
-  reset();
+  reset('project');
   config.contextScope = 'org';
   const { proj, items } = await makeProject('r4', { pl: false, labels: false, tab: false });
   const before = await snapshot(proj);
@@ -429,7 +447,7 @@ async function assertStoppedAfterClass(p, proj, before, word) {
 }
 
 check('retrieve: a Cancel landing as the first call finishes stops the second — the class stays, the translation is left as it was', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r5');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { before: (call, n) => { if (n === 1) proto.cancelCurrent.call(p.s); } } });
@@ -439,7 +457,7 @@ check('retrieve: a Cancel landing as the first call finishes stops the second �
 });
 
 check('retrieve: a Cancel during the temp call, after the project one — partial, the class kept', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r5b');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { honourCancel: true, before: (call, n) => { if (n === 2) proto.cancelCurrent.call(p.s); } } });
@@ -451,7 +469,7 @@ check('retrieve: a Cancel during the temp call, after the project one — partia
 });
 
 check('retrieve: the temp call timing out after the project one — partial, the class kept', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r5c');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined) } });
@@ -461,7 +479,7 @@ check('retrieve: the temp call timing out after the project one — partial, the
 });
 
 check('retrieve: a Cancel between the calls with a folder and a file — each row worded for its shape, the note for both', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r5d', { cot: true });
   const p = provider(proj, items, { hooks: { before: (call, n) => { if (n === 1) proto.cancelCurrent.call(p.s); } } });
   await retrieve(p, ['Translations:pl', 'CustomObjectTranslation:Product2-pl', 'ApexClass:Foo']);
@@ -475,7 +493,7 @@ check('retrieve: a Cancel between the calls with a folder and a file — each ro
 });
 
 check('retrieve: a folder alone stopped after the project retrieve — the toast and note say "files"', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r5e', { cot: true, pl: false, labels: false, tab: false });
   const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined) } });
   await retrieve(p, ['CustomObjectTranslation:Product2-pl', 'ApexClass:Foo']);
@@ -485,7 +503,7 @@ check('retrieve: a folder alone stopped after the project retrieve — the toast
 });
 
 check('retrieve: a failed CHILD row of a selected object is never swallowed by the soft toast of a stopped second half', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r18', { labels: false, tab: true });
   const p = provider(proj, items, { orgOnly: ['CustomObject:Product2'], hooks: {
     fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined),
@@ -498,7 +516,7 @@ check('retrieve: a failed CHILD row of a selected object is never swallowed by t
 });
 
 check('retrieve: failed rows count the components selected — three failed fields of one object are "1 component failed"', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r19', { pl: false, labels: false, tab: false });
   const broken = ['A', 'B', 'C'].map(x => ({ type: 'CustomField', fullName: `Product2.Acme_${x}__c`, state: 'Failed', problem: 'bad', filePath: null }));
   const p = provider(proj, items, { orgOnly: ['CustomObject:Product2'], hooks: { extraRows: () => broken } });
@@ -520,7 +538,7 @@ check('rowOwnerKey: the item itself, an object child → its object, a file insi
 });
 
 check('retrieve: the hidden-panel toast counts the components selected, not the rows the org answered with', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r15', { pl: false, labels: false, tab: false });
   const p = provider(proj, items, { orgOnly: ['CustomObject:Product2'] });
   await retrieve(p, ['CustomObject:Product2']);
@@ -529,7 +547,7 @@ check('retrieve: the hidden-panel toast counts the components selected, not the 
 });
 
 check('retrieve, scope org without the org list: partial items are never "complete", and every note is in the dialog — once', async () => {
-  reset();
+  reset('project');
   config.contextScope = 'org';
   const { proj, items } = await makeProject('r16', { profile: 'LOCAL PROFILE', cot: true });
   const p = provider(proj, items, { orgOnly: [] }); // a list with nothing in it — and for another org below
@@ -537,17 +555,17 @@ check('retrieve, scope org without the org list: partial items are never "comple
   await retrieve(p, ['Profile:Admin', 'CustomObjectTranslation:Product2-pl', 'Translations:pl']);
   const lines = ui.warns.find(w => w.modal).detail.split('\n');
   assert.ok(lines.some(l => /^\d+ companions \(scope: org\) are retrieved alongside, into a temporary project, never written to yours\.$/.test(l)), lines.join('\n'));
-  assert.ok(lines.includes('Translations:pl: comes back complete.'), lines.join('\n'));
-  assert.ok(lines.includes('Profile:Admin, CustomObjectTranslation:Product2-pl: complete only for what the project knows.'), lines.join('\n'));
+  assert.ok(lines.includes(`Translations:pl: fetched with every label, app, tab, flow, quick action and report type on the org so it comes back complete — minutes on a big org; ${TO_PROJECT}.`), lines.join('\n'));
+  assert.ok(lines.includes('Profile:Admin: complete only for what the project knows.'), lines.join('\n'));
+  assert.ok(lines.includes('CustomObjectTranslation:Product2-pl: complete only for what the project knows.'), lines.join('\n'));
   assert.ok(!lines.some(l => (l.includes('Profile:Admin') || l.includes('Product2-pl')) && l.includes('back complete')), lines.join('\n'));
   assert.ok(lines.includes('org list not loaded — layouts and quick actions for Product2-pl were taken from the project; Fetch Org for the org\'s full set'), lines.join('\n'));
   assert.ok(lines.includes('org list not loaded — standard objects for Profile:Admin were taken from the project; Fetch Org to include the org\'s standard objects'), lines.join('\n'));
-  assert.ok(lines.some(l => l.startsWith('scope "org" asks for every component of the profile\'s types')), lines.join('\n'));
   assert.ok(!lines.some(l => l.startsWith('companions: ')), 'the summary is in the first line already, never twice');
 });
 
 check('retrieve, scope org, only partial items: the first line still says what rides along', async () => {
-  reset();
+  reset('project');
   config.contextScope = 'org';
   const { proj, items } = await makeProject('r17', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
   const p = provider(proj, items);
@@ -560,20 +578,20 @@ check('retrieve, scope org, only partial items: the first line still says what r
 });
 
 check('retrieve: an item project scope can\'t fill is never promised "complete" — the dialog says it comes back nearly empty', async () => {
-  reset();
+  reset('project');
   // A class and a profile, but no labels, apps, tabs, flows, quick actions or report types.
   const { proj, items } = await makeProject('r13', { profile: 'LOCAL PROFILE', labels: false, tab: false, missingTab: false });
   const p = provider(proj, items);
   await retrieve(p, ['Translations:pl', 'Profile:Admin']);
   const lines = ui.warns.find(w => w.modal).detail.split('\n');
   assert.ok(lines.includes('2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours.'), lines.join('\n'));
-  assert.ok(lines.includes('Profile:Admin: comes back complete.'), lines.join('\n'));
+  assert.ok(lines.includes(`Profile:Admin: completed for this project's components only (1 class, 1 field) — the org's other permissions are left out ${PROJECT_TAIL}.`), lines.join('\n'));
   assert.ok(!lines.some(l => l.includes('Translations:pl') && l.includes('complete.')), lines.join('\n'));
   assert.ok(lines.includes('project scope found no CustomLabels/CustomApplication/CustomTab/Flow/QuickAction/ReportType in this project — Translations:pl will come back nearly empty; set sfOrgDeployWrapper.contextScope to "org"'), lines.join('\n'));
 });
 
 check('retrieve, scope org: the org list\'s standard objects ride beside CustomObject:*, its custom ones never by name', async () => {
-  reset();
+  reset('project');
   config.contextScope = 'org';
   const { proj, items } = await makeProject('r14', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
   const p = provider(proj, items, { orgOnly: ['CustomObject:Account', 'CustomObject:Opportunity', 'CustomObject:Acme_Widget__c'] });
@@ -584,7 +602,7 @@ check('retrieve, scope org: the org list\'s standard objects ride beside CustomO
 });
 
 check('retrieve: a Cancel during the temp call copies nothing', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r6');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { honourCancel: true, before: (call, n) => { if (n === 1) proto.cancelCurrent.call(p.s); } } });
@@ -596,7 +614,7 @@ check('retrieve: a Cancel during the temp call copies nothing', async () => {
 });
 
 check('retrieve: a failed temp retrieve leaves the local translation untouched — alone, an error run', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r7');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { fail: () => new SfCliError('INVALID_SESSION_ID: Session expired or invalid') } });
@@ -608,7 +626,7 @@ check('retrieve: a failed temp retrieve leaves the local translation untouched �
 });
 
 check('retrieve: a failed temp retrieve after the project one — the class is kept, the translation fails alone, untouched', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r8');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('INVALID_TYPE: something went wrong') : undefined) } });
@@ -625,14 +643,14 @@ check('retrieve: a failed temp retrieve after the project one — the class is k
 });
 
 check('retrieve: an object translation folder is MERGED — org files overwrite, a local-only file stays; the object never lands', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r9', { cot: true });
   const before = await snapshot(proj);
   const p = provider(proj, items);
   await retrieve(p, ['CustomObjectTranslation:Product2-pl']);
   assert.strictEqual(p.calls.length, 1);
   assert.deepStrictEqual(p.calls[0].requested, ['CustomObjectTranslation:Product2-pl', 'CustomObject:Product2']);
-  assert.ok(ui.warns.find(w => w.modal).detail.includes('1 companion (scope: project) is retrieved alongside, into a temporary project, never written to yours.\nCustomObjectTranslation:Product2-pl: comes back complete.'));
+  assert.ok(ui.warns.find(w => w.modal).detail.includes(`1 companion (scope: project) is retrieved alongside, into a temporary project, never written to yours.\nCustomObjectTranslation:Product2-pl: completed for its object and this project's layouts and quick actions only (none in this project) — the org's other layout and quick-action translations are left out ${PROJECT_TAIL}.`));
   // The hidden-panel toast counts components, not the folder's three file rows.
   assert.deepStrictEqual(p.notices, [['ok', 'Retrieved 1 component from acme-dev']]);
   const dir = rel(p, 'objectTranslations', 'Product2-pl');
@@ -662,7 +680,7 @@ check('retrieve: a merged folder\'s row — created when nothing existed, unchan
     ['r9d', { cot: 'parentSame' }, [], 'changed']
   ];
   for (const [name, opts, orgOnly, want] of cases) {
-    reset();
+    reset('project');
     const { proj, items } = await makeProject(name, { pl: false, labels: false, tab: false, ...opts });
     const p = provider(proj, items, { orgOnly });
     await retrieve(p, ['CustomObjectTranslation:Product2-pl']);
@@ -674,7 +692,7 @@ check('retrieve: a merged folder\'s row — created when nothing existed, unchan
 });
 
 check('retrieve: a profile comes back with what its companions describe; the local class body stays', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r10', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
   const before = await snapshot(proj);
   const p = provider(proj, items);
@@ -691,7 +709,7 @@ check('retrieve: a profile comes back with what its companions describe; the loc
 });
 
 check('retrieve, companions off: ONE call into the project as before, and the run says so', async () => {
-  reset();
+  reset('project');
   config.contextCompanions = false;
   const { proj, items } = await makeProject('r11');
   const p = provider(proj, items);
@@ -703,7 +721,7 @@ check('retrieve, companions off: ONE call into the project as before, and the ru
 });
 
 check('retrieve, project scope with nothing to send: one call, and the LOUD note in the modal and on the run', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('r12', { labels: false, tab: false });
   const p = provider(proj, items);
   await retrieve(p, ['Translations:pl']);
@@ -726,7 +744,7 @@ const diffCards = (p) => p.posted.filter(m => m.type === 'status').map(m => m.ca
 const ORG_PROFILE_WITH_COMPANIONS = orgAnswer(['Profile:Admin', 'ApexClass:AcmeService', 'CustomField:Product2.Status__c'], '62.0').out[0].body;
 
 check('diff: the retrieve carries the companions; the profile opens ONE editor, companions none, a missing companion is not "not on org"', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('d1', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
   const p = diffProvider(proj, items);
   await proto.runDiff.call(p.s, ['Profile:Admin']);
@@ -743,11 +761,13 @@ check('diff: the retrieve carries the companions; the profile opens ONE editor, 
   assert.ok(card.lines.includes('1 message about companions only (e.g. one not on the org) — see the SF Deploy output'), card.lines.join('\n'));
   assert.strictEqual(card.meta, '1 differ · 0 in sync · 0 not on org');
   assert.ok(!p.calls[0].opts.manifest, 'four targets: --metadata');
+  // Project scope compares what the org says about THIS project's components only.
+  assert.ok(card.lines.includes(PROJECT_SCOPE_DIFF_LINE), card.lines.join('\n'));
   assert.strictEqual(p.calls[0].project.sourceApiVersion, '62.0', 'the temp project carries the project\'s API version');
 });
 
 check('diff: above MANIFEST_THRESHOLD the retrieve is a package.xml, like a retrieve', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('d5', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false, classes: 30 });
   const p = diffProvider(proj, items);
   await proto.runDiff.call(p.s, ['Profile:Admin']);
@@ -759,7 +779,7 @@ check('diff: above MANIFEST_THRESHOLD the retrieve is a package.xml, like a retr
 
 check('retrieve, then diff the same three: All 3 in sync — in both scopes', async () => {
   for (const scope of ['project', 'org']) {
-    reset();
+    reset('project');
     config.contextScope = scope;
     const { proj, items } = await makeProject(`rd-${scope}`, { profile: 'LOCAL PROFILE', cot: 'parentSame' });
     const keys = ['Translations:pl', 'CustomObjectTranslation:Product2-pl', 'Profile:Admin'];
@@ -774,7 +794,7 @@ check('retrieve, then diff the same three: All 3 in sync — in both scopes', as
 });
 
 check('diff: a profile identical to the org\'s complete one → All 1 in sync (companions are not counted)', async () => {
-  reset();
+  reset('project');
   const { proj, items } = await makeProject('d2', { profile: ORG_PROFILE_WITH_COMPANIONS, pl: false, labels: false, tab: false });
   const p = diffProvider(proj, items);
   await proto.runDiff.call(p.s, ['Profile:Admin']);
@@ -784,7 +804,7 @@ check('diff: a profile identical to the org\'s complete one → All 1 in sync (c
 });
 
 check('diff, scope org: a package.xml with `*` for each type', async () => {
-  reset();
+  reset('project');
   config.contextScope = 'org';
   const { proj, items } = await makeProject('d3', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
   const p = diffProvider(proj, items);
@@ -796,17 +816,79 @@ check('diff, scope org: a package.xml with `*` for each type', async () => {
   // the local file was written at.
   assert.ok(p.calls[0].manifestXml.includes('<version>62.0</version>'), p.calls[0].manifestXml);
   assert.strictEqual(p.calls[0].project.sourceApiVersion, '62.0');
+  assert.ok(!diffCards(p)[0].lines.includes(PROJECT_SCOPE_DIFF_LINE), 'scope org compares everything');
   assert.strictEqual(ui.diffs.length, 1);
 });
 
 check('diff, companions off: the profile alone, and the card says so', async () => {
-  reset();
+  reset('project');
   config.contextCompanions = false;
   const { proj, items } = await makeProject('d4', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
   const p = diffProvider(proj, items);
   await proto.runDiff.call(p.s, ['Profile:Admin']);
   assert.deepStrictEqual(p.calls[0].requested, ['Profile:Admin']);
   assert.ok(diffCards(p)[0].lines.includes('retrieved without companions'));
+});
+
+// ============================================================ the default
+check('DEFAULT scope is org: everything of the companion types, as `*`, and the dialog says what and how long', async () => {
+  reset(); // no contextScope set — whatever the extension defaults to
+  const { proj, items } = await makeProject('def1');
+  const p = provider(proj, items);
+  await retrieve(p, ['Translations:pl']);
+  const temp = p.calls[0];
+  assert.ok(temp.opts.manifest && temp.manifestXml.includes('<members>*</members>\n    <name>CustomLabels</name>'), temp.manifestXml || temp.metadata.join(' '));
+  const lines = ui.warns.find(w => w.modal).detail.split('\n');
+  assert.ok(lines.includes(`Translations:pl: fetched with every label, app, tab, flow, quick action and report type on the org so it comes back complete — minutes on a big org; ${TO_PROJECT}.`), lines.join('\n'));
+  assert.ok(lines.includes('6 companions (scope: org) are retrieved alongside, into a temporary project, never written to yours.'), lines.join('\n'));
+});
+
+// ============================================================ object rows
+const ALL_IN_SYNC = 'Nothing opened — the org copy and your local copy are byte-identical (line endings ignored)';
+check('diff: an object\'s group (its row + its field), all identical → All 2 in sync, the object row compared by its definition file', async () => {
+  reset('project');
+  const { proj, items } = await makeProject('o1', { object: true, pl: false, labels: false, tab: false });
+  const p = diffProvider(proj, items);
+  await proto.runDiff.call(p.s, ['CustomObject:Product2', 'CustomField:Product2.Status__c']);
+  assert.strictEqual(ui.diffs.length, 0);
+  const card = diffCards(p)[0];
+  assert.deepStrictEqual([card.kind, card.title, card.meta], ['ok', 'All 2 in sync with acme-dev', '0 differ · 2 in sync · 0 not on org'], JSON.stringify(card));
+  assert.ok(card.lines.includes('in sync: CustomObject:Product2/Product2.object-meta.xml, CustomField:Product2.Status__c'), card.lines.join('\n'));
+  assert.deepStrictEqual(p.notices, [['ok', `All 2 in sync with acme-dev — ${ALL_IN_SYNC}`]]);
+});
+
+check('diff: a differing object definition opens ONE editor on the FILE — never the folder', async () => {
+  reset('project');
+  const { proj, items } = await makeProject('o2', { object: 'differs', pl: false, labels: false, tab: false });
+  const p = diffProvider(proj, items);
+  await proto.runDiff.call(p.s, ['CustomObject:Product2']);
+  assert.strictEqual(ui.diffs.length, 1);
+  const d = ui.diffs[0];
+  assert.strictEqual(d.right, path.join(proj, 'core', 'main', 'default', 'objects', 'Product2', 'Product2.object-meta.xml'));
+  assert.strictEqual(fs.readFileSync(d.left, 'utf8'), 'ORG OBJECT');
+  assert.ok(d.title.startsWith('CustomObject:Product2/Product2.object-meta.xml'), d.title);
+  assert.ok(diffCards(p)[0].lines.includes('✓ opened diff: CustomObject:Product2/Product2.object-meta.xml'));
+});
+
+check('diff: an object with no definition file in the project says so — and an identical field still reads All 1 in sync, ok', async () => {
+  reset('project');
+  const { proj, items } = await makeProject('o3', { object: 'fieldsOnly', pl: false, labels: false, tab: false });
+  const p = diffProvider(proj, items);
+  await proto.runDiff.call(p.s, ['CustomObject:Product2', 'CustomField:Product2.Status__c']);
+  const card = diffCards(p)[0];
+  assert.deepStrictEqual([card.kind, card.title, card.meta], ['ok', 'All 1 in sync with acme-dev', '0 differ · 1 in sync · 0 not on org'], JSON.stringify(card));
+  assert.ok(card.lines.includes('— CustomObject:Product2 — no object definition file in this project; its fields and rules are compared as their own rows'), card.lines.join('\n'));
+  assert.deepStrictEqual(p.notices.map(n => n[0]), ['ok'], 'informational, not a warning');
+});
+
+check('diff: ONLY an object row with no definition file → Nothing to diff (warn), nothing opened', async () => {
+  reset('project');
+  const { proj, items } = await makeProject('o4', { object: 'fieldsOnly', pl: false, labels: false, tab: false });
+  const p = diffProvider(proj, items);
+  await proto.runDiff.call(p.s, ['CustomObject:Product2']);
+  const card = diffCards(p)[0];
+  assert.deepStrictEqual([card.kind, card.title], ['warn', 'Nothing to diff']);
+  assert.strictEqual(ui.diffs.length, 0);
 });
 
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
