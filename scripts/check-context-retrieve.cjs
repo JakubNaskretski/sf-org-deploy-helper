@@ -69,7 +69,7 @@ const RR = require(path.join(ROOT, 'out', 'runRecords.js'));
 const finished = [];
 const realFromResult = RR.retrieveRunFromResult;
 RR.retrieveRunFromResult = (result, input) => { finished.push(JSON.parse(JSON.stringify({ result, input }))); return realFromResult(result, input); };
-const { DeployPanelProvider } = require(path.join(ROOT, 'out', 'panelProvider.js'));
+const { DeployPanelProvider, folderState } = require(path.join(ROOT, 'out', 'panelProvider.js'));
 const { SfCliError, SfCliCancelledError } = require(path.join(ROOT, 'out', 'sfCliService.js'));
 const proto = DeployPanelProvider.prototype;
 
@@ -88,8 +88,10 @@ const reset = () => {
 const NS = 'xmlns="http://soap.sforce.com/2006/04/metadata"';
 const ORG_CLASS = { AcmeService: 'public class AcmeService { /* org */ }', Foo: 'public class Foo {}' };
 /** What the org answers for one retrieve, given everything named in it.
- *  `requested` holds Type:Name keys (a `*` member matches the whole type). */
-function orgAnswer(requested) {
+ *  `requested` holds Type:Name keys (a `*` member matches the whole type).
+ *  `apiVersion` undefined = the org's max: a profile then carries an element
+ *  the project's 62.0 can't have, exactly as the real org does. */
+function orgAnswer(requested, apiVersion) {
   const has = (type, name) => requested.some(k => k === `${type}:${name}` || k === `${type}:*`);
   const hasType = (type) => requested.some(k => k.startsWith(`${type}:`));
   const out = []; // { type, fullName, rel, body } — rel under <pkg>/main/default
@@ -118,12 +120,14 @@ function orgAnswer(requested) {
       const parts = ['    <userPermissions>\n        <enabled>true</enabled>\n        <name>ApiEnabled</name>\n    </userPermissions>'];
       for (const c of Object.keys(ORG_CLASS)) if (has('ApexClass', c)) parts.push(`    <classAccesses>\n        <apexClass>${c}</apexClass>\n        <enabled>true</enabled>\n    </classAccesses>`);
       if (has('CustomField', 'Product2.Status__c') || has('CustomObject', 'Product2')) parts.push('    <fieldPermissions>\n        <field>Product2.Status__c</field>\n        <readable>true</readable>\n    </fieldPermissions>');
+      if (apiVersion === undefined) parts.push('    <objectPermissions>\n        <object>Product2</object>\n        <viewAllFields>false</viewAllFields>\n    </objectPermissions>');
       out.push({ type, fullName: 'Admin', rel: 'profiles/Admin.profile-meta.xml', body: `<?xml version="1.0" encoding="UTF-8"?>\n<Profile ${NS}>\n${parts.join('\n')}\n</Profile>\n` });
     } else if (type === 'CustomObjectTranslation') {
       if (name !== 'Product2-pl') { missing.push([type, name]); continue; }
+      // The real CLI reports EVERY file of the folder as a row of the component.
       out.push({ type, fullName: name, rel: `objectTranslations/${name}/${name}.objectTranslation-meta.xml`, body: 'ORG PARENT' });
       if (has('CustomObject', 'Product2')) {
-        for (const f of ['Status__c', 'Family']) out.push({ type: 'CustomFieldTranslation', fullName: `${name}.${f}`, rel: `objectTranslations/${name}/${f}.fieldTranslation-meta.xml`, body: `ORG ${f}` });
+        for (const f of ['Status__c', 'Family']) out.push({ type, fullName: name, rel: `objectTranslations/${name}/${f}.fieldTranslation-meta.xml`, body: `ORG ${f}` });
       }
     } else if (type === 'CustomObject') {
       if (name !== 'Product2' && name !== '*') { missing.push([type, name]); continue; }
@@ -165,6 +169,8 @@ function fakeSf(calls, hooks = {}) {
       const call = { metadata: [...metadata], cwd, opts, manifestXml: opts.manifest ? fs.readFileSync(opts.manifest, 'utf8') : undefined, cancelled: false,
         project: JSON.parse(fs.readFileSync(path.join(cwd, 'sfdx-project.json'), 'utf8')) };
       call.requested = call.manifestXml ? manifestKeys(call.manifestXml) : call.metadata;
+      // A package.xml <version> wins over the project's sourceApiVersion.
+      call.apiVersion = (call.manifestXml && /<version>([^<]+)<\/version>/.exec(call.manifestXml) || [])[1] ?? call.project.sourceApiVersion;
       calls.push(call);
       const n = calls.length;
       const promise = (async () => {
@@ -173,7 +179,7 @@ function fakeSf(calls, hooks = {}) {
         if (call.cancelled && hooks.honourCancel) throw new SfCliCancelledError();
         const err = hooks.fail && hooks.fail(call, n);
         if (err) throw err;
-        const { out, missing } = orgAnswer(call.requested);
+        const { out, missing } = orgAnswer(call.requested, call.apiVersion);
         const pkg = await defaultPkg(cwd);
         const files = [];
         for (const f of out) {
@@ -226,13 +232,27 @@ async function makeProject(name, opts = {}) {
     add('CustomTab', 'Acme_Missing__c', await w(path.join(D, 'tabs', 'Acme_Missing__c.tab-meta.xml'), 'NEVER DEPLOYED'));
   }
   if (opts.cot) {
+    // true: an older local copy; 'same': exactly the org's; 'parentSame': the
+    // org's parent and Status__c, no Family yet.
     const dir = path.join(proj, D, 'objectTranslations', 'Product2-pl');
-    const files = [
-      await w(path.join(D, 'objectTranslations', 'Product2-pl', 'Product2-pl.objectTranslation-meta.xml'), 'LOCAL PARENT'),
-      await w(path.join(D, 'objectTranslations', 'Product2-pl', 'Status__c.fieldTranslation-meta.xml'), 'LOCAL Status__c'),
-      await w(path.join(D, 'objectTranslations', 'Product2-pl', 'LocalOnly__c.fieldTranslation-meta.xml'), 'LOCAL ONLY')
+    const T = (f) => path.join(D, 'objectTranslations', 'Product2-pl', f);
+    const files = opts.cot === 'same' ? [
+      await w(T('Product2-pl.objectTranslation-meta.xml'), 'ORG PARENT'),
+      await w(T('Status__c.fieldTranslation-meta.xml'), 'ORG Status__c'),
+      await w(T('Family.fieldTranslation-meta.xml'), 'ORG Family')
+    ] : opts.cot === 'parentSame' ? [
+      await w(T('Product2-pl.objectTranslation-meta.xml'), 'ORG PARENT'),
+      await w(T('Status__c.fieldTranslation-meta.xml'), 'ORG Status__c')
+    ] : [
+      await w(T('Product2-pl.objectTranslation-meta.xml'), 'LOCAL PARENT'),
+      await w(T('Status__c.fieldTranslation-meta.xml'), 'LOCAL Status__c'),
+      await w(T('LocalOnly__c.fieldTranslation-meta.xml'), 'LOCAL ONLY')
     ];
     add('CustomObjectTranslation', 'Product2-pl', dir, files);
+  }
+  for (let n = 0; n < (opts.classes ?? 0); n++) {
+    const cls = await w(path.join(D, 'classes', `AcmeBulk${n}.cls`), `public class AcmeBulk${n} {}`);
+    add('ApexClass', `AcmeBulk${n}`, cls, [cls]);
   }
   return { proj, items };
 }
@@ -453,11 +473,31 @@ check('retrieve: an object translation folder is MERGED — org files overwrite,
   assert.ok(!fs.existsSync(path.join(proj, 'app', 'main', 'default', 'objects')), 'the companion object was not written');
   const { runs: [run] } = lastRun(p);
   assert.ok(run.notes.includes(`copied into your project: ${dir}${path.sep} (3 files)`), JSON.stringify(run.notes));
-  const fieldRow = finished[0].result.inboundFiles.find(f => f.fullName === 'Product2-pl.Family');
-  assert.strictEqual(fieldRow.filePath, path.join(proj, dir, 'Family.fieldTranslation-meta.xml'));
-  // States describe the PROJECT copy, not the throwaway one where everything is new.
-  const byName = Object.fromEntries(finished[0].result.inboundFiles.map(f => [f.fullName, f.state]));
-  assert.deepStrictEqual([byName['Product2-pl'], byName['Product2-pl.Status__c'], byName['Product2-pl.Family']], ['Changed', 'Changed', 'Created']);
+  // Every file row at its project path…
+  assert.deepStrictEqual(finished[0].result.inboundFiles.map(f => path.relative(proj, f.filePath)).sort(), [
+    path.join(dir, 'Family.fieldTranslation-meta.xml'), path.join(dir, 'Product2-pl.objectTranslation-meta.xml'), path.join(dir, 'Status__c.fieldTranslation-meta.xml')
+  ]);
+  // …and the folder is ONE component: an existing parent overwritten → changed,
+  // even though a field file is new (the strongest-state pick would say created).
+  assert.deepStrictEqual(lastRun(p).latestRows.rows.map(r => [r.k, r.o]), [['CustomObjectTranslation:Product2-pl', 'changed']]);
+});
+
+check('retrieve: a merged folder\'s row — created when nothing existed, unchanged when identical, changed when files were added', async () => {
+  const cases = [
+    ['r9b', {}, ['CustomObjectTranslation:Product2-pl'], 'created'],
+    ['r9c', { cot: 'same' }, [], 'unchanged'],
+    ['r9d', { cot: 'parentSame' }, [], 'changed']
+  ];
+  for (const [name, opts, orgOnly, want] of cases) {
+    reset();
+    const { proj, items } = await makeProject(name, { pl: false, labels: false, tab: false, ...opts });
+    const p = provider(proj, items, { orgOnly });
+    await retrieve(p, ['CustomObjectTranslation:Product2-pl']);
+    assert.deepStrictEqual(lastRun(p).latestRows.rows.map(r => [r.k, r.o]), [['CustomObjectTranslation:Product2-pl', want]], name);
+    assert.ok(fs.existsSync(path.join(proj, opts.cot ? 'core' : 'app', 'main', 'default', 'objectTranslations', 'Product2-pl', 'Family.fieldTranslation-meta.xml')), name);
+  }
+  assert.strictEqual(folderState([]), 'Unchanged');
+  assert.strictEqual(folderState(['Created', 'Unchanged']), 'Changed');
 });
 
 check('retrieve: a profile comes back with what its companions describe; the local class body stays', async () => {
@@ -510,7 +550,7 @@ function diffProvider(proj, items, hooks) {
   return p;
 }
 const diffCards = (p) => p.posted.filter(m => m.type === 'status').map(m => m.card);
-const ORG_PROFILE_WITH_COMPANIONS = orgAnswer(['Profile:Admin', 'ApexClass:AcmeService', 'CustomField:Product2.Status__c']).out[0].body;
+const ORG_PROFILE_WITH_COMPANIONS = orgAnswer(['Profile:Admin', 'ApexClass:AcmeService', 'CustomField:Product2.Status__c'], '62.0').out[0].body;
 
 check('diff: the retrieve carries the companions; the profile opens ONE editor, companions none, a missing companion is not "not on org"', async () => {
   reset();
@@ -529,6 +569,35 @@ check('diff: the retrieve carries the companions; the profile opens ONE editor, 
   assert.ok(card.lines.includes('companions: ApexClass:AcmeService, CustomTab:Acme_Missing__c, CustomField:Product2.Status__c (scope: project)'), card.lines.join('\n'));
   assert.ok(card.lines.includes('1 message about companions only (e.g. one not on the org) — see the SF Deploy output'), card.lines.join('\n'));
   assert.strictEqual(card.meta, '1 differ · 0 in sync · 0 not on org');
+  assert.ok(!p.calls[0].opts.manifest, 'four targets: --metadata');
+  assert.strictEqual(p.calls[0].project.sourceApiVersion, '62.0', 'the temp project carries the project\'s API version');
+});
+
+check('diff: above MANIFEST_THRESHOLD the retrieve is a package.xml, like a retrieve', async () => {
+  reset();
+  const { proj, items } = await makeProject('d5', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false, classes: 30 });
+  const p = diffProvider(proj, items);
+  await proto.runDiff.call(p.s, ['Profile:Admin']);
+  assert.ok(p.calls[0].requested.length > 30, String(p.calls[0].requested.length));
+  assert.ok(p.calls[0].opts.manifest, 'over 30 targets must not go as --metadata argv');
+  assert.ok(p.calls[0].manifestXml.includes('<members>AcmeBulk29</members>'));
+  assert.ok(JSON.stringify(p.posted).includes('--manifest '), 'the echoed command names the package.xml');
+});
+
+check('retrieve, then diff the same three: All 3 in sync — in both scopes', async () => {
+  for (const scope of ['project', 'org']) {
+    reset();
+    config.contextScope = scope;
+    const { proj, items } = await makeProject(`rd-${scope}`, { profile: 'LOCAL PROFILE', cot: 'parentSame' });
+    const keys = ['Translations:pl', 'CustomObjectTranslation:Product2-pl', 'Profile:Admin'];
+    await retrieve(provider(proj, items), keys);
+    const d = diffProvider(proj, items);
+    await proto.runDiff.call(d.s, keys);
+    const card = diffCards(d)[0];
+    assert.strictEqual(ui.diffs.length, 0, `${scope}: ${JSON.stringify(ui.diffs.map(x => x.title))}`);
+    // Translations:pl + Profile:Admin + the folder's 3 files, each just written.
+    assert.deepStrictEqual([card.kind, card.title], ['ok', 'All 5 in sync with acme-dev'], `${scope}: ${JSON.stringify(card)}`);
+  }
 });
 
 check('diff: a profile identical to the org\'s complete one → All 1 in sync (companions are not counted)', async () => {
@@ -550,10 +619,10 @@ check('diff, scope org: a package.xml with `*` for each type', async () => {
   assert.ok(p.calls[0].opts.manifest);
   assert.ok(p.calls[0].manifestXml.includes('<members>*</members>\n    <name>ApexClass</name>'), p.calls[0].manifestXml);
   assert.ok(p.calls[0].manifestXml.includes('<members>Admin</members>\n    <name>Profile</name>'));
-  // A diff runs at the org's max API version on BOTH routes (no sourceApiVersion
-  // in its temp project, no <version> in its package.xml).
-  assert.ok(!p.calls[0].manifestXml.includes('<version>'), p.calls[0].manifestXml);
-  assert.ok(!('sourceApiVersion' in p.calls[0].project));
+  // A diff compares at the PROJECT's API version on both routes, the version
+  // the local file was written at.
+  assert.ok(p.calls[0].manifestXml.includes('<version>62.0</version>'), p.calls[0].manifestXml);
+  assert.strictEqual(p.calls[0].project.sourceApiVersion, '62.0');
   assert.strictEqual(ui.diffs.length, 1);
 });
 

@@ -24,7 +24,8 @@ This file starts at the current release; earlier history predates it.
 - **Object translations are in the tree.** `objectTranslations/<Object>-<lang>/` folders are
   listed as one component each and deploy, validate, retrieve and diff like any other; a diff
   compares the folder file by file.
-- **Diff opens only what differs.** Every component is compared with the org first; identical
+- **Diff opens only what differs.** Every component is compared with the org first, at your
+  project's API version (so a file you just retrieved reads as in sync); identical
   files (line endings ignored) are counted on the card instead of opening an editor, and the
   "About to open N diff editors" question is gone. At most `sfOrgDeployWrapper.diffEditorCap`
   editors open (default 10); the rest are listed on the card. When nothing differs the card

@@ -35,10 +35,12 @@ export const PROFILE_OBJECT_CHILD_TYPES: readonly string[] = [
   'ListView', 'RecordType', 'SharingReason', 'ValidationRule', 'WebLink'
 ];
 
-/** The top-level types a Profile grants access to. */
+/** The top-level types a Profile grants access to. Not CustomMetadata: a
+ *  profile's customMetadataTypeAccesses come with the `__mdt` CustomObject, and
+ *  `CustomMetadata:*` would pull every custom metadata RECORD for nothing. */
 export const PROFILE_TOP_TYPES: readonly string[] = [
   'CustomObject', 'ApexClass', 'ApexPage', 'CustomApplication', 'CustomTab', 'Layout',
-  'CustomPermission', 'Flow', 'ExternalDataSource', 'CustomMetadata'
+  'CustomPermission', 'Flow', 'ExternalDataSource'
 ];
 
 /** Of the object children, only fields (fieldPermissions) and record types
@@ -75,7 +77,7 @@ export function translatedObject(name: string): string | undefined {
  *     QuickAction, ReportType — the project's members, or `*` each.
  *   Profile:<name> → CustomObject + its children, ApexClass, ApexPage,
  *     CustomApplication, CustomTab, Layout, CustomPermission, Flow,
- *     ExternalDataSource, CustomMetadata — the project's members (field-granular:
+ *     ExternalDataSource — the project's members (field-granular:
  *     `CustomObject:X` for an object file AND each scanned child, which is what
  *     makes the profile's entries for exactly those come back), or `*` each.
  *

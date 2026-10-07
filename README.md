@@ -51,7 +51,8 @@ and `Translations:pl` as an empty stub — overwriting a complete local file. So
 send these types together with their **companions**: an object translation with its object (and
 its layouts and quick actions), a translation with the labels, apps, tabs, flows, quick actions
 and report types it translates, a profile with the objects, fields, classes, pages, apps, tabs,
-layouts, custom permissions, flows, external data sources and custom metadata it grants access to.
+layouts, custom permissions, flows and external data sources it grants access to (custom metadata
+types come with their objects).
 
 The companions go to a temporary project and are never written to yours — only the profile or
 translation itself is copied back (an object translation folder is merged: files the org sent are

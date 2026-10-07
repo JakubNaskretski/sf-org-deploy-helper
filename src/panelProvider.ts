@@ -4458,7 +4458,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     if (hooks.isCancelled()) throw new SfCliCancelledError();
 
     const pkgDir = await resolveDefaultPackageDir(root);
-    const copies: Array<{ key: string; src: string; dest: string; dir: boolean }> = [];
+    const copies: Array<{ key: string; src: string; dest: string; dir: boolean; state?: 'Created' | 'Changed' | 'Unchanged' }> = [];
     const written: string[] = [];
     // The CLI's own state describes the TEMP project, where every file is new.
     // What the user needs is what happened to THEIR copy.
@@ -4484,14 +4484,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       }
       const dest = item.filePath || path.join(root, pkgDir, 'main', 'default', shape.folder, path.basename(src));
       let count = 1;
+      const dirStates: Array<'Created' | 'Changed' | 'Unchanged'> = [];
       if (shape.dir) {
         const inside = await listFilesUnder(src);
-        for (const f of inside) await copyOne(f, path.join(dest, path.relative(src, f)));
+        for (const f of inside) {
+          const to = path.join(dest, path.relative(src, f));
+          await copyOne(f, to);
+          dirStates.push(stateOf.get(to)!);
+        }
         count = inside.length;
       } else {
         await copyOne(src, dest);
       }
-      copies.push({ key, src, dest, dir: !!shape.dir });
+      copies.push({ key, src, dest, dir: !!shape.dir, state: shape.dir ? folderState(dirStates) : undefined });
       const shown = isUnder(root, dest) ? path.relative(root, dest) : dest;
       written.push(shape.dir ? `${shown}${path.sep} (${count} file${count === 1 ? '' : 's'})` : shown);
       this.output.appendLine(`[Retrieve] ${key}: copied ${shape.dir ? `${count} file${count === 1 ? '' : 's'} ` : ''}from the temp project to ${dest}`);
@@ -4510,7 +4515,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         continue;
       }
       const to = reported && isUnder(copy.src, reported) ? path.join(copy.dest, path.relative(copy.src, reported)) : copy.dest;
-      const ownState = retrieveProblem(f) || f.state === 'Failed' ? undefined : stateOf.get(to);
+      // A folder is ONE component, and the CLI reports each of its files as a row
+      // of that component: every row carries the folder's state, or the run's
+      // strongest-state pick reads one new field file as "created" for a folder
+      // whose existing parent was overwritten.
+      const ownState = retrieveProblem(f) || f.state === 'Failed' ? undefined : copy.dir ? copy.state : stateOf.get(to);
       files.push({ ...f, filePath: to, ...(ownState ? { state: ownState } : {}) });
     }
     // Messages about a companion alone (one not on the org) are not about what
@@ -5479,9 +5488,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // a bogus "not on org". Source format also lands each file at the same relative
           // path as the local copy, so top-level types and decomposed object children
           // (CustomField, ValidationRule, …) both match by name with no separate
-          // MDAPI→source convert step.
+          // MDAPI→source convert step. At the PROJECT's API version: the local file
+          // was written at that version, and the org renders newer-API elements
+          // (a profile's `<viewAllFields>`) that file cannot have — compared at the
+          // org's max, a component retrieved a minute ago would read "differs".
           const proj = path.join(tmpRoot, 'proj');
-          await scaffoldSourceProject(proj);
+          await scaffoldSourceProject(proj, await resolveApiVersion(root));
           // A Profile / Translations / CustomObjectTranslation is only complete
           // beside the components it describes (src/companions.ts) — without them
           // every fieldPermission of a profile reads "only local". Companions ride
@@ -5489,10 +5501,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           const context = this.contextPlanFor(slowItems, org, true);
           companionNotes.push(...context.notes);
           const diffTargets: MetadataItem[] = [...slowItems, ...context.plan.companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
-          // A `*` member only travels in a package.xml.
+          // Same rule as a retrieve: above MANIFEST_THRESHOLD the `--metadata`
+          // argv blows Windows' ~32 KB command line, and a `*` member only
+          // travels in a package.xml.
           let diffManifest: { path: string; dir: string } | undefined;
-          if (hasWildcard(context.plan.companions)) {
-            diffManifest = await this.writeTempManifest(diffTargets, { omitVersion: true });
+          if (diffTargets.length > MANIFEST_THRESHOLD || hasWildcard(context.plan.companions)) {
+            diffManifest = await this.writeTempManifest(diffTargets);
             tmpPaths.push(diffManifest.dir);
           }
           if (diffCancelled) throw new SfCliCancelledError();
@@ -6017,11 +6031,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  retrieve path (MANIFEST_THRESHOLD) — a fresh mkdtemp dir per run, so
    *  concurrent queued runs can never collide. The caller removes it via
    *  cleanupTempManifest once the run is done. */
-  private async writeTempManifest(items: MetadataItem[], opts: { omitVersion?: boolean } = {}): Promise<{ path: string; dir: string }> {
+  private async writeTempManifest(items: MetadataItem[]): Promise<{ path: string; dir: string }> {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-manifest-'));
-    // omitVersion: a diff's retrieve runs at the org's max API version on its
-    // `--metadata` route (see scaffoldSourceProject) — its package.xml must too.
-    const apiVersion = opts.omitVersion ? undefined : await resolveApiVersion(this.workspaceRoot ?? process.cwd());
+    const apiVersion = await resolveApiVersion(this.workspaceRoot ?? process.cwd());
     const file = path.join(dir, 'package.xml');
     await fs.writeFile(file, buildManifestXml(items.map(i => ({ type: i.type, name: i.name })), apiVersion), 'utf8');
     return { path: file, dir };
@@ -7823,6 +7835,16 @@ export async function listFilesUnder(dir: string): Promise<string[]> {
   return out.sort();
 }
 
+/** A merged folder's state from its files' (what happened to the PROJECT copy):
+ *  nothing existed before → Created; every file there and identical →
+ *  Unchanged; anything else (an existing file overwritten, or new files beside
+ *  existing ones) → Changed. */
+export function folderState(states: ReadonlyArray<'Created' | 'Changed' | 'Unchanged'>): 'Created' | 'Changed' | 'Unchanged' {
+  if (states.length > 0 && states.every(st => st === 'Created')) return 'Created';
+  if (states.every(st => st === 'Unchanged')) return 'Unchanged';
+  return 'Changed';
+}
+
 /** What the context half of a retrieve hands back: rows for the selected items
  *  only (project paths), the messages that concern them, and what was copied. */
 interface ContextRetrieveOutcome {
@@ -7832,11 +7854,12 @@ interface ContextRetrieveOutcome {
 }
 
 /** Scaffold a throwaway SFDX project so a source-format retrieve has somewhere to
- *  land without touching the user's workspace. For a diff `sourceApiVersion` is
- *  deliberately omitted so the retrieve uses the org's max API version. A retrieve
- *  whose files are copied INTO the project passes the project's own version: the
- *  file must be what a retrieve straight into the project would have written (a
- *  newer API adds profile fields an older project version can't deploy back). */
+ *  land without touching the user's workspace. Both callers pass the PROJECT's
+ *  `sourceApiVersion` (undefined when it has none — then the CLI picks): a
+ *  retrieve copied into the project must write what a retrieve straight into it
+ *  would, and a diff is only honest at the version the local file was written
+ *  at — the org's max adds elements (a profile's `<viewAllFields>`) an older
+ *  project version cannot have, so a file retrieved a minute ago "differs". */
 async function scaffoldSourceProject(projDir: string, sourceApiVersion?: string): Promise<void> {
   await fs.mkdir(path.join(projDir, 'force-app'), { recursive: true });
   await fs.writeFile(

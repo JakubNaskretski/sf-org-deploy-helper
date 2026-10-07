@@ -159,8 +159,10 @@ check('profile, project scope: field-granular — the object AND each scanned ch
     'CustomField:Product2.Status__c', 'CustomField:Account.Acme_Tier__c', 'RecordType:Acme_Widget__c.Retail', 'ListView:Product2.AllProducts',
     'ApexClass:AcmeService', 'ApexPage:AcmePage', 'CustomApplication:Acme_Sales', 'CustomTab:Acme_Widget__c',
     'Layout:Product2-Product Layout', 'Layout:Product2-Acme Layout', 'Layout:Account-Account Layout',
-    'CustomPermission:Acme_Admin', 'Flow:Acme_Onboard', 'ExternalDataSource:Acme_Ext', 'CustomMetadata:Acme_Rate.Default'
+    'CustomPermission:Acme_Admin', 'Flow:Acme_Onboard', 'ExternalDataSource:Acme_Ext'
   ]));
+  // customMetadataTypeAccesses come with the `__mdt` CustomObject; records add nothing.
+  assert.ok(!keys(plan).some(k => k.startsWith('CustomMetadata:')), keys(plan).join(', '));
   assert.ok(!keys(plan).some(k => k.startsWith('PermissionSet:') || k.startsWith('Translations:') || k.startsWith('CustomLabels:')), keys(plan).join(', '));
 });
 
@@ -173,11 +175,12 @@ check('profile, org scope: `*` per type (fields and record types among the child
   const plan = companionsFor([it('Profile', 'Admin')], { scope: 'org', localItems: LOCAL });
   assert.deepStrictEqual(keys(plan), [
     'CustomObject:*', 'ApexClass:*', 'ApexPage:*', 'CustomApplication:*', 'CustomTab:*', 'Layout:*',
-    'CustomPermission:*', 'Flow:*', 'ExternalDataSource:*', 'CustomMetadata:*', 'CustomField:*', 'RecordType:*',
+    'CustomPermission:*', 'Flow:*', 'ExternalDataSource:*', 'CustomField:*', 'RecordType:*',
     // `*` covers custom objects only: the standard ones the project knows are named.
     'CustomObject:Product2', 'CustomObject:Account'
   ]);
   assert.ok(!keys(plan).includes('CustomObject:Acme_Widget__c'), 'a custom object IS covered by the wildcard');
+  assert.ok(!keys(plan).includes('CustomMetadata:*'), 'never every custom metadata record on the org');
   assert.ok(plan.note.some(n => n.startsWith('scope "org" asks for every component') && n.includes('slow on big orgs')), plan.note.join('\n'));
 });
 
