@@ -3,6 +3,33 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.31.0
+
+- **Profiles and translations come back complete.** Retrieving a profile, an org-wide
+  translation (`translations/pl.translation-meta.xml`) or an object translation used to bring
+  back a nearly empty file — the org fills these in only for the components named in the same
+  request — and that stub overwrote your complete local copy. Retrieve and Diff now send them
+  together with their **companions**: an object translation with its object (and its layouts and
+  quick actions), a translation with the labels, apps, tabs, flows, quick actions and report
+  types it translates, a profile with the objects, fields, classes, pages, apps, tabs, layouts
+  and permissions it grants access to. The companions land in a temporary project and are never
+  written to yours; only the profile or translation itself is copied back, and an object
+  translation folder is merged so a file only you have is kept. The confirm dialog says how many
+  companions ride along, and the run names what was copied into your project.
+- **Choose how far companions reach.** New setting `sfOrgDeployWrapper.contextScope`: `project`
+  (default) sends what this project has; `org` sends everything of those types on the org —
+  complete, but slow on a big org. If the project has none of them, the result says so instead
+  of quietly bringing back a stub. `sfOrgDeployWrapper.contextCompanions` (default on) turns the
+  whole behaviour off.
+- **Object translations are in the tree.** `objectTranslations/<Object>-<lang>/` folders are
+  listed as one component each and deploy, validate, retrieve and diff like any other; a diff
+  compares the folder file by file.
+- **Diff opens only what differs.** Every component is compared with the org first; identical
+  files (line endings ignored) are counted on the card instead of opening an editor, and the
+  "About to open N diff editors" question is gone. At most `sfOrgDeployWrapper.diffEditorCap`
+  editors open (default 10); the rest are listed on the card. When nothing differs the card
+  says "All N in sync" so a diff that opens nothing never looks like a dead click.
+
 ## 0.30.1
 
 - **The tests card counts classes and methods.** One test class with seven methods now reads
