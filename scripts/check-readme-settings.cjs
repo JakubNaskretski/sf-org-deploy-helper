@@ -33,6 +33,24 @@ for (const key of keys) {
   });
 }
 
+// The other direction: a setting that was REMOVED (0.31.1 dropped
+// contextScope for the companion picker) must leave no README row and no
+// reader in the code — a README promising a knob that does nothing, or code
+// quietly reading an undeclared key, is the same drift turned around.
+check('README names no `sfOrgDeployWrapper.*` setting that package.json does not declare', () => {
+  const named = [...new Set([...readme.matchAll(/`(sfOrgDeployWrapper\.[A-Za-z]+)`/g)].map(m => m[1]))];
+  assert.ok(named.length >= keys.length, `README names ${named.length} settings, ${keys.length} declared`);
+  assert.deepStrictEqual(named.filter(k => !(k in props)), []);
+});
+
+check('every setting the code reads (`.get<T>(\'name\'`) is declared in package.json', () => {
+  const srcDir = path.join(__dirname, '..', 'src');
+  const src = fs.readdirSync(srcDir).filter(f => f.endsWith('.ts')).map(f => fs.readFileSync(path.join(srcDir, f), 'utf8')).join('\n');
+  const read = [...new Set([...src.matchAll(/\.get<[^>]+>\('([A-Za-z]+)'/g)].map(m => `sfOrgDeployWrapper.${m[1]}`))];
+  assert.ok(read.length >= 15, `only ${read.length} setting reads found — the pattern no longer matches the code`);
+  assert.deepStrictEqual(read.filter(k => !(k in props)), []);
+});
+
 check('this harness is registered in package.json "check"', () => {
   assert.ok(pkg.scripts.check.includes('node ./scripts/check-readme-settings.cjs'));
 });

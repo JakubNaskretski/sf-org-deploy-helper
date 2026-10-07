@@ -275,11 +275,12 @@ function diffStub(items, orgFolders) {
   return { stub, posted, log, retrieved };
 }
 const cards = (posted) => posted.filter(m => m.type === 'status').map(m => m.card);
-// The object rides along with every diff of its translation (src/companions.ts).
-// Default scope org, no Fetch Org list in this double → its layouts and quick
+// The object rides along with every diff of its translation (src/companions.ts),
+// no picker asked. No Fetch Org list in this double → its layouts and quick
 // actions came from the project, and the card says so.
 const COMPANION_LINES = [
-  'companions: CustomObject:Product2 (scope: org)',
+  'companions: CustomObject:Product2',
+  'CustomObjectTranslation:Product2-pl: fetched with its object — complete only for what the project knows',
   'org list not loaded — layouts and quick actions for Product2-pl were taken from the project; Fetch Org for the org\'s full set'
 ];
 const drain = () => { for (const fn of editorListeners.splice(0)) fn([]); };

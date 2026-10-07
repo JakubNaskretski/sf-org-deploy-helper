@@ -4,7 +4,10 @@
 // components named in the same request — `Profile:Admin` alone comes back
 // with user permissions and nothing else, `Translations:pl` alone as an
 // empty stub. Retrieve and Diff add these companions to the org round trip;
-// they are never written to the user's project.
+// they are never written to the user's project. For a Translations file or a
+// Profile the USER picks what rides along, per companion type (pickRows: this
+// project's members, or all on the org); an object translation's companions
+// are fixed.
 // No vscode here on purpose — this is the part the harness drives directly.
 import type { MetadataItem } from './metadataScanner';
 
@@ -13,28 +16,48 @@ import type { MetadataItem } from './metadataScanner';
  *  GlobalValueSetTranslation was verified byte-identical alone and with its set. */
 export const CONTEXT_TYPES: ReadonlySet<string> = new Set(['CustomObjectTranslation', 'Translations', 'Profile']);
 
-/** `org` (default): every component of the companion types on the org — the
- *  file comes back complete, at the cost of a bigger retrieve (disclosed).
- *  `project`: only what the project itself has (fast, field-granular) — the
- *  file is then completed for those components only, and says so. */
-export type Scope = 'project' | 'org';
-export const CONTEXT_SCOPE_DEFAULT: Scope = 'org';
-
 export interface Companion { type: string; name: string }
+
+/** How one companion type rides along: `org` — every one of that type on the
+ *  org; `project` — the ones this project has. A type with neither is left out. */
+export type RowKind = 'project' | 'org';
+
+/** One row of the companion picker (Translations / Profile), and what ticking
+ *  it sends. */
+export interface PickRow {
+  /** `<Type>:project` | `<Type>:org` — what workspaceState remembers per file. */
+  id: string;
+  type: string;
+  kind: RowKind;
+  label: string;
+  description: string;
+  /** Ticked when nothing is remembered for the file: every `this project's`
+   *  row (what this project has), and the labels row when the project has a
+   *  labels file. */
+  byDefault: boolean;
+  companions: Companion[];
+}
+
 export interface CompanionPlan {
   companions: Companion[];
   /** Card / modal / run-note lines explaining what rides along and why. */
   note: string[];
-  /** `Type:Name` of each selected item that will come back nearly empty: project
-   *  scope found nothing it describes. Never to be promised "complete". */
+  /** `Type:Name` of each selected item sent with no companion at all (nothing
+   *  ticked): it comes back nearly empty. Never to be promised "complete". */
   incomplete: string[];
   /** Each selected context item's own companions (`Type:Name` key → list), for
    *  the per-item lines describeContext() writes. */
   own: Record<string, Companion[]>;
-  /** `Type:Name` of each selected item scope org could fill only from the
+  /** `Type:Name` of each selected item an org-wide row could fill only from the
    *  project, because the org list was not loaded (or named none of what it
    *  needed): complete for what the project knows, not for the org. */
   partial: string[];
+  /** Per picker item (Translations / Profile): the companion types it is
+   *  fetched with, in picker order, and how — the org row won where both were
+   *  ticked. */
+  chosen: Record<string, Array<{ type: string; kind: RowKind; companions: Companion[] }>>;
+  /** Per picker item: the companion types nothing was ticked for. */
+  leftOut: Record<string, string[]>;
 }
 
 /** What an org-wide Translations file translates. */
@@ -55,8 +78,22 @@ export const PROFILE_TOP_TYPES: readonly string[] = [
   'CustomPermission', 'Flow', 'ExternalDataSource'
 ];
 
+/** The items that get a picker, and the companion types each one offers, in
+ *  the picker's order. A CustomObjectTranslation is not here: its companions
+ *  (its object, that object's layouts and quick actions) are fixed and small. */
+export const PICK_TYPES: Readonly<Record<string, readonly string[]>> = {
+  Translations: TRANSLATIONS_COMPANION_TYPES,
+  Profile: PROFILE_TOP_TYPES
+};
+
+/** The companion types the picker offers for an item of `type`, or undefined:
+ *  no picker for it. */
+export function pickTypesFor(type: string): readonly string[] | undefined {
+  return Object.prototype.hasOwnProperty.call(PICK_TYPES, type) ? PICK_TYPES[type] : undefined;
+}
+
 /** Of the object children, only fields (fieldPermissions) and record types
- *  (recordTypeVisibilities) appear in a profile. Scope `org` asks for these two
+ *  (recordTypeVisibilities) appear in a profile. The org row asks for these two
  *  as `*`; every list view, web link and validation rule on the org would add
  *  nothing to the profile and only slow the retrieve. */
 const PROFILE_ORG_CHILD_WILDCARDS: readonly string[] = ['CustomField', 'RecordType'];
@@ -78,40 +115,149 @@ export function translatedObject(name: string): string | undefined {
   return dash > 0 ? name.slice(0, dash) : undefined;
 }
 
+type Item = Pick<MetadataItem, 'type' | 'name'>;
+
+const TYPE_LABELS: Readonly<Record<string, string>> = {
+  CustomLabels: 'Labels', CustomApplication: 'Apps', CustomTab: 'Tabs', Flow: 'Flows', QuickAction: 'Quick actions',
+  ReportType: 'Report types', CustomObject: 'Objects', ApexClass: 'Apex classes', ApexPage: 'Visualforce pages',
+  Layout: 'Layouts', CustomPermission: 'Custom permissions', ExternalDataSource: 'External data sources'
+};
+
+/** The picker's heading for a companion type (`Tabs`, `Apex classes`). */
+export function typeLabel(type: string): string {
+  return TYPE_LABELS[type] ?? type;
+}
+
+/** `Acme_A, Acme_B, Acme_C +8 more`. */
+function nameList(names: readonly string[]): string {
+  return names.slice(0, 3).join(', ') + (names.length > 3 ? ` +${names.length - 3} more` : '');
+}
+
+/** The standard objects of a list: object files, and the objects of scanned
+ *  children (`CustomField:Account.Tier__c` → Account). */
+function standardObjectsOf(items: readonly Item[]): string[] {
+  const out: string[] = [];
+  for (const i of items) {
+    const name = i.type === 'CustomObject' ? i.name : PROFILE_OBJECT_CHILD_TYPES.includes(i.type) ? i.name.split('.')[0] : undefined;
+    if (name && isStandardObject(name) && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 /**
- * The companions `selected` needs for a complete retrieve.
+ * The picker rows for one selected Translations / Profile item, grouped by
+ * companion type in PICK_TYPES order — two per type:
+ *   `<Type>: this project's (N)` — the project's members of that type (names in
+ *     the description); absent when the project has none. For a profile's
+ *     objects: each object file AND each scanned child (field-granular — a
+ *     profile comes back with entries for exactly those).
+ *   `<Type>: all on the org` — `*`. For a profile's objects: `CustomObject:*`,
+ *     `CustomField:*`, `RecordType:*`, plus the standard objects by name (the
+ *     wildcard misses them) from the org list and the project.
+ * Labels get ONE row: the project's labels file and every label on the org are
+ * the same request (`CustomLabels:CustomLabels` is the org's whole label set).
+ */
+export function pickRows(item: Item, ctx: { localItems: readonly Item[]; orgItems?: readonly Item[]; orgLabel?: string }): PickRow[] {
+  const types = pickTypesFor(item.type);
+  if (!types) return [];
+  const org = ctx.orgLabel ?? 'the org';
+  const local = ctx.localItems;
+  const rows: PickRow[] = [];
+  for (const type of types) {
+    const label = typeLabel(type);
+    if (type === 'CustomLabels') {
+      rows.push({
+        id: 'CustomLabels:org', type, kind: 'org', label,
+        description: `the labels file — every custom label on ${org}`,
+        byDefault: local.some(i => i.type === 'CustomLabels'),
+        companions: [{ type, name: 'CustomLabels' }]
+      });
+      continue;
+    }
+    if (type === 'CustomObject') {
+      const objects = local.filter(i => i.type === 'CustomObject');
+      const children = local.filter(i => PROFILE_OBJECT_CHILD_TYPES.includes(i.type));
+      const names: string[] = [];
+      for (const i of [...objects, ...children]) {
+        const n = i.type === 'CustomObject' ? i.name : i.name.split('.')[0];
+        if (n && !names.includes(n)) names.push(n);
+      }
+      if (names.length > 0) {
+        rows.push({
+          id: `${type}:project`, type, kind: 'project', label: `${label}: this project's (${names.length})`,
+          description: nameList(names) + (children.length ? ` · with ${countPhrase(children)}` : ''),
+          byDefault: true,
+          companions: [...objects, ...children].map(i => ({ type: i.type, name: i.name }))
+        });
+      }
+      const fromOrg = standardObjectsOf((ctx.orgItems ?? []).filter(i => i.type === 'CustomObject'));
+      const fromProject = standardObjectsOf(local).filter(n => !fromOrg.includes(n));
+      const standard = [...fromOrg, ...fromProject];
+      rows.push({
+        id: `${type}:org`, type, kind: 'org', label: `${label}: all on the org`,
+        description: `every custom object, field and record type on ${org}` + (fromOrg.length
+          ? ` + ${fromOrg.length} standard object${fromOrg.length === 1 ? '' : 's'} from the Fetch Org list`
+          : ` + this project's standard objects (Fetch Org to name the org's)`),
+        byDefault: false,
+        companions: [
+          { type, name: WILDCARD }, ...PROFILE_ORG_CHILD_WILDCARDS.map(t => ({ type: t, name: WILDCARD })),
+          ...standard.map(name => ({ type, name }))
+        ]
+      });
+      continue;
+    }
+    const mine = local.filter(i => i.type === type);
+    if (mine.length > 0) {
+      rows.push({
+        id: `${type}:project`, type, kind: 'project', label: `${label}: this project's (${mine.length})`,
+        description: nameList(mine.map(i => i.name)), byDefault: true,
+        companions: mine.map(i => ({ type: i.type, name: i.name }))
+      });
+    }
+    rows.push({
+      id: `${type}:org`, type, kind: 'org', label: `${label}: all on the org`,
+      description: `every ${noun(type, 1)} on ${org}`, byDefault: false,
+      companions: [{ type, name: WILDCARD }]
+    });
+  }
+  return rows;
+}
+
+/** The rows ticked when nothing is remembered for the file. */
+export function defaultPicks(rows: readonly PickRow[]): string[] {
+  return rows.filter(r => r.byDefault).map(r => r.id);
+}
+
+/**
+ * The companions `selected` needs, as the picker's rows say.
  *
- *   CustomObjectTranslation:<Obj>-<lang> → always CustomObject:<Obj>; plus the
- *     object's layouts (`<Obj>-*`) and quick actions (`<Obj>.*`) — from the
- *     project (scope project) or from the org list (scope org; the project when
- *     the org list is not loaded, and the note says so).
- *   Translations:<lang> → CustomLabels, CustomApplication, CustomTab, Flow,
- *     QuickAction, ReportType — the project's members, or `*` each.
- *   Profile:<name> → CustomObject + its children, ApexClass, ApexPage,
- *     CustomApplication, CustomTab, Layout, CustomPermission, Flow,
- *     ExternalDataSource — the project's members (field-granular:
- *     `CustomObject:X` for an object file AND each scanned child, which is what
- *     makes the profile's entries for exactly those come back), or `*` each.
+ *   CustomObjectTranslation:<Obj>-<lang> → no picker: always CustomObject:<Obj>
+ *     plus the object's layouts (`<Obj>-*`) and quick actions (`<Obj>.*`) from
+ *     the org list — the project's when the org list is not loaded, and the
+ *     note says so.
+ *   Translations:<lang>, Profile:<name> → per companion type, the ticked row
+ *     (`picks[Type:Name]`, row ids; absent = defaultPicks): the org row wins
+ *     over the project row of the same type; a type with nothing ticked is left
+ *     out (`leftOut`, and describeContext says so).
  *
  * Never a component already in `selected`, never one twice, and never a
  * `Type:Name` when the same type is already asked for as `*` (except a standard
  * CustomObject, which the wildcard does not cover).
  */
 export function companionsFor(
-  selected: ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>>,
+  selected: readonly Item[],
   ctx: {
-    scope: Scope;
+    /** Row ids per picker item (`Type:Name`), as the picker returned them. */
+    picks?: Readonly<Record<string, readonly string[]>>;
     /** The project's scanned items. */
-    localItems: ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>>;
+    localItems: readonly Item[];
     /** The org listing for the target org, when one is loaded. */
-    orgItems?: ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>>;
+    orgItems?: readonly Item[];
   }
 ): CompanionPlan {
   const context = selected.filter(i => CONTEXT_TYPES.has(i.type));
-  if (context.length === 0) return { companions: [], note: [], incomplete: [], partial: [], own: {} };
-  const scope: Scope = ctx.scope === 'org' ? 'org' : 'project';
+  if (context.length === 0) return { companions: [], note: [], incomplete: [], partial: [], own: {}, chosen: {}, leftOut: {} };
   const local = ctx.localItems;
-  const localOf = (type: string): Array<Pick<MetadataItem, 'type' | 'name'>> => local.filter(i => i.type === type);
 
   const wanted: Companion[] = [];
   const own: Record<string, Companion[]> = {};
@@ -124,6 +270,8 @@ export function companionsFor(
   const note: string[] = [];
   const incomplete: string[] = [];
   const partial: string[] = [];
+  const chosen: CompanionPlan['chosen'] = {};
+  const leftOut: CompanionPlan['leftOut'] = {};
   const fallbackObjects: string[] = [];
   const noLayoutObjects: string[] = [];
   const fallbackProfiles: string[] = [];
@@ -134,69 +282,51 @@ export function companionsFor(
       const obj = translatedObject(item.name);
       if (!obj) continue;
       add('CustomObject', obj);
-      const isLayout = (i: Pick<MetadataItem, 'type' | 'name'>): boolean => i.type === 'Layout' && i.name.startsWith(`${obj}-`);
-      const isAction = (i: Pick<MetadataItem, 'type' | 'name'>): boolean => i.type === 'QuickAction' && i.name.startsWith(`${obj}.`);
-      // Scope org reads the org list — per type, since a list that has no
-      // entries of a type (none on the org, or the type never listed) can't
-      // name any; the project's then. No list at all: the project's, said so.
-      const org = scope === 'org' ? ctx.orgItems : undefined;
-      if (scope === 'org' && !org) {
+      const isLayout = (i: Item): boolean => i.type === 'Layout' && i.name.startsWith(`${obj}-`);
+      const isAction = (i: Item): boolean => i.type === 'QuickAction' && i.name.startsWith(`${obj}.`);
+      // The org list, per type — a list with no entries of a type (none on the
+      // org, or the type never listed) can't name any; the project's then. No
+      // list at all: the project's, said so.
+      const org = ctx.orgItems;
+      if (!org) {
         fallbackObjects.push(item.name);
-        partial.push(`${item.type}:${item.name}`);
+        partial.push(current);
       }
-      const from = (type: string): ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>> =>
-        org && org.some(i => i.type === type) ? org : local;
+      const from = (type: string): readonly Item[] => (org && org.some(i => i.type === type) ? org : local);
       // Every object has a layout, so a loaded list with NO Layout at all never
       // listed the type (its fetch failed): not complete. Zero quick actions is
       // an ordinary org, and says nothing.
       if (org && !org.some(i => i.type === 'Layout')) {
         noLayoutObjects.push(item.name);
-        partial.push(`${item.type}:${item.name}`);
+        partial.push(current);
       }
       for (const i of from('Layout')) if (isLayout(i)) add(i.type, i.name);
       for (const i of from('QuickAction')) if (isAction(i)) add(i.type, i.name);
-    } else if (item.type === 'Translations') {
-      if (scope === 'org') {
-        for (const t of TRANSLATIONS_COMPANION_TYPES) add(t, WILDCARD);
-      } else {
-        const found = TRANSLATIONS_COMPANION_TYPES.flatMap(t => localOf(t));
-        for (const i of found) add(i.type, i.name);
-        if (found.length === 0) {
-          note.push(emptyScopeNote(`${item.type}:${item.name}`, TRANSLATIONS_COMPANION_TYPES));
-          incomplete.push(`${item.type}:${item.name}`);
-        }
-      }
-    } else if (item.type === 'Profile') {
-      if (scope === 'org') {
-        for (const t of PROFILE_TOP_TYPES) add(t, WILDCARD);
-        for (const t of PROFILE_ORG_CHILD_WILDCARDS) add(t, WILDCARD);
-        // The wildcard misses standard objects: name the org list's (Account,
-        // Product2 — their objectPermissions and standard-field permissions come
-        // with nothing else), plus the ones the project knows, as an object file
-        // or as the parent of a scanned child. No org list, or one that names no
-        // standard object: the project's alone, and the note says so.
-        const orgObjects = (ctx.orgItems ?? []).filter(i => i.type === 'CustomObject');
-        if (!orgObjects.some(i => isStandardObject(i.name))) {
-          fallbackProfiles.push(`${item.type}:${item.name}`);
-          partial.push(`${item.type}:${item.name}`);
-        }
-        for (const i of orgObjects) if (isStandardObject(i.name)) add('CustomObject', i.name);
-        for (const i of local) {
-          if (i.type === 'CustomObject' && isStandardObject(i.name)) add('CustomObject', i.name);
-          else if (PROFILE_OBJECT_CHILD_TYPES.includes(i.type)) {
-            const parent = i.name.split('.')[0];
-            if (parent && isStandardObject(parent)) add('CustomObject', parent);
-          }
-        }
-      } else {
-        const found = [...PROFILE_TOP_TYPES, ...PROFILE_OBJECT_CHILD_TYPES].flatMap(t => localOf(t));
-        for (const i of found) add(i.type, i.name);
-        if (found.length === 0) {
-          note.push(emptyScopeNote(`${item.type}:${item.name}`, PROFILE_TOP_TYPES));
-          incomplete.push(`${item.type}:${item.name}`);
-        }
+      continue;
+    }
+    const types = pickTypesFor(item.type);
+    if (!types) continue;
+    const rows = pickRows(item, ctx);
+    const ticked = new Set(ctx.picks?.[current] ?? defaultPicks(rows));
+    const mine: CompanionPlan['chosen'][string] = [];
+    const out: string[] = [];
+    for (const type of types) {
+      const ofType = rows.filter(r => r.type === type && ticked.has(r.id));
+      // Both rows of a type ticked: the org row wins (it covers the project's).
+      const row = ofType.find(r => r.kind === 'org') ?? ofType.find(r => r.kind === 'project');
+      if (!row) { out.push(type); continue; }
+      mine.push({ type, kind: row.kind, companions: row.companions });
+      for (const c of row.companions) add(c.type, c.name);
+      // The wildcard misses standard objects, so the org row names them — from
+      // the org list, or (no list, or one naming none) from the project alone.
+      if (type === 'CustomObject' && row.kind === 'org' && !(ctx.orgItems ?? []).some(i => i.type === 'CustomObject' && isStandardObject(i.name))) {
+        fallbackProfiles.push(current);
+        partial.push(current);
       }
     }
+    chosen[current] = mine;
+    leftOut[current] = out;
+    if (mine.length === 0) incomplete.push(current);
   }
 
   // Dedupe: against the selection, against itself, and a `*` for a type
@@ -213,7 +343,7 @@ export function companionsFor(
     companions.push(c);
   }
 
-  if (companions.length > 0) note.unshift(`companions: ${summarize(companions)} (scope: ${scope})`);
+  if (companions.length > 0) note.unshift(`companions: ${summarize(companions)}`);
   if (fallbackObjects.length > 0) {
     note.push(`org list not loaded — layouts and quick actions for ${fallbackObjects.join(', ')} were taken from the project; Fetch Org for the org's full set`);
   }
@@ -223,10 +353,11 @@ export function companionsFor(
   if (fallbackProfiles.length > 0) {
     note.push(`${ctx.orgItems ? 'no standard objects in the org list' : 'org list not loaded'} — standard objects for ${fallbackProfiles.join(', ')} were taken from the project; Fetch Org to include the org's standard objects`);
   }
-  return { companions, note, incomplete, partial, own };
+  return { companions, note, incomplete, partial, own, chosen, leftOut };
 }
 
 const NOUNS: Readonly<Record<string, readonly [string, string]>> = {
+  CustomLabels: ['label', 'labels'],
   CustomApplication: ['app', 'apps'], CustomTab: ['tab', 'tabs'], Flow: ['flow', 'flows'],
   QuickAction: ['quick action', 'quick actions'], ReportType: ['report type', 'report types'],
   CustomObject: ['object', 'objects'], CustomField: ['field', 'fields'], RecordType: ['record type', 'record types'],
@@ -237,66 +368,71 @@ const NOUNS: Readonly<Record<string, readonly [string, string]>> = {
   FieldSet: ['field set', 'field sets'], Index: ['index', 'indexes'], SharingReason: ['sharing reason', 'sharing reasons']
 };
 
+function noun(type: string, n: number): string {
+  const pair = NOUNS[type];
+  return pair ? pair[n === 1 ? 0 : 1] : type;
+}
+
+/** `a`, `a and b`, `a, b and c`. */
+function joinAnd(parts: readonly string[]): string {
+  return parts.length <= 1 ? parts.join('') : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
 /** `the labels, 11 tabs, 33 apps` — what one item's companions are, by type. */
 export function countPhrase(companions: readonly Companion[]): string {
   const byType = new Map<string, number>();
   for (const c of companions) byType.set(c.type, (byType.get(c.type) ?? 0) + 1);
-  return [...byType].map(([type, n]) => {
-    if (type === 'CustomLabels') return 'the labels';
-    const noun = NOUNS[type];
-    return noun ? `${n} ${n === 1 ? noun[0] : noun[1]}` : `${n} ${type}`;
-  }).join(', ');
+  return [...byType].map(([type, n]) => (type === 'CustomLabels' ? 'the labels' : `${n} ${noun(type, n)}`)).join(', ');
 }
 
-const ORG_WHOLESALE: Readonly<Record<string, string>> = {
-  Profile: 'every object, field, record type, class, page, app, tab, layout, custom permission, flow and external data source on the org',
-  Translations: 'every label, app, tab, flow, quick action and report type on the org'
-};
-const TO_PROJECT = 'set sfOrgDeployWrapper.contextScope to "project" to limit it to this project';
-const TO_ORG = 'scope: project; set sfOrgDeployWrapper.contextScope to "org" for everything';
-
 /**
- * One line per selected context item saying what it comes back with — the
- * dialog's (and, in project scope, the run's) promise, so it has to be exact:
- *   - scope org, filled from the org: "complete", and what is fetched wholesale
- *     (minutes on a big org);
- *   - scope org, filled from the project only (no Fetch Org list): "complete only
- *     for what the project knows" — the plan's note says why;
- *   - scope project: never "complete" — completed for this project's components
- *     only, with what they are, and what is left out;
- *   - nothing to send (project scope found none): no line; the LOUD note speaks.
+ * One line per selected context item saying what it is fetched with — the
+ * dialog's, the run's and a diff card's promise, so it has to be exact:
+ *   - a picker item: the labels, this project's members (`11 tabs (project)`),
+ *     the types fetched whole (`all flows on the org`), and what was left out
+ *     (`— apps, quick actions and report types left out`). "complete" ONLY when
+ *     every type is an org row (and the org list named the standard objects);
+ *     nothing ticked at all: it comes back nearly empty, and says so.
+ *   - an object translation: its object and the org's layouts and quick
+ *     actions — complete; without the org list, only for what the project knows.
  */
-export function describeContext(selected: ReadonlyArray<Pick<MetadataItem, 'type' | 'name'>>, plan: CompanionPlan, scope: Scope): string[] {
+export function describeContext(selected: readonly Item[], plan: CompanionPlan): string[] {
   const lines: string[] = [];
   for (const item of selected.filter(i => CONTEXT_TYPES.has(i.type))) {
     const key = `${item.type}:${item.name}`;
-    if (plan.incomplete.includes(key)) continue;
-    const mine = plan.own[key] ?? [];
-    if (scope === 'org') {
-      if (plan.partial.includes(key)) { lines.push(`${key}: complete only for what the project knows.`); continue; }
-      if (item.type === 'CustomObjectTranslation') {
-        const extra = mine.filter(c => c.type !== 'CustomObject');
-        lines.push(`${key}: fetched with its object${extra.length ? ` and the org's ${countPhrase(extra)}` : ''} so it comes back complete.`);
-      } else {
-        lines.push(`${key}: fetched with ${ORG_WHOLESALE[item.type]} so it comes back complete — minutes on a big org; ${TO_PROJECT}.`);
-      }
+    if (item.type === 'CustomObjectTranslation') {
+      const extra = (plan.own[key] ?? []).filter(c => c.type !== 'CustomObject');
+      lines.push(plan.partial.includes(key)
+        ? `${key}: fetched with its object${extra.length ? ` and ${countPhrase(extra)}` : ''} — complete only for what the project knows`
+        : `${key}: fetched with its object${extra.length ? ` and the org's ${countPhrase(extra)}` : ''} so it comes back complete`);
       continue;
     }
-    if (item.type === 'CustomObjectTranslation') {
-      const extra = mine.filter(c => c.type !== 'CustomObject');
-      lines.push(`${key}: completed for its object and this project's layouts and quick actions only (${extra.length ? countPhrase(extra) : 'none in this project'}) — the org's other layout and quick-action translations are left out (${TO_ORG}).`);
-    } else {
-      const leftOut = item.type === 'Profile' ? 'permissions' : 'translations';
-      lines.push(`${key}: completed for this project's components only (${countPhrase(mine)}) — the org's other ${leftOut} are left out (${TO_ORG}).`);
+    if (!pickTypesFor(item.type)) continue;
+    const chosen = plan.chosen[key] ?? [];
+    const leftOut = plan.leftOut[key] ?? [];
+    if (chosen.length === 0) {
+      lines.push(`${key}: fetched alone — nothing ticked to fetch it with, so it comes back nearly empty`);
+      continue;
     }
+    const parts: string[] = [];
+    if (chosen.some(c => c.type === 'CustomLabels')) parts.push('the labels');
+    const project = chosen.filter(c => c.kind === 'project');
+    if (project.length) parts.push(`${countPhrase(project.flatMap(c => c.companions))} (project)`);
+    const org = chosen.filter(c => c.kind === 'org' && c.type !== 'CustomLabels');
+    if (org.length) parts.push(`all ${joinAnd(org.map(c => noun(c.type, 2)))} on the org`);
+    let line = `${key}: fetched with ${parts.join(', ')}`;
+    if (leftOut.length) line += ` — ${joinAnd(leftOut.map(t => noun(t, 2)))} left out`;
+    else if (project.length === 0) line += plan.partial.includes(key) ? ' — complete only for what the project knows' : ' so it comes back complete';
+    lines.push(line);
   }
   return lines;
 }
 
-/** The loud one: project scope had nothing to send, so the org will answer with
- *  a stub that, retrieved, overwrites a complete local file. */
-function emptyScopeNote(key: string, types: readonly string[]): string {
-  return `project scope found no ${types.join('/')} in this project — ${key} will come back nearly empty; set sfOrgDeployWrapper.contextScope to "org"`;
+/** True when a picker item is fetched with less than everything on the org — a
+ *  project row, or a type left out: the org's file then lacks the entries for
+ *  what was not fetched, and a diff shows the local ones as local-only. */
+export function fetchedPartly(plan: CompanionPlan): boolean {
+  return Object.keys(plan.chosen).some(k => (plan.leftOut[k] ?? []).length > 0 || plan.chosen[k].some(c => c.kind === 'project'));
 }
 
 /** `CustomObject:Product2, Layout ×3, CustomLabels (all)` — per type, in order. */

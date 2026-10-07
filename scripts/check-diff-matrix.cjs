@@ -44,7 +44,9 @@ const vscodeStub = {
     showWarningMessage: (message) => { ui.warn.push(message); return Promise.resolve(undefined); },
     showErrorMessage: () => Promise.resolve(undefined),
     withProgress: (_o, body) => body({ report: () => {} }, { onCancellationRequested: () => ({ dispose: () => {} }) }),
-    onDidChangeVisibleTextEditors: (fn) => { editorListeners.push(fn); return { dispose: () => {} }; }
+    onDidChangeVisibleTextEditors: (fn) => { editorListeners.push(fn); return { dispose: () => {} }; },
+    // The companion picker (a Profile in a batch): Enter, the ticked rows.
+    showQuickPick: (items) => Promise.resolve(items.filter(i => i.picked))
   },
   commands: {
     executeCommand: (id, ...args) => {
@@ -55,12 +57,13 @@ const vscodeStub = {
   workspace: { getConfiguration: () => ({ get: (k, fallback) => (k in config ? config[k] : fallback) }) },
   Uri: { file: (fsPath) => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
+  QuickPickItemKind: { Separator: -1, Default: 0 },
   ProgressLocation: { Notification: 15 }
 };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { DeployPanelProvider, DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+const { DeployPanelProvider, DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES, PARTIAL_FETCH_DIFF_LINE } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 const { inferItemForPath, OBJECT_CHILD_TYPES, DIRECTORY_ITEM_TYPES } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 
 // ------------------------------------------------------------------ fixtures
@@ -348,9 +351,14 @@ check('BATCH: types the org does not have report as missing, not as opened', asy
   const card = cards(posted).find(c => c.title.startsWith('Nothing to diff'));
   assert.ok(card, `expected a verdict card: ${JSON.stringify(cards(posted))}`);
   assert.deepStrictEqual(card.lines.filter(l => l.startsWith('— ')), batch.map(f => `— ${f.type}:${f.name} — not on org`));
-  // The batch holds a Profile: its companions ride along (default scope org) and
-  // the card names them — informational lines, never a "not on org" verdict.
-  assert.deepStrictEqual(card.lines.filter(l => !l.startsWith('— ')).map(l => l.split(':')[0]), ['companions', 'org list not loaded — standard objects for Profile']);
+  // The batch holds a Profile: Enter in its picker ticks this project's rows —
+  // here the tab, layout and flow already in the batch, so nothing more rides
+  // along — and the card says what it was fetched with: informational lines,
+  // never a "not on org" verdict.
+  assert.deepStrictEqual(card.lines.filter(l => !l.startsWith('— ')), [
+    'Profile:Widget User: fetched with 1 tab, 1 layout, 1 flow (project) — objects, classes, pages, apps, custom permissions and data sources left out',
+    PARTIAL_FETCH_DIFF_LINE
+  ]);
 });
 
 // The fixture table is the contract; this keeps it honest as types are added.

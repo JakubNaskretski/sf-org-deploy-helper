@@ -9,7 +9,7 @@ import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInf
 import { isLikelyProduction } from './kit/orgs';
 import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolveDefaultPackageDir, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
-import { CONTEXT_SCOPE_DEFAULT, CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, Scope, companionsFor, describeContext, hasWildcard, isCompanionMessage } from './companions';
+import { CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, companionsFor, defaultPicks, describeContext, fetchedPartly, hasWildcard, isCompanionMessage, pickRows, pickTypesFor, typeLabel } from './companions';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
 const DISCOVERY_RETRY_DELAYS_MS = [1500, 4000, 10000];
@@ -177,6 +177,11 @@ const TEST_LEVEL_KEY = 'testLevel';
  *  persisted alongside TEST_LEVEL_KEY so a context-menu deploy fired after a reload
  *  still has classes to run without the panel ever being reopened. */
 const RUN_TESTS_KEY = 'runTests';
+/** workspaceState key for the companion picker's last choice per file:
+ *  `Record<Type:Name, row id[]>` (row ids from companions.ts pickRows), newest
+ *  write last, at most COMPANION_PICKS_MAX files. */
+const COMPANION_PICKS_KEY = 'contextCompanionPicks';
+const COMPANION_PICKS_MAX = 200;
 
 /** Cap on the deploy queue (Feature: deploy queue). Generous for a human clicking
  *  Deploy/Validate repeatedly while something else runs; an 11th request gets an
@@ -4219,12 +4224,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (allItems.length === 0) return;
       const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
       const noun = `${allItems.length} component${allItems.length === 1 ? '' : 's'}`;
+      // A Translations file or a Profile: the user picks what rides along, one
+      // quick pick per item, before the confirm. Escape drops the whole retrieve
+      // — nothing fetched, nothing written, the slot freed by the finally below.
+      const picked = await this.pickCompanions(allItems, org, orgLabel);
+      if (!picked) { this.reportPickerCancelled(`Retrieve from ${orgLabel}`); return; }
       // A Profile, Translations or CustomObjectTranslation comes back complete only
       // beside the components it describes (src/companions.ts). With companions to
       // send, those items take a throwaway project and only their own files are
       // copied back (`ctxItems`); everything else (`items`) retrieves straight into
       // the project exactly as before.
-      const context = this.contextPlanFor(allItems, org, false);
+      const context = this.contextPlanFor(allItems, org, false, picked.picks);
       const ctxItems = context.split ? allItems.filter(i => CONTEXT_TYPES.has(i.type)) : [];
       const items = context.split ? allItems.filter(i => !CONTEXT_TYPES.has(i.type)) : allItems;
       // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
@@ -4244,6 +4254,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         'Retrieve'
       );
       if (confirm !== 'Retrieve') return;
+      // Confirmed: the picker's answer is what this file is fetched with from now on.
+      picked.remember();
       // A run from here on: what it asks for, then what came back.
       const runId = newRunId();
       const runStartedAt = Date.now();
@@ -4566,17 +4578,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /** The companions a Retrieve or Diff of `items` sends with its context items
-   *  (src/companions.ts), as the two settings say. `split`: there are companions
-   *  to send, so the context items take the temporary-project route. `notes` go
-   *  on the retrieve's run, `diffNotes` on a diff's card; `modalLine` is the
-   *  confirm's disclosure — what each item comes back with, BEFORE the overwrite.
-   *  `sameRequest`: the companions travel in the SAME retrieve as all of `items`
-   *  (Diff), so a selected component is never asked for twice. A Retrieve sends
-   *  the context items on their own, so there they are checked against those
-   *  alone — a selected CustomLabels still has to ride with Translations:pl. */
-  private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean): { plan: CompanionPlan; split: boolean; notes: string[]; diffNotes: string[]; modalLine?: string } {
+   *  (src/companions.ts): the picker's rows (`picks`) for a Translations file or
+   *  a Profile, the fixed set for an object translation. `split`: there are
+   *  companions to send, so the context items take the temporary-project route.
+   *  `notes` go on the retrieve's run, `diffNotes` on a diff's card; `modalLine`
+   *  is the confirm's disclosure — what each item is fetched with, and what is
+   *  left out, BEFORE the overwrite. `sameRequest`: the companions travel in the
+   *  SAME retrieve as all of `items` (Diff), so a selected component is never
+   *  asked for twice. A Retrieve sends the context items on their own, so there
+   *  they are checked against those alone — a selected CustomLabels still has to
+   *  ride with Translations:pl. */
+  private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean, picks: Record<string, string[]>): { plan: CompanionPlan; split: boolean; notes: string[]; diffNotes: string[]; modalLine?: string } {
     const ctx = items.filter(i => CONTEXT_TYPES.has(i.type));
-    const none: CompanionPlan = { companions: [], note: [], incomplete: [], partial: [], own: {} };
+    const none: CompanionPlan = { companions: [], note: [], incomplete: [], partial: [], own: {}, chosen: {}, leftOut: {} };
     if (ctx.length === 0) return { plan: none, split: false, notes: [], diffNotes: [] };
     const names = ctx.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctx.length > 3 ? ` +${ctx.length - 3} more` : '');
     const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
@@ -4586,28 +4600,104 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         modalLine: `${names}: retrieved without companions (sfOrgDeployWrapper.contextCompanions is off) — may come back nearly empty.`
       };
     }
-    const scope: Scope = cfg.get<string>('contextScope', CONTEXT_SCOPE_DEFAULT) === 'project' ? 'project' : 'org';
-    const plan = companionsFor(sameRequest ? items : ctx, { scope, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
-    const n = plan.companions.length;
-    if (n === 0) return { plan, split: false, notes: plan.note, diffNotes: plan.note, modalLine: plan.note.join('\n') || undefined };
-    // What each item comes back with — "complete" only where that is true (scope
-    // org, filled from the org); project scope says "this project's components
-    // only"; an item project scope found nothing for gets the LOUD note instead.
-    const itemLines = describeContext(ctx, plan, scope);
-    const summary = plan.note.filter(l => l.startsWith('companions: '));
-    // Every other note (empty scope, org-list fallback) — never the summary twice.
+    const plan = companionsFor(sameRequest ? items : ctx, { picks, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
+    // What each item is fetched with — "complete" only where every type is
+    // fetched whole from the org; what was left out, named; nothing ticked at
+    // all, "nearly empty".
+    const itemLines = describeContext(ctx, plan);
+    // Every other note (org-list fallbacks) — never the summary twice.
     const other = plan.note.filter(l => !l.startsWith('companions: '));
+    // A diff of a file fetched with less than everything on the org: the org's
+    // copy says nothing about the rest, so the local entries for it read local-only.
+    const partly = fetchedPartly(plan) ? [PARTIAL_FETCH_DIFF_LINE] : [];
+    const n = plan.companions.length;
+    if (n === 0) {
+      const lines = [...itemLines, ...other];
+      return { plan, split: false, notes: lines, diffNotes: [...itemLines, ...partly, ...other], modalLine: lines.join('\n') || undefined };
+    }
+    const summary = plan.note.filter(l => l.startsWith('companions: '));
     // The count is everything that rides along, for all the items together — so
     // it stands on its own line, never beside a subset of them.
-    const head = `${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`;
+    const head = `${n} companion${n === 1 ? '' : 's'} ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`;
     return {
       plan, split: true,
-      // Project scope: the per-item lines ARE the run's caveat, so they replace
-      // the summary (the run keeps 5 notes).
-      notes: scope === 'project' ? [...itemLines, ...other] : [...summary, ...other],
-      diffNotes: [...summary, ...(scope === 'project' ? [PROJECT_SCOPE_DIFF_LINE] : []), ...other],
+      // The per-item lines ARE the run's caveat (the run keeps 5 notes).
+      notes: [...itemLines, ...other],
+      diffNotes: [...summary, ...itemLines, ...partly, ...other],
       modalLine: [head, ...itemLines, ...other].join('\n')
     };
+  }
+
+  /**
+   * The companion picker: for each selected Translations / Profile item, in
+   * order, ONE multi-select quick pick of its companion types — this project's
+   * members, or all on the org, two rows per type, one for the labels
+   * (companions.ts pickRows) — ticked as remembered for that file, else every
+   * `this project's` row. Escape on any of them answers undefined: the caller
+   * drops the whole retrieve / diff before anything is fetched. With
+   * `contextCompanionPrompt: "remembered"` a file whose remembered rows all
+   * still exist is not asked again. `remember()` stores the answers — called
+   * once the run is committed (after a retrieve's confirm; a diff has none).
+   * Nothing to ask (no such item, or companions off): empty picks.
+   */
+  private async pickCompanions(items: MetadataItem[], org: string, orgLabel: string): Promise<{ picks: Record<string, string[]>; remember: () => void } | undefined> {
+    const picks: Record<string, string[]> = {};
+    const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
+    const pickable = cfg.get<boolean>('contextCompanions', true) === false ? [] : items.filter(i => pickTypesFor(i.type));
+    if (pickable.length === 0) return { picks, remember: () => undefined };
+    const silent = cfg.get<string>('contextCompanionPrompt', 'always') === 'remembered';
+    const stored = readCompanionPicks(this.context?.workspaceState.get<unknown>(COMPANION_PICKS_KEY));
+    const orgItems = this.orgListFor(org);
+    const asked: string[] = [];
+    for (const item of pickable) {
+      const key = `${item.type}:${item.name}`;
+      if (key in picks) continue;
+      const rows = pickRows(item, { localItems: this.items ?? [], orgItems, orgLabel });
+      const kept = stored[key];
+      // A remembered row that no longer exists (the project lost its tabs)
+      // changes what the choice means: asked again, even in "remembered" mode.
+      const valid = kept?.filter(id => rows.some(r => r.id === id));
+      if (silent && kept && valid && valid.length === kept.length) { picks[key] = valid; continue; }
+      const ticked = new Set(valid ?? defaultPicks(rows));
+      const options: Array<vscode.QuickPickItem & { rowId?: string }> = [];
+      let heading: string | undefined;
+      for (const r of rows) {
+        if (r.type !== heading) {
+          heading = r.type;
+          options.push({ label: typeLabel(r.type), kind: vscode.QuickPickItemKind.Separator });
+        }
+        options.push({ label: r.label, description: r.description, picked: ticked.has(r.id), rowId: r.id });
+      }
+      const answer = await vscode.window.showQuickPick(options, {
+        canPickMany: true,
+        ignoreFocusOut: true,
+        matchOnDescription: true,
+        title: `Fetch ${key} with…`,
+        placeHolder: 'Enter = the ticked rows (remembered); Escape cancels'
+      });
+      if (!answer) return undefined;
+      picks[key] = answer.map(a => a.rowId).filter((id): id is string => typeof id === 'string');
+      asked.push(key);
+    }
+    return {
+      picks,
+      remember: () => {
+        const state = this.context?.workspaceState;
+        if (!state || asked.length === 0) return;
+        const next = readCompanionPicks(state.get<unknown>(COMPANION_PICKS_KEY));
+        // Newest last; the oldest files fall off past the cap.
+        for (const key of asked) { delete next[key]; next[key] = picks[key]; }
+        const keys = Object.keys(next);
+        for (const k of keys.slice(0, Math.max(0, keys.length - COMPANION_PICKS_MAX))) delete next[k];
+        void Promise.resolve(state.update(COMPANION_PICKS_KEY, next)).catch(() => undefined);
+      }
+    };
+  }
+
+  /** Escape in the companion picker: nothing was fetched or written and no run
+   *  was started — the card says so. No toast: the user just pressed Escape. */
+  private reportPickerCancelled(action: string): void {
+    this.post({ type: 'status', card: { kind: 'warn', title: `${action} cancelled`, meta: 'cancelled before anything was fetched' } });
   }
 
   /** The Fetch Org listing as items, only when it was fetched for `org`. */
@@ -5376,6 +5466,12 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // which files differ — selecting one object (254 children) asked to open 254
       // editors when a handful differed. Only DIFFERING files get an editor, up to
       // diffEditorCap; identical ones are counted on the card (see `consider`).
+      // A Translations file or a Profile: the same picker as a Retrieve, before
+      // the org round trip — Escape drops the whole diff. No confirm follows, so
+      // the answer is remembered right away.
+      const picked = await this.pickCompanions(diffable, org, orgLabel);
+      if (!picked) { this.reportPickerCancelled(`Diff against ${orgLabel}`); return; }
+      picked.remember();
       const items = diffable;
       const cap = this.diffEditorCap();
 
@@ -5550,7 +5646,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // beside the components it describes (src/companions.ts) — without them
           // every fieldPermission of a profile reads "only local". Companions ride
           // in the same retrieve, get no editor and are never "not on org".
-          const context = this.contextPlanFor(slowItems, org, true);
+          const context = this.contextPlanFor(slowItems, org, true, picked.picks);
           companionNotes.push(...context.diffNotes);
           const diffTargets: MetadataItem[] = [...slowItems, ...context.plan.companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
           // Same rule as a retrieve: above MANIFEST_THRESHOLD the `--metadata`
@@ -7250,9 +7346,21 @@ export const WHOLE_FOLDER_DIFF_TYPES = new Set<string>(['CustomObjectTranslation
  *  check-open-target.cjs pins DIRECTORY_ITEM_TYPES ⊆ one of the three sets. */
 export const DEFINITION_FILE_DIFF_TYPES = new Set<string>(['CustomObject']);
 
-/** A project-scope diff of a profile / translation compares what the org says
- *  about THIS project's components only. */
-export const PROJECT_SCOPE_DIFF_LINE = 'compared for this project\'s components only (scope: project) — entries for components not in this project show as local-only';
+/** A diff of a profile / translation fetched with less than everything on the
+ *  org (a project row, a type left out) compares what the org says about THOSE
+ *  components only. */
+export const PARTIAL_FETCH_DIFF_LINE = 'compared with what was fetched alongside only — entries for components left out or not in this project show as local-only';
+
+/** The companion picker's remembered choices (COMPANION_PICKS_KEY), validated —
+ *  workspaceState can hand back anything. */
+export function readCompanionPicks(raw: unknown): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (Array.isArray(v) && v.every(x => typeof x === 'string')) out[k] = [...v as string[]];
+  }
+  return out;
+}
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
  *  one REST query instead of a Metadata API retrieve round-trip. */

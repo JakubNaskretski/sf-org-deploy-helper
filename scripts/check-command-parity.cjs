@@ -135,6 +135,27 @@ check('runByUri\'s action union grew, but deploy/retrieve/diff wiring is untouch
   assert.ok(/if \(action === 'retrieve'\) return this\.runRetrieve\(\[key\], \{ sourceDir \}\);/.test(providerSrc));
 });
 
+// The companion picker lives in runRetrieve / runDiff, so the context-menu and
+// palette Retrieve / Diff (runByUri, pinned above) ask exactly what the panel's
+// buttons ask — before the org is contacted, and an Escape stops there.
+check('palette / context-menu Retrieve and Diff reach the same companion picker as the panel, before any org call', () => {
+  assert.ok(/return this\.runDiff\(\[key\], orgOverride, uri\.fsPath\);/.test(providerSrc), 'runByUri must hand a diff to runDiff');
+  const body = (name) => {
+    const start = providerSrc.indexOf(`private async ${name}(`);
+    assert.ok(start > 0, `${name} not found`);
+    return providerSrc.slice(start, providerSrc.indexOf('\n  }\n', start));
+  };
+  for (const [fn, action] of [['runRetrieve', 'Retrieve from'], ['runDiff', 'Diff against']]) {
+    const src = body(fn);
+    const pick = src.indexOf('const picked = await this.pickCompanions(');
+    assert.ok(pick > 0, `${fn} never asks the picker`);
+    assert.ok(src.includes(`if (!picked) { this.reportPickerCancelled(\`${action} \${orgLabel}\`); return; }`), `${fn}: an Escape must end it before anything is fetched`);
+    const firstOrgCall = src.indexOf('this.sf.');
+    assert.ok(firstOrgCall > pick, `${fn}: the picker must come before the first org call`);
+    assert.ok(/contextPlanFor\([^)]*, picked\.picks\)/.test(src), `${fn}: the plan must be built from the picker's answer`);
+  }
+});
+
 check('every id in package.json "check" is a file that actually exists (sanity on the harness list itself)', () => {
   const scripts = [...pkg.scripts.check.matchAll(/node \.\/scripts\/([\w-]+\.cjs)/g)].map(m => m[1]);
   assert.ok(scripts.includes('check-command-parity.cjs'), 'this harness must be registered in package.json "check"');
