@@ -187,6 +187,22 @@ export async function resolvePackageDirs(root: string): Promise<string[]> {
   return ['force-app'];
 }
 
+/** The project's DEFAULT package directory (`"default": true`), else the first
+ *  one listed, else `force-app` — where the CLI itself writes a retrieved
+ *  component the project doesn't have yet. */
+export async function resolveDefaultPackageDir(root: string): Promise<string> {
+  try {
+    const cfg = await fs.readFile(path.join(root, 'sfdx-project.json'), 'utf8');
+    const dirs = ((JSON.parse(cfg) as { packageDirectories?: Array<{ path?: unknown; default?: unknown }> }).packageDirectories ?? [])
+      .filter((d): d is { path: string; default?: unknown } => !!d && typeof d.path === 'string' && d.path.length > 0);
+    const pick = dirs.find(d => d.default === true) ?? dirs[0];
+    if (pick) return pick.path;
+  } catch {
+    // ignore
+  }
+  return 'force-app';
+}
+
 /** Read `sourceApiVersion` from sfdx-project.json (the same field the CLI itself
  *  defaults deploys to) for a generated manifest's `<version>`. Same read shape as
  *  resolvePackageDirs, but NO fallback: a manifest `<version>` WINS over the

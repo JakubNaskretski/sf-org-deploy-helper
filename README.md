@@ -41,6 +41,29 @@ are hidden unless `sfOrgDeployWrapper.fetchIncludeManaged` is on (the card says 
 type). DataPack exports (`vlocity/`, `*_DataPack.json`) are data, not Metadata API source: the
 scan flags them but cannot list them.
 
+## Translations & profiles
+
+A profile, an org-wide translation (`translations/pl.translation-meta.xml`) and an object
+translation (`objectTranslations/Product2-pl/`) are not stored on the org as files: the org
+builds them on request, and fills in only the parts that describe components named in the SAME
+request. Retrieved alone, `Profile:Admin` comes back with its user permissions and nothing else,
+and `Translations:pl` as an empty stub — overwriting a complete local file. So Retrieve and Diff
+send these types together with their **companions**: an object translation with its object (and
+its layouts and quick actions), a translation with the labels, apps, tabs, flows, quick actions
+and report types it translates, a profile with the objects, fields, classes, pages, apps, tabs,
+layouts, custom permissions, flows, external data sources and custom metadata it grants access to.
+
+The companions go to a temporary project and are never written to yours — only the profile or
+translation itself is copied back (an object translation folder is merged: files the org sent are
+overwritten, a file only you have is kept). The confirm dialog says how many companions ride
+along, and the run names what was copied into your project. With
+`sfOrgDeployWrapper.contextScope` at `project` (the default) the companions are what this project
+has, so the file comes back complete for what you work on; `org` asks for everything of those
+types on the org — complete, but slow on a big org. If the project has none of them, the run says
+so loudly instead of quietly bringing back a stub. Object translations are listed in the tree as
+one folder each, and deploy, validate and diff like any other component; a diff opens only the
+files that differ. Deploy and validate need no companions — the full local file is sent.
+
 ## Deploy File + Dependencies
 
 Right-click an Apex class/trigger, an LWC or Aura bundle, or a Visualforce page/component
@@ -99,6 +122,8 @@ the job up again and finishes the same run.
 - `sfOrgDeployWrapper.changedBaseRef` — what the **Changed** view compares against. `auto` (the default) shows your uncommitted edits plus the commits no other branch has, one collapsible section per commit — so work stays listed after a commit and after a push, whatever the integration branch is called. On a checkout with no other branch to compare against, or one more than 100 commits ahead, it falls back to uncommitted-only and says so in the header; standing on the integration branch itself reads its own commits as this branch's work — commits you didn't write are labelled with their author, and you can pick a ref instead. Set a git ref (e.g. `main`, `origin/devInt`) to show everything that differs from it instead, or empty for uncommitted changes only. The label in the Changed view's header switches it.
 - `sfOrgDeployWrapper.openDiffInFloatingWindow` — pop org-comparison diffs into their own OS window (default on). Turn off to keep them as diff tabs in the main window.
 - `sfOrgDeployWrapper.diffEditorCap` — how many diff editors one Diff may open (default 10, 1–100). Everything selected is compared with the org first and only files that differ get an editor; identical files (line endings ignored) are counted on the result card, and differing files past the cap are listed there as "differs (not opened)".
+- `sfOrgDeployWrapper.contextCompanions` — Retrieve and Diff of a profile, an org-wide translation (`translations/pl.translation-meta.xml`) or an object translation also ask the org for the components it describes, so it comes back complete (default on). The companions land in a temporary project and are never written to yours; only the profile or translation is copied back. Off: these types are retrieved alone, nearly empty, and the result says so. See **Translations & profiles** above.
+- `sfOrgDeployWrapper.contextScope` — which companions are sent: `project` (default) — only the labels, apps, tabs, flows, objects, fields, classes… this project has; `org` — every component of those types on the org (complete, slow on big orgs). An object translation always brings its object; with `org`, its layouts and quick actions come from the Fetch Org list.
 - `sfOrgDeployWrapper.defaultTestLevel` — the Apex test level preselected in the panel's picker and used by context-menu/editor deploys before the picker is touched this session. Empty by default (smart default: `RunLocalTests` in production, `NoTestRun` in a sandbox).
 - `sfOrgDeployWrapper.backupBeforeRetrieve` — back up local files before a retrieve overwrites them (default on), restorable via **SF Deploy: Restore Retrieve Backup**. The last 5 backups per workspace are kept; a retrieve is aborted if its backup can't be written.
 - `sfOrgDeployWrapper.syncOrgWithFamily` — follow and publish the Salesforce org shared across the Skrety SF plugins via `skrety.salesforce.targetOrg` (default off — this plugin keeps its own org, remembered per VS Code window).

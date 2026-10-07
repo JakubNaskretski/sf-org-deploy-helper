@@ -275,6 +275,8 @@ function diffStub(items, orgFolders) {
   return { stub, posted, log, retrieved };
 }
 const cards = (posted) => posted.filter(m => m.type === 'status').map(m => m.card);
+// The object rides along with every diff of its translation (src/companions.ts).
+const COMPANION_LINE = 'companions: CustomObject:Product2 (scope: project)';
 const drain = () => { for (const fn of editorListeners.splice(0)) fn([]); };
 const runDiff = (stub, keys, focusFile) => DeployPanelProvider.prototype.runDiff.call(stub, keys, undefined, focusFile);
 const item = () => scanned.find(i => i.name === 'Product2-pl');
@@ -289,7 +291,9 @@ check('folder diff: only the differing files open — paired with THIS translati
   resetUi();
   const { stub, posted, log, retrieved } = diffStub([item()], { 'Product2-pl': ORG, 'Product2-de': DECOY });
   await runDiff(stub, ['CustomObjectTranslation:Product2-pl']);
-  assert.deepStrictEqual(retrieved, [['CustomObjectTranslation:Product2-pl']], 'one retrieve of the component itself');
+  // One retrieve: the component, and its object as a companion (0.31.0) — alone,
+  // the org answers with the parent stub and no field translations at all.
+  assert.deepStrictEqual(retrieved, [['CustomObjectTranslation:Product2-pl', 'CustomObject:Product2']], 'one retrieve of the component and its object');
   const byFile = Object.fromEntries(ui.diffs.map(d => [d.title.split(' — ')[0], d]));
   assert.deepStrictEqual(Object.keys(byFile).sort(), [
     'CustomObjectTranslation:Product2-pl/Acme_LocalOnly__c.fieldTranslation-meta.xml (only local)',
@@ -360,7 +364,7 @@ check('folder diff: an org without the folder reports the component as not on or
   assert.strictEqual(ui.diffs.length, 0);
   const card = cards(posted)[0];
   assert.strictEqual(card.title, 'Nothing to diff — not on acme-dev');
-  assert.deepStrictEqual(card.lines, ['— CustomObjectTranslation:Product2-pl — not on org']);
+  assert.deepStrictEqual(card.lines, ['— CustomObjectTranslation:Product2-pl — not on org', COMPANION_LINE]);
   drain();
 });
 
@@ -387,7 +391,7 @@ check('focus: a right-click on one field translation diffs just that file', asyn
   assert.strictEqual(ui.diffs[0].right, clicked);
   assert.strictEqual(await read(ui.diffs[0].left), ORG['Acme_Status__c.fieldTranslation-meta.xml'], 'cross-matched the decoy');
   assert.ok(ui.diffs[0].title.startsWith('CustomObjectTranslation:Product2-pl/Acme_Status__c.fieldTranslation-meta.xml — '), ui.diffs[0].title);
-  assert.deepStrictEqual(cards(posted)[0].lines, ['✓ opened diff: CustomObjectTranslation:Product2-pl/Acme_Status__c.fieldTranslation-meta.xml']);
+  assert.deepStrictEqual(cards(posted)[0].lines, ['✓ opened diff: CustomObjectTranslation:Product2-pl/Acme_Status__c.fieldTranslation-meta.xml', COMPANION_LINE]);
   drain();
 });
 
@@ -397,7 +401,7 @@ check('focus: a right-click on an identical file opens nothing and says in sync'
   await runDiff(stub, ['CustomObjectTranslation:Product2-pl'], path.join(dir, 'Acme_Crlf__c.fieldTranslation-meta.xml'));
   assert.strictEqual(ui.diffs.length, 0);
   const card = cards(posted)[0];
-  assert.deepStrictEqual([card.title, card.lines], ['All 1 in sync with acme-dev', [ALL_IN_SYNC_LINE, 'in sync: CustomObjectTranslation:Product2-pl/Acme_Crlf__c.fieldTranslation-meta.xml']]);
+  assert.deepStrictEqual([card.title, card.lines], ['All 1 in sync with acme-dev', [ALL_IN_SYNC_LINE, 'in sync: CustomObjectTranslation:Product2-pl/Acme_Crlf__c.fieldTranslation-meta.xml', COMPANION_LINE]]);
   drain();
 });
 

@@ -275,6 +275,24 @@
           "maximum": 100,
           "markdownDescription": "How many diff editors one **Diff** may open. Every selected component is compared with the org first, and only files that differ get an editor — identical ones (line endings ignored) are counted on the result card instead. Differing files past this cap are listed on the card as \"differs (not opened)\" so you can diff them on their own. VS Code doesn't enforce the `minimum`/`maximum` at runtime, so the extension clamps whatever you set here."
         },
+        "sfOrgDeployWrapper.contextCompanions": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Retrieve and Diff of a **Profile**, an org-wide **Translations** file or a **CustomObjectTranslation** also ask the org for the components it describes (\"companions\": labels, tabs, apps, objects, classes…) — without them the org answers with a nearly empty file. Companions go to a temporary project and are never written to yours; only the profile or translation is copied back. Turn off to retrieve these types alone, as before (the result says so). See `#sfOrgDeployWrapper.contextScope#` for which companions are sent."
+        },
+        "sfOrgDeployWrapper.contextScope": {
+          "type": "string",
+          "enum": [
+            "project",
+            "org"
+          ],
+          "enumDescriptions": [
+            "Send only the companions this project has (its labels, tabs, objects, fields, classes…). Fast; the profile or translation comes back complete for what the project contains.",
+            "Send every component of the companion types on the org (`*`). Complete, but slow on big orgs."
+          ],
+          "default": "project",
+          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `project` (default) — only what this project has; `org` — everything of those types on the org. An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list."
+        },
         "sfOrgDeployWrapper.defaultTestLevel": {
           "type": "string",
           "enum": [
@@ -341,7 +359,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-diff-sync.cjs && node ./scripts/check-object-translations.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-registry-names.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs && node ./scripts/check-run-records.cjs && node ./scripts/check-run-view.cjs && node ./scripts/check-status-pane.cjs && node ./scripts/check-run-store.cjs && node ./scripts/check-run-producers.cjs && node ./scripts/check-test-handoff.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-diff-sync.cjs && node ./scripts/check-object-translations.cjs && node ./scripts/check-companions.cjs && node ./scripts/check-context-retrieve.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-registry-names.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs && node ./scripts/check-run-records.cjs && node ./scripts/check-run-view.cjs && node ./scripts/check-status-pane.cjs && node ./scripts/check-run-store.cjs && node ./scripts/check-run-producers.cjs && node ./scripts/check-test-handoff.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },
