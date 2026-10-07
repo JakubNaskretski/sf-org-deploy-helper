@@ -31,16 +31,17 @@ const Module = require('module');
 // ---------------------------------------------------------------- vscode stub
 const ui = { diffs: [], warn: [] };
 const editorListeners = [];
-// What the ">5 diff editors" modal answers. Undefined = the user dismissed it,
-// which aborts the run — so the batch cases below have to answer it explicitly.
-let modalAnswer;
-const resetUi = () => { ui.diffs.length = 0; ui.warn.length = 0; editorListeners.length = 0; modalAnswer = undefined; };
+// Settings a case overrides (sfOrgDeployWrapper.<key>); everything else reads
+// its default. The BATCH case raises diffEditorCap: it checks PAIRING for every
+// type at once, so every differing file has to get its editor.
+const config = {};
+const resetUi = () => { ui.diffs.length = 0; ui.warn.length = 0; editorListeners.length = 0; for (const k of Object.keys(config)) delete config[k]; };
 
 const vscodeStub = {
   window: {
     setStatusBarMessage: () => ({ dispose: () => {} }),
     showInformationMessage: () => Promise.resolve(undefined),
-    showWarningMessage: (message) => { ui.warn.push(message); return Promise.resolve(modalAnswer); },
+    showWarningMessage: (message) => { ui.warn.push(message); return Promise.resolve(undefined); },
     showErrorMessage: () => Promise.resolve(undefined),
     withProgress: (_o, body) => body({ report: () => {} }, { onCancellationRequested: () => ({ dispose: () => {} }) }),
     onDidChangeVisibleTextEditors: (fn) => { editorListeners.push(fn); return { dispose: () => {} }; }
@@ -51,7 +52,7 @@ const vscodeStub = {
       return Promise.resolve(undefined);
     }
   },
-  workspace: { getConfiguration: () => ({ get: (_k, fallback) => fallback }) },
+  workspace: { getConfiguration: () => ({ get: (k, fallback) => (k in config ? config[k] : fallback) }) },
   Uri: { file: (fsPath) => ({ fsPath, scheme: 'file' }) },
   ViewColumn: { Active: -1 },
   ProgressLocation: { Notification: 15 }
@@ -59,7 +60,7 @@ const vscodeStub = {
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
-const { DeployPanelProvider, DIFF_UNSUPPORTED } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
+const { DeployPanelProvider, DIFF_UNSUPPORTED, WHOLE_FOLDER_DIFF_TYPES } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 const { inferItemForPath, OBJECT_CHILD_TYPES, DIRECTORY_ITEM_TYPES } = require(path.join(__dirname, '..', 'out', 'metadataScanner.js'));
 
 // ------------------------------------------------------------------ fixtures
@@ -76,6 +77,11 @@ const FIX = [
     siblings: ['lwc/widgetList/widgetList.html', 'lwc/widgetList/widgetList.js-meta.xml'] },
   { rel: 'aura/WidgetApp/WidgetApp.cmp', type: 'AuraDefinitionBundle', name: 'WidgetApp', focus: true,
     siblings: ['aura/WidgetApp/WidgetAppController.js', 'aura/WidgetApp/WidgetApp.cmp-meta.xml'] },
+  // Folder-typed too, with a whole-folder diff of its own (check-object-translations.cjs);
+  // a right-click on one file inside still diffs just that file. The field
+  // translation beside it is the sibling decoy.
+  { rel: 'objectTranslations/Widget__c-pl/Widget__c-pl.objectTranslation-meta.xml', type: 'CustomObjectTranslation', name: 'Widget__c-pl', focus: true,
+    siblings: ['objectTranslations/Widget__c-pl/Size__c.fieldTranslation-meta.xml'] },
   { rel: 'flows/Widget_Flow.flow-meta.xml', type: 'Flow', name: 'Widget_Flow' },
   { rel: 'layouts/Widget__c-Widget Layout.layout-meta.xml', type: 'Layout', name: 'Widget__c-Widget Layout' },
   { rel: 'permissionsets/Widget_Access.permissionset-meta.xml', type: 'PermissionSet', name: 'Widget_Access' },
@@ -260,7 +266,7 @@ for (const f of FIX.filter(x => x.fast)) {
 // components with each other — invisible in the one-type-at-a-time cases above.
 check('BATCH: every retrieve-path type in ONE tree still pairs correctly', async () => {
   resetUi();
-  modalAnswer = 'Open All'; // past the >5-editors cap
+  config.diffEditorCap = 100; // every differing file gets its editor — pairing is the subject here
   const batch = FIX.filter(f => !f.fast && !f.unsupported && !f.focus);
   const items = batch.map(itemFor);
   const orgRels = batch.flatMap(orgFilesFor);
@@ -341,7 +347,10 @@ check('BATCH: types the org does not have report as missing, not as opened', asy
   assert.strictEqual(ui.diffs.length, 0);
   const card = cards(posted).find(c => c.title.startsWith('Nothing to diff'));
   assert.ok(card, `expected a verdict card: ${JSON.stringify(cards(posted))}`);
-  assert.deepStrictEqual(card.lines, batch.map(f => `— ${f.type}:${f.name} — not on org`));
+  assert.deepStrictEqual(card.lines.filter(l => l.startsWith('— ')), batch.map(f => `— ${f.type}:${f.name} — not on org`));
+  // The batch holds a Profile: its companions ride along (default scope org) and
+  // the card names them — informational lines, never a "not on org" verdict.
+  assert.deepStrictEqual(card.lines.filter(l => !l.startsWith('— ')).map(l => l.split(':')[0]), ['companions', 'org list not loaded — standard objects for Profile']);
 });
 
 // The fixture table is the contract; this keeps it honest as types are added.
@@ -354,6 +363,7 @@ check('the fixture table covers every type the diff flow special-cases', () => {
     assert.ok(covered.has(t), `${t} is folder-typed but has no fixture`);
     assert.ok(FIX.find(f => f.type === t).focus, `${t} fixture must exercise the focus rule`);
   }
+  for (const t of WHOLE_FOLDER_DIFF_TYPES) assert.ok(covered.has(t), `${t} has a whole-folder diff but no fixture`);
   for (const t of DIFF_UNSUPPORTED) {
     // StaticResource is the one DIFF_UNSUPPORTED member with no folder-typed
     // escape hatch: source format stores archives as an unzipped FOLDER, so

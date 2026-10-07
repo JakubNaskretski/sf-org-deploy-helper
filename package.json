@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.30.1",
+  "version": "0.31.0",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -121,22 +121,22 @@
       "explorer/context": [
         {
           "command": "sfOrgDeployWrapper.deployFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@1"
         },
         {
           "command": "sfOrgDeployWrapper.retrieveFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@2"
         },
         {
           "command": "sfOrgDeployWrapper.diffFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@3"
         },
         {
           "command": "sfOrgDeployWrapper.diffFileWithOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@4"
         },
         {
@@ -156,34 +156,34 @@
         },
         {
           "command": "sfOrgDeployWrapper.openInOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@7"
         },
         {
           "command": "sfOrgDeployWrapper.deleteFromOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@8"
         }
       ],
       "editor/context": [
         {
           "command": "sfOrgDeployWrapper.deployFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@1"
         },
         {
           "command": "sfOrgDeployWrapper.retrieveFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@2"
         },
         {
           "command": "sfOrgDeployWrapper.diffFile",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@3"
         },
         {
           "command": "sfOrgDeployWrapper.diffFileWithOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@4"
         },
         {
@@ -193,12 +193,12 @@
         },
         {
           "command": "sfOrgDeployWrapper.openInOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@6"
         },
         {
           "command": "sfOrgDeployWrapper.deleteFromOrg",
-          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura)[\\\\/]/",
+          "when": "resourceExtname =~ /\\.(cls|trigger|page|component|resource|email)$/ || resourceFilename =~ /-meta\\.xml$/ || resourcePath =~ /[\\\\/](lwc|aura|objectTranslations)[\\\\/]/",
           "group": "sfdeploy@7"
         }
       ],
@@ -268,6 +268,31 @@
           "default": true,
           "markdownDescription": "Pop org-comparison diffs into their own OS window (auxiliary window). Turn off to keep them as diff tabs in the main window."
         },
+        "sfOrgDeployWrapper.diffEditorCap": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 100,
+          "markdownDescription": "How many diff editors one **Diff** may open. Every selected component is compared with the org first, and only files that differ get an editor — identical ones (line endings ignored) are counted on the result card instead. Differing files past this cap are listed on the card as \"differs (not opened)\" so you can diff them on their own. VS Code doesn't enforce the `minimum`/`maximum` at runtime, so the extension clamps whatever you set here."
+        },
+        "sfOrgDeployWrapper.contextCompanions": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Retrieve and Diff of a **Profile**, an org-wide **Translations** file or a **CustomObjectTranslation** also ask the org for the components it describes (\"companions\": labels, tabs, apps, objects, classes…) — without them the org answers with a nearly empty file. Companions go to a temporary project and are never written to yours; only the profile or translation is copied back. Turn off to retrieve these types alone, as before (the result says so). See `#sfOrgDeployWrapper.contextScope#` for which companions are sent."
+        },
+        "sfOrgDeployWrapper.contextScope": {
+          "type": "string",
+          "enum": [
+            "project",
+            "org"
+          ],
+          "enumDescriptions": [
+            "Send only the companions this project has (its labels, tabs, objects, fields, classes…). Fast, but the profile or translation is then completed for this project's components only — the org's other entries are left out, and the dialog says so.",
+            "Send every component of the companion types on the org (`*`), and the standard objects from the Fetch Org list, so the file comes back complete (once Fetch Org has listed the org — without it, standard objects come from the project). Can take minutes on a big org; the dialog says what is fetched."
+          ],
+          "default": "org",
+          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `org` (default) — everything of those types on the org, so the file comes back complete once **Fetch Org** has listed the org; it can take minutes on a big org, and the dialog says what is fetched (a wildcard can't name standard objects, so they come from that list — or, without it, from the project). `project` — only what this project has: faster, but the file is completed for this project's components only and the org's other entries are left out (the dialog and the run say so). An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list too."
+        },
         "sfOrgDeployWrapper.defaultTestLevel": {
           "type": "string",
           "enum": [
@@ -334,7 +359,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./ && node ./scripts/copy-panel-js.mjs",
-    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-registry-names.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs && node ./scripts/check-run-records.cjs && node ./scripts/check-run-view.cjs && node ./scripts/check-status-pane.cjs && node ./scripts/check-run-store.cjs && node ./scripts/check-run-producers.cjs && node ./scripts/check-test-handoff.cjs",
+    "check": "npm run compile && node ./scripts/check-no-shadow.cjs && node ./scripts/check-infer.cjs && node ./scripts/check-project-discovery.cjs && node ./scripts/check-missing-deps.cjs && node ./scripts/check-changed-retry.cjs && node ./scripts/check-changed-live.cjs && node ./scripts/check-changed-commits.cjs && node ./scripts/check-dep-graph.cjs && node ./scripts/check-suggestions.cjs && node ./scripts/check-suggestion-flow.cjs && node ./scripts/check-confirm-modal.cjs && node ./scripts/check-select-deployed.cjs && node ./scripts/check-panel-selection.cjs && node ./scripts/check-retry-helpers.cjs && node ./scripts/check-hidden-panel-notice.cjs && node ./scripts/check-open-target.cjs && node ./scripts/check-card-buttons.cjs && node ./scripts/check-deploy-deps.cjs && node ./scripts/check-file-watch.cjs && node ./scripts/check-diff-focus.cjs && node ./scripts/check-diff-matrix.cjs && node ./scripts/check-diff-sync.cjs && node ./scripts/check-object-translations.cjs && node ./scripts/check-companions.cjs && node ./scripts/check-context-retrieve.cjs && node ./scripts/check-org-membership.cjs && node ./scripts/check-org-sync.cjs && node ./scripts/check-retrieve-conflicts.cjs && node ./scripts/check-fetch-org.cjs && node ./scripts/check-double-click.cjs && node ./scripts/check-registry-rules.cjs && node ./scripts/check-registry-names.cjs && node ./scripts/check-org-cache.cjs && node ./scripts/check-sf-spawn.cjs && node ./scripts/check-readme-settings.cjs && node ./scripts/check-command-parity.cjs && node ./scripts/check-large-selection.cjs && node ./scripts/check-cmd-log.cjs && node ./scripts/check-run-records.cjs && node ./scripts/check-run-view.cjs && node ./scripts/check-status-pane.cjs && node ./scripts/check-run-store.cjs && node ./scripts/check-run-producers.cjs && node ./scripts/check-test-handoff.cjs",
     "watch": "tsc -watch -p ./",
     "package": "npx -y @vscode/vsce@latest package --allow-missing-repository"
   },

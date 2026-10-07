@@ -128,9 +128,16 @@ check('both user-facing retrieve cards echo the flag keyed on the same variable'
   // Whole lines: the manifest echo nests backticks inside `${...}`, so a
   // [^`]* match would stop early.
   const echoes = src.split('\n').filter(l => l.includes('beginCmd(`sf project retrieve start'));
-  const userFacing = echoes.filter(e => !/metadataArgs\(slowItems\)/.test(e)); // diff slow path excluded
+  // Temp-project retrieves excluded: the diff slow path, and the context half of
+  // a retrieve (a Profile / Translations with its companions, src/companions.ts).
+  const tempProject = /targetArg\(undefined, (diffTargets|ctxTargets),/;
+  const userFacing = echoes.filter(e => !tempProject.test(e));
   assert.strictEqual(userFacing.length, 2, echoes.join('\n'));
   for (const e of userFacing) assert.ok(/--target-org \$\{org\}\$\{ignoreConflicts \? ' --ignore-conflicts' : ''\}`\);$/.test(e.trim()), e);
+  // …and those two never claim the flag: a throwaway project has no tracking to conflict with.
+  const temp = echoes.filter(e => tempProject.test(e));
+  assert.strictEqual(temp.length, 2, echoes.join('\n'));
+  for (const e of temp) assert.ok(!e.includes('ignore-conflicts'), e);
 });
 
 check('the gate reads the value maybeBackupBeforeRetrieve returns (dir only when files were copied)', () => {
@@ -232,11 +239,13 @@ check('a mix of copyable and non-copyable candidates counts only what was actual
   });
 });
 
-check('diff slow-path retrieve is NOT forced', () => {
-  const i = src.indexOf('metadataArgs(slowItems)');
-  assert.ok(i > 0);
-  const window = src.slice(i, i + 600);
-  assert.ok(!/ignoreConflicts: true/.test(window), 'diff temp-dir retrieve must not force the flag');
+check('temp-project retrieves (diff slow path, context half of a retrieve) are NOT forced', () => {
+  for (const anchor of ['targetArg(undefined, diffTargets,', 'targetArg(undefined, ctxTargets,']) {
+    const i = src.indexOf(anchor);
+    assert.ok(i > 0, anchor);
+    const window = src.slice(i, i + 600);
+    assert.ok(!/ignoreConflicts/.test(window), `temp-dir retrieve must not pass the flag: ${anchor}`);
+  }
 });
 
 check('deploy flag still comes from the setting (with the one-off retry override), never hard-coded', () => {

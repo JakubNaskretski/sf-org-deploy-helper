@@ -90,7 +90,7 @@ const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? vscodeStub : origLoad(req, ...rest));
 
 const {
-  DeployPanelProvider, classifyDiffOutcome, nothingDiffableNotice, notifyHeadline
+  DeployPanelProvider, classifyDiffOutcome, nothingDiffableNotice, notifyHeadline, ALL_IN_SYNC_LINE
 } = require(path.join(__dirname, '..', 'out', 'panelProvider.js'));
 const providerSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panelProvider.ts'), 'utf8');
 
@@ -304,56 +304,90 @@ check('a deploy timeout is a failure, not a warn verdict — it keeps waiting', 
 
 // ====================================================== the diff classification
 // Card text is a contract (it is also the persisted history), so the strings are
-// pinned exactly as 0.16.0 rendered them — the notification decision is what's new.
+// pinned exactly. 0.31.0 changed them on purpose: a diff now compares before it
+// opens anything, so the counts are per compared FILE PAIR — differ (opened or
+// past diffEditorCap) · in sync · not on org — and "everything is identical" is
+// an outcome of its own that must never read as a dead click.
+const counts = (o) => Object.assign({ opened: 0, differ: 0, inSync: 0, missing: 0, errors: 0, unsupported: 0, attempted: 1 }, o);
 check('all opened → ok card, and NO toast: the diff editor is the feedback', () => {
-  const out = classifyDiffOutcome({ opened: 2, missing: 0, errors: 0, unsupported: 0, attempted: 2 }, 'acme-dev');
+  const out = classifyDiffOutcome(counts({ opened: 2, differ: 2, attempted: 2 }), 'acme-dev');
   assert.deepStrictEqual(out, {
     kind: 'ok',
-    title: 'Diff opened for 2 components against acme-dev',
-    meta: '2 opened · 0 missing · 0 errors',
+    title: 'Diff opened for 2 differing files against acme-dev',
+    meta: '2 differ · 0 in sync · 0 not on org',
     notify: 'none'
   });
 });
 
 check('nothing on the org → warn card AND a warn toast (the reported bug)', () => {
-  const out = classifyDiffOutcome({ opened: 0, missing: 1, errors: 0, unsupported: 0, attempted: 1 }, 'acme-dev');
+  const out = classifyDiffOutcome(counts({ missing: 1 }), 'acme-dev');
   assert.deepStrictEqual(out, {
     kind: 'warn',
     title: 'Nothing to diff — not on acme-dev',
-    meta: '0 opened · 1 missing · 0 errors',
+    meta: '0 differ · 0 in sync · 1 not on org',
     notify: 'warn'
   });
 });
 
 check('in-band errors → err card and the failure treatment', () => {
-  const out = classifyDiffOutcome({ opened: 0, missing: 0, errors: 2, unsupported: 0, attempted: 2 }, 'acme-dev');
+  const out = classifyDiffOutcome(counts({ errors: 2, attempted: 2 }), 'acme-dev');
   assert.strictEqual(out.kind, 'err');
   assert.strictEqual(out.notify, 'err');
   assert.strictEqual(out.title, 'Diff completed with issues against acme-dev');
+  assert.strictEqual(out.meta, '0 differ · 0 in sync · 0 not on org · 2 errors');
 });
 
 check('errors win over opened diffs — a partial org failure still reports', () => {
-  const out = classifyDiffOutcome({ opened: 1, missing: 0, errors: 1, unsupported: 0, attempted: 2 }, 'acme-dev');
+  const out = classifyDiffOutcome(counts({ opened: 1, differ: 1, errors: 1, attempted: 2 }), 'acme-dev');
   assert.strictEqual(out.kind, 'err');
   assert.strictEqual(out.notify, 'err');
-  assert.strictEqual(out.title, 'Diff opened for 1 component against acme-dev');
+  assert.strictEqual(out.title, 'Diff opened for 1 differing file against acme-dev');
 });
 
 check('a partial miss stays a warn CARD but not a second notification', () => {
   // One editor opened, one component absent: the editors are visible feedback, so
   // this deliberately does not toast. The card carries which one was skipped.
-  const out = classifyDiffOutcome({ opened: 1, missing: 1, errors: 0, unsupported: 0, attempted: 2 }, 'acme-dev');
+  const out = classifyDiffOutcome(counts({ opened: 1, differ: 1, missing: 1, attempted: 2 }), 'acme-dev');
   assert.strictEqual(out.kind, 'warn');
   assert.strictEqual(out.notify, 'none');
 });
 
 check('"not on org" wording is reserved for a run where EVERYTHING was missing', () => {
-  const all = classifyDiffOutcome({ opened: 0, missing: 3, errors: 0, unsupported: 0, attempted: 3 }, 'acme-dev');
-  const some = classifyDiffOutcome({ opened: 0, missing: 2, errors: 0, unsupported: 1, attempted: 3 }, 'acme-dev');
+  const all = classifyDiffOutcome(counts({ missing: 3, attempted: 3 }), 'acme-dev');
+  const some = classifyDiffOutcome(counts({ missing: 2, unsupported: 1, attempted: 3 }), 'acme-dev');
   assert.strictEqual(all.title, 'Nothing to diff — not on acme-dev');
   assert.strictEqual(some.title, 'Diff completed with issues against acme-dev');
-  assert.strictEqual(some.meta, '0 opened · 2 missing · 0 errors · 1 unsupported');
+  assert.strictEqual(some.meta, '0 differ · 0 in sync · 2 not on org · 1 unsupported');
   assert.strictEqual(some.notify, 'warn');
+});
+
+check('ALL IN SYNC is unmistakable: ok card, its own title, the lead line, and a toast', () => {
+  const out = classifyDiffOutcome(counts({ inSync: 3, attempted: 3 }), 'acme-dev');
+  assert.deepStrictEqual(out, {
+    kind: 'ok',
+    title: 'All 3 in sync with acme-dev',
+    meta: '0 differ · 3 in sync · 0 not on org',
+    notify: 'ok',
+    lead: 'Nothing opened — the org copy and your local copy are byte-identical (line endings ignored)'
+  });
+  assert.strictEqual(out.lead, ALL_IN_SYNC_LINE);
+});
+
+check('some in sync, some differ → the editors are the feedback, no lead line', () => {
+  const out = classifyDiffOutcome(counts({ opened: 1, differ: 1, inSync: 37, attempted: 38 }), 'acme-dev');
+  assert.strictEqual(out.meta, '1 differ · 37 in sync · 0 not on org');
+  assert.strictEqual(out.notify, 'none');
+  assert.strictEqual(out.lead, undefined);
+});
+
+check('in sync but something was NOT compared is not "all in sync"', () => {
+  const missing = classifyDiffOutcome(counts({ inSync: 2, missing: 1, attempted: 3 }), 'acme-dev');
+  assert.strictEqual(missing.kind, 'warn');
+  assert.strictEqual(missing.title, 'Diff completed with issues against acme-dev');
+  assert.strictEqual(missing.lead, undefined);
+  const unsupported = classifyDiffOutcome(counts({ inSync: 2, unsupported: 1, attempted: 2 }), 'acme-dev');
+  assert.strictEqual(unsupported.kind, 'warn');
+  assert.strictEqual(unsupported.lead, undefined);
 });
 
 // --------------------------------------------- nothing diffable at all (early return)
@@ -484,6 +518,25 @@ check('WIRING: a diff that OPENS an editor adds no toast on top of it', async ()
   assert.ok(ui.commands.some(c => c.id === 'vscode.diff'), 'the diff editor never opened');
   assert.deepStrictEqual([ui.notices.length, ui.warn.length, ui.info.length, ui.error.length], [0, 0, 0, 0],
     'the diff editor IS the feedback — nothing else should fire');
+});
+
+check('WIRING: an identical class opens NOTHING, and with the panel closed says why', async () => {
+  resetUi();
+  // The local side is a real file; the org body is the same bytes with CRLF line
+  // endings and no final newline — both normalised away, nothing else is.
+  const local = path.join(__dirname, '..', 'tsconfig.json');
+  const body = require('fs').readFileSync(local, 'utf8').replace(/\n/g, '\r\n').replace(/\r\n$/, '');
+  const { stub, posted, log } = diffStub([item('ApexClass', 'Same', local)], [{ Name: 'Same', NamespacePrefix: null, Body: body }]);
+  await DeployPanelProvider.prototype.runDiff.call(stub, ['ApexClass:Same']);
+  drainTmpCleanup();
+  assert.ok(!ui.commands.some(c => c.id === 'vscode.diff'), 'an identical file must not open an editor');
+  const card = cards(posted)[0];
+  assert.ok(card, `no card: ${log.join(' | ')}`);
+  assert.deepStrictEqual([card.kind, card.title, card.meta], ['ok', 'All 1 in sync with acme-dev', '0 differ · 1 in sync · 0 not on org']);
+  assert.deepStrictEqual(card.lines, [ALL_IN_SYNC_LINE, 'in sync: ApexClass:Same']);
+  // The toast says the same — a diff that opens nothing must not be a dead click.
+  assert.deepStrictEqual(ui.notices.map(n => n.title), [`SF Deploy: All 1 in sync with acme-dev — ${ALL_IN_SYNC_LINE}`]);
+  assert.deepStrictEqual([ui.warn.length, ui.error.length], [0, 0], 'in sync is not a warning');
 });
 
 // ------------------------------------------------------------- cancellation

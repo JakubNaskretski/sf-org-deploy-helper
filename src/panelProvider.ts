@@ -7,8 +7,9 @@ import { execFile } from 'child_process';
 import { OrgStore } from './orgStore';
 import { DeleteResult, DeployFileResult, DeployResult, DeployTestFailure, OrgInfo, OrgMember, RetrieveFileResult, RetrieveResult, SfCliCancelledError, SfCliError, SfCliService, TestLevel, stripAnsi, fileProblem, fileType, retrieveProblem } from './sfCliService';
 import { isLikelyProduction } from './kit/orgs';
-import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
+import { DIRECTORY_ITEM_TYPES, RULES, FolderRule, LearnedRule, MetadataItem, MissingDependencies, OBJECT_CHILD_TYPES, STATIC_RULE_FOLDERS, buildManifestXml, bundleDefinitionFile, deriveRule, deriveRulesForTypes, detectMissingDependencies, findItemForPath, foldPathKey, inferItemForPath, isProjectNotFound, listMetaFileNames, mergeChangedKeys, parseManifestTypes, resolveApiVersion, resolveDefaultPackageDir, resolvePackageDirs, retryProjectNotFound, scanWorkspace, SuggestionCandidateInfo, buildSuggestionCandidates } from './metadataScanner';
 import { loadRegistryRules, registryNonDerivable, registryRulesSource } from './registryRules';
+import { CONTEXT_SCOPE_DEFAULT, CONTEXT_SHAPES, CONTEXT_TYPES, Companion, CompanionPlan, Scope, companionsFor, describeContext, hasWildcard, isCompanionMessage } from './companions';
 
 /** Backoff for an explicit scan that found no sfdx-project.json (see doLoadFiles). */
 const DISCOVERY_RETRY_DELAYS_MS = [1500, 4000, 10000];
@@ -345,6 +346,17 @@ const DELETE_ARGV_LIMIT = 6000;
  *  never capped, and beginCmd's text is replaced with that real echo by the
  *  time the run finishes. */
 const ECHO_METADATA_CAP = 20;
+
+/** sfOrgDeployWrapper.diffEditorCap: how many diff editors one Diff may open.
+ *  Only files that DIFFER from the org get an editor — identical ones are counted
+ *  on the card instead — so the cap bounds the editors, never the comparison: a
+ *  differing file past it is still named on the card ("differs (not opened)").
+ *  Clamped like the other numeric settings (a hand-edited settings.json skips
+ *  the schema's minimum/maximum). */
+const DIFF_EDITOR_CAP_DEFAULT = 10;
+const DIFF_EDITOR_CAP_MAX = 100;
+/** How many in-sync names the card spells out before "+N more". */
+const IN_SYNC_NAMES_SHOWN = 3;
 
 /** Cap on a status card's `lines` — a deploy/retrieve over a few thousand
  *  components would otherwise render (and persist) every single one. The kept
@@ -4203,16 +4215,24 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       if (!root) return;
       const org = this.requireOrg();
       if (!org) return;
-      const items = this.resolveKeys(keys);
-      if (items.length === 0) return;
+      const allItems = this.resolveKeys(keys);
+      if (allItems.length === 0) return;
       const orgLabel = this.orgs.find(o => o.username === org)?.alias ?? org;
-      const noun = `${items.length} component${items.length === 1 ? '' : 's'}`;
+      const noun = `${allItems.length} component${allItems.length === 1 ? '' : 's'}`;
+      // A Profile, Translations or CustomObjectTranslation comes back complete only
+      // beside the components it describes (src/companions.ts). With companions to
+      // send, those items take a throwaway project and only their own files are
+      // copied back (`ctxItems`); everything else (`items`) retrieves straight into
+      // the project exactly as before.
+      const context = this.contextPlanFor(allItems, org, false);
+      const ctxItems = context.split ? allItems.filter(i => CONTEXT_TYPES.has(i.type)) : [];
+      const items = context.split ? allItems.filter(i => !CONTEXT_TYPES.has(i.type)) : allItems;
       // Above MANIFEST_THRESHOLD, --metadata Type:Name × N argv blows Windows'
       // ~32 KB command-line limit well under 1,000 components — see runDeploy.
       const useManifest = !opts.sourceDir && items.length > MANIFEST_THRESHOLD;
 
-      const orgOnlyCount = items.filter(i => !i.filePath).length;
-      const localCount = items.length - orgOnlyCount;
+      const orgOnlyCount = allItems.filter(i => !i.filePath).length;
+      const localCount = allItems.length - orgOnlyCount;
       const detail = orgOnlyCount > 0 && localCount > 0
         ? `${localCount} local file${localCount !== 1 ? 's' : ''} will be overwritten · ${orgOnlyCount} new file${orgOnlyCount !== 1 ? 's' : ''} will be created`
         : orgOnlyCount > 0
@@ -4220,7 +4240,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           : 'This will overwrite your local files.';
       const confirm = await vscode.window.showWarningMessage(
         `Retrieve ${noun} from ${orgLabel}?`,
-        { modal: true, detail: [detail, manifestNotice(useManifest)].filter(Boolean).join('\n') },
+        { modal: true, detail: [detail, manifestNotice(useManifest), context.modalLine].filter(Boolean).join('\n') },
         'Retrieve'
       );
       if (confirm !== 'Retrieve') return;
@@ -4228,17 +4248,18 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       const runId = newRunId();
       const runStartedAt = Date.now();
       const target: RunTarget = opts.sourceDir ? 'sourceDir' : 'selection';
-      this.runStore.begin(beginRun({ id: runId, op: 'retrieve', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, target, items }));
+      this.runStore.begin(beginRun({ id: runId, op: 'retrieve', org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, target, items: allItems }));
 
       // Pre-retrieve backup: save the local copies about to be overwritten so the
       // retrieve is undoable. Only local files matter — org-only/new items have none.
       // A FAILED backup ABORTS the retrieve (see backupBeforeRetrieve): shipping the
       // overwrite without the safety net the user was promised is worse than not
-      // having the feature. Runs inside the already-reserved slot.
+      // having the feature. Runs inside the already-reserved slot. Covers the
+      // context items too: their copy-back overwrites just the same.
       let backupNote: string | undefined;
       let backupDir: string | undefined;
       try {
-        const backupResult = await this.maybeBackupBeforeRetrieve(root, items.flatMap(i => [i.filePath, ...i.files]), orgLabel);
+        const backupResult = await this.maybeBackupBeforeRetrieve(root, allItems.flatMap(i => [i.filePath, ...i.files]), orgLabel);
         backupNote = backupResult?.note;
         backupDir = backupResult?.dir;
       } catch (err) {
@@ -4266,52 +4287,132 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           return; // releaseBusy() in the outer finally frees the slot
         }
       }
-      const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
       reserved = false;
-      const start = Date.now();
+      // One Cancel for both calls: it flips the flag AND kills whichever sf call is
+      // in flight. A bare handle.cancel is a no-op once that call has settled, so a
+      // Cancel landing as the project retrieve finished would otherwise be lost and
+      // the second call would start anyway.
+      let cancelled = false;
+      let inFlight: (() => void) | undefined;
+      // The command currently open in the log, ended as failed if anything throws.
+      let open: { id: string; start: number } | undefined;
+      const tmpDirs: string[] = [];
       try {
         await this.withWindowProgress(`Retrieving ${noun} from ${orgLabel}`, async () => {
         this.postProgress(`Retrieving ${noun} from ${orgLabel}…`);
-        // The metadata list is passed as usual even when useManifest is set —
-        // retrieveMetadata's own precedence (manifest wins) ignores it, same as
-        // the manifest-file retrieve feature below (runManifestRetrieve).
-        const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, manifest: manifest?.path, ignoreConflicts });
-        this.currentCancel = handle.cancel;
-        const { result, cmd } = await handle.promise;
-        this.updateCmd(cmdId, cmd);
-        const files = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
+        this.currentCancel = () => { cancelled = true; inFlight?.(); };
+        const files: RetrieveFileResult[] = [];
+        const messages: NonNullable<RetrieveResult['messages']> = [];
+        if (items.length > 0) {
+          const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(opts.sourceDir, items, manifest?.path)} --target-org ${org}${ignoreConflicts ? ' --ignore-conflicts' : ''}`);
+          open = { id: cmdId, start: Date.now() };
+          // The metadata list is passed as usual even when useManifest is set —
+          // retrieveMetadata's own precedence (manifest wins) ignores it, same as
+          // the manifest-file retrieve feature below (runManifestRetrieve).
+          const handle = this.sf.retrieveMetadata(items.map(i => `${i.type}:${i.name}`), org, root, { timeoutMs: this.timeoutMs(), sourceDirs: opts.sourceDir ? [opts.sourceDir] : undefined, manifest: manifest?.path, ignoreConflicts });
+          inFlight = handle.cancel;
+          const { result, cmd } = await handle.promise;
+          inFlight = undefined;
+          this.updateCmd(cmdId, cmd);
+          const got = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
+          this.endCmd(cmdId, !got.some(f => retrieveProblem(f) || f.state === 'Failed') && got.length > 0, Date.now() - open.start);
+          open = undefined;
+          files.push(...got);
+          messages.push(...(result.messages ?? []));
+        }
+        const written: string[] = [];
+        // Set when the context half was cancelled or timed out AFTER the project
+        // retrieve had already written its files.
+        let ctxStopped: string | undefined;
+        if (ctxItems.length > 0) {
+          let ctx: ContextRetrieveOutcome;
+          try {
+            if (cancelled) throw new SfCliCancelledError();
+            ctx = await this.retrieveContextItems(ctxItems, context.plan.companions, org, root, {
+              setInFlight: c => { inFlight = c; },
+              isCancelled: () => cancelled,
+              setOpen: o => { open = o; },
+              tmpDirs
+            });
+          } catch (err) {
+            // A failed, cancelled or timed-out CLI call copies nothing. A failure of
+            // the copy itself can stop partway through a folder — that is what the
+            // backup taken above is for. With no project retrieve before it, this IS
+            // the retrieve's failure (or cancel, or timeout); after one, those files
+            // are already written — fail the context items alone, keep the rest of
+            // the answer honest, and still rescan.
+            if (items.length === 0) throw err;
+            if (open) { this.endCmd(open.id, false, Date.now() - open.start); open = undefined; }
+            ctxStopped = err instanceof SfCliCancelledError ? 'cancelled' : isTimeoutError(err) ? 'timed out' : undefined;
+            // The Output channel gets the CLI's own words, as reportError /
+            // reportDeployTimeout would have given it.
+            if (!(err instanceof SfCliCancelledError)) this.handleError(`Retrieve from ${orgLabel}`, err);
+            // Per row, per shape: a folder (an object translation) has FILES.
+            const why = (i: MetadataItem): string => ctxStopped
+              ? `${ctxStopped} before ${CONTEXT_SHAPES[i.type]?.dir ? 'its files were copied — its local files were left as they were' : 'its file was copied — its local file was left as it was'}`
+              : err instanceof Error ? err.message : String(err);
+            ctx = { files: ctxItems.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why(i) })), messages: [], written: [] };
+            if (ctxStopped) {
+              const list = ctxItems.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctxItems.length > 3 ? ` +${ctxItems.length - 3} more` : '');
+              const one = ctxItems.length === 1;
+              const what = one ? (CONTEXT_SHAPES[ctxItems[0].type]?.dir ? 'its files were' : 'its file was') : 'their files were';
+              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before ${what} copied — ${one ? 'its local copy was' : 'their local copies were'} left as ${one ? 'it was' : 'they were'}.${ctxTimeoutHint(ctxStopped)}` });
+            }
+          }
+          files.push(...ctx.files);
+          messages.push(...ctx.messages);
+          written.push(...ctx.written);
+        }
+        const result: RetrieveResult = { status: 0, success: true, inboundFiles: files, messages };
         const ok = files.filter(f => !retrieveProblem(f) && (f.state === undefined || f.state !== 'Failed'));
         const failed = files.filter(f => retrieveProblem(f) || f.state === 'Failed');
-        const missing = items.filter(i => !files.some(f => f.fullName === i.name && f.type === i.type));
+        const missing = allItems.filter(i => !files.some(f => f.fullName === i.name && f.type === i.type));
         // Org-level messages (e.g. "entity of type X named Y cannot be found")
         // explain an empty result better than the bare missing list — surface them.
-        const msgLines = (result.messages ?? []).filter(m => m.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
-        this.endCmd(cmdId, failed.length === 0 && ok.length > 0, Date.now() - start);
+        const msgLines = messages.filter(m => m.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
         // Every ok row came FROM the org — proof of membership even when the last
         // Fetch Org predates the component. The local side ('On org' → 'In both')
         // is covered by the loadFiles() rescan below.
         this.confirmOnOrg(ok, org, orgLabel);
+        const notes = [
+          ...(backupNote ? [backupNote] : []),
+          ...context.notes,
+          ...(written.length ? [`copied into your project: ${written.join(', ')}`] : [])
+        ];
         this.runStore.finish(retrieveRunFromResult(result, {
           id: runId, org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, finishedAt: Date.now(),
-          target, items, backupDir, notes: backupNote ? [backupNote] : undefined
+          target, items: allItems, backupDir, notes: notes.length ? notes : undefined
         }));
+        // SELECTED components, not result rows: a translation folder answers with
+        // one row per file, an object with one per field — the confirm said N. A
+        // row counts for the selected item it belongs to (rowOwnerKey); one that
+        // belongs to none counts as itself.
+        const count = (rows: RetrieveFileResult[]): number => new Set(rows.map(f => rowOwnerKey(f, allItems))).size;
+        const okCount = count(ok);
+        const failedCount = count(failed);
+        const ctxKeys = new Set(ctxItems.map(i => `${i.type}:${i.name}`));
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
-          this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
+          this.notifySuccessIfPanelHidden(`Retrieved ${okCount} component${okCount === 1 ? '' : 's'} from ${orgLabel}`);
         } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
           this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
+        } else if (ctxStopped && failed.every(f => ctxKeys.has(rowOwnerKey(f, allItems)))) {
+          // The user's own Cancel (or the timeout) on the second half, and nothing
+          // ELSE failed: no failure toast. Any other failed row still gets one.
+          const filesOf = ctxItems.length > 1 || CONTEXT_SHAPES[ctxItems[0].type]?.dir ? 'local files left as they were' : 'local file left as it was';
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${ctxItems.length} ${ctxStopped} (${filesOf}).${ctxTimeoutHint(ctxStopped)}`, 'warn');
         } else if (failed.length > 0) {
-          this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, [
+          this.failureToast(`Retrieve from ${orgLabel}: ${failedCount} component${failedCount === 1 ? '' : 's'} failed.`, [
             ...failed.map(f => `✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`), ...msgLines
           ]);
         } else if (missing.length > 0) {
           // Nothing FAILED, but components the user asked for weren't on the org.
-          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${ok.length} retrieved · ${missing.length} not on org`, 'warn');
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${missing.length} not on org`, 'warn');
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
         });
       } catch (err) {
-        this.endCmd(cmdId, false, Date.now() - start);
+        if (open) this.endCmd(open.id, false, Date.now() - open.start);
         if (err instanceof SfCliCancelledError) this.reportCancelled(`Retrieve from ${orgLabel}`, undefined, runId, 'cancelled');
         else if (isTimeoutError(err)) this.reportDeployTimeout(`Retrieve from ${orgLabel}`, err, 'retrieve', runId);
         else this.reportError(`Retrieve from ${orgLabel}`, err, runId);
@@ -4319,10 +4420,205 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         this.currentCancel = undefined;
         this.setBusy(false);
         await this.cleanupTempManifest(manifest?.dir);
+        for (const d of tmpDirs) await fs.rm(d, { recursive: true, force: true }).catch(() => undefined);
       }
     } finally {
       releaseBusy();
     }
+  }
+
+  /**
+   * The context half of a retrieve: `ctxItems` (Profile / Translations /
+   * CustomObjectTranslation) plus their companions go to a THROWAWAY source
+   * project, and only the selected items' own files come back — a profile or
+   * translation file, an object translation folder merged in (files overwritten,
+   * a file only the project has is never deleted, as the CLI itself does). Each
+   * lands on the local item's own path, else where the CLI would write it
+   * (`<default package dir>/main/default/<folder>/…`). Companions are NEVER
+   * written to the project. Retrieved files are found by suffix in the whole
+   * temp tree AFTER the retrieve — the nesting the CLI uses is not assumed.
+   * Rows come back for the selected items only, `filePath` rewritten to the
+   * project copy. Throws on a failed or cancelled call before anything is
+   * copied, so the local files stay as they were; a failing COPY (disk full,
+   * permissions) can stop partway through a folder, which the pre-retrieve
+   * backup covers.
+   */
+  private async retrieveContextItems(
+    ctxItems: MetadataItem[],
+    companions: Companion[],
+    org: string,
+    root: string,
+    hooks: {
+      setInFlight: (cancel: (() => void) | undefined) => void;
+      isCancelled: () => boolean;
+      setOpen: (open: { id: string; start: number } | undefined) => void;
+      tmpDirs: string[];
+    }
+  ): Promise<ContextRetrieveOutcome> {
+    // realpath: the CLI reports realpath'd file paths (macOS /var → /private/var).
+    const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deploy-retrieve-')));
+    hooks.tmpDirs.push(tmpRoot);
+    const proj = path.join(tmpRoot, 'proj');
+    await scaffoldSourceProject(proj, await resolveApiVersion(root));
+    const ctxTargets: MetadataItem[] = [...ctxItems, ...companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
+    // A `*` member only travels in a package.xml (`--metadata Type:*` is a
+    // local-source pattern, not an org wildcard).
+    let ctxManifest: { path: string; dir: string } | undefined;
+    if (ctxTargets.length > MANIFEST_THRESHOLD || hasWildcard(companions)) {
+      ctxManifest = await this.writeTempManifest(ctxTargets);
+      hooks.tmpDirs.push(ctxManifest.dir);
+    }
+    if (hooks.isCancelled()) throw new SfCliCancelledError();
+    const start = Date.now();
+    const cmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(undefined, ctxTargets, ctxManifest?.path)} --target-org ${org} (in temp project ${proj})`);
+    hooks.setOpen({ id: cmdId, start });
+    const handle = this.sf.retrieveMetadata(ctxTargets.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs(), manifest: ctxManifest?.path });
+    hooks.setInFlight(handle.cancel);
+    let result: RetrieveResult;
+    try {
+      const r = await handle.promise;
+      result = r.result;
+      this.updateCmd(cmdId, `${r.cmd} (in temp project ${proj})`);
+    } finally {
+      hooks.setInFlight(undefined);
+    }
+    const all = (result.inboundFiles ?? result.files ?? []) as RetrieveFileResult[];
+    const ctxKeys = new Set(ctxItems.map(i => `${i.type}:${i.name}`));
+    const ownFailed = all.some(f => ctxKeys.has(`${f.type}:${f.fullName}`) && (retrieveProblem(f) || f.state === 'Failed'));
+    this.endCmd(cmdId, !ownFailed && all.length > 0, Date.now() - start);
+    hooks.setOpen(undefined);
+    // A Cancel that landed while the call was finishing: copy nothing.
+    if (hooks.isCancelled()) throw new SfCliCancelledError();
+
+    const pkgDir = await resolveDefaultPackageDir(root);
+    const copies: Array<{ key: string; src: string; dest: string; dir: boolean; state?: 'Created' | 'Changed' | 'Unchanged' }> = [];
+    const written: string[] = [];
+    // The CLI's own state describes the TEMP project, where every file is new.
+    // What the user needs is what happened to THEIR copy.
+    const stateOf = new Map<string, 'Created' | 'Changed' | 'Unchanged'>();
+    const copyOne = async (from: string, to: string): Promise<void> => {
+      const prev = await fs.readFile(to).catch(() => undefined);
+      const next = await fs.readFile(from);
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      await fs.copyFile(from, to);
+      stateOf.set(to, prev === undefined ? 'Created' : prev.equals(next) ? 'Unchanged' : 'Changed');
+    };
+    for (const item of ctxItems) {
+      const shape = CONTEXT_SHAPES[item.type];
+      if (!shape) continue;
+      const key = `${item.type}:${item.name}`;
+      const localBase = item.filePath ? path.basename(item.filePath) : undefined;
+      const find = shape.dir ? findDirBySuffix : findFileBySuffix;
+      const src = (localBase ? await find(proj, path.join(shape.folder, localBase)) : undefined)
+        ?? await find(proj, path.join(shape.folder, shape.dir ? item.name : `${item.name}${shape.suffix}`));
+      if (!src) {
+        this.output.appendLine(`[Retrieve] ${key}: not in the org's answer — the local copy was left as it was.`);
+        continue;
+      }
+      const dest = item.filePath || path.join(root, pkgDir, 'main', 'default', shape.folder, path.basename(src));
+      let count = 1;
+      const dirStates: Array<'Created' | 'Changed' | 'Unchanged'> = [];
+      if (shape.dir) {
+        const inside = await listFilesUnder(src);
+        for (const f of inside) {
+          const to = path.join(dest, path.relative(src, f));
+          await copyOne(f, to);
+          dirStates.push(stateOf.get(to)!);
+        }
+        count = inside.length;
+      } else {
+        await copyOne(src, dest);
+      }
+      copies.push({ key, src, dest, dir: !!shape.dir, state: shape.dir ? folderState(dirStates) : undefined });
+      const shown = isUnder(root, dest) ? path.relative(root, dest) : dest;
+      written.push(shape.dir ? `${shown}${path.sep} (${count} file${count === 1 ? '' : 's'})` : shown);
+      this.output.appendLine(`[Retrieve] ${key}: copied ${shape.dir ? `${count} file${count === 1 ? '' : 's'} ` : ''}from the temp project to ${dest}`);
+    }
+
+    // Rows: the selected items (and, for a folder, the files inside it) — never a
+    // companion's. A failure row for a selected item is kept even with nothing
+    // to copy, so its message reaches the run.
+    const files: RetrieveFileResult[] = [];
+    for (const f of all) {
+      const key = `${f.type}:${f.fullName}`;
+      const reported = f.filePath ? (path.isAbsolute(f.filePath) ? f.filePath : path.resolve(proj, f.filePath)) : undefined;
+      const copy = copies.find(c => c.key === key) ?? (reported ? copies.find(c => c.dir && isUnder(c.src, reported)) : undefined);
+      if (!copy) {
+        if (ctxKeys.has(key) && (retrieveProblem(f) || f.state === 'Failed')) files.push({ ...f, filePath: undefined });
+        continue;
+      }
+      const to = reported && isUnder(copy.src, reported) ? path.join(copy.dest, path.relative(copy.src, reported)) : copy.dest;
+      // A folder is ONE component, and the CLI reports each of its files as a row
+      // of that component: every row carries the folder's state, or the run's
+      // strongest-state pick reads one new field file as "created" for a folder
+      // whose existing parent was overwritten.
+      const ownState = retrieveProblem(f) || f.state === 'Failed' ? undefined : copy.dir ? copy.state : stateOf.get(to);
+      files.push({ ...f, filePath: to, ...(ownState ? { state: ownState } : {}) });
+    }
+    // Messages about a companion alone (one not on the org) are not about what
+    // the user picked: logged, not shown as the run's notes.
+    const messages = (result.messages ?? []).filter(m => {
+      const about = !!m.problem && isCompanionMessage(m.problem, companions, ctxItems);
+      if (about) this.output.appendLine(`[Retrieve] companion: ${m.fileName ?? '?'}: ${m.problem}`);
+      return !about;
+    });
+    return { files, messages, written };
+  }
+
+  /** The companions a Retrieve or Diff of `items` sends with its context items
+   *  (src/companions.ts), as the two settings say. `split`: there are companions
+   *  to send, so the context items take the temporary-project route. `notes` go
+   *  on the retrieve's run, `diffNotes` on a diff's card; `modalLine` is the
+   *  confirm's disclosure — what each item comes back with, BEFORE the overwrite.
+   *  `sameRequest`: the companions travel in the SAME retrieve as all of `items`
+   *  (Diff), so a selected component is never asked for twice. A Retrieve sends
+   *  the context items on their own, so there they are checked against those
+   *  alone — a selected CustomLabels still has to ride with Translations:pl. */
+  private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean): { plan: CompanionPlan; split: boolean; notes: string[]; diffNotes: string[]; modalLine?: string } {
+    const ctx = items.filter(i => CONTEXT_TYPES.has(i.type));
+    const none: CompanionPlan = { companions: [], note: [], incomplete: [], partial: [], own: {} };
+    if (ctx.length === 0) return { plan: none, split: false, notes: [], diffNotes: [] };
+    const names = ctx.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctx.length > 3 ? ` +${ctx.length - 3} more` : '');
+    const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
+    if (cfg.get<boolean>('contextCompanions', true) === false) {
+      return {
+        plan: none, split: false, notes: ['retrieved without companions'], diffNotes: ['retrieved without companions'],
+        modalLine: `${names}: retrieved without companions (sfOrgDeployWrapper.contextCompanions is off) — may come back nearly empty.`
+      };
+    }
+    const scope: Scope = cfg.get<string>('contextScope', CONTEXT_SCOPE_DEFAULT) === 'project' ? 'project' : 'org';
+    const plan = companionsFor(sameRequest ? items : ctx, { scope, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
+    const n = plan.companions.length;
+    if (n === 0) return { plan, split: false, notes: plan.note, diffNotes: plan.note, modalLine: plan.note.join('\n') || undefined };
+    // What each item comes back with — "complete" only where that is true (scope
+    // org, filled from the org); project scope says "this project's components
+    // only"; an item project scope found nothing for gets the LOUD note instead.
+    const itemLines = describeContext(ctx, plan, scope);
+    const summary = plan.note.filter(l => l.startsWith('companions: '));
+    // Every other note (empty scope, org-list fallback) — never the summary twice.
+    const other = plan.note.filter(l => !l.startsWith('companions: '));
+    // The count is everything that rides along, for all the items together — so
+    // it stands on its own line, never beside a subset of them.
+    const head = `${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours.`;
+    return {
+      plan, split: true,
+      // Project scope: the per-item lines ARE the run's caveat, so they replace
+      // the summary (the run keeps 5 notes).
+      notes: scope === 'project' ? [...itemLines, ...other] : [...summary, ...other],
+      diffNotes: [...summary, ...(scope === 'project' ? [PROJECT_SCOPE_DIFF_LINE] : []), ...other],
+      modalLine: [head, ...itemLines, ...other].join('\n')
+    };
+  }
+
+  /** The Fetch Org listing as items, only when it was fetched for `org`. */
+  private orgListFor(org: string): MetadataItem[] | undefined {
+    if (!this.orgMembers || this.orgMembersOrg !== org) return undefined;
+    const out: MetadataItem[] = [];
+    for (const k of this.orgMembers.keys()) {
+      const colon = k.indexOf(':');
+      if (colon > 0) out.push({ type: k.slice(0, colon), name: k.slice(colon + 1), filePath: '', files: [] });
+    }
+    return out;
   }
 
   /**
@@ -5075,18 +5371,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Cap the number of diff editors we open in one go.
-      let items = diffable;
-      if (diffable.length > 5) {
-        const choice = await vscode.window.showWarningMessage(
-          `About to open ${diffable.length} diff editors.`,
-          { modal: true, detail: 'Opening many diff editors can slow the window down.' },
-          'Open All',
-          'First 5'
-        );
-        if (!choice) return;
-        if (choice === 'First 5') items = diffable.slice(0, 5);
-      }
+      // No "About to open N diff editors" gate before the org round trip: that
+      // trip IS the cost of a diff, and until it returns nothing is known about
+      // which files differ — selecting one object (254 children) asked to open 254
+      // editors when a handful differed. Only DIFFERING files get an editor, up to
+      // diffEditorCap; identical ones are counted on the card (see `consider`).
+      const items = diffable;
+      const cap = this.diffEditorCap();
 
       // Always isolate temp dir outside the workspace so git doesn't see it.
       const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deploy-diff-'));
@@ -5095,8 +5386,19 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       try {
       await this.withWindowProgress(`Comparing ${items.length} component${items.length === 1 ? '' : 's'} with ${orgLabel}`, async report => {
         const missing: MetadataItem[] = [];
-        const opened: string[] = [];
         const errors: string[] = [];
+        // What the card says was compared, one entry per file pair (a component
+        // is one pair; a CustomObjectTranslation folder is one pair per file).
+        const opened: string[] = [];
+        const notOpened: string[] = [];
+        const inSync: string[] = [];
+        const folderLines: string[] = [];
+        // What rode along with the retrieve (companions), for the card.
+        const companionNotes: string[] = [];
+        // Informational lines that are not a problem (an object row with no
+        // definition file in the project), and how many items were ONLY that.
+        const infoLines: string[] = [];
+        let infoOnly = 0;
 
         // Float strategy: open the FIRST diff as a normal tab, then move JUST that
         // editor to a new window (`moveEditorToNewWindow` moves the active editor
@@ -5142,6 +5444,36 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // during the editor-opening phase used to lock the button as "Cancelling…"
         // while every remaining diff still opened.
         let diffCancelled = false;
+
+        /** The ONE compare/cap path every diff pair takes — fast-path bodies,
+         *  retrieved files, focused files and translation-folder files alike.
+         *  Identical (sameAfterEol: CRLF→LF, one missing final newline): no editor,
+         *  counted. Different (or present on
+         *  one side only): an editor while the cap allows, else named on the card.
+         *  A side that cannot be read is never called identical. */
+        const consider = async (u: DiffUnit): Promise<'same' | 'opened' | 'notOpened'> => {
+          if (diffCancelled) throw new SfCliCancelledError();
+          if (await diffUnitInSync(u)) { inSync.push(u.label); return 'same'; }
+          if (opened.length >= cap) { notOpened.push(u.label); return 'notOpened'; }
+          // The org side, LEFT. A file only the local side has diffs against an
+          // empty staged twin named like it (same syntax highlighting).
+          const localName = path.basename(u.local ?? u.org ?? u.item.filePath);
+          const left = u.org !== undefined ? await stageDiffCopy(u.org, u.item)
+            : await stageDiffText(u.orgText ?? '', u.item, localName);
+          tmpPaths.push(left.dir);
+          // The local side, RIGHT — an empty read-only stand-in when only the org has the file.
+          let right = u.local;
+          if (right === undefined) {
+            const empty = await stageDiffText('', u.item, localName);
+            tmpPaths.push(empty.dir);
+            right = empty.file;
+          }
+          await this.openDiff(u.item, left.file, orgLabel, diffColumn(), u.fileLabel, right);
+          opened.push(u.label);
+          await floatFirstDiff();
+          return 'opened';
+        };
+
         if (fastItems.length > 0) {
           report('querying org (Tooling API)…');
           this.postProgress(`Fetching ${fastItems.length} component${fastItems.length === 1 ? '' : 's'} from ${orgLabel} via Tooling API…`);
@@ -5181,12 +5513,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
                 const body = rec?.[field];
                 if (recs.length === 0) { missing.push(item); continue; }
                 if (typeof body !== 'string' || body === '(hidden)') { slowItems.push(item); continue; }
-                if (diffCancelled) throw new SfCliCancelledError();
-                const staged = await stageDiffText(body, item);
-                tmpPaths.push(staged.dir);
-                await this.openDiff(item, staged.file, orgLabel, diffColumn());
-                opened.push(`${item.type}:${item.name}`);
-                await floatFirstDiff();
+                await consider({ item, label: `${item.type}:${item.name}`, local: item.filePath, orgText: body });
               }
             } catch (e) {
               this.endCmd(qCmdId, false, Date.now() - qStart);
@@ -5213,13 +5540,32 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // a bogus "not on org". Source format also lands each file at the same relative
           // path as the local copy, so top-level types and decomposed object children
           // (CustomField, ValidationRule, …) both match by name with no separate
-          // MDAPI→source convert step.
+          // MDAPI→source convert step. At the PROJECT's API version: the local file
+          // was written at that version, and the org renders newer-API elements
+          // (a profile's `<viewAllFields>`) that file cannot have — compared at the
+          // org's max, a component retrieved a minute ago would read "differs".
           const proj = path.join(tmpRoot, 'proj');
-          await scaffoldSourceProject(proj);
+          await scaffoldSourceProject(proj, await resolveApiVersion(root));
+          // A Profile / Translations / CustomObjectTranslation is only complete
+          // beside the components it describes (src/companions.ts) — without them
+          // every fieldPermission of a profile reads "only local". Companions ride
+          // in the same retrieve, get no editor and are never "not on org".
+          const context = this.contextPlanFor(slowItems, org, true);
+          companionNotes.push(...context.diffNotes);
+          const diffTargets: MetadataItem[] = [...slowItems, ...context.plan.companions.map(c => ({ type: c.type, name: c.name, filePath: '', files: [] }))];
+          // Same rule as a retrieve: above MANIFEST_THRESHOLD the `--metadata`
+          // argv blows Windows' ~32 KB command line, and a `*` member only
+          // travels in a package.xml.
+          let diffManifest: { path: string; dir: string } | undefined;
+          if (diffTargets.length > MANIFEST_THRESHOLD || hasWildcard(context.plan.companions)) {
+            diffManifest = await this.writeTempManifest(diffTargets);
+            tmpPaths.push(diffManifest.dir);
+          }
+          if (diffCancelled) throw new SfCliCancelledError();
           const rStart = Date.now();
-          const rCmdId = this.beginCmd(`sf project retrieve start ${this.metadataArgs(slowItems)} --target-org ${org}`);
+          const rCmdId = this.beginCmd(`sf project retrieve start ${this.targetArg(undefined, diffTargets, diffManifest?.path)} --target-org ${org}`);
           const handle = this.sf.retrieveMetadata(
-            slowItems.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs() }
+            diffTargets.map(i => `${i.type}:${i.name}`), org, proj, { timeoutMs: this.timeoutMs(), manifest: diffManifest?.path }
           );
           this.currentCancel = () => { diffCancelled = true; handle.cancel(); };
           let result: RetrieveResult;
@@ -5233,14 +5579,47 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           }
 
           const sfFailures = (result.messages ?? []).filter(m => m.problem);
+          let companionMessages = 0;
           for (const f of sfFailures) {
+            // One about a companion alone (a local tab never deployed) says
+            // nothing about what was compared: logged, not an error.
+            if (isCompanionMessage(f.problem!, context.plan.companions, slowItems)) {
+              companionMessages++;
+              this.output.appendLine(`[Diff] companion: ${f.fileName ?? '?'}: ${f.problem}`);
+              continue;
+            }
             errors.push(`${f.fileName ?? '?'}: ${f.problem}`);
           }
-          this.endCmd(rCmdId, sfFailures.length === 0, Date.now() - rStart);
+          if (companionMessages > 0) companionNotes.push(`${companionMessages} message${companionMessages === 1 ? '' : 's'} about companions only (e.g. one not on the org) — see the SF Deploy output`);
+          this.endCmd(rCmdId, errors.length === 0, Date.now() - rStart);
 
-          report('opening diff editors…');
+          report('comparing with your local files…');
           for (const item of slowItems) {
             if (diffCancelled) throw new SfCliCancelledError();
+            if (item !== focused && DEFINITION_FILE_DIFF_TYPES.has(item.type)) {
+              // An object ROW compares its definition file, through the same
+              // compare/cap path; the folder itself never reaches vscode.diff.
+              const def = await objectDefinitionFile(item);
+              if (!def) {
+                // A standard object the project only has fields for: nothing of
+                // its own to compare — said, but not a problem with the diff.
+                infoLines.push(`— ${item.type}:${item.name} — no object definition file in this project; its fields and rules are compared as their own rows`);
+                infoOnly++;
+                continue;
+              }
+              const defName = path.basename(def);
+              const remoteDef = await findFileBySuffix(proj, path.join('objects', path.basename(path.dirname(def)), defName));
+              if (!remoteDef) { missing.push(item); continue; }
+              await consider({ item: { ...item, filePath: def }, label: `${item.type}:${item.name}/${defName}`, fileLabel: defName, local: def, org: remoteDef });
+              continue;
+            }
+            if (item !== focused && WHOLE_FOLDER_DIFF_TYPES.has(item.type)) {
+              // A folder-typed component with a whole-component diff: pair every
+              // file of the local folder with its twin in the org's copy.
+              const line = await this.diffFolderUnits(item, proj, consider);
+              if (line === undefined) missing.push(item); else folderLines.push(line);
+              continue;
+            }
             const isChild = OBJECT_CHILD_TYPES.has(item.type);
             let remoteFile: string | undefined;
             if (item === focused) {
@@ -5272,32 +5651,59 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               missing.push(item === focused && focusLabel ? { ...item, name: `${item.name}/${focusLabel}` } : item);
               continue;
             }
-            const staged = await stageDiffCopy(remoteFile, item);
-            tmpPaths.push(staged.dir);
-            await this.openDiff(item, staged.file, orgLabel, diffColumn(), item === focused ? focusLabel : undefined);
-            opened.push(`${item.type}:${item.name}${item === focused && focusLabel ? `/${focusLabel}` : ''}`);
-            await floatFirstDiff();
+            await consider({
+              item,
+              label: `${item.type}:${item.name}${item === focused && focusLabel ? `/${focusLabel}` : ''}`,
+              fileLabel: item === focused ? focusLabel : undefined,
+              local: item.filePath,
+              org: remoteFile
+            });
           }
         }
 
         const lines: string[] = [];
         for (const k of opened) lines.push(`✓ opened diff: ${k}`);
+        if (notOpened.length) {
+          lines.push(`${notOpened.length} more differ${notOpened.length === 1 ? 's' : ''} — not opened (sfOrgDeployWrapper.diffEditorCap is ${cap}); diff ${notOpened.length === 1 ? 'it' : 'them'} on ${notOpened.length === 1 ? 'its' : 'their'} own:`);
+          for (const k of notOpened) lines.push(`— differs (not opened): ${k}`);
+        }
+        for (const l of folderLines) lines.push(l);
+        for (const l of infoLines) lines.push(l);
+        const syncLine = inSyncLine(inSync);
+        if (syncLine) lines.push(syncLine);
         for (const m of missing) lines.push(`— ${m.type}:${m.name} — not on org`);
         for (const e of errors) lines.push(`✗ ${e}`);
         for (const w of preLines) lines.push(w);
+        for (const n of companionNotes) lines.push(n);
+        // Hundreds of differing files would otherwise render (and persist) one
+        // line each; the full list goes to the Output channel capLines points at.
+        if (lines.length > CARD_LINE_CAP) for (const l of lines) this.output.appendLine(`[Diff] ${l}`);
 
+        if (infoOnly > 0 && infoOnly === items.length && errors.length === 0) {
+          // Only object rows with no definition file: nothing was compared at all.
+          this.post({ type: 'status', card: { kind: 'warn', title: 'Nothing to diff', meta: 'no object definition file in this project', lines: capLines(lines) } });
+          this.notifyIfPanelHidden('Nothing to diff — no object definition file in this project', 'warn');
+          return;
+        }
+        // An object row with no definition file was never a comparison: it is
+        // not counted, so it can't turn an all-identical diff into a warning.
         const outcome = classifyDiffOutcome({
-          opened: opened.length, missing: missing.length, errors: errors.length,
-          unsupported: unsupported.length, attempted: items.length
+          opened: opened.length, differ: opened.length + notOpened.length, inSync: inSync.length,
+          missing: missing.length, errors: errors.length, unsupported: unsupported.length, attempted: items.length - infoOnly
         }, orgLabel);
+        // All in sync: the one outcome that opens nothing on purpose — its first
+        // line says so, or an empty editor area reads as a dead click.
+        if (outcome.lead) lines.unshift(outcome.lead);
         this.post({
           type: 'status',
-          card: { kind: outcome.kind, title: outcome.title, meta: outcome.meta, lines }
+          card: { kind: outcome.kind, title: outcome.title, meta: outcome.meta, lines: capLines(lines) }
         });
         // The whole verdict lived in that card, so with the panel hidden a diff that
         // opened nothing was a dead click. Opened editors need no toast — they are
         // the feedback — which is why this is classified rather than unconditional.
+        // "Everything is in sync" opens nothing either, and is just as much an answer.
         if (outcome.notify === 'warn') this.notifyIfPanelHidden(outcome.title, 'warn');
+        else if (outcome.notify === 'ok') this.notifyIfPanelHidden(outcome.lead ? `${outcome.title} — ${outcome.lead}` : outcome.title, 'ok');
         // In-band retrieve errors get the failure treatment (details mirrored into
         // the output channel), but gated on the panel being hidden: unlike the
         // deploy/retrieve failure paths, this one never toasted, and a visible panel
@@ -5896,16 +6302,57 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.noticeDismissers?.clear();
   }
 
+  /** sfOrgDeployWrapper.diffEditorCap, clamped (see DIFF_EDITOR_CAP_DEFAULT). */
+  private diffEditorCap(): number {
+    const v = vscode.workspace.getConfiguration('sfOrgDeployWrapper').get<number>('diffEditorCap', DIFF_EDITOR_CAP_DEFAULT);
+    return typeof v === 'number' && Number.isFinite(v)
+      ? Math.max(1, Math.min(DIFF_EDITOR_CAP_MAX, Math.floor(v)))
+      : DIFF_EDITOR_CAP_DEFAULT;
+  }
+
+  /** Whole-folder diff of a WHOLE_FOLDER_DIFF_TYPES component: every file of the
+   *  local folder (listed now, not from the scan — a file added since counts) is
+   *  paired with its twin in the org's copy of the SAME folder in the retrieve
+   *  tree (`<typeFolder>/<name>`, found by path suffix), and each pair goes
+   *  through `consider`, the one compare/cap path. Returns the card's per-folder
+   *  summary line, or undefined when the org has no copy of the folder at all
+   *  (the caller reports the component as not on the org). */
+  private async diffFolderUnits(
+    item: MetadataItem,
+    proj: string,
+    consider: (u: DiffUnit) => Promise<'same' | 'opened' | 'notOpened'>
+  ): Promise<string | undefined> {
+    const typeFolder = RULES.find(r => r.type === item.type && r.bundle)?.folder;
+    if (!typeFolder) return undefined;
+    const orgDir = await findDirBySuffix(proj, path.join(typeFolder, item.name));
+    if (!orgDir) return undefined;
+    const listed = await listFilesUnder(item.filePath);
+    const localFiles = listed.length ? listed : item.files.filter(f => isUnder(item.filePath, f));
+    const pairs = pairFolderFiles(item.filePath, localFiles, orgDir, await listFilesUnder(orgDir), item.name);
+    const key = `${item.type}:${item.name}`;
+    let same = 0, differ = 0, onlyOrg = 0, onlyLocal = 0;
+    for (const p of pairs) {
+      const file = p.rel.split(path.sep).join('/');
+      const side = p.local === undefined ? ' (only on org)' : p.org === undefined ? ' (only local)' : '';
+      const verdict = await consider({ item, label: `${key}/${file}${side}`, fileLabel: `${file}${side}`, local: p.local, org: p.org });
+      if (verdict === 'same') same++;
+      else if (p.local === undefined) onlyOrg++;
+      else if (p.org === undefined) onlyLocal++;
+      else differ++;
+    }
+    return `${key} — ${same} identical · ${differ} differ · ${onlyOrg} only on org · ${onlyLocal} only local`;
+  }
+
   /** `fileLabel` names the single file when the item is a folder-typed component
    *  diffed through one of its files — `Type:Name` alone wouldn't say which. */
-  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn, fileLabel?: string): Promise<void> {
+  private async openDiff(item: MetadataItem, remoteFile: string, orgLabel: string, viewColumn?: vscode.ViewColumn, fileLabel?: string, localFile: string = item.filePath): Promise<void> {
     // Org copy LEFT (read-only staged temp), local file RIGHT (the editable side) —
     // matches git / the official Salesforce extension, and makes the diff editor's
     // copy-block arrows pull org changes INTO the local file. The reverse order made
     // the arrows "copy" local blocks into a doomed temp file that never reaches the
     // org (deploy is the only upload path).
     const title = `${item.type}:${item.name}${fileLabel ? `/${fileLabel}` : ''} — ${orgLabel} ↔ Local`;
-    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(item.filePath), title, { preview: false, viewColumn });
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(remoteFile), vscode.Uri.file(localFile), title, { preview: false, viewColumn });
   }
 
   /** `runId`: the run this cancel ends — its card says it, instead of a card of
@@ -6778,13 +7225,34 @@ function orgKind(o: OrgInfo): 'prod' | 'sandbox' | 'scratch' | 'other' {
 
 /** Metadata types whose MDAPI-format retrieve differs structurally from source format,
  *  making `vscode.diff` against the local source-format file misleading. Exported
- *  because it is load-bearing beyond diff quality: runDiff hands `item.filePath`
- *  straight to `vscode.diff`, so every DIRECTORY_ITEM_TYPES member has to be in
- *  here or that call would pass a folder to an editor — the same wall the openFile
- *  handler hit. check-open-target.cjs pins the containment. The one way past this
+ *  because it is load-bearing beyond diff quality: runDiff's generic path hands
+ *  `item.filePath` straight to `vscode.diff`, so every DIRECTORY_ITEM_TYPES member
+ *  has to be in here — or in WHOLE_FOLDER_DIFF_TYPES, which never takes that path —
+ *  or that call would pass a folder to an editor, the same wall the openFile
+ *  handler hit. check-open-target.cjs pins the containment. The other way past this
  *  set is runDiff's `focusFile`, which first rewrites `filePath` to a real file
  *  inside the folder. */
-export const DIFF_UNSUPPORTED = new Set<string>(['CustomObject', 'LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
+export const DIFF_UNSUPPORTED = new Set<string>(['LightningComponentBundle', 'AuraDefinitionBundle', 'StaticResource']);
+
+/** The other way past that wall: folder-typed components whose WHOLE folder is
+ *  compared file by file (diffFolderUnits) — every `vscode.diff` call gets a file
+ *  from inside the folder, never the folder. A CustomObjectTranslation is nothing
+ *  but its folder of small XML files, so per-file pairing is the whole answer;
+ *  an LWC or an object has a single "the file you clicked" story instead.
+ *  check-open-target.cjs pins DIRECTORY_ITEM_TYPES ⊆ DIFF_UNSUPPORTED ∪ this. */
+export const WHOLE_FOLDER_DIFF_TYPES = new Set<string>(['CustomObjectTranslation']);
+
+/** The third way past it: a folder-typed component whose ROW diffs its own
+ *  definition file — an object's `<Obj>.object-meta.xml`. Its fields, rules and
+ *  record types are rows of their own (ticking an object's group selects them
+ *  all), so the definition file is the object row's whole share, and its label
+ *  names the file so nobody reads it as "fields compared too".
+ *  check-open-target.cjs pins DIRECTORY_ITEM_TYPES ⊆ one of the three sets. */
+export const DEFINITION_FILE_DIFF_TYPES = new Set<string>(['CustomObject']);
+
+/** A project-scope diff of a profile / translation compares what the org says
+ *  about THIS project's components only. */
+export const PROJECT_SCOPE_DIFF_LINE = 'compared for this project\'s components only (scope: project) — entries for components not in this project show as local-only';
 
 /** Tooling API body field per metadata type eligible for the diff fast path:
  *  one REST query instead of a Metadata API retrieve round-trip. */
@@ -6812,27 +7280,107 @@ export function notifyHeadline(message: string): string {
   return collapsed.length > NOTIFY_HEADLINE_MAX ? `${collapsed.slice(0, NOTIFY_HEADLINE_MAX - 1)}…` : collapsed;
 }
 
+/** The all-identical card's line, and the toast's second half. "Line endings
+ *  ignored" is the whole of the normalisation (sameAfterEol) — whitespace inside
+ *  a line still counts, so the text claims no more than was checked. */
+export const ALL_IN_SYNC_LINE = 'Nothing opened — the org copy and your local copy are byte-identical (line endings ignored)';
+
 /**
  * Card presentation for a finished diff run, plus whether the verdict needs a
  * native notification when the panel is hidden. Pure, so the "which outcome may
  * stay silent" rule is assertable: an opened diff editor IS the feedback, while a
- * run that opened nothing, or one the org failed part of, would otherwise be a
- * dead click from the context menu.
- * `attempted` is the diffable set actually processed (after the >5 cap), which is
- * what "everything was missing" has to be measured against.
+ * run that opened nothing — every file in sync, nothing on the org, or one the
+ * org failed part of — would otherwise be a dead click from the context menu.
+ * Counts are per compared FILE PAIR (a component is one pair, a translation
+ * folder one per file); `differ` includes the pairs past the editor cap.
+ * `attempted` is the diffable set of components, which is what "everything was
+ * missing" has to be measured against. `lead` (all in sync only) goes first on
+ * the card and into the toast: an outcome that opens no editor must say so.
  */
 export function classifyDiffOutcome(
-  counts: { opened: number; missing: number; errors: number; unsupported: number; attempted: number },
+  counts: { opened: number; differ: number; inSync: number; missing: number; errors: number; unsupported: number; attempted: number },
   orgLabel: string
-): { kind: 'ok' | 'warn' | 'err'; title: string; meta: string; notify: 'none' | 'warn' | 'err' } {
-  const { opened, missing, errors, unsupported, attempted } = counts;
+): { kind: 'ok' | 'warn' | 'err'; title: string; meta: string; notify: 'none' | 'ok' | 'warn' | 'err'; lead?: string } {
+  const { opened, differ, inSync, missing, errors, unsupported, attempted } = counts;
   const kind = errors > 0 ? 'err' : ((missing > 0 || unsupported > 0) ? 'warn' : 'ok');
+  const allInSync = kind === 'ok' && differ === 0 && inSync > 0;
   const title = opened > 0
-    ? `Diff opened for ${opened} component${opened === 1 ? '' : 's'} against ${orgLabel}`
+    ? `Diff opened for ${opened} differing file${opened === 1 ? '' : 's'} against ${orgLabel}`
+    : allInSync ? `All ${inSync} in sync with ${orgLabel}`
     : (missing === attempted ? `Nothing to diff — not on ${orgLabel}` : `Diff completed with issues against ${orgLabel}`);
-  const meta = `${opened} opened · ${missing} missing · ${errors} errors${unsupported ? ` · ${unsupported} unsupported` : ''}`;
-  const notify = errors > 0 ? 'err' : (opened === 0 && kind === 'warn' ? 'warn' : 'none');
-  return { kind, title, meta, notify };
+  const meta = `${differ} differ · ${inSync} in sync · ${missing} not on org${errors ? ` · ${errors} error${errors === 1 ? '' : 's'}` : ''}${unsupported ? ` · ${unsupported} unsupported` : ''}`;
+  const notify = errors > 0 ? 'err' : opened > 0 ? 'none' : kind === 'warn' ? 'warn' : 'ok';
+  return { kind, title, meta, notify, ...(allInSync ? { lead: ALL_IN_SYNC_LINE } : {}) };
+}
+
+/** `in sync: A, B, C, +N more` — every identical pair on ONE card line. */
+export function inSyncLine(labels: string[]): string | undefined {
+  if (labels.length === 0) return undefined;
+  const shown = labels.slice(0, IN_SYNC_NAMES_SHOWN);
+  const rest = labels.length - shown.length;
+  return `in sync: ${shown.join(', ')}${rest > 0 ? `, +${rest} more` : ''}`;
+}
+
+/** One local↔org file pair a diff compares. One side may be absent — a file only
+ *  one copy of a translation folder has — and then diffs against an empty staged
+ *  file. `orgText` is the Tooling fast path's body, in place of `org`. */
+export interface DiffUnit {
+  item: MetadataItem;
+  /** What the card names: `Type:Name`, or `Type:Name/<file>` inside a folder. */
+  label: string;
+  /** Editor-title suffix naming the file (folder-typed components). */
+  fileLabel?: string;
+  local?: string;
+  org?: string;
+  orgText?: string;
+}
+
+/** Equal after `\r\n`→`\n` and ignoring ONE missing final newline — nothing
+ *  else: a whitespace change inside a line is a real difference. Latin-1 maps
+ *  bytes 1:1, so a binary file is compared byte for byte, never through a lossy
+ *  UTF-8 decode that could call two different files equal. */
+export function sameAfterEol(a: Buffer, b: Buffer): boolean {
+  const norm = (buf: Buffer): string => buf.toString('latin1').replace(/\r\n/g, '\n').replace(/\n$/, '');
+  return norm(a) === norm(b);
+}
+
+/** Whether a pair is identical. A one-sided pair, or a side that cannot be read
+ *  (a local file gone since the scan), is NOT — that is a difference to show. */
+export async function diffUnitInSync(u: Pick<DiffUnit, 'local' | 'org' | 'orgText'>): Promise<boolean> {
+  if (u.local === undefined || (u.org === undefined && u.orgText === undefined)) return false;
+  try {
+    const local = await fs.readFile(u.local);
+    const org = u.org !== undefined ? await fs.readFile(u.org) : Buffer.from(u.orgText!, 'utf8');
+    return sameAfterEol(local, org);
+  } catch {
+    return false;
+  }
+}
+
+/** Pair a local component folder's files with its org copy's, by path RELATIVE to
+ *  each folder — never by basename across the retrieve tree, where every
+ *  translation of one object carries the same `<Field>.fieldTranslation-meta.xml`.
+ *  Case-insensitive (the local disk's spelling vs the CLI's). The definition file
+ *  `<name>.*` sorts first, then by path. Pure. */
+export function pairFolderFiles(
+  localDir: string, localFiles: string[], orgDir: string, orgFiles: string[], name = ''
+): Array<{ rel: string; local?: string; org?: string }> {
+  const keyOf = (rel: string): string => rel.split(path.sep).join('/').toLowerCase();
+  const inside = (rel: string): boolean => !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  const pairs = new Map<string, { rel: string; local?: string; org?: string }>();
+  for (const f of localFiles) {
+    const rel = path.relative(localDir, f);
+    if (inside(rel) && !pairs.has(keyOf(rel))) pairs.set(keyOf(rel), { rel, local: f });
+  }
+  for (const f of orgFiles) {
+    const rel = path.relative(orgDir, f);
+    if (!inside(rel)) continue;
+    const hit = pairs.get(keyOf(rel));
+    if (!hit) pairs.set(keyOf(rel), { rel, org: f });
+    else if (hit.org === undefined) hit.org = f;
+  }
+  const first = (rel: string): number => (name && rel.toLowerCase().startsWith(`${name.toLowerCase()}.`) ? 0 : 1);
+  return [...pairs.values()].sort((a, b) => first(a.rel) - first(b.rel) || (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
 }
 
 /** Condensed reason for a diff that had nothing to compare at all. The toast has no
@@ -7337,14 +7885,110 @@ export async function findFileBySuffix(dir: string, suffixPath: string): Promise
   return findFile(dir, (_n, full) => { const f = full.toLowerCase(); return f === want || f.endsWith(path.sep + want); });
 }
 
+/** findFileBySuffix for a DIRECTORY (`objectTranslations/Product2-pl`): first
+ *  match, depth-first, case-insensitive for the same reason. */
+export async function findDirBySuffix(dir: string, suffixPath: string): Promise<string | undefined> {
+  const want = path.sep + suffixPath.toLowerCase();
+  const walk = async (d: string, depth: number): Promise<string | undefined> => {
+    if (depth > 20) return undefined;
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return undefined; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(d, e.name);
+      if (full.toLowerCase().endsWith(want)) return full;
+      const nested = await walk(full, depth + 1);
+      if (nested) return nested;
+    }
+    return undefined;
+  };
+  return walk(dir, 0);
+}
+
+/** Every regular file below `dir`, sorted. Dot-entries (`.DS_Store`, editor
+ *  scratch) are not metadata and would read as "only local"; links are skipped,
+ *  as the scanner skips them. */
+export async function listFilesUnder(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (d: string, depth: number): Promise<void> => {
+    if (depth > 20) return;
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) await walk(full, depth + 1);
+      else if (e.isFile()) out.push(full);
+    }
+  };
+  await walk(dir, 0);
+  return out.sort();
+}
+
+/** The run-note / toast tail for a context half that timed out. */
+function ctxTimeoutHint(stopped: string | undefined): string {
+  return stopped === 'timed out' ? ' Raise sfOrgDeployWrapper.commandTimeoutMs for large retrieves.' : '';
+}
+
+/** The selected component a retrieve row answers for, as `Type:Name`: the item
+ *  itself; an object child (`CustomField:Product2.Status__c`) → its selected
+ *  object; a file inside a selected folder (bundle, object, translation) → that
+ *  folder. A row that belongs to no selected item is its own key. */
+export function rowOwnerKey(f: Pick<RetrieveFileResult, 'type' | 'fullName' | 'filePath'>, selected: ReadonlyArray<MetadataItem>): string {
+  const own = `${f.type}:${f.fullName}`;
+  if (selected.some(i => `${i.type}:${i.name}` === own)) return own;
+  if (OBJECT_CHILD_TYPES.has(f.type) && f.fullName.includes('.')) {
+    const parent = `CustomObject:${f.fullName.slice(0, f.fullName.indexOf('.'))}`;
+    if (selected.some(i => `${i.type}:${i.name}` === parent)) return parent;
+  }
+  if (f.filePath) {
+    const folder = selected.find(i => DIRECTORY_ITEM_TYPES.has(i.type) && i.filePath && isUnder(i.filePath, f.filePath!));
+    if (folder) return `${folder.type}:${folder.name}`;
+  }
+  return own;
+}
+
+/** An object item's own definition file: the item when it already IS that file
+ *  (inferItemForPath's shape), else `<folder>/<Obj>.object-meta.xml` when the
+ *  project has it. Undefined for a standard object the project has only
+ *  fields for. */
+async function objectDefinitionFile(item: MetadataItem): Promise<string | undefined> {
+  const isFile = (p: string): Promise<boolean> => fs.stat(p).then(st => st.isFile(), () => false);
+  if (item.filePath.endsWith('.object-meta.xml') && await isFile(item.filePath)) return item.filePath;
+  const inside = path.join(item.filePath, `${item.name}.object-meta.xml`);
+  return item.filePath && await isFile(inside) ? inside : undefined;
+}
+
+/** A merged folder's state from its files' (what happened to the PROJECT copy):
+ *  nothing existed before → Created; every file there and identical →
+ *  Unchanged; anything else (an existing file overwritten, or new files beside
+ *  existing ones) → Changed. */
+export function folderState(states: ReadonlyArray<'Created' | 'Changed' | 'Unchanged'>): 'Created' | 'Changed' | 'Unchanged' {
+  if (states.length > 0 && states.every(st => st === 'Created')) return 'Created';
+  if (states.every(st => st === 'Unchanged')) return 'Unchanged';
+  return 'Changed';
+}
+
+/** What the context half of a retrieve hands back: rows for the selected items
+ *  only (project paths), the messages that concern them, and what was copied. */
+interface ContextRetrieveOutcome {
+  files: RetrieveFileResult[];
+  messages: NonNullable<RetrieveResult['messages']>;
+  written: string[];
+}
+
 /** Scaffold a throwaway SFDX project so a source-format retrieve has somewhere to
- *  land without touching the user's workspace. `sourceApiVersion` is deliberately
- *  omitted so the retrieve uses the org's max API version (what we want for a diff). */
-async function scaffoldSourceProject(projDir: string): Promise<void> {
+ *  land without touching the user's workspace. Both callers pass the PROJECT's
+ *  `sourceApiVersion` (undefined when it has none — then the CLI picks): a
+ *  retrieve copied into the project must write what a retrieve straight into it
+ *  would, and a diff is only honest at the version the local file was written
+ *  at — the org's max adds elements (a profile's `<viewAllFields>`) an older
+ *  project version cannot have, so a file retrieved a minute ago "differs". */
+async function scaffoldSourceProject(projDir: string, sourceApiVersion?: string): Promise<void> {
   await fs.mkdir(path.join(projDir, 'force-app'), { recursive: true });
   await fs.writeFile(
     path.join(projDir, 'sfdx-project.json'),
-    JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }], namespace: '' }, null, 2),
+    JSON.stringify({ packageDirectories: [{ path: 'force-app', default: true }], namespace: '', ...(sourceApiVersion ? { sourceApiVersion } : {}) }, null, 2),
     'utf8'
   );
 }
@@ -7370,9 +8014,9 @@ async function stageDiffCopy(srcPath: string, item: MetadataItem): Promise<{ fil
 
 /** Write org-side text (a tooling-query body) into a diff-staging file named like the
  *  local file so the diff editor gets the right syntax highlighting. */
-async function stageDiffText(content: string, item: MetadataItem): Promise<{ file: string; dir: string }> {
+async function stageDiffText(content: string, item: MetadataItem, basename: string = path.basename(item.filePath)): Promise<{ file: string; dir: string }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-diff-stage-'));
-  const file = path.join(dir, safeStagedName(item, path.basename(item.filePath)));
+  const file = path.join(dir, safeStagedName(item, basename));
   await fs.writeFile(file, content, 'utf8');
   await fs.chmod(file, 0o444); // read-only — see stageDiffCopy
   return { file, dir };
