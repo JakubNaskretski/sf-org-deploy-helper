@@ -229,7 +229,7 @@ async function makeProject(name, opts = {}) {
     const cls = await w(path.join(D, 'classes', 'AcmeService.cls'), 'public class AcmeService { /* local */ }');
     add('ApexClass', 'AcmeService', cls, [cls, await w(path.join(D, 'classes', 'AcmeService.cls-meta.xml'), '<ApexClass/>')]);
     add('CustomField', 'Product2.Status__c', await w(path.join(D, 'objects', 'Product2', 'fields', 'Status__c.field-meta.xml'), 'LOCAL FIELD'));
-    add('CustomTab', 'Acme_Missing__c', await w(path.join(D, 'tabs', 'Acme_Missing__c.tab-meta.xml'), 'NEVER DEPLOYED'));
+    if (opts.missingTab !== false) add('CustomTab', 'Acme_Missing__c', await w(path.join(D, 'tabs', 'Acme_Missing__c.tab-meta.xml'), 'NEVER DEPLOYED'));
   }
   if (opts.cot) {
     // true: an older local copy; 'same': exactly the org's; 'parentSame': the
@@ -283,6 +283,8 @@ function provider(proj, items, extra = {}) {
   const toasts = [];
   const backups = [];
   const calls = [];
+  const counters = { loads: 0 };
+  const notices = [];
   const s = Object.create(proto);
   Object.assign(s, {
     busy: false, confirmOpen: false, deployQueue: [], cmdSeq: 0,
@@ -290,7 +292,7 @@ function provider(proj, items, extra = {}) {
     items, workspaceRoot: proj,
     orgs: [{ username: ORG, alias: 'acme-dev', instanceUrl: 'https://acme-dev.sandbox.my.salesforce.com', isSandbox: true }],
     orgStore: { get: () => ORG, set: async () => {}, setFromUserPick: async () => {} },
-    loadFiles: async () => {},
+    loadFiles: async () => { counters.loads++; },
     maybeBackupBeforeRetrieve: async (_root, candidates) => { backups.push([...candidates]); return { note: 'Backed up — restore via \'SF Deploy: Restore Retrieve Backup\'.', dir: path.join(tmp, 'backup') }; },
     output: { appendLine: () => {} },
     context: { workspaceState: { get: k => kept[k], update: async (k, v) => { kept[k] = v === undefined ? undefined : JSON.parse(JSON.stringify(v)); } }, globalState: { get: () => undefined, update: async () => {} } },
@@ -299,7 +301,9 @@ function provider(proj, items, extra = {}) {
     failureToast: (message, lines) => toasts.push({ message, lines })
   });
   s.sf = fakeSf(calls, extra.hooks);
-  return { s, posted, kept, toasts, backups, calls };
+  s.notifySuccessIfPanelHidden = (m) => notices.push(['ok', m]);
+  s.notifyIfPanelHidden = (m, kind) => notices.push([kind, m]);
+  return { s, posted, kept, toasts, backups, calls, counters, notices };
 }
 const lastRun = (p) => p.posted.filter(m => m.type === 'runs').slice(-1)[0];
 const retrieve = (p, keys) => proto.runRetrieve.call(p.s, keys);
@@ -346,7 +350,7 @@ check('retrieve: the backup covers the translation; the modal discloses the comp
   assert.strictEqual(p.backups.length, 1);
   assert.ok(p.backups[0].includes(path.join(proj, rel(p, 'translations', 'pl.translation-meta.xml'))), JSON.stringify(p.backups[0]));
   const modal = ui.warns.find(w => w.modal);
-  assert.ok(modal && modal.detail.includes('Translations:pl: 2 companions (scope: project) are retrieved alongside so it comes back complete — into a temporary project, never written to yours.'), modal && modal.detail);
+  assert.ok(modal && modal.detail.includes('Translations:pl: 2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours — so it comes back complete.'), modal && modal.detail);
 });
 
 check('retrieve: the run carries project paths, the companion note and what was copied — no companion row, no temp path', async () => {
@@ -400,16 +404,76 @@ check('retrieve, scope org: a NEW translation lands in the default package dir; 
   assert.ok(!fs.existsSync(temp.manifestXml && path.dirname(temp.opts.manifest)), 'the temp package.xml is removed');
 });
 
-check('retrieve: a Cancel landing as the first call finishes stops the second — the translation is left as it was', async () => {
+/** After the project retrieve wrote the class, the context half stopped: the run
+ *  keeps the class, marks the translation alone, rescans, and reads "partial". */
+async function assertStoppedAfterClass(p, proj, before, word) {
+  const { runs: [run], latestRows } = lastRun(p);
+  assert.strictEqual(run.status, 'partial', JSON.stringify(run));
+  const rows = Object.fromEntries(latestRows.rows.map(r => [r.k, r]));
+  assert.strictEqual(rows['ApexClass:Foo'].o, 'created', 'the class the first call wrote stays on the run');
+  assert.strictEqual(rows['Translations:pl'].o, 'failed');
+  assert.ok(rows['Translations:pl'].m.startsWith(`${word} before the org answered — the local file was left as it was`), rows['Translations:pl'].m);
+  assert.ok(run.notes.includes(`Translations:pl: ${word} before the org answered — its local file was left as it was`), JSON.stringify(run.notes));
+  const after = await snapshot(proj);
+  assert.strictEqual(after[rel(p, 'translations', 'pl.translation-meta.xml')], before[rel(p, 'translations', 'pl.translation-meta.xml')]);
+  assert.ok(path.join('app', 'main', 'default', 'classes', 'Foo.cls') in after, 'the class is on disk');
+  assert.strictEqual(p.counters.loads, 1, 'the project is rescanned');
+  assert.deepStrictEqual(p.toasts, [], 'the user\'s own Cancel (or the timeout) is no failure toast');
+  assert.deepStrictEqual(p.notices, [['warn', `Retrieve from acme-dev: 1 retrieved · 1 ${word} (local file left as it was)`]]);
+}
+
+check('retrieve: a Cancel landing as the first call finishes stops the second — the class stays, the translation is left as it was', async () => {
   reset();
   const { proj, items } = await makeProject('r5');
   const before = await snapshot(proj);
   const p = provider(proj, items, { hooks: { before: (call, n) => { if (n === 1) proto.cancelCurrent.call(p.s); } } });
   await retrieve(p, ['Translations:pl', 'ApexClass:Foo']);
   assert.strictEqual(p.calls.length, 1, 'the second call must never start');
-  assert.strictEqual(lastRun(p).runs[0].status, 'cancelled');
-  const after = await snapshot(proj);
-  assert.strictEqual(after[rel(p, 'translations', 'pl.translation-meta.xml')], before[rel(p, 'translations', 'pl.translation-meta.xml')]);
+  await assertStoppedAfterClass(p, proj, before, 'cancelled');
+});
+
+check('retrieve: a Cancel during the temp call, after the project one — partial, the class kept', async () => {
+  reset();
+  const { proj, items } = await makeProject('r5b');
+  const before = await snapshot(proj);
+  const p = provider(proj, items, { hooks: { honourCancel: true, before: (call, n) => { if (n === 2) proto.cancelCurrent.call(p.s); } } });
+  await retrieve(p, ['Translations:pl', 'ApexClass:Foo']);
+  assert.strictEqual(p.calls.length, 2);
+  assert.ok(p.calls[1].cancelled, 'the in-flight temp call was killed');
+  await assertStoppedAfterClass(p, proj, before, 'cancelled');
+  assert.deepStrictEqual(p.s.cmdLog.map(e => e.status), ['ok', 'err']);
+});
+
+check('retrieve: the temp call timing out after the project one — partial, the class kept', async () => {
+  reset();
+  const { proj, items } = await makeProject('r5c');
+  const before = await snapshot(proj);
+  const p = provider(proj, items, { hooks: { fail: (_c, n) => (n === 2 ? new SfCliError('sf project retrieve start timed out after 180000ms') : undefined) } });
+  await retrieve(p, ['Translations:pl', 'ApexClass:Foo']);
+  await assertStoppedAfterClass(p, proj, before, 'timed out');
+});
+
+check('retrieve: an item project scope can\'t fill is never promised "complete" — the dialog says it comes back nearly empty', async () => {
+  reset();
+  // A class and a profile, but no labels, apps, tabs, flows, quick actions or report types.
+  const { proj, items } = await makeProject('r13', { profile: 'LOCAL PROFILE', labels: false, tab: false, missingTab: false });
+  const p = provider(proj, items);
+  await retrieve(p, ['Translations:pl', 'Profile:Admin']);
+  const lines = ui.warns.find(w => w.modal).detail.split('\n');
+  assert.ok(lines.includes('Profile:Admin: 2 companions (scope: project) are retrieved alongside, into a temporary project, never written to yours — so it comes back complete.'), lines.join('\n'));
+  assert.ok(!lines.some(l => l.includes('Translations:pl') && l.includes('complete.')), lines.join('\n'));
+  assert.ok(lines.includes('project scope found no CustomLabels/CustomApplication/CustomTab/Flow/QuickAction/ReportType in this project — Translations:pl will come back nearly empty; set sfOrgDeployWrapper.contextScope to "org"'), lines.join('\n'));
+});
+
+check('retrieve, scope org: the org list\'s standard objects ride beside CustomObject:*, its custom ones never by name', async () => {
+  reset();
+  config.contextScope = 'org';
+  const { proj, items } = await makeProject('r14', { profile: 'LOCAL PROFILE', pl: false, labels: false, tab: false });
+  const p = provider(proj, items, { orgOnly: ['CustomObject:Account', 'CustomObject:Opportunity', 'CustomObject:Acme_Widget__c'] });
+  await retrieve(p, ['Profile:Admin']);
+  const objects = p.calls[0].requested.filter(k => k.startsWith('CustomObject:')).sort();
+  assert.deepStrictEqual(objects, ['CustomObject:*', 'CustomObject:Account', 'CustomObject:Opportunity', 'CustomObject:Product2']);
+  assert.ok(!lastRun(p).runs[0].notes.some(n => n.startsWith('org list not loaded')), JSON.stringify(lastRun(p).runs[0].notes));
 });
 
 check('retrieve: a Cancel during the temp call copies nothing', async () => {
@@ -461,7 +525,9 @@ check('retrieve: an object translation folder is MERGED — org files overwrite,
   await retrieve(p, ['CustomObjectTranslation:Product2-pl']);
   assert.strictEqual(p.calls.length, 1);
   assert.deepStrictEqual(p.calls[0].requested, ['CustomObjectTranslation:Product2-pl', 'CustomObject:Product2']);
-  assert.ok(ui.warns.find(w => w.modal).detail.includes('CustomObjectTranslation:Product2-pl: 1 companion (scope: project) is retrieved alongside so it comes back complete'));
+  assert.ok(ui.warns.find(w => w.modal).detail.includes('CustomObjectTranslation:Product2-pl: 1 companion (scope: project) is retrieved alongside, into a temporary project, never written to yours — so it comes back complete.'));
+  // The hidden-panel toast counts components, not the folder's three file rows.
+  assert.deepStrictEqual(p.notices, [['ok', 'Retrieved 1 component from acme-dev']]);
   const dir = rel(p, 'objectTranslations', 'Product2-pl');
   const after = await snapshot(proj);
   assert.deepStrictEqual(changes(before, after), {

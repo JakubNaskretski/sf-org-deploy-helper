@@ -182,6 +182,26 @@ check('profile, org scope: `*` per type (fields and record types among the child
   assert.ok(!keys(plan).includes('CustomObject:Acme_Widget__c'), 'a custom object IS covered by the wildcard');
   assert.ok(!keys(plan).includes('CustomMetadata:*'), 'never every custom metadata record on the org');
   assert.ok(plan.note.some(n => n.startsWith('scope "org" asks for every component') && n.includes('slow on big orgs')), plan.note.join('\n'));
+  assert.ok(plan.note.includes('org list not loaded — standard objects for Profile:Admin were taken from the project; Fetch Org to include the org\'s standard objects'), plan.note.join('\n'));
+});
+
+check('profile, org scope with the org list: its standard objects are named beside the wildcard, its custom ones are not', () => {
+  const orgItems = [...ORG_LIST, it('CustomObject', 'Account'), it('CustomObject', 'Opportunity'), it('CustomObject', 'Acme_Other__c'), it('CustomObject', 'Acme_Rate__mdt')];
+  const plan = companionsFor([it('Profile', 'Admin')], { scope: 'org', localItems: LOCAL, orgItems });
+  const objects = keys(plan).filter(k => k.startsWith('CustomObject:'));
+  assert.deepStrictEqual(objects, ['CustomObject:*', 'CustomObject:Account', 'CustomObject:Opportunity', 'CustomObject:Product2']);
+  assert.ok(!plan.note.some(n => n.startsWith('org list not loaded')), plan.note.join('\n'));
+  // A loaded list that never listed CustomObject can't name them: the project's, said so.
+  const noObjects = companionsFor([it('Profile', 'Admin')], { scope: 'org', localItems: LOCAL, orgItems: ORG_LIST });
+  assert.ok(noObjects.note.some(n => n.startsWith('org list not loaded — standard objects for Profile:Admin')), noObjects.note.join('\n'));
+});
+
+check('incomplete: exactly the items project scope found nothing for', () => {
+  const local = [it('ApexClass', 'AcmeService')];
+  const plan = companionsFor([it('Translations', 'pl'), it('Profile', 'Admin'), it('CustomObjectTranslation', 'Case-pl')], { scope: 'project', localItems: local });
+  assert.deepStrictEqual(plan.incomplete, ['Translations:pl']);
+  assert.deepStrictEqual(keys(plan), ['ApexClass:AcmeService', 'CustomObject:Case']);
+  assert.deepStrictEqual(companionsFor([it('Translations', 'pl')], { scope: 'org', localItems: [] }).incomplete, [], 'scope org is never "nearly empty"');
 });
 
 check('profile, project scope, nothing to send → the LOUD note', () => {
@@ -220,7 +240,7 @@ check('dedupe: a `*` suppresses that type\'s names — a CUSTOM object too, a st
 check('nothing for a selection without context types — PermissionSet included', () => {
   for (const scope of ['project', 'org']) {
     const plan = companionsFor([it('PermissionSet', 'Acme_Access'), it('ApexClass', 'AcmeService'), it('GlobalValueSetTranslation', 'ProductForm-pl')], { scope, localItems: LOCAL, orgItems: ORG_LIST });
-    assert.deepStrictEqual(plan, { companions: [], note: [] });
+    assert.deepStrictEqual(plan, { companions: [], note: [], incomplete: [] });
   }
 });
 

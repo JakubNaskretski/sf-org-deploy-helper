@@ -4321,10 +4321,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           messages.push(...(result.messages ?? []));
         }
         const written: string[] = [];
+        // Set when the context half was cancelled or timed out AFTER the project
+        // retrieve had already written its files.
+        let ctxStopped: string | undefined;
         if (ctxItems.length > 0) {
-          if (cancelled) throw new SfCliCancelledError();
           let ctx: ContextRetrieveOutcome;
           try {
+            if (cancelled) throw new SfCliCancelledError();
             ctx = await this.retrieveContextItems(ctxItems, context.plan.companions, org, root, {
               setInFlight: c => { inFlight = c; },
               isCancelled: () => cancelled,
@@ -4332,14 +4335,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
               tmpDirs
             });
           } catch (err) {
-            // Nothing was copied, so the local files are as they were. With no
-            // project retrieve before it, this IS the retrieve's failure; after one,
-            // those files are already written — fail the context items alone and
-            // keep the rest of the answer honest.
-            if (items.length === 0 || err instanceof SfCliCancelledError || isTimeoutError(err)) throw err;
+            // A failed, cancelled or timed-out CLI call copies nothing. A failure of
+            // the copy itself can stop partway through a folder — that is what the
+            // backup taken above is for. With no project retrieve before it, this IS
+            // the retrieve's failure (or cancel, or timeout); after one, those files
+            // are already written — fail the context items alone, keep the rest of
+            // the answer honest, and still rescan.
+            if (items.length === 0) throw err;
             if (open) { this.endCmd(open.id, false, Date.now() - open.start); open = undefined; }
-            const why = err instanceof Error ? err.message : String(err);
+            ctxStopped = err instanceof SfCliCancelledError ? 'cancelled' : isTimeoutError(err) ? 'timed out' : undefined;
+            const why = ctxStopped
+              ? `${ctxStopped} before the org answered — the local file was left as it was`
+              : err instanceof Error ? err.message : String(err);
             ctx = { files: ctxItems.map(i => ({ type: i.type, fullName: i.name, state: 'Failed', problem: why })), messages: [], written: [] };
+            if (ctxStopped) {
+              const list = ctxItems.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctxItems.length > 3 ? ` +${ctxItems.length - 3} more` : '');
+              ctx.messages.push({ fileName: list, problem: `${ctxStopped} before the org answered — ${ctxItems.length === 1 ? 'its local file was' : 'their local files were'} left as ${ctxItems.length === 1 ? 'it was' : 'they were'}` });
+            }
           }
           files.push(...ctx.files);
           messages.push(...ctx.messages);
@@ -4365,17 +4377,23 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           id: runId, org, orgLabel, orgKind: this.orgKindOf(org), startedAt: runStartedAt, finishedAt: Date.now(),
           target, items: allItems, backupDir, notes: notes.length ? notes : undefined
         }));
+        // Components, not files: a translation folder answers with one row per file.
+        const okCount = new Set(ok.map(f => `${f.type}:${f.fullName}`)).size;
+        const failedCount = new Set(failed.map(f => `${f.type}:${f.fullName}`)).size;
         if (failed.length === 0 && ok.length > 0 && missing.length === 0) {
-          this.notifySuccessIfPanelHidden(`Retrieved ${ok.length} component${ok.length === 1 ? '' : 's'} from ${orgLabel}`);
+          this.notifySuccessIfPanelHidden(`Retrieved ${okCount} component${okCount === 1 ? '' : 's'} from ${orgLabel}`);
         } else if (ok.length === 0 && failed.length === 0 && missing.length > 0) {
           this.notifyIfPanelHidden(`Nothing retrieved from ${orgLabel} — ${missing.length} component${missing.length === 1 ? '' : 's'} not found on the org`, 'warn');
+        } else if (ctxStopped && failedCount === ctxItems.length) {
+          // The user's own Cancel (or the timeout) on the second half: no failure toast.
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${ctxItems.length} ${ctxStopped} (local file${ctxItems.length === 1 ? '' : 's'} left as ${ctxItems.length === 1 ? 'it was' : 'they were'})`, 'warn');
         } else if (failed.length > 0) {
-          this.failureToast(`Retrieve from ${orgLabel}: ${failed.length} component${failed.length === 1 ? '' : 's'} failed.`, [
+          this.failureToast(`Retrieve from ${orgLabel}: ${failedCount} component${failedCount === 1 ? '' : 's'} failed.`, [
             ...failed.map(f => `✗ ${f.type}:${f.fullName} — ${retrieveProblem(f) ?? 'failed'}`), ...msgLines
           ]);
         } else if (missing.length > 0) {
           // Nothing FAILED, but components the user asked for weren't on the org.
-          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${ok.length} retrieved · ${missing.length} not on org`, 'warn');
+          this.notifyIfPanelHidden(`Retrieve from ${orgLabel}: ${okCount} retrieved · ${missing.length} not on org`, 'warn');
         }
         // refresh workspace scan (file count badges etc.)
         this.loadFiles().catch(() => undefined);
@@ -4407,8 +4425,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    * written to the project. Retrieved files are found by suffix in the whole
    * temp tree AFTER the retrieve — the nesting the CLI uses is not assumed.
    * Rows come back for the selected items only, `filePath` rewritten to the
-   * project copy. Throws on a failed or cancelled call, before anything is
-   * copied, so the local files stay as they were.
+   * project copy. Throws on a failed or cancelled call before anything is
+   * copied, so the local files stay as they were; a failing COPY (disk full,
+   * permissions) can stop partway through a folder, which the pre-retrieve
+   * backup covers.
    */
   private async retrieveContextItems(
     ctxItems: MetadataItem[],
@@ -4543,12 +4563,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  alone — a selected CustomLabels still has to ride with Translations:pl. */
   private contextPlanFor(items: MetadataItem[], org: string, sameRequest: boolean): { plan: CompanionPlan; split: boolean; notes: string[]; modalLine?: string } {
     const ctx = items.filter(i => CONTEXT_TYPES.has(i.type));
-    if (ctx.length === 0) return { plan: { companions: [], note: [] }, split: false, notes: [] };
-    const names = ctx.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (ctx.length > 3 ? ` +${ctx.length - 3} more` : '');
+    if (ctx.length === 0) return { plan: { companions: [], note: [], incomplete: [] }, split: false, notes: [] };
+    const nameList = (list: MetadataItem[]): string =>
+      list.slice(0, 3).map(i => `${i.type}:${i.name}`).join(', ') + (list.length > 3 ? ` +${list.length - 3} more` : '');
+    const names = nameList(ctx);
     const cfg = vscode.workspace.getConfiguration('sfOrgDeployWrapper');
     if (cfg.get<boolean>('contextCompanions', true) === false) {
       return {
-        plan: { companions: [], note: [] }, split: false, notes: ['retrieved without companions'],
+        plan: { companions: [], note: [], incomplete: [] }, split: false, notes: ['retrieved without companions'],
         modalLine: `${names}: retrieved without companions (sfOrgDeployWrapper.contextCompanions is off) — may come back nearly empty.`
       };
     }
@@ -4556,10 +4578,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const plan = companionsFor(sameRequest ? items : ctx, { scope, localItems: this.items ?? [], orgItems: this.orgListFor(org) });
     const n = plan.companions.length;
     if (n === 0) return { plan, split: false, notes: plan.note, modalLine: plan.note.join('\n') || undefined };
-    return {
-      plan, split: true, notes: plan.note,
-      modalLine: `${names}: ${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside so ${ctx.length === 1 ? 'it comes' : 'they come'} back complete — into a temporary project, never written to yours.`
-    };
+    // "Complete" only for the items whose companions were found: one that project
+    // scope found nothing for comes back nearly empty — over a full local file —
+    // and its note says so HERE, before the overwrite, not only on the run. The
+    // fallback and org-scope notes ride along for the same reason.
+    const complete = ctx.filter(i => !plan.incomplete.includes(`${i.type}:${i.name}`));
+    const head = `${n} companion${n === 1 ? '' : 's'} (scope: ${scope}) ${n === 1 ? 'is' : 'are'} retrieved alongside, into a temporary project, never written to yours`;
+    const lines = [complete.length > 0
+      ? `${nameList(complete)}: ${head} — so ${complete.length === 1 ? 'it comes' : 'they come'} back complete.`
+      : `${names}: ${head}.`];
+    lines.push(...plan.note.filter(l => !l.startsWith('companions: ')));
+    return { plan, split: true, notes: plan.note, modalLine: lines.join('\n') };
   }
 
   /** The Fetch Org listing as items, only when it was fetched for `org`. */

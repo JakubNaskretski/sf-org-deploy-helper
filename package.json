@@ -288,10 +288,10 @@
           ],
           "enumDescriptions": [
             "Send only the companions this project has (its labels, tabs, objects, fields, classes…). Fast; the profile or translation comes back complete for what the project contains.",
-            "Send every component of the companion types on the org (`*`). Complete, but slow on big orgs."
+            "Send every component of the companion types on the org (`*`), and the standard objects from the Fetch Org list. Complete once Fetch Org has listed the org (without it, standard objects come from the project); slow on big orgs."
           ],
           "default": "project",
-          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `project` (default) — only what this project has; `org` — everything of those types on the org. An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list."
+          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `project` (default) — only what this project has; `org` — everything of those types on the org, complete once **Fetch Org** has listed it (a wildcard can't name standard objects, so they come from that list — or, without it, from the project). An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list too."
         },
         "sfOrgDeployWrapper.defaultTestLevel": {
           "type": "string",

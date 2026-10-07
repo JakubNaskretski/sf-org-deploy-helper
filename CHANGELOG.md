@@ -18,8 +18,9 @@ This file starts at the current release; earlier history predates it.
   companions ride along, and the run names what was copied into your project.
 - **Choose how far companions reach.** New setting `sfOrgDeployWrapper.contextScope`: `project`
   (default) sends what this project has; `org` sends everything of those types on the org —
-  complete, but slow on a big org. If the project has none of them, the result says so instead
-  of quietly bringing back a stub. `sfOrgDeployWrapper.contextCompanions` (default on) turns the
+  complete once Fetch Org has listed the org (standard objects such as Account come from that
+  list), but slow on a big org. If the project has none of them, the confirm dialog says so
+  before anything is overwritten, instead of quietly bringing back a stub. `sfOrgDeployWrapper.contextCompanions` (default on) turns the
   whole behaviour off.
 - **Object translations are in the tree.** `objectTranslations/<Object>-<lang>/` folders are
   listed as one component each and deploy, validate, retrieve and diff like any other; a diff

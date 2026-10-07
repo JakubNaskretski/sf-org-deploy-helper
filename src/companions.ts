@@ -23,6 +23,9 @@ export interface CompanionPlan {
   companions: Companion[];
   /** Card / modal / run-note lines explaining what rides along and why. */
   note: string[];
+  /** `Type:Name` of each selected item that will come back nearly empty: project
+   *  scope found nothing it describes. Never to be promised "complete". */
+  incomplete: string[];
 }
 
 /** What an org-wide Translations file translates. */
@@ -96,7 +99,7 @@ export function companionsFor(
   }
 ): CompanionPlan {
   const context = selected.filter(i => CONTEXT_TYPES.has(i.type));
-  if (context.length === 0) return { companions: [], note: [] };
+  if (context.length === 0) return { companions: [], note: [], incomplete: [] };
   const scope: Scope = ctx.scope === 'org' ? 'org' : 'project';
   const local = ctx.localItems;
   const localOf = (type: string): Array<Pick<MetadataItem, 'type' | 'name'>> => local.filter(i => i.type === type);
@@ -104,7 +107,9 @@ export function companionsFor(
   const wanted: Companion[] = [];
   const add = (type: string, name: string): void => { wanted.push({ type, name }); };
   const note: string[] = [];
+  const incomplete: string[] = [];
   const fallbackObjects: string[] = [];
+  const fallbackProfiles: string[] = [];
   let profileOrgNote = false;
 
   for (const item of context) {
@@ -129,14 +134,23 @@ export function companionsFor(
       } else {
         const found = TRANSLATIONS_COMPANION_TYPES.flatMap(t => localOf(t));
         for (const i of found) add(i.type, i.name);
-        if (found.length === 0) note.push(emptyScopeNote(`${item.type}:${item.name}`, TRANSLATIONS_COMPANION_TYPES));
+        if (found.length === 0) {
+          note.push(emptyScopeNote(`${item.type}:${item.name}`, TRANSLATIONS_COMPANION_TYPES));
+          incomplete.push(`${item.type}:${item.name}`);
+        }
       }
     } else if (item.type === 'Profile') {
       if (scope === 'org') {
         for (const t of PROFILE_TOP_TYPES) add(t, WILDCARD);
         for (const t of PROFILE_ORG_CHILD_WILDCARDS) add(t, WILDCARD);
-        // The wildcard misses standard objects: name the ones the project knows,
-        // as an object file or as the parent of a scanned child.
+        // The wildcard misses standard objects: name the org list's (Account,
+        // Product2 — their objectPermissions and standard-field permissions come
+        // with nothing else), plus the ones the project knows, as an object file
+        // or as the parent of a scanned child. No org list (or one that never
+        // listed CustomObject): the project's alone, and the note says so.
+        const orgObjects = (ctx.orgItems ?? []).filter(i => i.type === 'CustomObject');
+        if (orgObjects.length === 0) fallbackProfiles.push(`${item.type}:${item.name}`);
+        for (const i of orgObjects) if (isStandardObject(i.name)) add('CustomObject', i.name);
         for (const i of local) {
           if (i.type === 'CustomObject' && isStandardObject(i.name)) add('CustomObject', i.name);
           else if (PROFILE_OBJECT_CHILD_TYPES.includes(i.type)) {
@@ -148,7 +162,10 @@ export function companionsFor(
       } else {
         const found = [...PROFILE_TOP_TYPES, ...PROFILE_OBJECT_CHILD_TYPES].flatMap(t => localOf(t));
         for (const i of found) add(i.type, i.name);
-        if (found.length === 0) note.push(emptyScopeNote(`${item.type}:${item.name}`, PROFILE_TOP_TYPES));
+        if (found.length === 0) {
+          note.push(emptyScopeNote(`${item.type}:${item.name}`, PROFILE_TOP_TYPES));
+          incomplete.push(`${item.type}:${item.name}`);
+        }
       }
     }
   }
@@ -171,10 +188,13 @@ export function companionsFor(
   if (fallbackObjects.length > 0) {
     note.push(`org list not loaded — layouts and quick actions for ${fallbackObjects.join(', ')} were taken from the project; Fetch Org for the org's full set`);
   }
-  if (profileOrgNote) {
-    note.push('scope "org" asks for every component of the profile\'s types on the org — slow on big orgs; a CustomObject wildcard covers custom objects only, so standard objects are named from the project');
+  if (fallbackProfiles.length > 0) {
+    note.push(`org list not loaded — standard objects for ${fallbackProfiles.join(', ')} were taken from the project; Fetch Org to include the org's standard objects`);
   }
-  return { companions, note };
+  if (profileOrgNote) {
+    note.push('scope "org" asks for every component of the profile\'s types on the org — slow on big orgs; a CustomObject wildcard covers custom objects only, so standard objects are named one by one');
+  }
+  return { companions, note, incomplete };
 }
 
 /** The loud one: project scope had nothing to send, so the org will answer with
