@@ -469,6 +469,13 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  summarized, so this is the only source once that happens. In memory only,
    *  like lastValidated: the offer ends with this window. */
   private lastDeployedApex?: { runId: string; org: string; keys: string[] };
+  /** The "Run tests" handoff this window is waiting on, from the moment it is
+   *  handed to sf-test-runner until its reply is in — `runId` is the deploy run
+   *  whose Status-card button started it (undefined for the toolbar). While it
+   *  is set a second "Run tests" is refused here with a note instead of being
+   *  handed over again, and that run's button shows "Running tests…". Declared
+   *  without an initializer: the harnesses drive bare prototypes. */
+  private testsInFlight?: { runId?: string; org: string; startedAt: number };
   /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
   private orgMembers = new Map<string, true>();
   /** The org username `orgMembers` was fetched from — guards against using a stale
@@ -1308,6 +1315,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         await this.runDiff(msg.keys);
         return;
       case 'runTests': {
+        // One handoff at a time from this panel: sf-test-runner runs one test
+        // run at a time anyway, and a second click (a double click, a re-render
+        // under the pointer) would only come back as its "already running".
+        if (this.refuseRunTestsInFlight(msg.runId)) return;
         let names: string[];
         let org: string | undefined;
         // Only the card path can truthfully claim the classes are already on
@@ -1351,7 +1362,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // moment THIS handler returns — a test run lasts minutes, and this
         // button must not hold that lock for the whole thing. sf-test-runner
         // owns its own busy guard, production confirm and "not deployed" prompt.
-        void this.runTestsInRunner(names, org, deployed);
+        void this.runTestsInRunner(names, org, deployed, msg.runId);
         return;
       }
       case 'openFile': {
@@ -3745,7 +3756,11 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
     const apex = this.lastDeployedApex;
     if (run.op === 'deploy' && run.status === 'succeeded' && apex && apex.runId === run.id && apex.keys.length && this.testRunnerAvailable()) {
-      out.runTests = { count: apex.keys.length };
+      // While THIS run's own handoff is out, its button says so and is locked.
+      const inFlight = this.testsInFlight;
+      out.runTests = inFlight && inFlight.runId === run.id
+        ? { count: apex.keys.length, running: true, startedAt: inFlight.startedAt }
+        : { count: apex.keys.length };
     }
     return out.suggest || out.quick || out.runTests ? out : undefined;
   }
@@ -5400,7 +5415,49 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  guard, its own production confirm, and its own "not deployed" prompt;
    *  holding our slot for a run that can take minutes would freeze every
    *  other button in this panel for no reason. */
-  private async runTestsInRunner(names: string[], org: string, deployed?: boolean): Promise<void> {
+  private async runTestsInRunner(names: string[], org: string, deployed?: boolean, runId?: string): Promise<void> {
+    // Taken synchronously, before the first await, so a second message handled
+    // right behind this one already finds it (refuseRunTestsInFlight).
+    const startedAt = Date.now();
+    this.testsInFlight = { runId, org, startedAt };
+    this.output.appendLine(`[runTests] handoff started runId=${runId ?? '(toolbar)'} org=${org} classes=${names.length}`);
+    // Only a Status-card run's button changes with the lock (liveRunPayload).
+    if (runId) this.runStore.refreshLive();
+    let status = 'no reply';
+    try {
+      status = await this.handOffTests(names, org, deployed);
+    } finally {
+      this.testsInFlight = undefined;
+      this.output.appendLine(`[runTests] handoff finished status=${status} in ${Date.now() - startedAt}ms`);
+      if (runId) this.runStore.refreshLive();
+    }
+  }
+
+  /** A "Run tests" click that arrives while a handoff is still out: refused
+   *  with a note on the Status pane and a line in the Output, never handed to
+   *  sf-test-runner a second time. `runId` is the clicked card's run
+   *  (undefined for the toolbar). True when refused. */
+  private refuseRunTestsInFlight(runId?: string): boolean {
+    const inFlight = this.testsInFlight;
+    if (!inFlight) return false;
+    const source = runId ? 'card' : 'toolbar';
+    this.output.appendLine(`[runTests] refused duplicate source=${source} runId=${runId ?? '(toolbar)'} — the handoff runId=${inFlight.runId ?? '(toolbar)'} started ${Date.now() - inFlight.startedAt}ms ago is still running`);
+    const sameRun = !!runId && inFlight.runId === runId;
+    this.post({
+      type: 'status',
+      card: {
+        kind: 'info',
+        title: sameRun
+          ? 'Tests for this deploy are already running in SF Tests — see its Results view'
+          : 'Tests started from this panel are already running in SF Tests — see its Results view, and run these once it finishes'
+      }
+    });
+    return true;
+  }
+
+  /** The handoff itself: one `runTestsFor` call and the ONE Status card with
+   *  its outcome. Returns the reply's status, for the Output line. */
+  private async handOffTests(names: string[], org: string, deployed?: boolean): Promise<string> {
     const orgInfo = this.orgs.find(o => o.username === org);
     const orgLabel = orgInfo?.alias ?? org;
     // Set only when executeCommand itself threw (command missing, or
@@ -5426,7 +5483,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     })();
     vscode.window.setStatusBarMessage('$(beaker) SF Deploy: running tests in SF Test Runner…', call);
     const result = await call;
-    this.post({ type: 'status', card: testsCard(result, orgLabel, callFailed) });
+    this.post({ type: 'status', card: testsCard(result, orgLabel, callFailed, deployed) });
+    return result ? result.status : callFailed ? 'call failed' : 'unreadable reply';
   }
 
   /** `focusFile` — the exact file a context-menu diff was invoked on. Only used for
@@ -7916,9 +7974,12 @@ export function parseRunTestsForResult(raw: unknown): RunTestsForResult | undefi
  *  is exactly 'ok'/'err'/'warn' (panel.js's CARD_ICONS); `post()` keeps every
  *  status card as a notice automatically, so nothing else is needed to make
  *  this survive a reload. `passed`/`failed` name the title for the two
- *  statuses that actually ran something; every other status speaks in its own
- *  (or a generic) message — there is no count to report. */
-export function testsCard(result: RunTestsForResult | undefined, orgLabel: string, callFailed?: boolean): { kind: 'ok' | 'err' | 'warn'; title: string; meta?: string } {
+ *  statuses that actually ran something, with sf-test-runner's own note (when
+ *  it sends one) as a line under it; `busy` is said in this panel's words —
+ *  nothing failed, the tests just weren't started; every other status speaks
+ *  in its own (or a generic) message — there is no count to report.
+ *  `deployed`: the click came from a deploy's Status card. */
+export function testsCard(result: RunTestsForResult | undefined, orgLabel: string, callFailed?: boolean, deployed?: boolean): { kind: 'ok' | 'err' | 'warn'; title: string; meta?: string; lines?: string[] } {
   if (!result) {
     // Two different "nothing to read" causes get two different words: a
     // THROW (command not found, or sf-test-runner itself errored) names the
@@ -7945,9 +8006,19 @@ export function testsCard(result: RunTestsForResult | undefined, orgLabel: strin
       const n = result.testClasses.length;
       const classes = n ? `${n} test ${n === 1 ? 'class' : 'classes'}, ` : '';
       const methods = `${result.passed} ${result.passed === 1 ? 'method' : 'methods'} passed, ${result.failed} failed`;
-      return { kind: result.status === 'passed' ? 'ok' : 'err', title: `Tests on ${alias}: ${classes}${methods}`, meta };
+      const card: { kind: 'ok' | 'err'; title: string; meta: string; lines?: string[] } = { kind: result.status === 'passed' ? 'ok' : 'err', title: `Tests on ${alias}: ${classes}${methods}`, meta };
+      // sf-test-runner's own note on the run (e.g. a class it ran that the
+      // org found no test methods in) — the counts alone would hide it.
+      if (result.message) card.lines = [result.message];
+      return card;
     }
-    case 'busy': return { kind: 'warn', title: result.message || `Tests on ${alias}: a test run is already in progress.`, meta: classesLine };
+    // sf-test-runner's single-run guard was held (the user's own run in SF
+    // Tests, say): nothing failed and nothing ran — say that, and what to do.
+    case 'busy': return {
+      kind: 'warn',
+      title: `SF Tests is already running tests — wait for that run; ${deployed ? 'this deploy\'s' : 'these'} tests were not started`,
+      meta: classesLine
+    };
     case 'noTests': return { kind: 'warn', title: result.message || `Tests on ${alias}: no matching test class found.`, meta: classesLine };
     case 'cancelled': return { kind: 'warn', title: result.message || `Tests on ${alias}: run cancelled.`, meta: classesLine };
     case 'error': default: return { kind: 'err', title: result.message || `Tests on ${alias}: the test run could not be started.`, meta: classesLine };

@@ -335,6 +335,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 .status-card.ok { border-left: 3px solid var(--ok); }
 .status-card.err { border-left: 3px solid var(--err); }
 .status-card.warn { border-left: 3px solid var(--warn); }
+.status-card.info { border-left: 3px solid var(--vscode-textLink-foreground, #3794ff); }
 .status-card.progress { border-left: 3px solid var(--accent); }
 .status-card .title { font-weight: 600; margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
 .status-card .card-icon { font-weight: 700; flex: none; }
@@ -344,6 +345,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 .status-card .card-icon.ok { color: var(--ok); }
 .status-card .card-icon.err { color: var(--err); }
 .status-card .card-icon.warn { color: var(--warn); }
+.status-card .card-icon.info { color: var(--vscode-textLink-foreground, #3794ff); }
 .status-card .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
 .status-card ul { margin: 4px 0 0 0; padding-left: 16px; font-size: 12px; }
 .status-card .err-text {

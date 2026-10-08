@@ -71,6 +71,12 @@
     const s = Math.max(0, Math.floor(ms / 1000));
     return s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
   }
+  /** "just now", "45s ago", "3m 12s ago". */
+  function fmtAgo(at, now) {
+    if (typeof at !== 'number' || !isFinite(at)) return 'just now';
+    const ms = (now === undefined ? Date.now() : now) - at;
+    return ms < 5000 ? 'just now' : fmtElapsed(ms) + ' ago';
+  }
   function splitKey(k) {
     const c = k.indexOf(':');
     return c < 0 ? { type: '', name: k } : { type: k.slice(0, c), name: k.slice(c + 1) };
@@ -568,8 +574,14 @@
     // only field — see runStore.ts's RunLive), never stored on the run itself.
     // `via: 'send'`, like Select below — it posts straight to the provider and
     // does not take this plugin's own busy slot, so it needs no slotBusy gate.
+    // Its own lock is `running`: set by the provider while this run's tests
+    // are out in SF Test Runner, cleared when the result card arrives.
     if (run.op === 'deploy' && run.status === 'succeeded' && run.runTests && run.runTests.count) {
-      buttons.push({ id: 'runTests', label: 'Run tests (' + fmtN(run.runTests.count) + ')', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: false, title: 'Run the Apex tests for what this deploy sent, in SF Test Runner' });
+      if (run.runTests.running) {
+        buttons.push({ id: 'runTests', label: 'Running tests in SF Tests…', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: true, title: 'Started ' + fmtAgo(run.runTests.startedAt, ctx.now) + '; the result card appears here when it finishes' });
+      } else {
+        buttons.push({ id: 'runTests', label: 'Run tests (' + fmtN(run.runTests.count) + ')', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: false, title: 'Run the Apex tests for what this deploy sent, in SF Test Runner' });
+      }
     }
     if (run.status === 'lost' && run.jobId) {
       buttons.push({ id: 'resume', label: 'Resume monitoring', primary: true, message: { type: 'resumeDeploy', jobId: run.jobId }, via: 'action', disabled: slotBusy, title: slotTitle('Check the same job again — it does not deploy again') });
@@ -625,7 +637,7 @@
 
   return {
     OUTCOMES, DEPLOY_CHIPS, RETRIEVE_CHIPS, ROW_H, DEFAULT_OPEN_MAX, SEARCH_MIN_ROWS, GLYPH, ORG,
-    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, plural, splitKey,
+    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, fmtAgo, plural, splitKey,
     outcomeLabel, outcomeKind, verdictFor, titleText, chipDefs, explainFor, whyText, histLabel,
     buildRows, visibleRange, actionsFor, rowCopyText, testCopyText, copyText
   };

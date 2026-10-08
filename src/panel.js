@@ -852,7 +852,7 @@
         }
         return;
       case 'status':
-        // msg.card = { kind: 'ok'|'err'|'warn', title, meta, lines[], errText, actions[], hint, at }
+        // msg.card = { kind: 'ok'|'err'|'warn'|'info', title, meta, lines[], errText, actions[], hint, at }
         state.statusCards.unshift(msg.card);
         if (state.statusCards.length > state.runCap) state.statusCards.length = state.runCap;
         renderStatus();
@@ -2044,7 +2044,7 @@
     return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
   }
 
-  const CARD_ICONS = { ok: '✓', err: '✕', warn: '⚠' };
+  const CARD_ICONS = { ok: '✓', err: '✕', warn: '⚠', info: 'ℹ' };
   const MAX_CARD_LINES = 8;
 
   // Card timestamp: time-only for today, date + time for older history entries.

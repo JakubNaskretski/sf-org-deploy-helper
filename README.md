@@ -102,14 +102,14 @@ deployed, failed, rolled back, validated or retrieved, with file:line links to t
 The counts above the list filter it, a search box narrows a long one, and a run of ten
 thousand components stays quick to scroll.
 
-The newest run carries the actions: Retry (and Retry + overwrite after a source conflict), Try
-with dependencies, Quick Deploy after a validation that ran tests, Run tests after a deploy that
-sent Apex (with **SF Test Runner** installed — the toolbar has the same button for whatever Apex
-is selected), Resume monitoring after lost contact, Restore / Discard backup after a retrieve,
-Select (ticks the listed rows in the tree) and Copy. Older runs are one-line summaries under
-**Earlier** in the pane's header — you can open and copy them, but they have no buttons; an older
-retrieve's backup is still restorable with **SF Deploy: Restore Retrieve Backup**. Other results
-(diff, delete, Fetch Org…) are short notices in the same history.
+The newest run carries the actions: Retry (and Retry + overwrite after a source conflict), Try with
+dependencies, Quick Deploy after a validation that ran tests, Run tests after a deploy that sent
+Apex (with **SF Test Runner** installed; it locks until the result arrives — the toolbar has the
+same button for whatever Apex is selected), Resume monitoring after lost contact, Restore / Discard
+backup after a retrieve, Select (ticks the listed rows in the tree) and Copy. Older runs are
+one-line summaries under **Earlier** in the pane's header — you can open and copy them, but they
+have no buttons; an older retrieve's backup is still restorable with **SF Deploy: Restore Retrieve
+Backup**. Other results (diff, delete, Fetch Org…) are short notices in the same history.
 
 The pane keeps your last `sfOrgDeployWrapper.statusHistoryRuns` runs (default 3) across
 reloads, the newest with its full list, and as many notices beside them. Quick Deploy is
