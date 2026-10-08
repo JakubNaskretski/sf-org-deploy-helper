@@ -473,8 +473,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  handed to sf-test-runner until its reply is in — `runId` is the deploy run
    *  whose Status-card button started it (undefined for the toolbar). While it
    *  is set a second "Run tests" is refused here with a note instead of being
-   *  handed over again, and that run's button shows "Running tests…". Declared
-   *  without an initializer: the harnesses drive bare prototypes. */
+   *  handed over again, and every Run tests button is locked: the newest
+   *  deploy's shows "Running tests…" (liveRunPayload), the toolbar's follows
+   *  the `testsRunning` of the busy posts. Declared without an initializer:
+   *  the harnesses drive bare prototypes. */
   private testsInFlight?: { runId?: string; org: string; startedAt: number };
   /** Keys ("Type:Name") of metadata components that exist on the currently-selected org. */
   private orgMembers = new Map<string, true>();
@@ -3756,9 +3758,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
     const apex = this.lastDeployedApex;
     if (run.op === 'deploy' && run.status === 'succeeded' && apex && apex.runId === run.id && apex.keys.length && this.testRunnerAvailable()) {
-      // While THIS run's own handoff is out, its button says so and is locked.
+      // While ANY handoff is out (this card's, or the toolbar's) the button
+      // says so and is locked — a click would only be refused.
       const inFlight = this.testsInFlight;
-      out.runTests = inFlight && inFlight.runId === run.id
+      out.runTests = inFlight
         ? { count: apex.keys.length, running: true, startedAt: inFlight.startedAt }
         : { count: apex.keys.length };
     }
@@ -5421,22 +5424,26 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     const startedAt = Date.now();
     this.testsInFlight = { runId, org, startedAt };
     this.output.appendLine(`[runTests] handoff started runId=${runId ?? '(toolbar)'} org=${org} classes=${names.length}`);
-    // Only a Status-card run's button changes with the lock (liveRunPayload).
-    if (runId) this.runStore.refreshLive();
+    // Lock every Run tests button: the newest deploy's (the runs) and the
+    // toolbar's (the busy post's testsRunning).
+    this.runStore.refreshLive();
+    this.postBusy();
     let status = 'no reply';
     try {
       status = await this.handOffTests(names, org, deployed);
     } finally {
       this.testsInFlight = undefined;
       this.output.appendLine(`[runTests] handoff finished status=${status} in ${Date.now() - startedAt}ms`);
-      if (runId) this.runStore.refreshLive();
+      this.runStore.refreshLive();
+      this.postBusy();
     }
   }
 
   /** A "Run tests" click that arrives while a handoff is still out: refused
    *  with a note on the Status pane and a line in the Output, never handed to
-   *  sf-test-runner a second time. `runId` is the clicked card's run
-   *  (undefined for the toolbar). True when refused. */
+   *  sf-test-runner a second time. The note is `transient` — shown, never kept
+   *  as a notice, so it can't push a real one out of the history. `runId` is
+   *  the clicked card's run (undefined for the toolbar). True when refused. */
   private refuseRunTestsInFlight(runId?: string): boolean {
     const inFlight = this.testsInFlight;
     if (!inFlight) return false;
@@ -5447,8 +5454,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       type: 'status',
       card: {
         kind: 'info',
+        transient: true,
         title: sameRun
-          ? 'Tests for this deploy are already running in SF Tests — see its Results view'
+          ? 'Run tests was clicked twice — sent to SF Tests once'
           : 'Tests started from this panel are already running in SF Tests — see its Results view, and run these once it finishes'
       }
     });
@@ -6394,7 +6402,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** The slot's current state, as the webview's `busy` message. */
   private postBusy(): void {
-    this.post({ type: 'busy', busy: this.busy, action: this.currentAction, cancelling: this.cancelling });
+    this.post({ type: 'busy', busy: this.busy, action: this.currentAction, cancelling: this.cancelling, testsRunning: !!this.testsInFlight });
   }
 
   private setBusy(b: boolean, action?: string): void {
@@ -6402,7 +6410,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     this.currentAction = b ? action : undefined;
     this.cancelling = false;
     if (!b) this.currentProgressText = undefined;
-    this.post({ type: 'busy', busy: b, action: this.currentAction, cancelling: false });
+    this.post({ type: 'busy', busy: b, action: this.currentAction, cancelling: false, testsRunning: !!this.testsInFlight });
     // Drain the next queued deploy/validate once the slot frees (Feature: deploy
     // queue). A microtask — never synchronous inside the caller's `finally` —
     // so the operation that just finished unwinds its OWN cleanup
@@ -6640,8 +6648,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // Stamp and persist every result card — the Status pane doubles as the
       // deployment history, surviving webview rebuilds AND window reloads (so a
       // failed context-menu deploy with the sidebar closed leaves a durable trace).
+      // A transient note (a refused second click) is stamped and shown, never kept.
       m.card.at ??= Date.now();
-      this.pushCardHistory(m.card);
+      if (m.card.transient !== true) this.pushCardHistory(m.card);
     }
     this.view?.webview.postMessage(msg);
   }

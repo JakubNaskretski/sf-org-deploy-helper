@@ -71,11 +71,10 @@
     const s = Math.max(0, Math.floor(ms / 1000));
     return s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
   }
-  /** "just now", "45s ago", "3m 12s ago". */
-  function fmtAgo(at, now) {
-    if (typeof at !== 'number' || !isFinite(at)) return 'just now';
-    const ms = (now === undefined ? Date.now() : now) - at;
-    return ms < 5000 ? 'just now' : fmtElapsed(ms) + ' ago';
+  /** "14:03" — the local clock time. */
+  function fmtClock(at) {
+    const d = new Date(at);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
   }
   function splitKey(k) {
     const c = k.indexOf(':');
@@ -574,11 +573,15 @@
     // only field — see runStore.ts's RunLive), never stored on the run itself.
     // `via: 'send'`, like Select below — it posts straight to the provider and
     // does not take this plugin's own busy slot, so it needs no slotBusy gate.
-    // Its own lock is `running`: set by the provider while this run's tests
-    // are out in SF Test Runner, cleared when the result card arrives.
+    // Its own lock is `running`: set by the provider while any Run tests
+    // handoff is out in SF Test Runner, cleared when the result card arrives —
+    // or `ctx.runTestsClickedAt`, the webview's own lock from the click until
+    // the provider answers it (panel.js), so a double click sends once.
     if (run.op === 'deploy' && run.status === 'succeeded' && run.runTests && run.runTests.count) {
-      if (run.runTests.running) {
-        buttons.push({ id: 'runTests', label: 'Running tests in SF Tests…', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: true, title: 'Started ' + fmtAgo(run.runTests.startedAt, ctx.now) + '; the result card appears here when it finishes' });
+      if (run.runTests.running || ctx.runTestsClickedAt) {
+        const at = run.runTests.startedAt || ctx.runTestsClickedAt;
+        const title = (typeof at === 'number' && isFinite(at) ? 'Started at ' + fmtClock(at) + '; the' : 'The') + ' result card appears here when it finishes';
+        buttons.push({ id: 'runTests', label: 'Running tests in SF Tests…', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: true, title });
       } else {
         buttons.push({ id: 'runTests', label: 'Run tests (' + fmtN(run.runTests.count) + ')', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: false, title: 'Run the Apex tests for what this deploy sent, in SF Test Runner' });
       }
@@ -637,7 +640,7 @@
 
   return {
     OUTCOMES, DEPLOY_CHIPS, RETRIEVE_CHIPS, ROW_H, DEFAULT_OPEN_MAX, SEARCH_MIN_ROWS, GLYPH, ORG,
-    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, fmtAgo, plural, splitKey,
+    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, fmtClock, plural, splitKey,
     outcomeLabel, outcomeKind, verdictFor, titleText, chipDefs, explainFor, whyText, histLabel,
     buildRows, visibleRange, actionsFor, rowCopyText, testCopyText, copyText
   };

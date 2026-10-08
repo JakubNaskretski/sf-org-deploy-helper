@@ -55,6 +55,9 @@
     // provider's `busy` posts (`cancelling`), which say whether the click actually
     // consumed a cancel handler — see the click handler and the busy case.
     cancelRequested: false,
+    // A "Run tests" handoff to SF Test Runner is out (the provider's busy
+    // posts): every Run tests button is locked until its result card arrives.
+    testsRunning: false,
     progress: null, // { text, startedAt } while an operation runs
     activeFileKey: null,
     statusCards: [],
@@ -325,7 +328,7 @@
   // take minutes), so this only needs the ordinary pendingAction/busy guard —
   // no org check here, the host's own requireOrg() covers it.
   $('runTestsBtn').addEventListener('click', () => {
-    if (state.pendingAction || state.busy) return;
+    if (state.pendingAction || state.busy || state.testsRunning) return;
     const apexSel = Array.from(state.selected).filter(k => /^Apex(Class|Trigger):/.test(k) && state.localKeys.has(k));
     if (!apexSel.length) return;
     sendAction('runTests', { keys: apexSel });
@@ -787,6 +790,8 @@
         if (!latest || latest.status !== 'running' || !state.runProgress || state.runProgress.id !== latest.id) state.runProgress = null;
         const ids = new Set(runs.map(r => r.id));
         for (const id of Object.keys(state.runLocal)) if (!ids.has(id)) delete state.runLocal[id];
+        // The provider's runs say whether tests are running now.
+        clearRunTestsClicks();
         renderStatus();
         return;
       }
@@ -825,6 +830,12 @@
         // (setBusy always posts cancelling:false) releases it.
         const cancelling = !!msg.cancelling;
         const lockChanged = cancelling !== state.cancelRequested;
+        const testsRunning = !!msg.testsRunning;
+        const testsChanged = testsRunning !== state.testsRunning;
+        state.testsRunning = testsRunning;
+        // The provider has answered a Run tests click by now: its own lock
+        // (the runs' `running`) takes over from the click's.
+        const clickCleared = clearRunTestsClicks();
         state.busy = busy;
         state.busyAction = busyAction;
         state.cancelRequested = cancelling;
@@ -837,7 +848,7 @@
             stopProgressTimer();
           }
         }
-        if (changed || hadPending || lockChanged) {
+        if (changed || hadPending || lockChanged || testsChanged || clickCleared) {
           renderActions();
           renderStatus();
         }
@@ -851,12 +862,17 @@
           if (progressTextEl) progressTextEl.textContent = msg.text;
         }
         return;
-      case 'status':
-        // msg.card = { kind: 'ok'|'err'|'warn'|'info', title, meta, lines[], errText, actions[], hint, at }
+      case 'status': {
+        // msg.card = { kind: 'ok'|'err'|'warn'|'info', title, meta, lines[], errText, actions[], hint, at, transient }
+        // A transient note (a refused second click) is not in the provider's
+        // history: the newest one is shown, and it never takes a kept card's
+        // place in the cap.
+        if (msg.card && msg.card.transient) state.statusCards = state.statusCards.filter(c => !c.transient);
         state.statusCards.unshift(msg.card);
-        if (state.statusCards.length > state.runCap) state.statusCards.length = state.runCap;
+        trimStatusCards();
         renderStatus();
         return;
+      }
       case 'statusHistory':
         // Persisted card history replayed by the provider on ready (newest first) —
         // the Status pane doubles as the deployment history across window reloads.
@@ -889,7 +905,12 @@
   function takeCap(cap) {
     if (typeof cap !== 'number' || !Number.isFinite(cap)) return;
     state.runCap = Math.min(10, Math.max(1, Math.floor(cap)));
-    if (state.statusCards.length > state.runCap) state.statusCards.length = state.runCap;
+    trimStatusCards();
+  }
+  /** The notices down to the cap — a transient note never counts against it. */
+  function trimStatusCards() {
+    let kept = 0;
+    state.statusCards = state.statusCards.filter(c => (c && c.transient) || ++kept <= state.runCap);
   }
 
   // ---- Renderers ----
@@ -1939,8 +1960,10 @@
     runTestsBtn.style.display = showRunTests ? '' : 'none';
     if (showRunTests) {
       runTestsBtn.textContent = `Run tests (${apexSel.length})`;
-      runTestsBtn.disabled = state.busy || pending;
-      runTestsBtn.title = pendingTip || (state.busy ? busyTip : 'Run these Apex tests in SF Test Runner');
+      runTestsBtn.disabled = state.busy || pending || state.testsRunning;
+      runTestsBtn.title = pendingTip || (state.busy ? busyTip
+        : state.testsRunning ? 'Tests are running in SF Tests — the result card appears in Status when they finish'
+        : 'Run these Apex tests in SF Test Runner');
     }
     if (state.busy) {
       retrieveBtn.style.display = 'none';
@@ -2364,6 +2387,15 @@
     return e;
   }
   function runLocalFor(id) { return (state.runLocal[id] ||= {}); }
+  /** Drop every Run tests click lock (renderRunActs) — the provider has
+   *  answered. True when there was one. */
+  function clearRunTestsClicks() {
+    let had = false;
+    for (const local of Object.values(state.runLocal)) {
+      if (local.runTestsClickedAt) { delete local.runTestsClickedAt; had = true; }
+    }
+    return had;
+  }
   /** The newest run's view state, reset when another run becomes the newest. */
   function runUiFor(run) {
     if (state.runUi.runId !== run.id) {
@@ -2733,7 +2765,8 @@
       complete: runSrc.complete, sent: runSrc.rows.filter(r => r.s === 1).map(r => r.k), selectKeys,
       filterLabel: chip ? chip.label.toLowerCase() : '',
       quick: run.quick, suggest: run.suggest,
-      quickUsed: !!local.quickUsed, suggestDone: !!local.suggestDone
+      quickUsed: !!local.quickUsed, suggestDone: !!local.suggestDone,
+      runTestsClickedAt: local.runTestsClickedAt
     });
     for (const b of buttons) {
       const btn = mk('button', `run-btn${b.primary ? ' primary' : ''}`, b.label);
@@ -2744,7 +2777,14 @@
       btn.addEventListener('click', () => {
         if (btn.disabled) return;
         if (b.via === 'copy') send('copyText', { text: RV.copyText(run, runModel.visible, runModel.visibleTests, { now: Date.now(), quick: run.quick }) });
-        else if (b.via === 'send') send(b.message.type, b.message);
+        else if (b.id === 'runTests') {
+          // Locked from the click until the provider answers (the next runs or
+          // busy post): a double click hands the tests over once.
+          btn.disabled = true;
+          send(b.message.type, b.message);
+          local.runTestsClickedAt = Date.now();
+          renderRunActs(run);
+        } else if (b.via === 'send') send(b.message.type, b.message);
         else if (b.via === 'open') {
           local.suggestOpen = true;
           // Reopening supersedes an earlier Back.

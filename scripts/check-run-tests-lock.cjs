@@ -8,12 +8,15 @@
 // "A test run is already in progress", read as an error. So:
 //   1) the provider holds ONE handoff at a time: a second Run tests (the same
 //      card, or the toolbar) is refused here — no second executeCommand — with
-//      an info card and an Output line naming where it came from; the lock
-//      ends when the reply is in, whatever it was;
-//   2) the newest deploy's run payload carries `running` while its own
-//      handoff is out, and the Status card draws that as a locked "Running
-//      tests in SF Tests…" button — through the real runs post and the real
-//      panel.js, not just the view function;
+//      a transient info note (shown, never kept as a notice) and an Output
+//      line naming where it came from; the lock ends when the reply is in,
+//      whatever it was;
+//   2) while ANY handoff is out every Run tests button is locked: the newest
+//      deploy's run payload carries `running`, drawn as "Running tests in SF
+//      Tests…" — through the real runs post and the real panel.js, not just
+//      the view function — and the busy posts carry `testsRunning`, which
+//      disables the toolbar's; the card's button also locks itself on the
+//      click, so a double click is handed over once;
 //   3) a `busy` reply (the user's own run in SF Tests) is a warning in this
 //      panel's words, not a failure, and the button is usable again after it;
 //   4) a passed/failed card carries sf-test-runner's own note as a line.
@@ -110,7 +113,8 @@ check('a second card click while the handoff is out: no second executeCommand, o
   const info = cards(posted);
   assert.strictEqual(info.length, 1, JSON.stringify(info));
   assert.strictEqual(info[0].kind, 'info');
-  assert.strictEqual(info[0].title, 'Tests for this deploy are already running in SF Tests — see its Results view');
+  assert.strictEqual(info[0].transient, true, 'a refused click is a note, never a kept notice');
+  assert.strictEqual(info[0].title, 'Run tests was clicked twice — sent to SF Tests once');
   assert.ok(logs.some((l) => l.startsWith(`[runTests] refused duplicate source=card runId=${RUN_ID} — the handoff runId=${RUN_ID} started `)), logs.join('\n'));
   release(PASSED);
   await settle();
@@ -145,7 +149,8 @@ check('the toolbar is refused too while a handoff is out — logged as "toolbar"
   const info = cards(posted);
   assert.strictEqual(info.length, 1);
   assert.strictEqual(info[0].kind, 'info');
-  assert.ok(/already running in SF Tests/.test(info[0].title) && !/this deploy/.test(info[0].title), info[0].title);
+  assert.strictEqual(info[0].transient, true);
+  assert.ok(/already running in SF Tests/.test(info[0].title) && !/clicked twice/.test(info[0].title), info[0].title);
   release(PASSED);
   await settle();
 });
@@ -202,24 +207,51 @@ check('the runs payload: `running` (with its start) is posted the moment the loc
   assert.deepStrictEqual(proto.liveRunPayload.call(s, run), { runTests: { count: 2 } });
 });
 
-check('a toolbar handoff never marks the deploy card running — those are not this deploy\'s tests', async () => {
+check('a toolbar handoff locks the newest deploy card too — its click would only be refused — with runs posts at take and clear', async () => {
   const release = heldReply();
-  const { s } = provider();
+  const { s, posted } = provider();
   await toolbarClick(s);
-  assert.ok(!proto.liveRunPayload.call(s, deployRun()).runTests.running);
+  const rt = proto.liveRunPayload.call(s, deployRun()).runTests;
+  assert.strictEqual(rt.running, true);
+  assert.strictEqual(typeof rt.startedAt, 'number');
+  assert.strictEqual(runsPosts(posted).length, 1, 'the runs are re-posted when a toolbar handoff takes the lock');
+  assert.strictEqual(headRunTests(runsPosts(posted)[0]).running, true);
   release(PASSED);
   await settle();
+  assert.strictEqual(runsPosts(posted).length, 2, 'and when it clears');
+  assert.ok(!headRunTests(runsPosts(posted)[1]).running);
 });
 
-check('runView: running draws a locked "Running tests in SF Tests…" saying when it started; otherwise the usual "Run tests (N)"', () => {
+check('the busy posts carry testsRunning: true from the moment the lock is taken, false once the result card is out', async () => {
+  const release = heldReply();
+  const { s, posted } = provider();
+  await toolbarClick(s);
+  const busy = () => posted.filter((m) => m.type === 'busy');
+  assert.strictEqual(busy().length, 1, JSON.stringify(posted.map((m) => m.type)));
+  assert.strictEqual(busy()[0].testsRunning, true);
+  release(PASSED);
+  await settle();
+  const last = busy()[busy().length - 1];
+  assert.strictEqual(last.testsRunning, false);
+  assert.ok(posted.indexOf(last) > posted.findIndex((m) => m.type === 'status'), 'after the result card');
+});
+
+const hm = (t) => { const d = new Date(t); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
+check('runView: running draws a locked "Running tests in SF Tests…" saying the clock time it started (a tooltip never re-renders by itself); otherwise the usual "Run tests (N)"', () => {
   const base = Object.assign(deployRun(), { runTests: { count: 3, running: true, startedAt: NOW - 75_000 } });
-  const ctx = { isLatest: true, busy: false, pending: false, complete: true, sent: [], selectKeys: [], now: NOW };
+  const ctx = { isLatest: true, busy: false, pending: false, complete: true, sent: [], selectKeys: [] };
   const b = RV.actionsFor(base, ctx).buttons.find((x) => x.id === 'runTests');
   assert.strictEqual(b.label, 'Running tests in SF Tests…');
   assert.strictEqual(b.disabled, true);
-  assert.strictEqual(b.title, 'Started 1m 15s ago; the result card appears here when it finishes');
-  const fresh = Object.assign(deployRun(), { runTests: { count: 3, running: true, startedAt: NOW - 1000 } });
-  assert.strictEqual(RV.actionsFor(fresh, ctx).buttons.find((x) => x.id === 'runTests').title, 'Started just now; the result card appears here when it finishes');
+  assert.strictEqual(b.title, `Started at ${hm(NOW - 75_000)}; the result card appears here when it finishes`);
+  // The webview's own click lock, before the provider has answered.
+  const clicked = Object.assign(deployRun(), { runTests: { count: 3 } });
+  const c = RV.actionsFor(clicked, Object.assign({}, ctx, { runTestsClickedAt: NOW })).buttons.find((x) => x.id === 'runTests');
+  assert.strictEqual(c.label, 'Running tests in SF Tests…');
+  assert.strictEqual(c.disabled, true);
+  assert.strictEqual(c.title, `Started at ${hm(NOW)}; the result card appears here when it finishes`);
+  const noStart = Object.assign(deployRun(), { runTests: { count: 3, running: true } });
+  assert.strictEqual(RV.actionsFor(noStart, ctx).buttons.find((x) => x.id === 'runTests').title, 'The result card appears here when it finishes');
   const idle = Object.assign(deployRun(), { runTests: { count: 3 } });
   const i = RV.actionsFor(idle, ctx).buttons.find((x) => x.id === 'runTests');
   assert.strictEqual(i.label, 'Run tests (3)');
@@ -264,6 +296,87 @@ check('panel.js, fed the provider\'s own runs posts: the button locks while the 
   back.fire('click');
   const sent = JSON.parse(JSON.stringify(p.outbound.filter((m) => m.type === 'runTests')));
   assert.deepStrictEqual(sent[sent.length - 1], { type: 'runTests', runId: RUN_ID });
+});
+
+check('panel.js: a double click on the card\'s Run tests sends ONE runTests — the button locks itself on the click — and a provider answer with no runs (a no-op) unlocks it', () => {
+  const { s, posted } = provider();
+  const p = boot();
+  s.runStore.refreshLive();
+  p.deliver(JSON.parse(JSON.stringify(runsPosts(posted).pop())));
+  const btn = actBtn(p, 'runTests');
+  btn.fire('click');
+  btn.fire('click');
+  assert.strictEqual(p.outbound.filter((m) => m.type === 'runTests').length, 1, 'a double click hands the tests over once');
+  const drawn = actBtn(p, 'runTests');
+  assert.strictEqual(drawn.textContent, 'Running tests in SF Tests…');
+  assert.strictEqual(drawn.disabled, true);
+  assert.ok(/^Started at \d\d:\d\d; /.test(drawn.title), drawn.title);
+  drawn.fire('click');
+  assert.strictEqual(p.outbound.filter((m) => m.type === 'runTests').length, 1);
+  // The provider answered without taking the lock (a stale run id, say): its busy re-sync unlocks.
+  p.deliver({ type: 'busy', busy: false, cancelling: false, testsRunning: false });
+  assert.strictEqual(actBtn(p, 'runTests').textContent, 'Run tests (2)');
+  assert.strictEqual(actBtn(p, 'runTests').disabled, false);
+  // A runs post is an answer too.
+  actBtn(p, 'runTests').fire('click');
+  assert.strictEqual(actBtn(p, 'runTests').disabled, true);
+  s.runStore.refreshLive();
+  p.deliver(JSON.parse(JSON.stringify(runsPosts(posted).pop())));
+  assert.strictEqual(actBtn(p, 'runTests').disabled, false);
+});
+
+check('panel.js: the toolbar\'s Run tests is disabled while busy says testsRunning, and a click then sends nothing', () => {
+  const p = panel({ selected: ['ApexClass:AcmeOrderService'], expandedGroups: [], filter: '', typeFilter: [], viewMode: 'all', testClasses: '' });
+  p.deliver({ type: 'files', objectChildTypes: [], items: ITEMS });
+  p.deliver({ type: 'peers', testRunner: true });
+  const tb = p.el('runTestsBtn');
+  assert.strictEqual(tb.style.display, '');
+  assert.strictEqual(tb.disabled, false);
+  p.deliver({ type: 'busy', busy: false, cancelling: false, testsRunning: true });
+  assert.strictEqual(tb.disabled, true);
+  assert.ok(/running in SF Tests/.test(tb.title), tb.title);
+  tb.fire('click');
+  assert.strictEqual(p.outbound.filter((m) => m.type === 'runTests').length, 0);
+  p.deliver({ type: 'busy', busy: false, cancelling: false, testsRunning: false });
+  assert.strictEqual(tb.disabled, false);
+  tb.fire('click');
+  assert.strictEqual(p.outbound.filter((m) => m.type === 'runTests').length, 1);
+});
+
+// ============================================================ 1b) the refusal note is never kept
+check('a refused click\'s note goes through the real post() without becoming a notice; a real result card is still kept', async () => {
+  const release = heldReply();
+  const webview = [];
+  const s = Object.create(proto);
+  Object.assign(s, {
+    items: ITEMS, orgs: ORGS, orgStore: { get: () => ORG }, liveSuggestions: new Map(),
+    lastDeployedApex: { runId: RUN_ID, org: ORG, keys: ['ApexClass:AcmeOrderService'] },
+    output: { appendLine: () => {} },
+    view: { webview: { postMessage: (m) => webview.push(m) } }
+  });
+  s.runStore.finish(deployRun());
+  await cardClick(s);
+  await cardClick(s);
+  const note = webview.find((m) => m.type === 'status');
+  assert.ok(note && note.card.transient === true && typeof note.card.at === 'number', JSON.stringify(note));
+  assert.strictEqual(s.runStore.notices().length, 0, 'the refusal must not be kept');
+  release(PASSED);
+  await settle();
+  assert.strictEqual(s.runStore.notices().length, 1, 'the result card is');
+  assert.strictEqual(s.runStore.notices()[0].kind, 'ok');
+});
+
+check('panel.js: a transient note shows without taking a kept card\'s place, and a newer one replaces it', () => {
+  const p = panel({ selected: [], expandedGroups: [], filter: '', typeFilter: [], viewMode: 'all', testClasses: '' });
+  const kept = [3, 2, 1].map((n) => ({ kind: 'ok', title: `Kept ${n}`, at: NOW - n * 1000 }));
+  p.deliver({ type: 'statusHistory', cards: kept, cap: 3 });
+  const titles = () => p.el('status').findAll((e) => e._classes && e._classes.has('status-card')).map((e) => e.find((x) => x.tagName === 'SPAN' && /^(Kept|Run tests|Fresh)/.test(x.textContent))).map((x) => x && x.textContent);
+  p.deliver({ type: 'status', card: { kind: 'info', transient: true, title: 'Run tests was clicked twice — sent to SF Tests once', at: NOW } });
+  assert.deepStrictEqual(titles(), ['Run tests was clicked twice — sent to SF Tests once', 'Kept 3', 'Kept 2', 'Kept 1']);
+  p.deliver({ type: 'status', card: { kind: 'info', transient: true, title: 'Run tests was clicked twice — sent to SF Tests once', at: NOW + 1 } });
+  assert.strictEqual(titles().length, 4, 'one transient note at a time');
+  p.deliver({ type: 'status', card: { kind: 'ok', title: 'Fresh', at: NOW + 2 } });
+  assert.deepStrictEqual(titles(), ['Fresh', 'Run tests was clicked twice — sent to SF Tests once', 'Kept 3', 'Kept 2']);
 });
 
 // ============================================================ 3) busy

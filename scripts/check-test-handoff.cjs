@@ -405,6 +405,8 @@ check('testsCard: passed/failed name the counts, the org and point at SF Tests â
 
 // ===================================================== 4) the 'runTests' handler
 function rtProvider(extra = {}) {
+  // The Status cards only: the runs/busy re-posts the in-flight lock makes
+  // around a handoff are pinned in check-run-tests-lock.cjs.
   const posted = [];
   const s = Object.create(proto);
   Object.assign(s, {
@@ -413,7 +415,7 @@ function rtProvider(extra = {}) {
     orgStore: { get: () => (extra.org === undefined ? ORG : extra.org) },
     lastDeployedApex: extra.lastDeployedApex,
     output: { appendLine: () => {} },
-    post: (m) => posted.push(m)
+    post: (m) => { if (m && m.type === 'status') posted.push(m); }
   });
   return { s, posted };
 }
