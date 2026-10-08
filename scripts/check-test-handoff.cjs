@@ -432,6 +432,7 @@ check('runTests (toolbar): resolves only the selected ApexClass/ApexTrigger WITH
   assert.deepStrictEqual(seenRaw.raw.classNames.slice().sort(), ['AcmeCaseTrigger', 'AcmeOrderService']);
   assert.strictEqual(seenRaw.raw.targetOrg, ORG);
   assert.ok(!('deployed' in seenRaw.raw), JSON.stringify(seenRaw.raw));
+  assert.ok(!('requestId' in seenRaw.raw), JSON.stringify(seenRaw.raw));
   assert.strictEqual(posted.length, 1);
   assert.strictEqual(posted[0].type, 'status');
   assert.strictEqual(posted[0].card.kind, 'ok');
@@ -455,8 +456,8 @@ check('runTests (toolbar): nothing Apex/local selected is a silent no-op', async
   assert.strictEqual(posted.length, 0);
 });
 
-// ---- mutation target: deployed:true on the card path, omitted on the toolbar path
-check('runTests: the Status-card path sends deployed:true (it just put exactly these classes on that org); the toolbar path omits the field entirely', async () => {
+// ---- mutation target: deployed:true and requestId on the card path, both omitted on the toolbar path
+check('runTests: the Status-card path sends deployed:true (it just put exactly these classes on that org) and requestId = the deploy\'s run id (sf-test-runner joins a duplicate of a run in flight); the toolbar path omits both fields entirely', async () => {
   resetToasts();
   let seenCard;
   execImpl = async (_cmd, raw) => { seenCard = raw; return { status: 'passed', testClasses: [], passed: 1, failed: 0 }; };
@@ -464,6 +465,7 @@ check('runTests: the Status-card path sends deployed:true (it just put exactly t
   await proto.handleMessage.call(cardS, { type: 'runTests', runId: 'run-d1' });
   await new Promise((r) => setTimeout(r, 0));
   assert.strictEqual(seenCard.deployed, true);
+  assert.deepStrictEqual(seenCard, { classNames: ['AcmeOrderService'], targetOrg: ORG, deployed: true, requestId: 'run-d1' });
 
   resetToasts();
   let seenToolbar;
@@ -472,6 +474,16 @@ check('runTests: the Status-card path sends deployed:true (it just put exactly t
   await proto.handleMessage.call(toolbarS, { type: 'runTests', keys: ['ApexClass:AcmeOrderService'] });
   await new Promise((r) => setTimeout(r, 0));
   assert.ok(!('deployed' in seenToolbar), JSON.stringify(seenToolbar));
+  assert.ok(!('requestId' in seenToolbar), JSON.stringify(seenToolbar));
+});
+check('runTestsForArgs: requestId only when it fits sf-test-runner\'s /^[\\w-]{1,64}$/ — never sent malformed or empty; deployed only when true', () => {
+  assert.deepStrictEqual(H.runTestsForArgs(['A'], ORG, { deployed: true, requestId: 'r1a2b3c4d5' }), { classNames: ['A'], targetOrg: ORG, deployed: true, requestId: 'r1a2b3c4d5' });
+  assert.deepStrictEqual(H.runTestsForArgs(['A'], ORG, { deployed: false }), { classNames: ['A'], targetOrg: ORG });
+  assert.deepStrictEqual(H.runTestsForArgs(['A'], ORG), { classNames: ['A'], targetOrg: ORG });
+  for (const bad of ['', 'has space', 'x'.repeat(65), 'a/b', '--flag x']) {
+    assert.ok(!('requestId' in H.runTestsForArgs(['A'], ORG, { requestId: bad })), JSON.stringify(bad));
+  }
+  assert.strictEqual(H.runTestsForArgs(['A'], ORG, { requestId: 'x'.repeat(64) }).requestId.length, 64);
 });
 
 check('runTests (Status card): resolves against lastDeployedApex by runId — never the webview\'s own names — and uses the PINNED org, not the live selection', async () => {

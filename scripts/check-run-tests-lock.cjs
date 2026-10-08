@@ -171,17 +171,17 @@ check('a toolbar handoff holds the lock as well: a second toolbar click is refus
   await settle();
 });
 
-check('the Output names each handoff: started with runId, org and class count; finished with the reply\'s status and how long it took', async () => {
+check('the Output names each handoff: started with runId, requestId, org and class count; finished with the reply\'s status and how long it took', async () => {
   execCalls.length = 0;
   const release = heldReply();
   const { s, logs } = provider();
   await cardClick(s);
-  assert.ok(logs.includes(`[runTests] handoff started runId=${RUN_ID} org=${ORG} classes=2`), logs.join('\n'));
+  assert.ok(logs.includes(`[runTests] handoff started runId=${RUN_ID} requestId=${RUN_ID} org=${ORG} classes=2`), logs.join('\n'));
   release({ status: 'failed', testClasses: ['AcmeOrderServiceTest'], passed: 2, failed: 1 });
   await settle();
   assert.ok(logs.some((l) => /^\[runTests\] handoff finished status=failed in \d+ms$/.test(l)), logs.join('\n'));
   await toolbarClick(s);
-  assert.ok(logs.includes(`[runTests] handoff started runId=(toolbar) org=${ORG} classes=1`), logs.join('\n'));
+  assert.ok(logs.includes(`[runTests] handoff started runId=(toolbar) requestId=(none) org=${ORG} classes=1`), logs.join('\n'));
   release(PASSED);
   await settle();
 });

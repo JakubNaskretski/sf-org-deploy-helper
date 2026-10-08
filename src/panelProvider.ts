@@ -20,7 +20,7 @@ import { generateNonce, getPanelHtml } from './panelHtml';
 import { COMMIT_CAP, CommitInfo, MAX_BRANCH_COMMITS, baseFromBoundary, boundaryArgs, commitLogArgs, parseBoundary, parseCommitLog } from './gitChanges';
 import { DeployRunInput, OrgKind, RUN_ID_RE, RunItem, RunRecord, RunRow, RunTarget, beginRun, deployRunFromResult, deploySuccessRows, envelopeProblem, fmtCount, newRunId, retrieveRunFromResult, runRetryFrom } from './runRecords';
 import { RunLive, RunStore } from './runStore';
-import { parseHandoffShape } from './handoff';
+import { parseHandoffShape, runTestsForArgs } from './handoff';
 // The deploy-result readers live with the run records (no vscode there);
 // re-exported so everything that imports them from here keeps working.
 export { deploySuccessRows, envelopeProblem };
@@ -1328,6 +1328,10 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // The toolbar's selection makes no such claim: it may include classes
         // never deployed at all.
         let deployed = false;
+        // The card path's handoff id for sf-test-runner: the deploy's own run
+        // id, so a duplicate of the same run can be joined there. The toolbar
+        // sends none.
+        let requestId: string | undefined;
         if (msg.runId) {
           // The newest run's Status-card button: resolve against what THAT
           // deploy actually sent and the org it sent it to — never the
@@ -1338,6 +1342,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           names = [...new Set(apex.keys.map(k => k.slice(k.indexOf(':') + 1)))];
           org = apex.org;
           deployed = true;
+          requestId = apex.runId;
         } else {
           // The toolbar button: whatever Apex is both selected and local.
           const keySet = new Set((Array.isArray(msg.keys) ? msg.keys : []).filter((k): k is string => typeof k === 'string'));
@@ -1364,7 +1369,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // moment THIS handler returns — a test run lasts minutes, and this
         // button must not hold that lock for the whole thing. sf-test-runner
         // owns its own busy guard, production confirm and "not deployed" prompt.
-        void this.runTestsInRunner(names, org, deployed, msg.runId);
+        void this.runTestsInRunner(names, org, { deployed, runId: msg.runId, requestId });
         return;
       }
       case 'openFile': {
@@ -5418,19 +5423,20 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
    *  guard, its own production confirm, and its own "not deployed" prompt;
    *  holding our slot for a run that can take minutes would freeze every
    *  other button in this panel for no reason. */
-  private async runTestsInRunner(names: string[], org: string, deployed?: boolean, runId?: string): Promise<void> {
+  private async runTestsInRunner(names: string[], org: string, opts: { deployed?: boolean; runId?: string; requestId?: string } = {}): Promise<void> {
+    const { deployed, runId, requestId } = opts;
     // Taken synchronously, before the first await, so a second message handled
     // right behind this one already finds it (refuseRunTestsInFlight).
     const startedAt = Date.now();
     this.testsInFlight = { runId, org, startedAt };
-    this.output.appendLine(`[runTests] handoff started runId=${runId ?? '(toolbar)'} org=${org} classes=${names.length}`);
+    this.output.appendLine(`[runTests] handoff started runId=${runId ?? '(toolbar)'} requestId=${requestId ?? '(none)'} org=${org} classes=${names.length}`);
     // Lock every Run tests button: the newest deploy's (the runs) and the
     // toolbar's (the busy post's testsRunning).
     this.runStore.refreshLive();
     this.postBusy();
     let status = 'no reply';
     try {
-      status = await this.handOffTests(names, org, deployed);
+      status = await this.handOffTests(names, org, deployed, requestId);
     } finally {
       this.testsInFlight = undefined;
       this.output.appendLine(`[runTests] handoff finished status=${status} in ${Date.now() - startedAt}ms`);
@@ -5465,7 +5471,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
 
   /** The handoff itself: one `runTestsFor` call and the ONE Status card with
    *  its outcome. Returns the reply's status, for the Output line. */
-  private async handOffTests(names: string[], org: string, deployed?: boolean): Promise<string> {
+  private async handOffTests(names: string[], org: string, deployed?: boolean, requestId?: string): Promise<string> {
     const orgInfo = this.orgs.find(o => o.username === org);
     const orgLabel = orgInfo?.alias ?? org;
     // Set only when executeCommand itself threw (command missing, or
@@ -5478,10 +5484,9 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // `deployed` is sf-test-runner's own flag ("these are on targetOrg
         // right now") — true only for the Status-card path, which just
         // deployed exactly these classes there; omitted (not merely false)
-        // for the toolbar path, which makes no such claim.
-        raw = await vscode.commands.executeCommand(TEST_RUNNER_COMMAND, {
-          classNames: names, targetOrg: org, ...(deployed ? { deployed: true } : {})
-        });
+        // for the toolbar path, which makes no such claim. Same for
+        // `requestId`: the card's deploy run id, none from the toolbar.
+        raw = await vscode.commands.executeCommand(TEST_RUNNER_COMMAND, runTestsForArgs(names, org, { deployed, requestId }));
       } catch (err) {
         callFailed = true;
         this.output.appendLine(`[runTests] ${err instanceof Error ? err.message : String(err)}`);

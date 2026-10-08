@@ -65,3 +65,35 @@ export function parseHandoffArgs(
   }
   return shape;
 }
+
+/** sf-test-runner's `requestId` rule: a caller's own id for one handoff. */
+export const REQUEST_ID = /^[\w-]{1,64}$/;
+
+/** What this plugin hands `sfTestRunner.runTestsFor` — this side's copy of
+ *  sf-test-runner's own HandoffArgs (its src/handoff.ts holds the contract).
+ *  `deployed`: the caller just put exactly these classes on `targetOrg`.
+ *  `requestId`: the caller's id for this handoff, so a duplicate of a run
+ *  already in flight can be joined rather than refused; a runner that
+ *  predates the field ignores it. Both optional, and left out rather than
+ *  sent empty. */
+export interface RunTestsForArgs {
+  classNames: string[];
+  targetOrg: string;
+  deployed?: boolean;
+  requestId?: string;
+}
+
+/** The `runTestsFor` payload: `deployed` only when true, `requestId` only
+ *  when it fits REQUEST_ID (never sent malformed). */
+export function runTestsForArgs(
+  classNames: string[],
+  targetOrg: string,
+  opts: { deployed?: boolean; requestId?: string } = {}
+): RunTestsForArgs {
+  return {
+    classNames,
+    targetOrg,
+    ...(opts.deployed ? { deployed: true } : {}),
+    ...(typeof opts.requestId === 'string' && REQUEST_ID.test(opts.requestId) ? { requestId: opts.requestId } : {})
+  };
+}
