@@ -207,19 +207,63 @@ check('the runs payload: `running` (with its start) is posted the moment the loc
   assert.deepStrictEqual(proto.liveRunPayload.call(s, run), { runTests: { count: 2 } });
 });
 
-check('a toolbar handoff locks the newest deploy card too — its click would only be refused — with runs posts at take and clear', async () => {
+check('a toolbar handoff locks the newest deploy card too — its click would only be refused — as `waiting` (not this card\'s run, so no start time of its own), with runs posts at take and clear', async () => {
   const release = heldReply();
   const { s, posted } = provider();
   await toolbarClick(s);
-  const rt = proto.liveRunPayload.call(s, deployRun()).runTests;
-  assert.strictEqual(rt.running, true);
-  assert.strictEqual(typeof rt.startedAt, 'number');
+  assert.deepStrictEqual(proto.liveRunPayload.call(s, deployRun()).runTests, { count: 2, waiting: true });
   assert.strictEqual(runsPosts(posted).length, 1, 'the runs are re-posted when a toolbar handoff takes the lock');
-  assert.strictEqual(headRunTests(runsPosts(posted)[0]).running, true);
+  assert.strictEqual(headRunTests(runsPosts(posted)[0]).waiting, true);
   release(PASSED);
   await settle();
   assert.strictEqual(runsPosts(posted).length, 2, 'and when it clears');
-  assert.ok(!headRunTests(runsPosts(posted)[1]).running);
+  assert.deepStrictEqual(headRunTests(runsPosts(posted)[1]), { count: 2 });
+});
+
+check('a newer deploy finishing during a card handoff gets `waiting`, never the other card\'s "running" and start time', async () => {
+  const release = heldReply();
+  const { s } = provider();
+  await cardClick(s);
+  const newer = Object.assign(deployRun(), { id: 'run-lock-2' });
+  s.lastDeployedApex = { runId: newer.id, org: ORG, keys: ['ApexClass:AcmeInvoiceService'] };
+  assert.deepStrictEqual(proto.liveRunPayload.call(s, newer).runTests, { count: 1, waiting: true });
+  release(PASSED);
+  await settle();
+  assert.deepStrictEqual(proto.liveRunPayload.call(s, newer).runTests, { count: 1 });
+});
+
+check('a throwing runs re-post at take still drops the lock and tells the toolbar — never a lock left set for the window\'s life', async () => {
+  execCalls.length = 0;
+  execImpl = async () => PASSED;
+  const { s, posted, logs } = provider();
+  s.runStore.refreshLive = () => { throw new Error('runs post failed'); };
+  await cardClick(s);
+  await settle();
+  assert.strictEqual(s.testsInFlight, undefined, 'the lock is dropped');
+  const busy = posted.filter((m) => m.type === 'busy');
+  assert.ok(busy.length && busy[busy.length - 1].testsRunning === false, JSON.stringify(busy));
+  assert.ok(logs.some((l) => l === '[runTests] runs post failed'), logs.join('\n'));
+  delete s.runStore.refreshLive;
+  await cardClick(s);
+  assert.strictEqual(s.testsInFlight === undefined, false, 'a new click takes the lock again');
+  await settle();
+});
+
+check('a throwing runs re-post at clear: the result card is out, the lock dropped, the busy post says testsRunning false', async () => {
+  execCalls.length = 0;
+  const release = heldReply();
+  const { s, posted } = provider();
+  await cardClick(s);
+  s.runStore.refreshLive = () => { throw new Error('runs post failed'); };
+  release(PASSED);
+  await settle();
+  assert.strictEqual(execCalls.length, 1);
+  assert.strictEqual(cards(posted).length, 1);
+  assert.strictEqual(cards(posted)[0].kind, 'ok');
+  assert.strictEqual(s.testsInFlight, undefined);
+  const busy = posted.filter((m) => m.type === 'busy');
+  assert.strictEqual(busy[busy.length - 1].testsRunning, false);
+  delete s.runStore.refreshLive;
 });
 
 check('the busy posts carry testsRunning: true from the moment the lock is taken, false once the result card is out', async () => {
@@ -250,6 +294,11 @@ check('runView: running draws a locked "Running tests in SF Tests…" saying the
   assert.strictEqual(c.label, 'Running tests in SF Tests…');
   assert.strictEqual(c.disabled, true);
   assert.strictEqual(c.title, `Started at ${hm(NOW)}; the result card appears here when it finishes`);
+  const waiting = Object.assign(deployRun(), { runTests: { count: 3, waiting: true } });
+  const w = RV.actionsFor(waiting, ctx).buttons.find((x) => x.id === 'runTests');
+  assert.strictEqual(w.label, 'Waiting for SF Tests…');
+  assert.strictEqual(w.disabled, true);
+  assert.strictEqual(w.title, 'Another test run is in progress; this card\'s Run tests unlocks when it finishes');
   const noStart = Object.assign(deployRun(), { runTests: { count: 3, running: true } });
   assert.strictEqual(RV.actionsFor(noStart, ctx).buttons.find((x) => x.id === 'runTests').title, 'The result card appears here when it finishes');
   const idle = Object.assign(deployRun(), { runTests: { count: 3 } });
@@ -377,6 +426,12 @@ check('panel.js: a transient note shows without taking a kept card\'s place, and
   assert.strictEqual(titles().length, 4, 'one transient note at a time');
   p.deliver({ type: 'status', card: { kind: 'ok', title: 'Fresh', at: NOW + 2 } });
   assert.deepStrictEqual(titles(), ['Fresh', 'Run tests was clicked twice — sent to SF Tests once', 'Kept 3', 'Kept 2']);
+  // The handoff it was about is still out: the note stays.
+  p.deliver({ type: 'busy', busy: false, cancelling: false, testsRunning: true });
+  assert.strictEqual(titles().length, 4);
+  // It is over: the note goes with it.
+  p.deliver({ type: 'busy', busy: false, cancelling: false, testsRunning: false });
+  assert.deepStrictEqual(titles(), ['Fresh', 'Kept 3', 'Kept 2']);
 });
 
 // ============================================================ 3) busy

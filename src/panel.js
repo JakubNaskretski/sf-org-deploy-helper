@@ -325,8 +325,10 @@
   $('retrieveBtn').addEventListener('click', () => action('retrieve'));
   $('diffBtn').addEventListener('click', () => action('diff'));
   // "Run tests": fire-and-forget on the host side (sf-test-runner's own run can
-  // take minutes), so this only needs the ordinary pendingAction/busy guard —
-  // no org check here, the host's own requireOrg() covers it.
+  // take minutes), so it takes no slot of its own: the ordinary pendingAction/
+  // busy guard, plus testsRunning — the provider's word that a handoff is
+  // still out, which locks every Run tests button. No org check here, the
+  // host's own requireOrg() covers it.
   $('runTestsBtn').addEventListener('click', () => {
     if (state.pendingAction || state.busy || state.testsRunning) return;
     const apexSel = Array.from(state.selected).filter(k => /^Apex(Class|Trigger):/.test(k) && state.localKeys.has(k));
@@ -833,6 +835,10 @@
         const testsRunning = !!msg.testsRunning;
         const testsChanged = testsRunning !== state.testsRunning;
         state.testsRunning = testsRunning;
+        // A transient note (a refused second click) was about the handoff that
+        // is now over: it goes with it.
+        const notesDropped = !testsRunning && state.statusCards.some(c => c && c.transient);
+        if (notesDropped) state.statusCards = state.statusCards.filter(c => !(c && c.transient));
         // The provider has answered a Run tests click by now: its own lock
         // (the runs' `running`) takes over from the click's.
         const clickCleared = clearRunTestsClicks();
@@ -848,7 +854,7 @@
             stopProgressTimer();
           }
         }
-        if (changed || hadPending || lockChanged || testsChanged || clickCleared) {
+        if (changed || hadPending || lockChanged || testsChanged || clickCleared || notesDropped) {
           renderActions();
           renderStatus();
         }
@@ -867,7 +873,7 @@
         // A transient note (a refused second click) is not in the provider's
         // history: the newest one is shown, and it never takes a kept card's
         // place in the cap.
-        if (msg.card && msg.card.transient) state.statusCards = state.statusCards.filter(c => !c.transient);
+        if (msg.card && msg.card.transient) state.statusCards = state.statusCards.filter(c => !(c && c.transient));
         state.statusCards.unshift(msg.card);
         trimStatusCards();
         renderStatus();

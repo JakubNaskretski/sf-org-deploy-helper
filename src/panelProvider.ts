@@ -1369,7 +1369,8 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         // moment THIS handler returns — a test run lasts minutes, and this
         // button must not hold that lock for the whole thing. sf-test-runner
         // owns its own busy guard, production confirm and "not deployed" prompt.
-        void this.runTestsInRunner(names, org, { deployed, runId: msg.runId, requestId });
+        void this.runTestsInRunner(names, org, { deployed, runId: msg.runId, requestId })
+          .catch(err => this.output.appendLine(`[runTests] ${err instanceof Error ? err.message : String(err)}`));
         return;
       }
       case 'openFile': {
@@ -3763,12 +3764,14 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     }
     const apex = this.lastDeployedApex;
     if (run.op === 'deploy' && run.status === 'succeeded' && apex && apex.runId === run.id && apex.keys.length && this.testRunnerAvailable()) {
-      // While ANY handoff is out (this card's, or the toolbar's) the button
-      // says so and is locked — a click would only be refused.
+      // While ANY handoff is out the button is locked — a click would only be
+      // refused: `running` (and since when) when it is THIS card's, `waiting`
+      // when it is another's (the toolbar's, or an older deploy's card).
       const inFlight = this.testsInFlight;
-      out.runTests = inFlight
-        ? { count: apex.keys.length, running: true, startedAt: inFlight.startedAt }
-        : { count: apex.keys.length };
+      const count = apex.keys.length;
+      out.runTests = !inFlight ? { count }
+        : inFlight.runId === run.id ? { count, running: true, startedAt: inFlight.startedAt }
+        : { count, waiting: true };
     }
     return out.suggest || out.quick || out.runTests ? out : undefined;
   }
@@ -5429,19 +5432,25 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     // right behind this one already finds it (refuseRunTestsInFlight).
     const startedAt = Date.now();
     this.testsInFlight = { runId, org, startedAt };
-    this.output.appendLine(`[runTests] handoff started runId=${runId ?? '(toolbar)'} requestId=${requestId ?? '(none)'} org=${org} classes=${names.length}`);
-    // Lock every Run tests button: the newest deploy's (the runs) and the
-    // toolbar's (the busy post's testsRunning).
-    this.runStore.refreshLive();
-    this.postBusy();
     let status = 'no reply';
+    // Everything after the lock is taken sits inside the try, and the lock is
+    // dropped and the toolbar told before anything that could throw on the way
+    // out: a lock left set would refuse every Run tests for the window's life.
     try {
+      this.output.appendLine(`[runTests] handoff started runId=${runId ?? '(toolbar)'} requestId=${requestId ?? '(none)'} org=${org} classes=${names.length}`);
+      // Lock every Run tests button: the newest deploy's (the runs) and the
+      // toolbar's (the busy post's testsRunning).
+      this.runStore.refreshLive();
+      this.postBusy();
       status = await this.handOffTests(names, org, deployed, requestId);
     } finally {
       this.testsInFlight = undefined;
-      this.output.appendLine(`[runTests] handoff finished status=${status} in ${Date.now() - startedAt}ms`);
-      this.runStore.refreshLive();
-      this.postBusy();
+      try {
+        this.output.appendLine(`[runTests] handoff finished status=${status} in ${Date.now() - startedAt}ms`);
+      } finally {
+        this.postBusy();
+        this.runStore.refreshLive();
+      }
     }
   }
 
