@@ -228,6 +228,17 @@ export function envelopeProblem(result: DeployResult): string {
   return flat.length > ENVELOPE_PROBLEM_MAX ? `${flat.slice(0, ENVELOPE_PROBLEM_MAX - 1)}…` : flat;
 }
 
+/** A run's notes, each cut at NOTE_MAX, at most NOTES_MAX of them — and none
+ *  dropped: past the cap the rest are folded into the last one (` · `). A
+ *  retrieve of several profiles and translations carries a line per request
+ *  plus the backup and what was copied; cut at the cap, the tail used to
+ *  vanish without a trace. */
+export function fitNotes(raw: readonly unknown[]): string[] {
+  const notes = raw.map(n => orgText(n, NOTE_MAX)).filter(Boolean);
+  if (notes.length <= NOTES_MAX) return notes;
+  return [...notes.slice(0, NOTES_MAX - 1), orgText(notes.slice(NOTES_MAX - 1).join(' · '), NOTE_MAX)];
+}
+
 /** Org text bound for storage: ANSI and control characters out (newlines stay —
  *  a test failure's message reads better on its own lines), then capped. */
 function orgText(raw: unknown, max: number): string {
@@ -461,7 +472,7 @@ export function deployRunFromResult(result: DeployResult, input: DeployRunInput)
   if (typeof jobId === 'string' && DEPLOY_JOB_ID_RE.test(jobId)) run.jobId = jobId;
   if (isTestLevel(input.testLevel)) run.testLevel = input.testLevel;
   if (message) run.message = message;
-  const notes = (input.notes ?? []).map(n => orgText(n, NOTE_MAX)).filter(Boolean).slice(0, NOTES_MAX);
+  const notes = fitNotes(input.notes ?? []);
   if (notes.length) run.notes = notes;
   if (input.retry) run.retry = { ...input.retry };
   if (input.conflict) run.conflict = true;
@@ -586,7 +597,7 @@ export function retrieveRunFromResult(result: RetrieveResult, input: RetrieveRun
   // Org-level messages ("entity of type X named Y cannot be found") explain an
   // empty or short result better than the bare missing list.
   const orgNotes = (result.messages ?? []).filter(m => m?.problem).map(m => `${m.fileName ?? '?'}: ${m.problem}`);
-  const notes = [...(input.notes ?? []), ...orgNotes].map(n => orgText(n, NOTE_MAX)).filter(Boolean).slice(0, NOTES_MAX);
+  const notes = fitNotes([...(input.notes ?? []), ...orgNotes]);
   const run: RunRecord = {
     v: 1, id: input.id, op: 'retrieve', status,
     org: input.org, orgLabel: input.orgLabel, orgKind: input.orgKind,

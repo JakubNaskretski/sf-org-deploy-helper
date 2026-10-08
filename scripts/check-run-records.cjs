@@ -629,6 +629,22 @@ check('package.json: sfOrgDeployWrapper.statusHistoryRuns is a number, default 3
   assert.strictEqual(s.maximum, RR.RUN_CAP_MAX);
 });
 
+check('fitNotes: at most 5 notes, NONE dropped — past the cap the rest fold into the last one; each cut at 500', () => {
+  assert.deepStrictEqual(RR.fitNotes(['a', '', 'b']), ['a', 'b']);
+  assert.deepStrictEqual(RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'n5']), ['n1', 'n2', 'n3', 'n4', 'n5']);
+  assert.deepStrictEqual(RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7']), ['n1', 'n2', 'n3', 'n4', 'n5 · n6 · n7']);
+  const long = RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'x'.repeat(400), 'y'.repeat(400)]);
+  assert.strictEqual(long.length, 5);
+  assert.strictEqual(long[4].length, 500);
+  assert.ok(long[4].endsWith('…'), 'a cut note says so');
+  // A retrieve's org messages come after its own notes, and are folded too.
+  const run = RR.retrieveRunFromResult({ status: 0, inboundFiles: [], messages: [{ fileName: 'f', problem: 'stopped' }] }, {
+    id: 'r1', org: 'acme-dev-user', orgLabel: 'acme-dev', startedAt: 1, finishedAt: 2, target: 'selection', items: [],
+    notes: ['backup', 'copied into your project: x', 'line 1', 'line 2', 'line 3']
+  });
+  assert.deepStrictEqual(run.notes, ['backup', 'copied into your project: x', 'line 1', 'line 2', 'line 3 · f: stopped']);
+});
+
 check('runRecords.js loads without vscode (the webview-free harness depends on it)', () => {
   const src = fs.readFileSync(path.join(OUT, 'runRecords.js'), 'utf8');
   assert.ok(!/require\(["']vscode["']\)/.test(src));

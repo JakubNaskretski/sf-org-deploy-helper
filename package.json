@@ -2,7 +2,7 @@
   "name": "sf-org-deploy-wrapper",
   "displayName": "SF Org Deploy Wrapper",
   "description": "Deploy, retrieve and diff Salesforce metadata against any authenticated org from a convenient sidebar panel.",
-  "version": "0.31.0",
+  "version": "0.31.1",
   "publisher": "Skrety",
   "icon": "plugin-icon.png",
   "license": "MIT",
@@ -278,20 +278,20 @@
         "sfOrgDeployWrapper.contextCompanions": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Retrieve and Diff of a **Profile**, an org-wide **Translations** file or a **CustomObjectTranslation** also ask the org for the components it describes (\"companions\": labels, tabs, apps, objects, classes…) — without them the org answers with a nearly empty file. Companions go to a temporary project and are never written to yours; only the profile or translation is copied back. Turn off to retrieve these types alone, as before (the result says so). See `#sfOrgDeployWrapper.contextScope#` for which companions are sent."
+          "markdownDescription": "Retrieve and Diff of a **Profile**, an org-wide **Translations** file or a **CustomObjectTranslation** also ask the org for the components it describes (\"companions\": labels, tabs, apps, objects, classes…) — without them the org answers with a nearly empty file. Companions go to a temporary project and are never written to yours; only the profile or translation is copied back. Turn off to retrieve these types alone, as before (the result says so). For a Translations file or a Profile you pick which companion types ride along — see `#sfOrgDeployWrapper.contextCompanionPrompt#`; an object translation always brings its object, and that object's layouts and quick actions."
         },
-        "sfOrgDeployWrapper.contextScope": {
+        "sfOrgDeployWrapper.contextCompanionPrompt": {
           "type": "string",
           "enum": [
-            "project",
-            "org"
+            "always",
+            "remembered"
           ],
           "enumDescriptions": [
-            "Send only the companions this project has (its labels, tabs, objects, fields, classes…). Fast, but the profile or translation is then completed for this project's components only — the org's other entries are left out, and the dialog says so.",
-            "Send every component of the companion types on the org (`*`), and the standard objects from the Fetch Org list, so the file comes back complete (once Fetch Org has listed the org — without it, standard objects come from the project). Can take minutes on a big org; the dialog says what is fetched."
+            "Ask every time: before each Retrieve or Diff of Translations files or Profiles, one picker per type shows what rides along, ticked with the rows the selected files of that type last chose in common (otherwise: everything this project has). Enter keeps the ticks.",
+            "Ask only until every selected file of a type (all the profiles, or all the translations, in the selection) has a remembered choice; after that each file's own choice is used without asking (the confirm dialog and the result still name it). A remembered row that no longer exists brings the picker back; an empty choice is never remembered."
           ],
-          "default": "org",
-          "markdownDescription": "Which companions `#sfOrgDeployWrapper.contextCompanions#` sends with a Profile, Translations or CustomObjectTranslation: `org` (default) — everything of those types on the org, so the file comes back complete once **Fetch Org** has listed the org; it can take minutes on a big org, and the dialog says what is fetched (a wildcard can't name standard objects, so they come from that list — or, without it, from the project). `project` — only what this project has: faster, but the file is completed for this project's components only and the org's other entries are left out (the dialog and the run say so). An object translation always brings its object; with `org` its layouts and quick actions come from the Fetch Org list too."
+          "default": "always",
+          "markdownDescription": "When the companion picker of `#sfOrgDeployWrapper.contextCompanions#` is shown for a **Translations** file or a **Profile**. It lists each companion type twice — *this project's* (the ones you have) and *all on the org* (everything of that type, slower on a big org) — and the labels once; you tick what rides along, at type level, with one picker for all the selected profiles and one for all the translations, and the choice is remembered for each file (an empty choice is not). `always` (default): ask every time, with the remembered ticks (first time: everything this project has), so one Enter repeats it. `remembered`: ask only until every selected file of a type has a remembered choice, then use each file's own without asking. Escape in the picker cancels the whole retrieve or diff."
         },
         "sfOrgDeployWrapper.defaultTestLevel": {
           "type": "string",
