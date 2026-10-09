@@ -388,14 +388,15 @@ check('parseRunTestsForResult: caps message/orgAlias at 500 chars rather than re
   assert.strictEqual(out.orgAlias.length, 500);
 });
 
-check('testsCard: passed/failed name the counts, the org and point at SF Tests → Results; busy/noTests/cancelled/error speak their own message or a fallback', () => {
+check('testsCard: passed/failed name the counts, the org and point at SF Tests → Results; noTests/cancelled/error speak their own message or a fallback', () => {
   assert.deepStrictEqual(P.testsCard({ status: 'passed', testClasses: [], passed: 4, failed: 0 }, 'acme-dev'), { kind: 'ok', title: 'Tests on acme-dev: 4 methods passed, 0 failed', meta: 'Details in SF Tests → Results.' });
   assert.deepStrictEqual(P.testsCard({ status: 'failed', orgAlias: 'acme-prod', testClasses: ['A'], passed: 1, failed: 1 }, 'acme-dev'), { kind: 'err', title: 'Tests on acme-prod: 1 test class, 1 method passed, 1 failed', meta: 'Classes: A · Details in SF Tests → Results.' });
   // One deployed test class with seven methods must not read as "7 tests".
   assert.strictEqual(P.testsCard({ status: 'passed', testClasses: ['AcmeServiceTest'], passed: 7, failed: 0 }, 'acme-dev').title, 'Tests on acme-dev: 1 test class, 7 methods passed, 0 failed');
   assert.strictEqual(P.testsCard({ status: 'passed', testClasses: ['A', 'B'], passed: 9, failed: 0 }, 'acme-dev').title, 'Tests on acme-dev: 2 test classes, 9 methods passed, 0 failed');
   assert.strictEqual(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').kind, 'warn');
-  assert.strictEqual(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').title, 'A test run is already in progress.');
+  // busy speaks in this panel's words (check-run-tests-lock.cjs pins them), not the runner's.
+  assert.ok(/were not started/.test(P.testsCard({ status: 'busy', testClasses: [], passed: 0, failed: 0, message: 'A test run is already in progress.' }, 'acme-dev').title));
   assert.strictEqual(P.testsCard({ status: 'noTests', testClasses: [], passed: 0, failed: 0 }, 'acme-dev').kind, 'warn', 'no message from TR here — this side still needs a title');
   assert.strictEqual(P.testsCard({ status: 'cancelled', testClasses: [], passed: 0, failed: 0 }, 'acme-dev').kind, 'warn');
   assert.strictEqual(P.testsCard({ status: 'error', testClasses: [], passed: 0, failed: 0, message: 'boom' }, 'acme-dev').title, 'boom');
@@ -404,6 +405,8 @@ check('testsCard: passed/failed name the counts, the org and point at SF Tests �
 
 // ===================================================== 4) the 'runTests' handler
 function rtProvider(extra = {}) {
+  // The Status cards only: the runs/busy re-posts the in-flight lock makes
+  // around a handoff are pinned in check-run-tests-lock.cjs.
   const posted = [];
   const s = Object.create(proto);
   Object.assign(s, {
@@ -412,7 +415,7 @@ function rtProvider(extra = {}) {
     orgStore: { get: () => (extra.org === undefined ? ORG : extra.org) },
     lastDeployedApex: extra.lastDeployedApex,
     output: { appendLine: () => {} },
-    post: (m) => posted.push(m)
+    post: (m) => { if (m && m.type === 'status') posted.push(m); }
   });
   return { s, posted };
 }
@@ -429,6 +432,7 @@ check('runTests (toolbar): resolves only the selected ApexClass/ApexTrigger WITH
   assert.deepStrictEqual(seenRaw.raw.classNames.slice().sort(), ['AcmeCaseTrigger', 'AcmeOrderService']);
   assert.strictEqual(seenRaw.raw.targetOrg, ORG);
   assert.ok(!('deployed' in seenRaw.raw), JSON.stringify(seenRaw.raw));
+  assert.ok(!('requestId' in seenRaw.raw), JSON.stringify(seenRaw.raw));
   assert.strictEqual(posted.length, 1);
   assert.strictEqual(posted[0].type, 'status');
   assert.strictEqual(posted[0].card.kind, 'ok');
@@ -452,8 +456,8 @@ check('runTests (toolbar): nothing Apex/local selected is a silent no-op', async
   assert.strictEqual(posted.length, 0);
 });
 
-// ---- mutation target: deployed:true on the card path, omitted on the toolbar path
-check('runTests: the Status-card path sends deployed:true (it just put exactly these classes on that org); the toolbar path omits the field entirely', async () => {
+// ---- mutation target: deployed:true and requestId on the card path, both omitted on the toolbar path
+check('runTests: the Status-card path sends deployed:true (it just put exactly these classes on that org) and requestId = the deploy\'s run id (sf-test-runner joins a duplicate of a run in flight); the toolbar path omits both fields entirely', async () => {
   resetToasts();
   let seenCard;
   execImpl = async (_cmd, raw) => { seenCard = raw; return { status: 'passed', testClasses: [], passed: 1, failed: 0 }; };
@@ -461,6 +465,7 @@ check('runTests: the Status-card path sends deployed:true (it just put exactly t
   await proto.handleMessage.call(cardS, { type: 'runTests', runId: 'run-d1' });
   await new Promise((r) => setTimeout(r, 0));
   assert.strictEqual(seenCard.deployed, true);
+  assert.deepStrictEqual(seenCard, { classNames: ['AcmeOrderService'], targetOrg: ORG, deployed: true, requestId: 'run-d1' });
 
   resetToasts();
   let seenToolbar;
@@ -469,6 +474,16 @@ check('runTests: the Status-card path sends deployed:true (it just put exactly t
   await proto.handleMessage.call(toolbarS, { type: 'runTests', keys: ['ApexClass:AcmeOrderService'] });
   await new Promise((r) => setTimeout(r, 0));
   assert.ok(!('deployed' in seenToolbar), JSON.stringify(seenToolbar));
+  assert.ok(!('requestId' in seenToolbar), JSON.stringify(seenToolbar));
+});
+check('runTestsForArgs: requestId only when it fits sf-test-runner\'s /^[\\w-]{1,64}$/ — never sent malformed or empty; deployed only when true', () => {
+  assert.deepStrictEqual(H.runTestsForArgs(['A'], ORG, { deployed: true, requestId: 'r1a2b3c4d5' }), { classNames: ['A'], targetOrg: ORG, deployed: true, requestId: 'r1a2b3c4d5' });
+  assert.deepStrictEqual(H.runTestsForArgs(['A'], ORG, { deployed: false }), { classNames: ['A'], targetOrg: ORG });
+  assert.deepStrictEqual(H.runTestsForArgs(['A'], ORG), { classNames: ['A'], targetOrg: ORG });
+  for (const bad of ['', 'has space', 'x'.repeat(65), 'a/b', '--flag x']) {
+    assert.ok(!('requestId' in H.runTestsForArgs(['A'], ORG, { requestId: bad })), JSON.stringify(bad));
+  }
+  assert.strictEqual(H.runTestsForArgs(['A'], ORG, { requestId: 'x'.repeat(64) }).requestId.length, 64);
 });
 
 check('runTests (Status card): resolves against lastDeployedApex by runId — never the webview\'s own names — and uses the PINNED org, not the live selection', async () => {

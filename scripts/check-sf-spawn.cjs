@@ -26,7 +26,7 @@ const Module = require('module');
 const origLoad = Module._load;
 Module._load = (req, ...rest) => (req === 'vscode' ? {} : origLoad(req, ...rest));
 
-const { resolveSfCommand, planSpawn } = require(path.join(__dirname, '..', 'out', 'kit', 'sfCli.js'));
+const { resolveSfCommand, planSpawn, SfCliService } = require(path.join(__dirname, '..', 'out', 'kit', 'sfCli.js'));
 
 let failed = 0;
 let ran = 0;
@@ -135,6 +135,33 @@ check('a bare .ps1 command (hypothetically resolved) is left untouched by planSp
     planSpawn('C:\\sf\\bin\\sf.ps1', ['org', 'list'], 'win32', {}, () => false),
     { command: 'C:\\sf\\bin\\sf.ps1', args: ['org', 'list'] }
   );
+});
+
+// ---- windowsHide -----------------------------------------------------------
+// The extension host has no console of its own, so on Windows every child
+// process started without windowsHide pops a console window. The compiled kit
+// reads child_process.spawn/execFileSync off the module at call time, so
+// patching the module object intercepts the real call sites.
+const cp = require('child_process');
+function captureOptions(name, run) {
+  const original = cp[name];
+  let options;
+  cp[name] = (_cmd, _args, opts) => { options = opts; throw new Error('stubbed'); };
+  try { run(); } catch { /* the stub's throw */ } finally { cp[name] = original; }
+  assert.ok(options, `${name} was not called`);
+  return options;
+}
+
+check('sf is spawned with windowsHide', () => {
+  let pending;
+  const opts = captureOptions('spawn', () => { pending = new SfCliService().runCancellable(['--version']).promise; });
+  if (pending) pending.catch(() => undefined);
+  assert.strictEqual(opts.windowsHide, true);
+});
+
+check('the `where sf` lookup runs with windowsHide', () => {
+  const opts = captureOptions('execFileSync', () => resolveSfCommand('win32', { PATH: '' }, () => false));
+  assert.strictEqual(opts.windowsHide, true);
 });
 
 if (failed) { console.error(`sf-spawn: ${failed}/${ran} checks FAILED`); process.exit(1); }

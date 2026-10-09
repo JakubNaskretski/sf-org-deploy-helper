@@ -71,6 +71,11 @@
     const s = Math.max(0, Math.floor(ms / 1000));
     return s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
   }
+  /** "14:03" — the local clock time. */
+  function fmtClock(at) {
+    const d = new Date(at);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
   function splitKey(k) {
     const c = k.indexOf(':');
     return c < 0 ? { type: '', name: k } : { type: k.slice(0, c), name: k.slice(c + 1) };
@@ -568,8 +573,22 @@
     // only field — see runStore.ts's RunLive), never stored on the run itself.
     // `via: 'send'`, like Select below — it posts straight to the provider and
     // does not take this plugin's own busy slot, so it needs no slotBusy gate.
+    // Its own lock is `running`: set by the provider while this card's Run
+    // tests handoff is out in SF Test Runner, cleared when the result card
+    // arrives — or `ctx.runTestsClickedAt`, the webview's own lock from the
+    // click until the provider answers it (panel.js), so a double click sends
+    // once — and `waiting` while ANOTHER handoff is out (the toolbar's, or an
+    // older deploy's card), whose start time is not this card's to show.
     if (run.op === 'deploy' && run.status === 'succeeded' && run.runTests && run.runTests.count) {
-      buttons.push({ id: 'runTests', label: 'Run tests (' + fmtN(run.runTests.count) + ')', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: false, title: 'Run the Apex tests for what this deploy sent, in SF Test Runner' });
+      if (run.runTests.running || ctx.runTestsClickedAt) {
+        const at = run.runTests.startedAt || ctx.runTestsClickedAt;
+        const title = (typeof at === 'number' && isFinite(at) ? 'Started at ' + fmtClock(at) + '; the' : 'The') + ' result card appears here when it finishes';
+        buttons.push({ id: 'runTests', label: 'Running tests in SF Tests…', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: true, title });
+      } else if (run.runTests.waiting) {
+        buttons.push({ id: 'runTests', label: 'Waiting for SF Tests…', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: true, title: 'Another test run is in progress; this card\'s Run tests unlocks when it finishes' });
+      } else {
+        buttons.push({ id: 'runTests', label: 'Run tests (' + fmtN(run.runTests.count) + ')', message: { type: 'runTests', runId: run.id }, via: 'send', disabled: false, title: 'Run the Apex tests for what this deploy sent, in SF Test Runner' });
+      }
     }
     if (run.status === 'lost' && run.jobId) {
       buttons.push({ id: 'resume', label: 'Resume monitoring', primary: true, message: { type: 'resumeDeploy', jobId: run.jobId }, via: 'action', disabled: slotBusy, title: slotTitle('Check the same job again — it does not deploy again') });
@@ -625,7 +644,7 @@
 
   return {
     OUTCOMES, DEPLOY_CHIPS, RETRIEVE_CHIPS, ROW_H, DEFAULT_OPEN_MAX, SEARCH_MIN_ROWS, GLYPH, ORG,
-    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, plural, splitKey,
+    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, fmtClock, plural, splitKey,
     outcomeLabel, outcomeKind, verdictFor, titleText, chipDefs, explainFor, whyText, histLabel,
     buildRows, visibleRange, actionsFor, rowCopyText, testCopyText, copyText
   };

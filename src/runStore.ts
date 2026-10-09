@@ -26,8 +26,11 @@ export interface RunLive {
   quick?: { jobId: string; until: number };
   /** The newest deploy's "Run tests" offer (sf-test-runner installed, this run
    *  sent Apex) — just the count; the provider re-resolves the actual class
-   *  names from lastDeployedApex when the button is clicked. */
-  runTests?: { count: number };
+   *  names from lastDeployedApex when the button is clicked. `running` (with
+   *  when it started) while that click's handoff is still out, `waiting`
+   *  while another one is (the toolbar's, or an older deploy's): either way
+   *  the button is locked until that result card arrives. */
+  runTests?: { count: number; running?: boolean; startedAt?: number; waiting?: boolean };
 }
 
 export interface RunStoreHost {

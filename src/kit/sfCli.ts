@@ -163,7 +163,7 @@ export function resolveSfCommand(
   // Fall back to `where sf`, which consults the same PATHEXT resolution the
   // shell uses. First line is the highest-priority match.
   try {
-    const out = execFileSync('where', ['sf'], { encoding: 'utf8', env });
+    const out = execFileSync('where', ['sf'], { encoding: 'utf8', env, windowsHide: true });
     const first = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean)[0];
     if (first) return first;
   } catch { /* `where` failed → fall through to the bare name */ }
@@ -340,6 +340,8 @@ export class SfCliService {
       const plan = planSpawn(this.sfCommand(), args);
       const child = spawn(plan.command, plan.args, {
         shell: false,
+        // Without it Windows opens a console window for every sf call.
+        windowsHide: true,
         cwd: options.cwd,
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
       });

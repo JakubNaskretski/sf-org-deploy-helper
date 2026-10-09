@@ -3,6 +3,24 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.31.2
+
+- **The Run tests button locks while the tests run.** After you click **Run tests (N)** on a
+  deploy's card, it turns into a disabled *Running tests in SF Tests…* (hover it to see when it
+  started) until the result card arrives, then becomes clickable again. The toolbar's Run tests
+  is locked for the same time.
+- **A second click no longer trips "already running".** The button locks on the click itself, so
+  a double click sends the tests to SF Test Runner once; should a second click still get through,
+  a short note says so ("Run tests was clicked twice — sent to SF Tests once") and is not kept in
+  the history. If SF Tests is busy with a run of your own, the card says so as a warning ("this
+  deploy's tests were not started"), not as a failure, and the button stays usable. Each handoff,
+  and any click refused this way, is logged in the Output.
+- **The card shows SF Tests' note on passed/failed.** When SF Test Runner adds a note to a result
+  (for example, a class marked as a test in which the org found no test methods), it now appears
+  as a line on the card under the counts.
+- **No console windows on Windows.** Every `sf` call (org refresh, deploy, status polling) used to
+  be able to flash a console window; they now run hidden.
+
 ## 0.31.1
 
 - **You choose what a translation or profile is fetched with.** The `sfOrgDeployWrapper.contextScope`
