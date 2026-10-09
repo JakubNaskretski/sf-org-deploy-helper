@@ -18,6 +18,8 @@ This file starts at the current release; earlier history predates it.
 - **The card shows SF Tests' note on passed/failed.** When SF Test Runner adds a note to a result
   (for example, a class marked as a test in which the org found no test methods), it now appears
   as a line on the card under the counts.
+- **No console windows on Windows.** Every `sf` call (org refresh, deploy, status polling) used to
+  be able to flash a console window; they now run hidden.
 
 ## 0.31.1
 
