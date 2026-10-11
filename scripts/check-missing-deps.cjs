@@ -1204,7 +1204,7 @@ check('envelopeProblem is empty for a result that carries no message', () => {
 
 check('envelopeProblem bounds org-controlled text', () => {
   const out = envelopeProblem({ errorMessage: 'x'.repeat(5000) });
-  assert.ok(out.length <= 400, `len ${out.length}`);
+  assert.ok(out.length <= 4000, `len ${out.length}`);
   assert.ok(out.endsWith('…'), out.slice(-5));
 });
 

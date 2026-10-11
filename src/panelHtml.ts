@@ -355,7 +355,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 .status-card .try-label { color: var(--muted); font-size: 11px; margin-top: 4px; }
 .status-card .hint { margin-top: 4px; font-size: 11px; color: var(--warn); }
-.status-card .show-more {
+.status-card .show-more, .run-card .show-more, .run-older-body .show-more {
   background: transparent; border: none; padding: 2px 0; margin-top: 2px;
   color: var(--vscode-textLink-foreground, #3794ff);
   cursor: pointer; font-size: 11px; font-family: inherit;
@@ -455,6 +455,8 @@ body.resizing { cursor: row-resize; user-select: none; }
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
 .run-plain.err { color: var(--err); } .run-plain.warn { color: var(--warn); } .run-plain.muted { color: var(--muted); }
+/* A long message opened by its "more" toggle: all of it, newlines kept. */
+.run-msg.open, .run-plain.open { -webkit-line-clamp: unset; display: block; white-space: pre-wrap; }
 .run-prog { margin-top: 5px; }
 .run-prow { display: flex; align-items: center; gap: 6px; font-size: 11px; min-height: 16px; }
 .run-plbl { flex: none; width: 70px; color: var(--muted); }
@@ -547,6 +549,8 @@ body.resizing { cursor: row-resize; user-select: none; }
   font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 15px; color: var(--err);
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere;
 }
+.run-msg.open { overflow-y: auto; }
+.run-l1 .show-more { flex: none; margin: 0; padding: 0 4px; line-height: 14px; }
 .run-note { flex: 1; min-width: 0; color: var(--muted); font-size: 11px; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-empty { padding: 8px; color: var(--muted); font-size: 12px; font-style: italic; }
 .run-earlier, .run-notice, .run-older { flex: none; display: flex; flex-direction: column; }
@@ -561,6 +565,11 @@ body.resizing { cursor: row-resize; user-select: none; }
 .run-older-body { margin: 2px 0 4px 16px; padding: 4px 8px; border-left: 2px solid var(--border); font-size: 12px; }
 .run-older-rows { margin: 4px 0 0; padding-left: 16px; font-size: 11px; }
 .run-older-rows li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A failure is one cut line; a long one keeps room for its "more" toggle and, opened, shows all of it. */
+.run-older-rows li > .run-older-txt { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.run-older-rows li.long > .run-older-txt { max-width: calc(100% - 48px); }
+.run-older-rows li.long > .show-more { margin-left: 4px; }
+.run-older-rows li.long.open > .run-older-txt { display: block; max-width: none; white-space: pre-wrap; overflow-wrap: anywhere; }
 .run-older-rows li.nav { cursor: pointer; }
 .run-older-rows li.run-older-more { list-style: none; margin-left: -16px; color: var(--muted); font-style: italic; }
 .run-older-rows li.nav:hover { text-decoration: underline; }

@@ -224,7 +224,51 @@ check('the org request-level message lands on the run, flattened and bounded', (
   const run = RR.deployRunFromResult({ status: 'Failed', success: false, errorMessage: 'Deploy failed.\n\tAcmeThing: Invalid type: acme__mdt' }, BASE());
   assert.strictEqual(run.message, 'Deploy failed. AcmeThing: Invalid type: acme__mdt');
   const long = RR.deployRunFromResult({ status: 'Failed', success: false, errorMessage: 'x'.repeat(5000) }, BASE());
-  assert.ok(long.message.length <= 400);
+  assert.ok(long.message.length <= 4000);
+});
+
+// An org message is long when the platform quotes a whole stack of prose; it used
+// to be cut at 400 (the run's line) and 500 (a row), the rest lost for good.
+const prose = (n) => Array.from({ length: Math.ceil(n / 6) }, (_, i) => `w${String(i).padStart(4, '0')}-`).join('').slice(0, n);
+
+check('envelopeProblem keeps a 3,000-character message whole; past 4,000 it is cut with a bare ellipsis', () => {
+  const text = prose(3000);
+  assert.strictEqual(RR.envelopeProblem({ errorMessage: text }), text);
+  assert.strictEqual(RR.deployRunFromResult({ status: 'Failed', success: false, errorMessage: text }, BASE()).message, text);
+  const cut = RR.envelopeProblem({ errorMessage: prose(6000) });
+  assert.strictEqual(cut.length, 4000);
+  assert.ok(cut.endsWith('…') && !cut.includes('shortened'), 'the org text really exceeded the cap: no history marker');
+});
+
+check('a 3,000-character org problem is kept whole in the live row, in the newest summary and after a reload', () => {
+  const text = prose(3000);
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { componentFailures: [
+    { componentType: 'ApexClass', fullName: 'AcmeInvoiceService', problem: text, lineNumber: 4 }
+  ] } }, BASE());
+  assert.strictEqual(run.rows.find(r => r.o === 'failed').m, text, 'the live row');
+  const latest = RR.summarizeRun(run, { latest: true });
+  assert.strictEqual(latest.rows.find(r => r.o === 'failed').m, text, 'the newest summary');
+  const [kept] = RR.normalizeRunsState({ v: 1, runs: [latest] }).runs;
+  assert.strictEqual(kept.rows.find(r => r.o === 'failed').m, text, 'what a reload reads back');
+});
+
+check('a 6,000-character org problem is cut at ROW_MESSAGE_MAX with a bare ellipsis', () => {
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { componentFailures: [
+    { componentType: 'ApexClass', fullName: 'AcmeInvoiceService', problem: prose(6000) }
+  ] } }, BASE());
+  const m = run.rows.find(r => r.o === 'failed').m;
+  assert.strictEqual(m.length, RR.ROW_MESSAGE_MAX);
+  assert.ok(m.endsWith('…') && !m.includes('shortened'));
+});
+
+check('a test failure message of 3,000 characters is kept whole; 6,000 is cut at ROW_MESSAGE_MAX', () => {
+  const text = prose(3000);
+  const run = RR.deployRunFromResult({ status: 'Failed', success: false, details: { runTestResult: { failures: [
+    { name: 'AcmeServiceTest', methodName: 'testLong', message: text, stackTrace: 'Class.AcmeServiceTest.testLong: line 9, column 1' },
+    { name: 'AcmeServiceTest', methodName: 'testHuge', message: prose(6000), stackTrace: '' }
+  ] } } }, BASE());
+  assert.strictEqual(run.tests[0].m, text);
+  assert.strictEqual(run.tests[1].m.length, RR.ROW_MESSAGE_MAX);
 });
 
 // ============================================ 3) mapping failures onto the request
@@ -335,6 +379,7 @@ check('failure text is org-controlled: ANSI and control characters out, capped',
   ] } }, BASE());
   const m = run.rows.find(r => r.o === 'failed').m;
   assert.ok(m.startsWith('bad  thing'), JSON.stringify(m.slice(0, 20)));
+  assert.strictEqual(m, 'bad  thing ' + 'y'.repeat(900), 'a 900-character message survives whole');
   assert.ok(m.length <= RR.ROW_MESSAGE_MAX);
 });
 
@@ -438,6 +483,66 @@ check('summary caps are exact: newest 100 failed + 50 skipped + 50 tests; older 
   assert.strictEqual(older.tests.length, 10);
 });
 
+check('a summary cut to fit the byte budget says so: every shortened message ends with the history marker, and cutting it again changes nothing', () => {
+  const MARK = '… (shortened in history)';
+  const run = bigRun({ failures: 40, tests: 3, msgLen: 3000 });
+  run.rows[0].m = 'short problem';
+  const latest = RR.summarizeRun(run, { latest: true });
+  assert.ok(RR.packedSize(latest) <= RR.LATEST_SUMMARY_MAX_BYTES);
+  const cut = [...latest.rows.slice(1), ...latest.tests];
+  assert.ok(cut.length > 5 && cut.every(x => x.m.length === 200 && x.m.endsWith(MARK)), 'each long row and test message is cut to 200 with the marker');
+  assert.strictEqual(latest.rows[0].m, 'short problem', 'a message that already fits is left alone');
+  const again = RR.summarizeRun(latest, { latest: true });
+  assert.deepStrictEqual(again.rows.map(r => r.m), latest.rows.map(r => r.m));
+  assert.strictEqual(again.message, latest.message);
+});
+
+check('the newest run\'s own message is never cut under the byte budget; an older run\'s still is, with the marker', () => {
+  const run = bigRun({ failures: 300, msgLen: 4000 });
+  run.message = prose(3000);
+  const latest = RR.summarizeRun(run, { latest: true });
+  assert.ok(RR.packedSize(latest) <= RR.LATEST_SUMMARY_MAX_BYTES, `latest summary is ${RR.packedSize(latest)} bytes`);
+  assert.strictEqual(latest.message, run.message, 'the rows file has no message: this copy keeps it whole');
+  assert.ok(latest.rows.length > 0 && latest.rows.every(r => r.m.length <= 200), 'the rows gave way instead');
+  const older = RR.summarizeRun(run, { latest: false });
+  assert.ok(RR.packedSize(older) <= RR.OLDER_SUMMARY_MAX_BYTES);
+  assert.ok(older.message.length <= 1000 && older.message.endsWith('… (shortened in history)'), 'an older run cuts it, and says so');
+});
+
+check('notes, hint, CLI actions and diagnosis at their 2,000-character cap stay whole in the newest summary and inside its byte budget, with or without a crowd of long failures', () => {
+  const org = (run) => Object.assign(run, {
+    message: prose(4000), hint: prose(2500),
+    cliActions: Array.from({ length: 6 }, (_, i) => `${i} ${prose(2500)}`),
+    notes: Array.from({ length: 6 }, (_, i) => `${i} ${prose(2500)}`),
+    diagnosis: Array.from({ length: 6 }, (_, i) => `${i} ${prose(2500)}`)
+  });
+  const lean = RR.summarizeRun(org(bigRun({ failures: 2 })), { latest: true });
+  for (const k of ['cliActions', 'notes', 'diagnosis']) {
+    assert.strictEqual(lean[k].length, 5, k);
+    assert.ok(lean[k].every(x => x.length === 2000 && x.endsWith('…')), `${k}: each cut at 2,000, not 500`);
+  }
+  assert.strictEqual(lean.hint.length, 2000);
+  assert.ok(RR.packedSize(lean) <= RR.LATEST_SUMMARY_MAX_BYTES, `lean summary is ${RR.packedSize(lean)} bytes`);
+  const crowd = RR.summarizeRun(org(bigRun({ failures: 300, tests: 60, msgLen: 4000 })), { latest: true });
+  assert.ok(RR.packedSize(crowd) <= RR.LATEST_SUMMARY_MAX_BYTES, `crowded summary is ${RR.packedSize(crowd)} bytes`);
+  assert.strictEqual(crowd.message.length, 4000, 'the message stays whole under the budget');
+});
+
+check('multi-byte org text still fits the newest budget: the message stays whole, the notes give way', () => {
+  const cjk = (n) => '字'.repeat(n);
+  const run = bigRun({ failures: 2 });
+  Object.assign(run, {
+    message: cjk(4000), hint: cjk(2000),
+    cliActions: Array.from({ length: 5 }, () => cjk(2000)),
+    notes: Array.from({ length: 5 }, () => cjk(2000)),
+    diagnosis: Array.from({ length: 5 }, () => cjk(2000))
+  });
+  const latest = RR.summarizeRun(run, { latest: true });
+  assert.ok(RR.packedSize(latest) <= RR.LATEST_SUMMARY_MAX_BYTES, `latest summary is ${RR.packedSize(latest)} bytes`);
+  assert.strictEqual(latest.message, run.message, 'the message the card and Copy have only here stays whole');
+  assert.ok(!latest.notes && !latest.cliActions && !latest.diagnosis && !latest.hint, 'the notes gave way, not the message');
+});
+
 check('the newest summary keeps what its buttons need; an older one keeps none of it; live payloads never persist', () => {
   const run = bigRun({ failures: 2 });
   const latest = RR.summarizeRun(run, { latest: true });
@@ -445,11 +550,12 @@ check('the newest summary keeps what its buttons need; an older one keeps none o
   assert.strictEqual(latest.conflict, true);
   assert.strictEqual(latest.backupDir, '/ws/.backups/2');
   assert.strictEqual(latest.suggestId, 'sug-1-2');
-  assert.strictEqual(latest.message.length, 2000);
+  assert.strictEqual(latest.message, run.message, 'the newest summary keeps a 3,000-character message whole');
   assert.strictEqual(latest.notes.length, 5);
   const older = RR.summarizeRun(run, { latest: false });
   for (const k of ['retry', 'conflict', 'backupDir', 'suggestId', 'notes', 'hint', 'cliActions']) assert.ok(!(k in older), `older run kept ${k}`);
   assert.strictEqual(older.message.length, 1000);
+  assert.ok(older.message.endsWith('… (shortened in history)'), 'an older run says its message was only shortened in history');
   for (const s of [latest, older]) {
     assert.ok(!('suggest' in s) && !('quick' in s), 'live-only payloads must never reach storage');
     assert.strictEqual(s.jobId, '0AfAc000001kR2mSAE');
@@ -554,10 +660,10 @@ check('normalize keeps the first of two runs with one id, sorts newest first, ke
 });
 
 check('the dependency diagnosis kept beside a suggestion survives storage, bounded like notes', () => {
-  const run = { ...GOOD(), status: 'failed', suggestId: 'sug-1-0', diagnosis: ['Missing but available locally: CustomObject:AcmeRate__mdt — add them to the deploy by hand.', 7, 'x'.repeat(900)] };
+  const run = { ...GOOD(), status: 'failed', suggestId: 'sug-1-0', diagnosis: ['Missing but available locally: CustomObject:AcmeRate__mdt — add them to the deploy by hand.', 7, 'x'.repeat(2500)] };
   const [back] = RR.normalizeRunsState(state(run)).runs;
   assert.strictEqual(back.diagnosis[0], run.diagnosis[0]);
-  assert.ok(back.diagnosis.every(d => typeof d === 'string' && d.length <= 500), JSON.stringify(back.diagnosis).slice(0, 200));
+  assert.ok(back.diagnosis.every(d => typeof d === 'string' && d.length <= 2000), JSON.stringify(back.diagnosis).slice(0, 200));
   assert.deepStrictEqual(RR.summarizeRun(back, { latest: true }).diagnosis, back.diagnosis);
 });
 
@@ -629,13 +735,13 @@ check('package.json: sfOrgDeployWrapper.statusHistoryRuns is a number, default 3
   assert.strictEqual(s.maximum, RR.RUN_CAP_MAX);
 });
 
-check('fitNotes: at most 5 notes, NONE dropped — past the cap the rest fold into the last one; each cut at 500', () => {
+check('fitNotes: at most 5 notes, NONE dropped — past the cap the rest fold into the last one; each cut at 2,000', () => {
   assert.deepStrictEqual(RR.fitNotes(['a', '', 'b']), ['a', 'b']);
   assert.deepStrictEqual(RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'n5']), ['n1', 'n2', 'n3', 'n4', 'n5']);
   assert.deepStrictEqual(RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7']), ['n1', 'n2', 'n3', 'n4', 'n5 · n6 · n7']);
-  const long = RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'x'.repeat(400), 'y'.repeat(400)]);
+  const long = RR.fitNotes(['n1', 'n2', 'n3', 'n4', 'x'.repeat(1500), 'y'.repeat(1500)]);
   assert.strictEqual(long.length, 5);
-  assert.strictEqual(long[4].length, 500);
+  assert.strictEqual(long[4].length, 2000);
   assert.ok(long[4].endsWith('…'), 'a cut note says so');
   // A retrieve's org messages come after its own notes, and are folded too.
   const run = RR.retrieveRunFromResult({ status: 0, inboundFiles: [], messages: [{ fileName: 'f', problem: 'stopped' }] }, {

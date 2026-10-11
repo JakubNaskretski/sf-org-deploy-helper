@@ -148,10 +148,14 @@ export const DEPLOY_JOB_ID_RE = /^0Af[A-Za-z0-9]{12,15}$/;
 export const RUN_CAP_DEFAULT = 3;
 export const RUN_CAP_MAX = 10;
 
-export const ROW_MESSAGE_MAX = 500;
+// ponytail: ceiling — the rows file has no byte budget, so ten thousand failed rows
+// at 4 KB each would be 40 MB on disk and in the webview; add a budget there if it bites.
+export const ROW_MESSAGE_MAX = 4000;
 const KEY_MAX = 600;
 const LEAF_MAX = 255;
-const NOTE_MAX = 500;
+// Notes, hint, CLI actions and diagnosis carry org text too; NOTES_MAX of them at
+// 2,000 each still sit well under LATEST_SUMMARY_MAX_BYTES (check-run-records pins it).
+const NOTE_MAX = 2000;
 const NOTES_MAX = 5;
 const PATH_MAX = 1024;
 
@@ -161,7 +165,7 @@ const PATH_MAX = 1024;
 const LATEST_FAILED_ROWS = 100;
 const LATEST_SKIPPED_ROWS = 50;
 const LATEST_TESTS = 50;
-const LATEST_MESSAGE_MAX = 2000;
+const LATEST_MESSAGE_MAX = 4000;
 const OLDER_FAILED_ROWS = 25;
 const OLDER_TESTS = 10;
 const OLDER_MESSAGE_MAX = 1000;
@@ -172,6 +176,15 @@ export const LATEST_SUMMARY_MAX_BYTES = 40_000;
 export const OLDER_SUMMARY_MAX_BYTES = 10_000;
 /** Message length a summary falls back to when its caps alone overshoot the budget. */
 const SUMMARY_SHORT_MESSAGE = 200;
+/** What a message cut for the history ends with, so the card says the org had
+ *  more (the build-time cap, by contrast, is the org's text really exceeding it). */
+const SHORTENED = '… (shortened in history)';
+
+/** `s` cut to `max` characters, marker included — so cutting a cut text again
+ *  changes nothing. */
+function shortened(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max - SHORTENED.length)}${SHORTENED}` : s;
+}
 
 /** Size of a value as it would be stored: UTF-8 bytes of its JSON. */
 export function packedSize(value: unknown): number {
@@ -212,9 +225,9 @@ export function deploySuccessRows(result: DeployResult): DeployFileResult[] {
 
 /** Cap on the request-level failure text echoed into a card line and fed to the
  *  dependency detector. Org-controlled, so bounded like every other such string;
- *  400 leaves room for the sentence that names the type ("Invalid type: Foo__mdt")
- *  without pasting a whole stack of platform prose into the card. */
-const ENVELOPE_PROBLEM_MAX = 400;
+ *  4,000 keeps a long platform message whole — the card shows its first lines
+ *  and a "more" toggle, and Copy has all of it. */
+const ENVELOPE_PROBLEM_MAX = 4000;
 
 /** The org's REQUEST-level failure text (`errorMessage` on the Metadata API deploy
  *  status), flattened and length-bounded; '' when the org didn't send one.
@@ -641,7 +654,7 @@ export function summarizeRun(run: RunRecord, opts: { latest: boolean }): RunReco
   if (run.testsRan !== undefined) out.testsRan = run.testsRan;
   if (run.fromRunId) out.fromRunId = run.fromRunId;
   const messageMax = latest ? LATEST_MESSAGE_MAX : OLDER_MESSAGE_MAX;
-  if (run.message) out.message = run.message.length > messageMax ? `${run.message.slice(0, messageMax - 1)}…` : run.message;
+  if (run.message) out.message = shortened(run.message, messageMax);
   if (latest) {
     if (run.hint) out.hint = orgText(run.hint, NOTE_MAX);
     if (run.cliActions?.length) out.cliActions = run.cliActions.slice(0, NOTES_MAX).map(a => orgText(a, NOTE_MAX));
@@ -654,18 +667,22 @@ export function summarizeRun(run: RunRecord, opts: { latest: boolean }): RunReco
   }
   // The caps bound the counts of things; a pathological run (hundreds of long
   // messages) can still overshoot the byte budget. Shorten messages first, then
-  // give up rows from the end (skipped before failed), then tests.
+  // give up rows from the end (skipped before failed), then tests. The newest
+  // run's own message stays whole: the rows file holds its rows and tests but
+  // not the message, so this copy is all the card and Copy would have.
   const budget = latest ? LATEST_SUMMARY_MAX_BYTES : OLDER_SUMMARY_MAX_BYTES;
   if (packedSize(out) > budget) {
-    const short = (m: string): string => (m.length > SUMMARY_SHORT_MESSAGE ? `${m.slice(0, SUMMARY_SHORT_MESSAGE - 1)}…` : m);
+    const short = (m: string): string => shortened(m, SUMMARY_SHORT_MESSAGE);
     for (const r of out.rows) if (r.m) r.m = short(r.m);
     for (const t of out.tests) t.m = short(t.m);
-    if (out.message) out.message = short(out.message);
+    if (out.message && !latest) out.message = short(out.message);
   }
   while (packedSize(out) > budget && (out.rows.length || out.tests.length)) {
     if (out.rows.length) out.rows.pop(); else out.tests.pop();
   }
   if (packedSize(out) > budget) { delete out.notes; delete out.cliActions; }
+  // Multi-byte text (3 bytes a character) can still be over: the rest of the org's notes go too.
+  if (packedSize(out) > budget) { delete out.diagnosis; delete out.hint; }
   out.rowsComplete = out.rows.length === run.rows.length && run.rowsComplete
     && out.rows.every((r, i) => r.k === run.rows[i].k && r.m === run.rows[i].m);
   return out;
