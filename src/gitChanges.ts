@@ -62,10 +62,14 @@ export function commitLogArgs(opts: { baseRef?: string; branch?: string; cap?: n
   return args.concat(rangeArgs(opts));
 }
 
-/** The range itself, shared by the commit listing and the boundary query. */
-function rangeArgs(opts: { baseRef?: string; branch?: string }): string[] {
+/** The range itself, shared by the commit listing and the boundary query. `tips`
+ *  are the commits it starts from: HEAD, and for the boundary query during an open
+ *  merge also MERGE_HEAD, so that a merged-in tip no branch has shows up in the
+ *  answer (see parseBoundary). `not` are commits it also leaves out: HEAD, to ask
+ *  what an open pull brings in on top of it. */
+function rangeArgs(opts: { baseRef?: string; branch?: string; tips?: string[]; not?: string[] }): string[] {
   if (opts.baseRef) return [`${opts.baseRef}..HEAD`];
-  const args = ['HEAD', '--not'];
+  const args = [...(opts.tips ?? ['HEAD']), '--not', ...(opts.not ?? [])];
   // Each --exclude applies to the ONE following --branches/--remotes, hence the
   // interleaving; the globs drop this branch and its remote counterparts so the
   // range isn't emptied by its own tips. The patterns are matched with the
@@ -88,31 +92,37 @@ function rangeArgs(opts: { baseRef?: string; branch?: string }): string[] {
  *  the answer away (baseFromBoundary). Under the cap the walk ran to the end of
  *  the range and the boundary is the real one. Without the cap this query walked
  *  the entire history of a trunk-only checkout on every refresh. */
-export function boundaryArgs(opts: { baseRef?: string; branch?: string; cap?: number }): string[] {
+export function boundaryArgs(opts: { baseRef?: string; branch?: string; cap?: number; tips?: string[]; not?: string[] }): string[] {
   return ['rev-list', '--boundary', '-n', String(opts.cap ?? MAX_BRANCH_COMMITS + 1)].concat(rangeArgs(opts));
 }
 
 /** Read `rev-list --boundary`: `-<hash>` lines are the commits just OUTSIDE the
  *  range (where this branch joins the others), the rest are the range itself.
  *
- *  `base` is the first boundary — the point to diff the working tree against so
- *  the view covers every commit of this branch, listed or capped away. No
- *  boundary at all means the range runs to the root: this branch is the whole
+ *  `bases` is EVERY boundary, in the order git printed them — the points to diff
+ *  the working tree against so the view covers every commit of this branch,
+ *  listed or capped away. One boundary is the plain case: the fork point, or the
+ *  tip the branch was rebased onto. A merge brings another lineage in (main, a
+ *  sibling branch) and that lineage's tip becomes a boundary of its own beside
+ *  the fork point, in an order git does not promise — so no single one of them is
+ *  the answer, and the caller diffs against each and keeps what they all report.
+ *  No boundary at all means the range runs to the root: this branch is the whole
  *  repository (a trunk-only checkout), which is not "this branch's work" — the
  *  caller then shows uncommitted changes only.
- *  With several boundaries (a branch merged in) the first one is used, so the
- *  diff can be a little wider than this branch alone; the sections still say
- *  where each component came from. */
-export function parseBoundary(stdout: string): { count: number; base?: string } {
-  let count = 0;
-  let base: string | undefined;
+ *
+ *  `listed` is the range itself: asked with MERGE_HEAD among the tips, a tip that
+ *  is listed belongs to this branch (the merge is a `git pull` of its own remote),
+ *  and one that is not belongs to another lineage. */
+export function parseBoundary(stdout: string): { count: number; bases: string[]; listed: string[] } {
+  const bases: string[] = [];
+  const listed: string[] = [];
   for (const line of stdout.split('\n')) {
     const hash = line.trim();
     if (!hash) continue;
-    if (hash.startsWith('-')) { if (!base) base = hash.slice(1); continue; }
-    count++;
+    if (hash.startsWith('-')) { bases.push(hash.slice(1)); continue; }
+    listed.push(hash);
   }
-  return { count, base };
+  return { count: listed.length, bases, listed };
 }
 
 /** Parse the output of `commitLogArgs`. Shape per commit: RS, then
@@ -150,14 +160,14 @@ export function parseCommitLog(stdout: string): CommitInfo[] {
 /** Why the automatic comparison gave up, for the view to say so. */
 export type BranchBaseGiveUp = 'whole-history' | 'too-long';
 
-/** The diff base for a `--boundary` answer, or a reason the view should stay
+/** The diff bases for a `--boundary` answer, or a reason the view should stay
  *  uncommitted-only: no boundary to diff against (a trunk-only checkout, where
  *  this branch IS the repository), or a range at least as long as the query's
  *  cap — at which point "this branch" is someone's trunk, not a piece of work,
- *  and the boundary is a truncation artifact rather than the fork point.
+ *  and the boundaries are truncation artifacts rather than the fork point.
  *  An empty range is neither: there is simply nothing committed to show. */
-export function baseFromBoundary(b: { count: number; base?: string }): { base?: string; giveUp?: BranchBaseGiveUp } {
+export function baseFromBoundary(b: { count: number; bases: string[] }): { bases?: string[]; giveUp?: BranchBaseGiveUp } {
   if (b.count > MAX_BRANCH_COMMITS) return { giveUp: 'too-long' };
-  if (b.count > 0 && !b.base) return { giveUp: 'whole-history' };
-  return { base: b.base };
+  if (b.count > 0 && b.bases.length === 0) return { giveUp: 'whole-history' };
+  return { bases: b.bases };
 }
