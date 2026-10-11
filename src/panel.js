@@ -75,10 +75,12 @@
     // The running run's live counts (runProgress): five numbers, never rows.
     runProgress: null,
     // How the newest run's list is being looked at: chip filter, search, folds,
-    // keyboard focus. In memory only, and reset when another run becomes newest.
-    runUi: { runId: null, filter: 'all', q: '', folds: {}, openAll: undefined, focus: -1 },
-    // Per run id: Quick Deploy used, the suggestion view's state, and whether an
-    // older run is expanded in the Earlier block.
+    // keyboard focus, which long messages are opened (id → true). In memory only,
+    // and reset when another run becomes newest.
+    runUi: { runId: null, filter: 'all', q: '', folds: {}, openAll: undefined, focus: -1, msgOpen: {} },
+    // Per run id: Quick Deploy used, the suggestion view's state, which of its
+    // long plain lines are opened, and whether an older run is expanded in the
+    // Earlier block.
     runLocal: {},
     earlierOpen: false,
     cmdLog: [],
@@ -2382,6 +2384,7 @@
   let runGroupCache = {};
   let runPaintQueued = false;
   let runResize = null;
+  let runColsKey = '';         // the card's, the list's and Earlier's estimates, as the pane was drawn
   let runClock = null;
   let runSearchTimer = null;
   const runTiming = { build: 0, paint: 0 };
@@ -2391,6 +2394,41 @@
     if (cls) e.className = cls;
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
+  }
+  /** Characters one line of a message holds at the pane's width, `px` wide each
+   *  — an estimate from one read of the width, never measured per row. A row's
+   *  monospace (Menlo at 11px) is ROW_PX; the card's proportional text and an
+   *  older run's indented list are read wider, so the toggle errs early. 68px
+   *  is what the list's padding, scrollbar and gutters take off the width. One
+   *  column is left off as slack: Menlo's advance is 1233/2048em = 6.6226px, a
+   *  hair over ROW_PX, so at some widths the estimate alone is a column too wide
+   *  and a tail would be cut with no toggle. */
+  const ROW_PX = 6.62;
+  const CARD_PX = 6.8;
+  const OLDER_PX = 8;
+  function msgCols(px) { return Math.max(16, Math.floor((($('status').clientWidth || 320) - 68) / px) - 1); }
+  /** Every toggle is decided at one width, so the pane is drawn again when this
+   *  changes (a dragged sidebar, a pane first shown after it was built hidden). */
+  function colsKey() { return [ROW_PX, CARD_PX, OLDER_PX].map(msgCols).join(); }
+  /** The "more ▾" / "less ▴" toggle of a long message. It never reaches the row
+   *  under it, whose own click opens the file. */
+  function moreBtn(open, toggle) {
+    const b = mk('button', 'show-more', open ? 'less ▴' : 'more ▾');
+    b.type = 'button';
+    b.tabIndex = -1;
+    b.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+    return b;
+  }
+  /** A long message's toggle: `el` carries `open` while `opened[id]` (kept per run,
+   *  so a redraw leaves it as the person set it). Returns the button. */
+  function openToggle(el, opened, id) {
+    el.classList.toggle('open', !!opened[id]);
+    const btn = moreBtn(!!opened[id], () => {
+      opened[id] = !opened[id];
+      el.classList.toggle('open', opened[id]);
+      btn.textContent = opened[id] ? 'less ▴' : 'more ▾';
+    });
+    return btn;
   }
   function runLocalFor(id) { return (state.runLocal[id] ||= {}); }
   /** Drop every Run tests click lock (renderRunActs) — the provider has
@@ -2405,7 +2443,7 @@
   /** The newest run's view state, reset when another run becomes the newest. */
   function runUiFor(run) {
     if (state.runUi.runId !== run.id) {
-      state.runUi = { runId: run.id, filter: 'all', q: '', folds: {}, openAll: undefined, focus: -1 };
+      state.runUi = { runId: run.id, filter: 'all', q: '', folds: {}, openAll: undefined, focus: -1, msgOpen: {} };
       runGroupCache = {};
     }
     return state.runUi;
@@ -2437,6 +2475,7 @@
     const searchCaret = runSearch && document.activeElement === runSearch ? [runSearch.selectionStart, runSearch.selectionEnd] : null;
     releaseRunList();
     st.innerHTML = '';
+    runColsKey = colsKey();
     // Notices since the newest run lead, a few at most, so the run stays in
     // reach of a short pane; the rest join the older entries behind Earlier.
     const newer = state.statusCards.filter(c => (c.at || 0) > latest.startedAt).slice(0, NEWER_NOTICES_SHOWN);
@@ -2473,7 +2512,13 @@
     if (typeof ResizeObserver === 'function') {
       // The pane resizing (splitter, sidebar width) or anything above the list
       // changing height moves the window the list must paint.
-      if (!runResize) runResize = new ResizeObserver(() => { if (runList) scheduleRunPaint(); });
+      // Which messages get a toggle, and how tall an opened one is, follow the
+      // pane's width, so a width that changes the estimate draws the pane again
+      // (never at width 0: a hidden pane keeps what it has until it is shown).
+      if (!runResize) runResize = new ResizeObserver(() => {
+        if (!runList) return;
+        if ($('status').clientWidth && colsKey() !== runColsKey) renderStatus(); else scheduleRunPaint();
+      });
       runResize.observe(st);
       if (runHead) runResize.observe(runHead);
     }
@@ -2527,9 +2572,9 @@
     const moreTests = (run.counts.testsFailed || 0) - tests.length;
     if (failures.length || tests.length || moreFailed > 0 || moreTests > 0) {
       const ul = mk('ul', 'run-older-rows');
-      for (const r of failures) ul.appendChild(olderRowEl(r.k, `${r.k}${r.m ? ' — ' + r.m.split('\n')[0] : ''}`, r.l, r.c));
+      for (const r of failures) ul.appendChild(olderRowEl(local, r.k, `${r.k}${r.m ? ' — ' + r.m : ''}`, r.l, r.c));
       if (moreFailed > 0) ul.appendChild(mk('li', 'run-older-more', `… ${RV.fmtN(moreFailed)} more ${RV.plural(moreFailed, 'failure')} not kept`));
-      for (const t of tests) ul.appendChild(olderRowEl(`ApexClass:${t.cls}`, `${t.cls}.${t.method} — ${t.m.split('\n')[0]}`, t.l, t.c));
+      for (const t of tests) ul.appendChild(olderRowEl(local, `ApexClass:${t.cls}`, `${t.cls}.${t.method} — ${t.m}`, t.l, t.c));
       if (moreTests > 0) ul.appendChild(mk('li', 'run-older-more', `… ${RV.fmtN(moreTests)} more test ${RV.plural(moreTests, 'failure')} not kept`));
       body.appendChild(ul);
     }
@@ -2546,9 +2591,16 @@
     wrap.appendChild(body);
     return wrap;
   }
-  function olderRowEl(key, text, line, column) {
-    const li = mk('li', '', text);
+  function olderRowEl(local, key, text, line, column) {
+    const li = mk('li');
     li.title = text;
+    // One cut line (a newline reads as a space); a longer or multi-line message
+    // opens in place. The list is indented, so a line holds fewer characters.
+    li.appendChild(mk('span', 'run-older-txt', text));
+    if (RV.msgLong(text, 1, msgCols(OLDER_PX))) {
+      li.classList.add('long');
+      li.appendChild(openToggle(li, (local.rowOpen ||= {}), text.slice(0, 80)));
+    }
     // Only a component with local source opens — org-only rows name nothing
     // the editor could show.
     if (state.localKeys.has(key)) {
@@ -2587,10 +2639,13 @@
     const sub = mk('div', 'run-sub', v.sub);
     sub.title = new Date(run.startedAt).toLocaleString();
     text.appendChild(sub);
+    const opened = (runLocalFor(run.id).plainOpen ||= {});
     for (const p of v.plain) {
       const line = mk('div', `run-plain${p.kind ? ' ' + p.kind : ''}`, p.text);
       line.title = p.text;
       text.appendChild(line);
+      // Keyed by what the line says, not its place: the lines before it come and go.
+      if (RV.msgLong(p.text, RV.MSG_PLAIN_LINES, msgCols(CARD_PX))) text.appendChild(openToggle(line, opened, `${p.kind || ''}|${p.text.slice(0, 80)}`));
     }
     box.appendChild(text);
     return box;
@@ -2753,7 +2808,7 @@
 
   function buildRunModel(run, ui) {
     const t0 = performance.now();
-    runModel = RV.buildRows(run, runSrc.rows, runSrc.tests, ui, { cache: runGroupCache, complete: runSrc.complete });
+    runModel = RV.buildRows(run, runSrc.rows, runSrc.tests, ui, { cache: runGroupCache, complete: runSrc.complete, cols: msgCols(ROW_PX) });
     runTiming.build = performance.now() - t0;
     if (ui.focus >= runModel.rows.length) ui.focus = -1;
   }
@@ -2966,14 +3021,15 @@
         l1.appendChild(name);
         if (x.f || x.l) l1.appendChild(location(x.k, `${x.f || r.name}${x.l ? `:${x.l}${x.c ? `:${x.c}` : ''}` : ''}`, x.l, x.c));
         const why = RV.whyText(x);
-        if (why) l1.appendChild(mk('span', 'run-why-col', why));
+        if (why) {
+          const w = mk('span', 'run-why-col', why);
+          w.title = why;
+          l1.appendChild(w);
+        }
+        if (r.more) l1.appendChild(moreBtn(!!r.mh, () => toggleRunMsg(r.mid)));
         l1.appendChild(copyBtn(RV.rowCopyText(x, run)));
         body.appendChild(l1);
-        if (x.m) {
-          const m = mk('div', 'run-msg', x.m);
-          m.title = x.m;
-          body.appendChild(m);
-        }
+        if (x.m) body.appendChild(msgEl(x.m, r));
         row.appendChild(body);
         if (state.localKeys.has(x.k)) row.title = `Open ${x.k}`;
         row.addEventListener('click', () => { setRunFocus(i, false); openRunKey(x.k, x.l, x.c); });
@@ -2991,17 +3047,30 @@
         name.title = name.textContent;
         l1.appendChild(name);
         if (t.l) l1.appendChild(location(key, `${t.cls}:${t.l}`, t.l, t.c));
+        if (r.more) l1.appendChild(moreBtn(!!r.mh, () => toggleRunMsg(r.mid)));
         l1.appendChild(copyBtn(RV.testCopyText(t)));
         body.appendChild(l1);
-        const m = mk('div', 'run-msg', t.m);
-        m.title = t.m;
-        body.appendChild(m);
+        body.appendChild(msgEl(t.m, r));
         row.appendChild(body);
         row.addEventListener('click', () => { setRunFocus(i, false); openRunKey(key, t.l, t.c); });
         return row;
       }
     }
     return row;
+  }
+
+  /** A row's message: two lines, or all of it in a box of the height the list gave the row. */
+  function msgEl(text, r) {
+    const m = mk('div', r.mh ? 'run-msg open' : 'run-msg', text);
+    m.title = text;
+    if (r.mh) m.style.height = `${r.mh}px`;
+    return m;
+  }
+  /** Open or close one row's message: the row's height changes, so the list is built again. */
+  function toggleRunMsg(id) {
+    const open = state.runUi.msgOpen;
+    if (open[id]) delete open[id]; else open[id] = true;
+    refreshRunList();
   }
 
   function toggleRunGroup(i) {

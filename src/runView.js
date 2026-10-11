@@ -33,12 +33,51 @@
   /** Fixed row heights (px) — the list is virtual, so every row's place is
    *  computed, never measured. A row with a message shows it on two lines. */
   const ROW_H = { section: 22, group: 24, leaf: 22, tall: 54, test: 54, note: 22 };
+  /** A message line is 15px; a row clamps its message to MSG_ROW_LINES, the card's
+   *  plain lines to MSG_PLAIN_LINES. An opened row message is as tall as its
+   *  lines (computed from the pane's width: `cols` characters a line, wrapped
+   *  by word), and past MSG_OPEN_MAX lines it scrolls inside its box. */
+  const MSG_LINE_H = 15;
+  const MSG_ROW_LINES = 2;
+  const MSG_PLAIN_LINES = 3;
+  const MSG_OPEN_MAX = 20;
+  const MSG_COLS = 40;
   /** Up to this many listed rows every group starts open; past it only the
    *  groups holding a failure do, so a 9,000-row success opens on its types. */
   const DEFAULT_OPEN_MAX = 300;
   /** Search appears once the list is longer than a glance. */
   const SEARCH_MIN_ROWS = 20;
   const GLYPH = { ok: '✓', err: '✗', skip: '•', warn: '•', info: '+', all: '•' };
+
+  /** Lines `text` takes when a line holds `cols` characters, wrapped the way a
+   *  browser does: a newline starts a line, a word that does not fit what is
+   *  left of one moves to the next, and a word longer than a whole line breaks
+   *  across ceil(length / cols) of them. An estimate, never measured. */
+  function msgLines(text, cols) {
+    cols = cols || MSG_COLS;
+    let lines = 0;
+    for (const part of String(text || '').split('\n')) {
+      let n = 1;
+      let used = 0;
+      for (const w of part.split(/\s+/)) {
+        if (!w) continue;
+        if (used && used + 1 + w.length <= cols) { used += 1 + w.length; continue; }
+        if (used) n++;
+        n += Math.ceil(w.length / cols) - 1;
+        used = w.length % cols || cols;
+      }
+      lines += n;
+    }
+    return lines;
+  }
+  /** Whether `text` is cut by a clamp to `max` lines: it wraps to more than that. */
+  function msgLong(text, max, cols) {
+    return msgLines(text, cols) > max;
+  }
+  /** Pixels an opened message needs: its wrapped lines. */
+  function msgOpenH(text, cols) {
+    return Math.min(msgLines(text, cols), MSG_OPEN_MAX) * MSG_LINE_H;
+  }
 
   // ---- formatting ----
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -438,7 +477,10 @@
    * folds: sections, type groups (most failures first, then biggest), leaves
    * (failures first, then by name), the "Apex test failures" section grouped
    * by class, and a note when the counts say more exists than is listed.
-   * `offsets[i]` is where row i starts; `totalH` is the list's height.
+   * `offsets[i]` is where row i starts; `totalH` is the list's height. A row
+   * whose message is cut by its clamp has `more`; when its id (`mid`) is in
+   * `ui.msgOpen` it is as tall as the whole message (`mh`, the box's height).
+   * `opts.cols` is how many characters a message line holds in this pane.
    */
   function buildRows(run, rows, tests, ui, opts) {
     opts = opts || {};
@@ -451,12 +493,24 @@
     const autoOpen = leaves <= DEFAULT_OPEN_MAX;
     const out = [];
     const isOpen = (id, dflt) => (id in folds ? folds[id] : ui.openAll !== undefined ? ui.openAll : dflt);
+    // A message the clamp cuts gets a toggle; opened, its row grows by the
+    // lines past the two it always has.
+    const msg = (mid, m) => {
+      const more = !!m && msgLong(m, MSG_ROW_LINES, opts.cols);
+      return { mid, more, mh: more && (ui.msgOpen || {})[mid] ? msgOpenH(m, opts.cols) : 0 };
+    };
+    const grown = (mm) => (mm.mh ? mm.mh - MSG_ROW_LINES * MSG_LINE_H : 0);
     if (g.groups.length && g.tgroups.length) out.push({ k: 'section', h: ROW_H.section, label: 'Components', n: g.visible.length });
     for (const grp of g.groups) {
       const id = filter + '|c|' + grp.type;
       const open = isOpen(id, autoOpen || grp.failed > 0);
       out.push({ k: 'group', h: ROW_H.group, id, label: grp.type, n: grp.items.length, counts: grp.counts, failed: grp.failed, open });
-      if (open) for (const it of grp.items) out.push({ k: 'leaf', h: it.row.m ? ROW_H.tall : ROW_H.leaf, row: it.row, name: it.name, type: grp.type });
+      if (open) {
+        for (const it of grp.items) {
+          const mm = msg(it.row.k, it.row.m);
+          out.push({ k: 'leaf', h: (it.row.m ? ROW_H.tall : ROW_H.leaf) + grown(mm), ...mm, row: it.row, name: it.name, type: grp.type });
+        }
+      }
     }
     // Rows the counts know about but the list does not hold: a summary kept
     // across a reload, or an org report that counted without itemizing.
@@ -485,7 +539,12 @@
         const id = filter + '|t|' + grp.cls;
         const open = isOpen(id, true);
         out.push({ k: 'tgroup', h: ROW_H.group, id, label: grp.cls, n: grp.items.length, failed: grp.items.length, open });
-        if (open) for (const x of grp.items) out.push({ k: 'test', h: ROW_H.test, test: x });
+        if (open) {
+          for (const x of grp.items) {
+            const mm = msg(x.cls + '.' + x.method, x.m);
+            out.push({ k: 'test', h: ROW_H.test + grown(mm), ...mm, test: x });
+          }
+        }
       }
     }
     if ((filter === 'all' || filter === 'tests') && !String(ui.q || '').trim()) {
@@ -643,8 +702,8 @@
   }
 
   return {
-    OUTCOMES, DEPLOY_CHIPS, RETRIEVE_CHIPS, ROW_H, DEFAULT_OPEN_MAX, SEARCH_MIN_ROWS, GLYPH, ORG,
-    fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, fmtClock, plural, splitKey,
+    OUTCOMES, DEPLOY_CHIPS, RETRIEVE_CHIPS, ROW_H, DEFAULT_OPEN_MAX, SEARCH_MIN_ROWS, GLYPH, ORG, MSG_PLAIN_LINES,
+    msgLines, msgLong, msgOpenH, fmtN, fmtWhen, fmtDate, fmtDuration, fmtElapsed, fmtClock, plural, splitKey,
     outcomeLabel, outcomeKind, verdictFor, titleText, chipDefs, explainFor, whyText, histLabel,
     buildRows, visibleRange, actionsFor, rowCopyText, testCopyText, copyText
   };

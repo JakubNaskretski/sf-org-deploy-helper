@@ -5,7 +5,7 @@
 //
 // It answers only what those scripts actually touch — a test double, not a
 // browser. There is no layout: sizes and offsets are plain settable numbers a
-// check sets itself (clientHeight defaults to 100, everything else to 0), events
+// check sets itself (clientHeight and clientWidth default to 100, everything else to 0), events
 // do not bubble, and a click fired on a disabled button is still delivered (the
 // checks gate that themselves, as a browser would).
 const fs = require('fs');
@@ -113,7 +113,8 @@ class El {
   get offsetWidth() { return 100; }
   get clientHeight() { return this._clientHeight ?? 100; }
   set clientHeight(v) { this._clientHeight = v; }
-  get clientWidth() { return 100; }
+  get clientWidth() { return this._clientWidth ?? 100; }
+  set clientWidth(v) { this._clientWidth = v; }
   get scrollTop() { return this._scrollTop ?? 0; }
   set scrollTop(v) { this._scrollTop = v; }
   get offsetTop() { return this._offsetTop ?? 0; }

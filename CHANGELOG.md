@@ -3,6 +3,35 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.31.3
+
+- **Merging main into your branch no longer fills the Changed view with main's changes.** After a
+  `git merge main` the view used to list every component main had changed since your branch left
+  it, as if you had edited them, one click from a deploy to Salesforce. It now lists only what your
+  branch changed, whatever you merged in: main, a teammate's branch, or both. The same holds while
+  the merge is still open (you are resolving conflicts, or ran it with `--no-commit`): the files
+  main brought in stay out, and the ones in conflict show under Uncommitted. A `git pull` of your
+  own branch is the exception: what it brings in is your branch's work, so it shows (listed by
+  author once committed). That is one branch at a time: an octopus merge (several branches in one
+  `git merge`) still lists the other branches' files until you commit it. This is the default
+  `auto` setting (a ref you set in `changedBaseRef` compares against that ref as before), and the
+  merged-in branch has to still exist locally or on the remote; a `git merge --squash main` is a
+  commit of your own and still shows.
+- **Checked against real git:** a merge stopped on a conflict, one run with `--no-commit`, one
+  aborted, one open on a branch with no commits of its own (also one cut from a teammate's
+  branch), one open on a detached HEAD and one open on a branch past the 100-commit limit, and a
+  `git pull` stopped on a conflict (also when the remote had merged main); a rebase onto main, a
+  rebase stopped on a conflict, a squash merge elsewhere, a fast-forward, main merged twice, a
+  sibling branch and main merged together, and a merge whose conflict was resolved with an extra
+  file in the merge commit (that file is listed, since the merge itself added it).
+- **Long error messages are no longer cut short.** The org's message on a failed component or
+  test used to be cut at 500 characters (the deploy's own message at 400) on the card and in Copy,
+  with the rest lost; it is now kept whole up to 4,000 characters (notes and hints up to 2,000). A
+  message that runs past a row's two lines (the card's three) gets a *more* toggle, judged by how
+  the words wrap at the pane's width (and again whenever you drag the pane wider or narrower), not
+  by a character count; a failure in an older run opens the same way; Copy always has the whole
+  text. Older runs in the history keep a shortened copy and say so.
+
 ## 0.31.2
 
 - **The Run tests button locks while the tests run.** After you click **Run tests (N)** on a

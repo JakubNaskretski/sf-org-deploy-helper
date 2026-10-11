@@ -103,6 +103,8 @@ interface GitRepoLite {
   state: {
     workingTreeChanges: GitChangeLite[];
     indexChanges: GitChangeLite[];
+    /** Files in conflict during a merge — kept apart from the two lists above. */
+    mergeChanges?: GitChangeLite[];
     onDidChange: vscode.Event<void>;
     /** Current branch; absent on a detached HEAD. */
     HEAD?: { name?: string };
@@ -2509,32 +2511,121 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     return email;
   }
 
-  /** Where this branch joins the rest of the repository — the ref to diff the
+  /** The changes every one of `refs` reports against the working tree: a path that
+   *  equals any one of them (a lineage's own file) is not in the intersection. One
+   *  ref is exactly the plain diff. Rejects when a diff does. */
+  private async sharedChanges(repo: GitRepoLite, refs: string[]): Promise<GitChangeLite[]> {
+    let shared = await repo.diffWith(refs[0]);
+    for (const ref of refs.slice(1)) {
+      const other = new Set((await repo.diffWith(ref)).map(c => c.uri?.fsPath));
+      shared = shared.filter(c => other.has(c.uri?.fsPath));
+    }
+    return shared;
+  }
+
+  /** Where this branch joins the rest of the repository — the refs to diff the
    *  working tree against on the `auto` comparison. Asked BEFORE the commit
    *  listing and over the UNCAPPED range, because a base taken from the capped
    *  list would exclude the commits the cap dropped, and a component whose only
    *  change is in one of them would vanish from the view entirely.
-   *  Undefined (uncommitted-only, with the reason logged) when the branch has
-   *  nothing of its own, when the range runs to the root — a trunk-only checkout,
-   *  where "my branch" is the whole project — or when it is longer than
-   *  MAX_BRANCH_COMMITS. Never throws. */
-  private async branchBase(api: GitApiLite, repo: GitRepoLite): Promise<{ base?: string; note?: string }> {
-    let boundary: { count: number; base?: string };
+   *  Usually one ref; a merge brings another lineage in (main, a sibling branch)
+   *  and its tip is a second one. `git merge-base --independent` drops any that
+   *  is an ancestor of another — fifty merges of main leave one tip, and the fork
+   *  point goes once a merged-in lineage contains it. If that spawn fails they
+   *  are all kept: the caller's intersection is still right, only slower.
+   *  A merge still IN PROGRESS (stopped on a conflict, or run --no-commit) has no
+   *  merge commit yet, so the merged-in tip is no boundary: MERGE_HEAD supplies it
+   *  and comes back as `mergeHead` too, because the caller also has to tell main's
+   *  staged files from yours. On a branch with no commits of its own HEAD is a base
+   *  beside it, so what HEAD already has stays out.
+   *  Unless the merge is a `git pull` of this branch's OWN remote: the range is asked
+   *  with MERGE_HEAD as a second tip, and one that comes back listed is this branch's
+   *  work (`pulled`), not another lineage. As a base it would hide every own file only
+   *  the older commits touched, so the fork point stays the base — and whatever that
+   *  remote merged in is a boundary of its own, reduced as usual.
+   *  Empty (uncommitted-only, with the reason logged when there is one) when the
+   *  branch has nothing of its own and no merge is open, when the range runs to the root — a
+   *  trunk-only checkout, where "my branch" is the whole project — or when it is
+   *  longer than MAX_BRANCH_COMMITS (the usual state on an integration branch that
+   *  main is merged back into). Giving up still reads MERGE_HEAD: with no
+   *  committed side to show, the staged files of an open merge are the only thing
+   *  left that could leak. A pull's are this branch's, bar what its remote merged
+   *  in from another lineage: `incoming` are the commits just outside what the pull
+   *  brings (main's tip among them), asked for with the same query, minus the ones HEAD
+   *  already has (the pushed commit is this branch's own work), and the index is
+   *  filtered against them like against bases, but only for files the pull changed. Never throws. */
+  private async branchBase(api: GitApiLite, repo: GitRepoLite): Promise<{ bases: string[]; mergeHead?: string; pulled?: boolean; incoming?: string[]; note?: string }> {
+    let mergeHead: string | undefined;
     try {
-      boundary = parseBoundary(await this.runGit(api, repo, boundaryArgs({ branch: repo.state.HEAD?.name })));
+      // -q: no merge in progress is exit 1 and no output — the usual answer, so
+      // it is not logged. The fork point is MERGE_HEAD's ancestor and drops out below.
+      // Known limit: an octopus merge in progress holds several heads in MERGE_HEAD and
+      // rev-parse reads the first, so the other heads' files show until it is committed.
+      mergeHead = (await this.runGit(api, repo, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])).trim() || undefined;
+    } catch { /* no merge in progress */ }
+    let boundary: { count: number; bases: string[]; listed: string[] };
+    try {
+      boundary = parseBoundary(await this.runGit(api, repo, boundaryArgs({ branch: repo.state.HEAD?.name, tips: mergeHead ? ['HEAD', mergeHead] : undefined })));
     } catch (err) {
       this.output.appendLine(`[changed] branch range failed: ${err instanceof Error ? err.message : String(err)}`);
-      return {};
+      // Unknown whether it is a pull: treated as another lineage's merge, so the index is still filtered.
+      return { bases: [], mergeHead };
     }
-    const { base, giveUp } = baseFromBoundary(boundary);
-    if (!giveUp) return { base };
+    const { bases = [], giveUp } = baseFromBoundary(boundary);
+    // Known limit: a merged-in tip that no branch or remote ref holds (a one-off `git pull
+    // <remote> <branch>`, a bare hash) is listed too and reads as this branch's own; and
+    // past the cap on a give-up the walk is cut short and may miss a pull's tip, which
+    // then reads as another lineage (its staged files stay out until the merge commits).
+    const pulled = !!mergeHead && boundary.listed.includes(mergeHead);
+    // The tip of ANOTHER lineage being merged in; a pull's MERGE_HEAD is this branch's own.
+    const merged = pulled ? undefined : mergeHead;
+    if (!giveUp) {
+      if (merged && !bases.includes(merged)) bases.push(merged);
+      if (merged && boundary.count === 0) {
+        // No commits of its own: HEAD itself is where this branch starts (a teammate's
+        // branch it was cut from, or its own tip on a detached HEAD). Against MERGE_HEAD
+        // alone, what HEAD has and main lacks would read as changed. At the fork point
+        // HEAD is MERGE_HEAD's ancestor and the reduce below drops it.
+        let head = 'HEAD';
+        try { head = (await this.runGit(api, repo, ['rev-parse', 'HEAD'])).trim() || head; } catch { /* the name works as a ref too */ }
+        if (!bases.includes(head)) bases.push(head);
+      }
+      if (bases.length < 2) return { bases, mergeHead, pulled };
+      let kept = bases;
+      try {
+        const independent = (await this.runGit(api, repo, ['merge-base', '--independent', ...bases])).split('\n').map(l => l.trim()).filter(Boolean);
+        if (independent.length) kept = independent;
+      } catch (err) {
+        this.output.appendLine(`[changed] merge-base --independent failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // The caller needs the merged-in tip's own diff to tell main's staged files
+      // from yours, so it stays even if git called it redundant.
+      if (merged && !kept.includes(merged)) kept = [...kept, merged];
+      return { bases: kept, mergeHead, pulled };
+    }
     // Say it in the view, not just the log: the label would otherwise claim to be
     // showing the branch while showing only the working tree.
     const note = giveUp === 'too-long'
       ? `More than ${MAX_BRANCH_COMMITS} commits of its own on this branch — showing uncommitted changes only. Set sfOrgDeployWrapper.changedBaseRef to compare against a ref.`
       : 'This branch is the whole repository (no other branch to measure against) — showing uncommitted changes only.';
     this.output.appendLine(`[changed] ${note}`);
-    return { note };
+    let incoming: string[] | undefined;
+    if (mergeHead && pulled) {
+      try {
+        incoming = baseFromBoundary(parseBoundary(await this.runGit(api, repo, boundaryArgs({ branch: repo.state.HEAD?.name, tips: [mergeHead], not: ['HEAD'] })))).bases;
+        if (incoming?.length) {
+          // A boundary HEAD already has (the pushed commit) is this branch's own: a staged
+          // file that equals it is one you put back, not one the pull brought in. --independent
+          // drops every ancestor of HEAD but keeps HEAD, so HEAD's hash is removed after.
+          const head = (await this.runGit(api, repo, ['rev-parse', 'HEAD'])).trim();
+          incoming = (await this.runGit(api, repo, ['merge-base', '--independent', 'HEAD', ...incoming])).split('\n').map(l => l.trim()).filter(l => l && l !== head);
+        }
+      } catch (err) {
+        incoming = undefined;
+        this.output.appendLine(`[changed] what the pull brings in failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return { bases: [], mergeHead, pulled, incoming, note };
   }
 
   /** Compute which local components differ, via the built-in vscode.git
@@ -2638,33 +2729,73 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       // hold several repositories: only a name they agree on means anything.
       const branches = new Set<string>();
       for (const repo of api.repositories) {
-        // With an explicit ref that IS the base; on auto it is where the branch
-        // joins the rest of the repository, so the diff spans every commit of
-        // this branch — including any the section cap drops.
+        // With an explicit ref that IS the base; on auto they are where the branch
+        // joins the rest of the repository (one, or one per lineage a merge
+        // brought in), so the diff spans every commit of this branch — including
+        // any the section cap drops.
         if (repo.state.HEAD?.name) branches.add(repo.state.HEAD.name);
         const branch = configuredRef || !auto ? undefined : await this.branchBase(api, repo);
         if (branch?.note) note = branch.note;
-        const baseRef = configuredRef ?? branch?.base;
-        const commits = baseRef ? await this.listBranchCommits(api, repo, configuredRef) : [];
-        if (baseRef) {
+        const bases = configuredRef ? [configuredRef] : branch?.bases ?? [];
+        // While a merge is open: the paths that differ from what it brings in, i.e. not
+        // staged by the merge itself. Undefined when no merge is open, or its diff failed.
+        let yours: Set<string> | undefined;
+        // A merge or pull open on a give-up branch: the paths the merged side changed.
+        let fromMerge: Set<string> | undefined;
+        const root = repo.rootUri?.fsPath;
+        const commits = bases.length ? await this.listBranchCommits(api, repo, configuredRef) : [];
+        if (bases.length) {
           // `diffWith(ref)` = working tree vs the ref (committed + uncommitted
           // tracked differences). An unknown ref rejects — name it rather than
           // showing a false "no changes". On auto the ref came from git itself, so
           // a failure is this repo's problem alone: log it and fall back to the
           // uncommitted answer instead of blanking a multi-repo workspace.
+          // With several bases keep only the paths EVERY diff reports: a file this
+          // branch changed differs from each lineage merged in, while a file a
+          // merge brought in equals that lineage's tip and drops out. One base is
+          // exactly the plain diff.
+          // Known limit: an edit on this branch that restores a merged-in lineage's older
+          // version of a file drops out of this diff and, once staged, out of the filter
+          // below; its commit section still lists it. That holds on this path only: a
+          // give-up has no section, so its filter below asks the merge for the file first.
           let refChanges: GitChangeLite[] = [];
           try {
-            refChanges = await repo.diffWith(baseRef);
+            refChanges = await this.sharedChanges(repo, bases);
+            // The same rule for the staged files of an open merge: one that equals a
+            // lineage being merged in is that lineage's, so it is outside the intersection.
+            yours = branch?.mergeHead ? new Set(refChanges.map(c => foldPathKey(c.uri?.fsPath ?? ''))) : undefined;
             usedBase = configuredRef ?? usedBase;
           } catch (err) {
-            this.output.appendLine(`[changed] diffWith(${baseRef}) failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.output.appendLine(`[changed] diffWith(${bases.join(', ')}) failed: ${err instanceof Error ? err.message : String(err)}`);
             if (configuredRef) {
               return { reason: `Can't compare against "${configuredRef}" — unknown git ref? (${stripAnsi(err instanceof Error ? err.message : String(err)).trim()})` };
             }
           }
           for (const change of refChanges) addPath(change.uri?.fsPath, keys);
+        } else if (branch?.mergeHead) {
+          // The branch gave up (too long, whole history) with a merge open: no committed
+          // keys to add, the view stays uncommitted-only, but git has still staged every
+          // file the merge brings in. The diffs are only the filter for those, and with no
+          // commit section to list a file again a staged one goes only if the merge itself
+          // brought it in: the merged side changed it (HEAD...MERGE_HEAD) AND the file
+          // equals another lineage's tip. For a merge that tip is MERGE_HEAD; for a pull
+          // of its own remote (its own work) it is a commit just outside what the pull
+          // brings in that HEAD lacks, i.e. what the remote merged from elsewhere (main).
+          // A revert to a version that side never changed stays either way.
+          // Nothing found or a diff failing: unfiltered.
+          const refs = branch.pulled ? branch.incoming : [branch.mergeHead];
+          if (refs?.length) {
+            try {
+              const equal = new Set((await this.sharedChanges(repo, refs)).map(c => foldPathKey(c.uri?.fsPath ?? '')));
+              // -z: paths unquoted; --no-renames: a rename names both its sides.
+              const changed = await this.runGit(api, repo, ['diff', '--name-only', '-z', '--no-renames', `HEAD...${branch.mergeHead}`]);
+              fromMerge = new Set(changed.split('\0').filter(Boolean).map(f => foldPathKey(root ? path.join(root, f) : f)));
+              yours = equal;
+            } catch (err) {
+              this.output.appendLine(`[changed] diffWith(${refs.join(', ')}) failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
         }
-        const root = repo.rootUri?.fsPath;
         const mine = commits.length ? await this.repoIdentity(api, repo) : '';
         for (const commit of commits) {
           const commitKeys = new Set<string>();
@@ -2684,9 +2815,17 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
         }
         // Uncommitted edits on top: diffWith(ref) omits untracked files (brand-new
         // components), and with no ref this IS the whole answer.
-        for (const change of [...repo.state.workingTreeChanges, ...repo.state.indexChanges]) {
+        for (const change of repo.state.workingTreeChanges) addPath(change.uri?.fsPath, uncommitted);
+        for (const change of repo.state.indexChanges) {
+          // A merge still in progress stages everything it brings in: a staged file
+          // that equals the merged-in tip is main's, not yours. A staged edit of
+          // yours, or a teammate's file a pull brought in, differs from it, so it stays.
+          const key = foldPathKey(change.uri?.fsPath ?? '');
+          if (yours && !yours.has(key) && (!fromMerge || fromMerge.has(key))) continue;
           addPath(change.uri?.fsPath, uncommitted);
         }
+        // Files in conflict are yours to resolve, in every mode.
+        for (const change of repo.state.mergeChanges ?? []) addPath(change.uri?.fsPath, uncommitted);
       }
       for (const k of uncommitted) keys.add(k);
       // One repository giving up doesn't make the VIEW a fallback: in a multi-root

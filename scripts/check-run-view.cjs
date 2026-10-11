@@ -317,6 +317,71 @@ check('folds: an explicit fold beats the default, Expand/Collapse all beat the d
   assert.strictEqual(other.rows.find(x => x.id === 'failed|c|ApexClass').open, true, 'a fold made under All does not close the Failed view');
 });
 
+check('msgLong: a message is cut by its clamp when it has more lines than that or wraps to more than the lines hold', () => {
+  assert.strictEqual(RV.MSG_PLAIN_LINES, 3);
+  assert.deepStrictEqual([RV.msgLong('x'.repeat(100), 2, 50), RV.msgLong('x'.repeat(101), 2, 50)], [false, true]);
+  assert.deepStrictEqual([RV.msgLong('a\nb', 2, 50), RV.msgLong('a\nb\nc', 2, 50)], [false, true], 'newline-separated lines count even when each is short');
+  assert.deepStrictEqual([RV.msgLong('x'.repeat(80), 2), RV.msgLong('x'.repeat(81), 2)], [false, true], 'no width known: 40 characters a line');
+  assert.strictEqual(RV.msgLong('', 2, 50), false);
+});
+
+// Lines are counted the way a browser wraps them (a word moves to the next line
+// rather than being split), not by characters: a message just under "lines x
+// cols" characters can still need one line more and lose its tail to the clamp.
+const WRAPPED = 'Variable does not exist: Acme_Discount_Percentage__c in field Acme_Order__c.Acme_Total__c formula';
+check('msgLines / msgLong wrap by word: a 97-character message wraps to 3 lines at 50 columns although 2 x 50 holds it', () => {
+  assert.strictEqual(WRAPPED.length, 97);
+  assert.ok(WRAPPED.length <= 2 * 50, 'a character count would call it two lines');
+  assert.strictEqual(RV.msgLines(WRAPPED, 50), 3, 'the greedy wrap is 24 / 36 / 35');
+  assert.strictEqual(RV.msgLong(WRAPPED, 2, 50), true);
+  const fits = 'Required field missing: Acme_Order__c.Acme_Total__c is blank';
+  assert.strictEqual(fits.length, 60);
+  assert.deepStrictEqual([RV.msgLines(fits, 50), RV.msgLong(fits, 2, 50)], [2, false], 'a 60-character one fits two lines');
+  assert.strictEqual(RV.msgLong('Duplicate value', 2, 50), false);
+});
+
+check('msgLines: a 30-word, 150-character message wraps to 3 lines at 80 columns; a word longer than a line takes ceil(length / cols); a newline starts a line', () => {
+  const words = ['a'.repeat(52), 'b'.repeat(41), ...Array(28).fill('z')];
+  const msg = words.join(' ');
+  assert.deepStrictEqual([words.length, msg.length], [30, 150]);
+  assert.ok(msg.length <= 2 * 80, 'a character count would call it two lines');
+  assert.strictEqual(RV.msgLines(msg, 80), 3);
+  assert.strictEqual(RV.msgLong(msg, 2, 80), true);
+  assert.strictEqual(RV.msgLines('x'.repeat(200), 50), 4);
+  assert.strictEqual(RV.msgLines('x'.repeat(201), 50), 5);
+  assert.strictEqual(RV.msgLines('x'.repeat(50), 50), 1);
+  assert.strictEqual(RV.msgLines('short ' + 'x'.repeat(120), 50), 4, 'the long word starts a line of its own, then breaks');
+  assert.strictEqual(RV.msgLines('x'.repeat(120) + ' tail', 50), 3, 'what is left of a broken word\'s last line is used');
+  assert.strictEqual(RV.msgLines('one\n\ntwo', 50), 3, 'a blank line is a line');
+  assert.strictEqual(RV.msgLines('  lead   gap  ', 50), 1, 'runs of spaces are one');
+  assert.strictEqual(RV.msgLines('', 50), 1);
+});
+
+check('an opened message makes its row as tall as its lines (computed from the pane width, capped at 20); unopened and short ones keep the fixed heights', () => {
+  const rows = [
+    { k: 'ApexClass:AcmeLong', o: 'failed', m: 'w'.repeat(400) },
+    { k: 'ApexClass:AcmeShort', o: 'failed', m: 'Duplicate value' },
+    { k: 'ApexClass:AcmeLines', o: 'failed', m: 'one\ntwo\nthree' },
+    { k: 'ApexClass:AcmeHuge', o: 'failed', m: 'w'.repeat(10000) }
+  ];
+  const tests = [{ cls: 'AcmeTest', method: 'testLong', m: 'x'.repeat(600), l: 3 }];
+  const r = base({ status: 'failed' });
+  const build = (msgOpen, cols) => RV.buildRows(r, rows, tests, UI({ msgOpen }), { cols });
+  const by = (m, name) => m.rows.find(x => (x.row && x.row.k === 'ApexClass:' + name) || (x.test && name === 'AcmeTest.testLong'));
+  const shut = build({}, 50);
+  assert.deepStrictEqual(['AcmeLong', 'AcmeShort', 'AcmeLines', 'AcmeHuge', 'AcmeTest.testLong'].map(n => by(shut, n).more), [true, false, true, true, true]);
+  assert.ok(shut.rows.filter(x => x.k === 'leaf' || x.k === 'test').every(x => x.h === 54 && x.mh === 0), 'shut: the fixed 54');
+  const open = build({ 'ApexClass:AcmeLong': true, 'ApexClass:AcmeShort': true, 'ApexClass:AcmeLines': true, 'ApexClass:AcmeHuge': true, 'AcmeTest.testLong': true }, 50);
+  assert.deepStrictEqual([by(open, 'AcmeLong').mh, by(open, 'AcmeLong').h], [8 * 15, 54 + 8 * 15 - 30], '400 characters at 50 a line: 8 lines');
+  assert.deepStrictEqual([by(open, 'AcmeShort').mh, by(open, 'AcmeShort').h], [0, 54], 'a short message has no toggle to open');
+  assert.deepStrictEqual([by(open, 'AcmeLines').mh, by(open, 'AcmeLines').h], [3 * 15, 54 + 15], 'three newline-separated lines');
+  assert.deepStrictEqual([by(open, 'AcmeHuge').mh, by(open, 'AcmeHuge').h], [20 * 15, 54 + 20 * 15 - 30], 'past 20 lines the message scrolls in its box');
+  assert.deepStrictEqual([by(open, 'AcmeTest.testLong').mh, by(open, 'AcmeTest.testLong').h], [12 * 15, 54 + 12 * 15 - 30], 'a test failure grows too');
+  assert.strictEqual(open.totalH, open.rows.reduce((n, x) => n + x.h, 0), 'the offsets follow the heights');
+  assert.strictEqual(open.offsets[open.rows.indexOf(by(open, 'AcmeShort'))], open.offsets[open.rows.indexOf(by(open, 'AcmeLong'))] + by(open, 'AcmeLong').h);
+  assert.strictEqual(by(build({ 'ApexClass:AcmeLong': true }, 25), 'AcmeLong').mh, 16 * 15, 'a narrower pane needs more lines');
+});
+
 check('test failures: their own section grouped by class, under a Components section; the Tests chip lists only them', () => {
   const r = run('fxtestsfail');
   const m = RV.buildRows(r, r.rows, r.tests, UI());
