@@ -2559,7 +2559,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
     try {
       // -q: no merge in progress is exit 1 and no output — the usual answer, so
       // it is not logged. The fork point is MERGE_HEAD's ancestor and drops out below.
-      // ponytail: an octopus merge in progress holds several heads in MERGE_HEAD and
+      // Known limit: an octopus merge in progress holds several heads in MERGE_HEAD and
       // rev-parse reads the first, so the other heads' files show until it is committed.
       mergeHead = (await this.runGit(api, repo, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])).trim() || undefined;
     } catch { /* no merge in progress */ }
@@ -2572,7 +2572,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
       return { bases: [], mergeHead };
     }
     const { bases = [], giveUp } = baseFromBoundary(boundary);
-    // ponytail: a merged-in tip that no branch or remote ref holds (a one-off `git pull
+    // Known limit: a merged-in tip that no branch or remote ref holds (a one-off `git pull
     // <remote> <branch>`, a bare hash) is listed too and reads as this branch's own; and
     // past the cap on a give-up the walk is cut short and may miss a pull's tip, which
     // then reads as another lineage (its staged files stay out until the merge commits).
@@ -2754,7 +2754,7 @@ export class DeployPanelProvider implements vscode.WebviewViewProvider {
           // branch changed differs from each lineage merged in, while a file a
           // merge brought in equals that lineage's tip and drops out. One base is
           // exactly the plain diff.
-          // ponytail: an edit on this branch that restores a merged-in lineage's older
+          // Known limit: an edit on this branch that restores a merged-in lineage's older
           // version of a file drops out of this diff and, once staged, out of the filter
           // below; its commit section still lists it. That holds on this path only: a
           // give-up has no section, so its filter below asks the merge for the file first.

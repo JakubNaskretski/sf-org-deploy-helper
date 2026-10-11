@@ -148,7 +148,7 @@ export const DEPLOY_JOB_ID_RE = /^0Af[A-Za-z0-9]{12,15}$/;
 export const RUN_CAP_DEFAULT = 3;
 export const RUN_CAP_MAX = 10;
 
-// ponytail: ceiling — the rows file has no byte budget, so ten thousand failed rows
+// Known limit: ceiling — the rows file has no byte budget, so ten thousand failed rows
 // at 4 KB each would be 40 MB on disk and in the webview; add a budget there if it bites.
 export const ROW_MESSAGE_MAX = 4000;
 const KEY_MAX = 600;
