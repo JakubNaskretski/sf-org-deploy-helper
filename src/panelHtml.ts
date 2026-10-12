@@ -323,7 +323,7 @@ body.resizing { cursor: row-resize; user-select: none; }
 }
 
 .status {
-  flex: 1; overflow-y: auto; padding: 8px;
+  flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 8px;
   display: flex; flex-direction: column; gap: 8px;
   /* The run list's offsetTop is measured against this box (panel.js paintRunList). */
   position: relative;

@@ -2475,7 +2475,6 @@
     const searchCaret = runSearch && document.activeElement === runSearch ? [runSearch.selectionStart, runSearch.selectionEnd] : null;
     releaseRunList();
     st.innerHTML = '';
-    runColsKey = colsKey();
     // Notices since the newest run lead, a few at most, so the run stays in
     // reach of a short pane; the rest join the older entries behind Earlier.
     const newer = state.statusCards.filter(c => (c.at || 0) > latest.startedAt).slice(0, NEWER_NOTICES_SHOWN);
@@ -2509,6 +2508,10 @@
       runSearch.focus();
       try { runSearch.setSelectionRange(searchCaret[0], searchCaret[1]); } catch (_) { /* not a text input any more */ }
     }
+    // Read the estimate only now, with the pane drawn: an empty pane has no
+    // scrollbar, so a key taken before the content would never match the
+    // observer's and the pane would redraw itself forever.
+    runColsKey = colsKey();
     if (typeof ResizeObserver === 'function') {
       // The pane resizing (splitter, sidebar width) or anything above the list
       // changing height moves the window the list must paint.
