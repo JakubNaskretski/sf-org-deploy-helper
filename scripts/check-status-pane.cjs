@@ -19,7 +19,11 @@
 //      gets a "more" toggle that opens all of it without opening the file, and
 //      stays open when the same run is delivered again;
 //   7) an older run's failure is one cut line, its tooltip carries the whole
-//      message, and a long or multi-line one opens in place the same way.
+//      message, and a long or multi-line one opens in place the same way;
+//   8) with a classic scrollbar (Windows) the pane settles after a draw: the
+//      observer's first report never redraws it again and again, a real width
+//      change redraws it once, and the toggles are decided at the width the
+//      filled pane has.
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
@@ -49,7 +53,7 @@ const LOCAL = F.localItems(SC);
 const runsMsg = (id, opts) => F.runsMessage(SC, id, Object.assign({ summarize: RR.summarizeRun, cap: 3 }, opts || {}));
 
 function boot(opts = {}) {
-  const p = panel({ selected: [], expandedGroups: [], filter: '', typeFilter: [], viewMode: 'all', testClasses: '' });
+  const p = panel({ selected: [], expandedGroups: [], filter: '', typeFilter: [], viewMode: 'all', testClasses: '' }, opts.shim);
   p.deliver({ type: 'orgs', orgs: [{ username: 'acme-dev-user', alias: 'acme-dev', label: 'acme-dev (acme-dev-user)', kind: 'sandbox' }], selected: 'acme-dev-user' });
   p.deliver({ type: 'files', objectChildTypes: [], items: opts.items || LOCAL });
   p.el('status').clientHeight = opts.height || 200;
@@ -873,6 +877,87 @@ check('the card\'s line and an older failure follow the pane\'s width too', () =
   resizeTo(p, 300);
   assert.strictEqual(btnAfter(card()).textContent, 'more ▾', 'four lines of 34 on the card');
   assert.strictEqual(toggleOf(oldLi()).textContent, 'more ▾', 'wraps past one line of 29 in the older list');
+});
+
+// ================================ 8) a classic scrollbar: the pane settles
+// A classic scrollbar (Windows, Linux, macOS set to always show scroll bars;
+// an overlay takes no width) takes 10px off the pane once it has content.
+// 0.31.3 took the width its redraw key compares from the just-emptied pane, so
+// the observer's first report — and every redraw observes the pane afresh —
+// always disagreed with it: the pane drew itself again every frame, forever.
+// drainResize() runs frames the way a browser does; a pane that never goes
+// quiet uses them all.
+const CLASSIC = { scrollbars: 'classic' };
+/** The same scrollbar where the gutter is not kept while the pane is empty (an
+ *  engine without scrollbar-gutter): the redraw key alone must hold the pane still. */
+const NO_GUTTER = { scrollbars: 'classic', gutter: false };
+const FRAMES = 12;
+/** Run frames until the observer has nothing more to say: the pane's whole
+ *  redraws meanwhile, and whether it went quiet before FRAMES ran out. */
+function settle(p) {
+  const st = p.el('status');
+  const before = st.htmlResets || 0;
+  const frames = p.drainResize(FRAMES);
+  return { redraws: (st.htmlResets || 0) - before, quiet: frames < FRAMES };
+}
+
+for (const [mode, shim] of [['the page\'s CSS', CLASSIC], ['no gutter kept', NO_GUTTER]]) {
+  check(`classic scrollbar (${mode}): a run that fills the pane is drawn once — the observer's first report redraws nothing, and the pane goes quiet`, () => {
+    for (const scenario of ['fxdeployfail', 'fxbigdeploy']) {
+      const p = boot({ scenario, shim, height: 900 });
+      assert.ok(listOf(p), `${scenario}: drawn`);
+      assert.deepStrictEqual(settle(p), { redraws: 0, quiet: true }, `${scenario}: settles with no redraw`);
+      assert.deepStrictEqual(settle(p), { redraws: 0, quiet: true }, `${scenario}: and stays quiet`);
+    }
+  });
+
+  check(`classic scrollbar (${mode}): a real width change (400 → 300 → 400) redraws the pane exactly once each way`, () => {
+    const p = boot({ scenario: 'fxbigdeploy', shim, height: 900 });
+    settle(p);
+    p.el('status').clientWidth = 300;
+    assert.deepStrictEqual(settle(p), { redraws: 1, quiet: true }, 'narrower');
+    p.el('status').clientWidth = 400;
+    assert.deepStrictEqual(settle(p), { redraws: 1, quiet: true }, 'and back');
+    p.el('status').clientHeight = 500;
+    assert.deepStrictEqual(settle(p), { redraws: 0, quiet: true }, 'a height change only repaints the list');
+  });
+
+  check(`classic scrollbar (${mode}): a pane drawn hidden (width 0) is drawn again once when shown, then is quiet`, () => {
+    const p = boot({ shim, height: 900 });
+    p.el('status').clientWidth = 0;
+    p.deliver(runsMsg('fxdeployfail'));
+    assert.deepStrictEqual(settle(p), { redraws: 0, quiet: true }, 'hidden: nothing to redraw');
+    p.el('status').clientWidth = 400;
+    assert.deepStrictEqual(settle(p), { redraws: 1, quiet: true }, 'shown');
+  });
+}
+
+// A redraw decides the toggles while the pane is empty, before the list is in
+// it; Expand, a fold or a search rebuilds only the list, in the filled pane.
+// With the gutter kept from the start (scrollbar-gutter: stable) both read the
+// filled pane's width, so they agree.
+// At 400px less the scrollbar the card holds 46 characters a line and a row 47
+// (47 and 49 at a full 400): CARD_390 takes three lines of 47 but six of 46,
+// ROW_390 two lines of 49 but four of 47.
+const CARD_390 = Array.from({ length: 3 }, () => `${'x'.repeat(23)} ${'y'.repeat(23)}`).join(' ');
+const ROW_390 = Array.from({ length: 2 }, () => `${'x'.repeat(24)} ${'y'.repeat(24)}`).join(' ');
+check('classic scrollbar: the toggles are decided at the width of the filled pane — the gutter is kept while it is still empty', () => {
+  const { msg } = longRun(CARD_390);
+  const { long } = longRun(ROW_390);
+  const rows = msg.latestRows.rows.map(r => (r.k === long ? { ...r, m: ROW_390 } : r));
+  const both = { ...msg, latestRows: { ...msg.latestRows, rows } };
+  const p = boot({ shim: CLASSIC, height: 5000 });
+  p.deliver(both);
+  settle(p);
+  const card = p.el('status').find(e => has(e, 'run-plain') && e.textContent === CARD_390);
+  const after = card._parent.children[card._parent.children.indexOf(card) + 1];
+  assert.ok(after && has(after, 'show-more'), 'the card\'s message: six lines of 46 in the filled pane');
+  click(chipBtn(p, 'failed'));
+  settle(p);
+  assert.ok(moreOf(rowFor(p, long)), 'a row, the pane drawn whole for the chip: four lines of 47');
+  click(p.el('status').find(e => e.tagName === 'BUTTON' && e.textContent === 'Expand'));
+  settle(p);
+  assert.ok(moreOf(rowFor(p, long)), 'the same row, only the list rebuilt (Expand): the same toggle');
 });
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));

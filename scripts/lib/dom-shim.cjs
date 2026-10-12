@@ -7,12 +7,21 @@
 // browser. There is no layout: sizes and offsets are plain settable numbers a
 // check sets itself (clientHeight and clientWidth default to 100, everything else to 0), events
 // do not bubble, and a click fired on a disabled button is still delivered (the
-// checks gate that themselves, as a browser would).
+// checks gate that themselves, as a browser would). The one piece of layout it
+// can model, on request, is a classic (Windows) scrollbar on #status: see panel().
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
 const SRC = path.join(__dirname, '..', '..', 'src');
+/** What a classic scrollbar takes off a pane's clientWidth. */
+const SCROLLBAR_PX = 10;
+/** Whether the page's own `.status { … }` rule (src/panelHtml.ts) reserves the
+ *  scrollbar's gutter while the pane is still empty. */
+function statusGutterStable() {
+  const rule = /\n\.status\s*\{([^}]*)\}/.exec(fs.readFileSync(path.join(SRC, 'panelHtml.ts'), 'utf8'));
+  return !!rule && /scrollbar-gutter\s*:\s*stable/.test(rule[1]);
+}
 
 class El {
   constructor(tag) {
@@ -41,7 +50,8 @@ class El {
   get className() { return [...this._classes].join(' '); }
   set className(v) { this._classes = new Set(String(v).split(/\s+/).filter(Boolean)); }
   get innerHTML() { return ''; }
-  set innerHTML(_v) { this.children = []; }
+  /** `htmlResets` counts the times the content was wiped (a pane redrawn whole). */
+  set innerHTML(_v) { this.children = []; this.htmlResets = (this.htmlResets || 0) + 1; }
   get firstChild() { return this.children[0] || null; }
   get lastChild() { return this.children[this.children.length - 1] || null; }
   get parentNode() { return this._parent || null; }
@@ -134,8 +144,13 @@ const IDS = [
   'statusEarlier'
 ];
 
-/** Boot one panel instance over the given persisted webview state. */
-function panel(persisted) {
+/** Boot one panel instance over the given persisted webview state.
+ *  `opts.scrollbars: 'classic'` gives #status a classic scrollbar: once it has
+ *  content (taken to overflow) its clientWidth is SCROLLBAR_PX under the width a
+ *  check sets — and so is an empty pane's when the page's CSS keeps the gutter
+ *  stable (`opts.gutter` overrides what the CSS says). A width of 0 (hidden)
+ *  stays 0. */
+function panel(persisted, opts = {}) {
   const els = new Map();
   const doc = {
     body: new El('body'),
@@ -148,6 +163,13 @@ function panel(persisted) {
     removeEventListener: () => {}
   };
   for (const id of IDS) { const e = new El('div'); e.id = id; e._doc = doc; els.set(id, e); }
+  if (opts.scrollbars === 'classic') {
+    const gutter = opts.gutter === undefined ? statusGutterStable() : !!opts.gutter;
+    Object.defineProperty(els.get('status'), 'clientWidth', {
+      get() { const w = this._clientWidth ?? 100; return w && (gutter || this.children.length) ? w - SCROLLBAR_PX : w; },
+      set(v) { this._clientWidth = v; }
+    });
+  }
   // The three lens tabs are static markup in panelHtml.ts; renderViewModes finds
   // them via querySelectorAll('#viewModes button') and rewrites their text.
   for (const mode of ['all', 'selected', 'changed']) {
@@ -163,13 +185,37 @@ function panel(persisted) {
   // assert exactly that ordering, then call flush() to run the deferred render
   // and get the old "render already happened" behaviour back.
   const pendingFrames = [];
-  // Every ResizeObserver the page creates, so a check can report a resize.
+  // Every ResizeObserver the page creates, so a check can report a resize —
+  // by calling its cb itself, or with drainResize(), which delivers what a
+  // browser would: a target observed afresh is reported (its last size starts
+  // at 0x0, as the spec has it), and after that only a size that changed.
   const resizeObservers = [];
   class ResizeObserver {
-    constructor(cb) { this.cb = cb; this.targets = new Set(); resizeObservers.push(this); }
-    observe(t) { this.targets.add(t); }
-    unobserve(t) { this.targets.delete(t); }
-    disconnect() { this.targets.clear(); }
+    constructor(cb) { this.cb = cb; this.targets = new Set(); this.last = new Map(); resizeObservers.push(this); }
+    observe(t) { this.targets.add(t); this.last.set(t, '0x0'); }
+    unobserve(t) { this.targets.delete(t); this.last.delete(t); }
+    disconnect() { this.targets.clear(); this.last.clear(); }
+  }
+  const sizeOf = (t) => `${t.clientWidth}x${t.clientHeight}`;
+  /** Up to `frames` frames: each runs the queued animation frames, then gathers
+   *  every observed target whose size differs from the one last reported and
+   *  calls each observer once with its entries. Stops at the first frame with
+   *  nothing to report; returns how many frames reported something. */
+  function drainResize(frames = 10) {
+    let reported = 0;
+    for (let f = 0; f < frames; f++) {
+      while (pendingFrames.length) pendingFrames.shift()();
+      const due = [];
+      for (const ro of resizeObservers) {
+        const entries = [...ro.targets].filter(t => ro.last.get(t) !== sizeOf(t)).map(target => ({ target }));
+        for (const e of entries) ro.last.set(e.target, sizeOf(e.target));
+        if (entries.length) due.push([ro, entries]);
+      }
+      if (!due.length) break;
+      reported++;
+      for (const [ro, entries] of due) ro.cb(entries);
+    }
+    return reported;
   }
 
   const sandbox = {
@@ -216,8 +262,9 @@ function panel(persisted) {
     outbound,
     pendingRenders: pendingFrames,
     resizeObservers,
+    drainResize,
     flush: () => { while (pendingFrames.length) pendingFrames.shift()(); }
   };
 }
 
-module.exports = { El, IDS, panel };
+module.exports = { El, IDS, panel, SCROLLBAR_PX };

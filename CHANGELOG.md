@@ -3,6 +3,13 @@
 All notable changes to this extension are documented here.
 This file starts at the current release; earlier history predates it.
 
+## 0.31.4
+
+- **The Status pane no longer redraws itself endlessly.** In 0.31.3, as soon as the pane's content
+  needed a scrollbar, the pane rebuilt itself many times a second without stopping, burning CPU and
+  making the panel sluggish, the more so the bigger the newest run. It now reserves the scrollbar's
+  space and reads its width after drawing, so it draws once, and once more only when you resize it.
+
 ## 0.31.3
 
 - **Merging main into your branch no longer fills the Changed view with main's changes.** After a
